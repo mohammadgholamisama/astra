@@ -442,16 +442,34 @@ export default function PanelsPage() {
     },
   });
 
+  const [testTip, setTestTip] = useState<{
+    id: number;
+    ok: boolean;
+    text: string;
+  } | null>(null);
+
   const test = useMutation({
     mutationFn: (id: number) =>
       api<{ success: boolean; error?: string }>(`/api/admin/panels/${id}/test`, {
         method: "POST",
       }),
-    onSuccess: (res) => {
-      setMsg(res.success ? "اتصال موفق بود" : `خطا: ${res.error || "ناموفق"}`);
+    onSuccess: (res, id) => {
+      setTestTip({
+        id,
+        ok: !!res.success,
+        text: res.success ? "اتصال موفق بود" : res.error || "اتصال ناموفق",
+      });
       qc.invalidateQueries({ queryKey: ["panels"] });
+      window.setTimeout(() => {
+        setTestTip((cur) => (cur?.id === id ? null : cur));
+      }, 2800);
     },
-    onError: (e: Error) => setMsg(e.message),
+    onError: (e: Error, id) => {
+      setTestTip({ id, ok: false, text: e.message || "خطای تست" });
+      window.setTimeout(() => {
+        setTestTip((cur) => (cur?.id === id ? null : cur));
+      }, 3200);
+    },
   });
 
   function onSubmit(e: FormEvent) {
@@ -569,15 +587,31 @@ export default function PanelsPage() {
                     <Pencil size={14} />
                     ویرایش
                   </button>
-                  <button
-                    type="button"
-                    className="btn ghost sm"
-                    onClick={() => test.mutate(p.id)}
-                    disabled={test.isPending}
-                  >
-                    <Wifi size={14} />
-                    تست
-                  </button>
+                  <span className="panel-test-wrap">
+                    <button
+                      type="button"
+                      className={`btn ghost sm${
+                        testTip?.id === p.id ? (testTip.ok ? " tip-ok" : " tip-err") : ""
+                      }`}
+                      onClick={() => test.mutate(p.id)}
+                      disabled={test.isPending && test.variables === p.id}
+                      aria-describedby={
+                        testTip?.id === p.id ? `panel-test-tip-${p.id}` : undefined
+                      }
+                    >
+                      <Wifi size={14} />
+                      {test.isPending && test.variables === p.id ? "…" : "تست"}
+                    </button>
+                    {testTip?.id === p.id && (
+                      <span
+                        id={`panel-test-tip-${p.id}`}
+                        className={`panel-test-tip ${testTip.ok ? "ok" : "err"}`}
+                        role="status"
+                      >
+                        {testTip.text}
+                      </span>
+                    )}
+                  </span>
                   <button
                     type="button"
                     className="btn danger sm"

@@ -104,23 +104,12 @@ export default function DashboardPage() {
             </div>
 
             <div className="board-strip-update">
-              {hasUpdate && (
-                <span className="board-upd-tag">
-                  آخرین: {toFaDigits(updateInfo!.remote_version)}
-                </span>
-              )}
-              {isLatest && !busy && (
-                <span className="board-upd-ok">
-                  <CheckCircle2 size={14} />
-                  به‌روز
-                </span>
-              )}
               {applyUpdate.isPending ? (
-                <span className="board-upd-busy">در حال نصب…</span>
+                <span className="board-upd-busy">در حال نصب آپدیت…</span>
               ) : hasUpdate ? (
                 <button
                   type="button"
-                  className="btn sm"
+                  className="board-upd-cta"
                   disabled={busy}
                   onClick={() => {
                     if (
@@ -133,13 +122,32 @@ export default function DashboardPage() {
                     applyUpdate.mutate();
                   }}
                 >
-                  <Download size={14} />
-                  نصب آپدیت
+                  <span className="board-upd-cta-glow" aria-hidden />
+                  <Download size={15} />
+                  <span className="board-upd-cta-text">
+                    آپدیت پنل
+                    <small>v{toFaDigits(updateInfo!.remote_version)}</small>
+                  </span>
+                </button>
+              ) : isLatest ? (
+                <button
+                  type="button"
+                  className="board-upd-fresh"
+                  disabled={busy}
+                  onClick={() => {
+                    setErr("");
+                    checkUpdate.mutate();
+                  }}
+                >
+                  <CheckCircle2 size={15} />
+                  پنل به‌روز است
                 </button>
               ) : (
                 <button
                   type="button"
-                  className="btn ghost sm"
+                  className={`btn ghost sm board-upd-check${
+                    checkUpdate.isPending ? " is-busy" : ""
+                  }`}
                   disabled={busy}
                   onClick={() => {
                     setErr("");
@@ -150,7 +158,7 @@ export default function DashboardPage() {
                     size={14}
                     className={checkUpdate.isPending ? "spin" : undefined}
                   />
-                  {checkUpdate.isPending ? "بررسی…" : "بررسی آپدیت"}
+                  {checkUpdate.isPending ? "در حال بررسی…" : "بررسی آپدیت"}
                 </button>
               )}
             </div>

@@ -76,13 +76,18 @@ export default function Layout() {
           <span />
         </button>
         <div className="topbar-center">
-          <span className="topbar-brand">Astra</span>
           <span className="topbar-page">{pageLabel}</span>
+          <span className="topbar-brand">Astra</span>
         </div>
         <div className="topbar-actions">
-          <ThemeToggle />
-          <button type="button" className="btn ghost sm topbar-logout" onClick={doLogout}>
-            خروج
+          <button
+            type="button"
+            className="topbar-icon-btn"
+            onClick={doLogout}
+            aria-label="خروج از حساب"
+            title="خروج"
+          >
+            <LogOut size={17} strokeWidth={2.2} />
           </button>
         </div>
       </header>
