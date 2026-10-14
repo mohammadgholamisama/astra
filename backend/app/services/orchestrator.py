@@ -32,17 +32,34 @@ def coefficient_from_config(config: dict | None) -> float:
     return c
 
 
-def remote_data_limit_bytes(user_limit: int, config: dict | None) -> int:
-    """Bytes to set on remote panel = Astra quota ÷ coefficient.
+def remote_data_limit_bytes(
+    user_limit: int,
+    config: dict | None,
+    *,
+    used_weighted_total: int = 0,
+    used_raw_on_panel: int = 0,
+) -> int:
+    """Absolute traffic ceiling to push to one remote panel.
 
-    coeff 1 + 1GiB Astra → 1GiB on panel
-    coeff 2 + 1GiB Astra → 512MiB on panel (user still sees 1GiB in Astra)
+    Astra quota is SHARED across all panels:
+      user.used_traffic = Σ (raw_i × coefficient_i)
+      when that sum hits data_limit → subscription ends everywhere.
+
+    Each remote only gets: already_used_on_panel + remaining_astra/coeff
+    so one panel cannot silently consume the whole quota on every panel.
     """
     limit = int(user_limit or 0)
     if limit <= 0:
-        return 0
+        return 0  # unlimited on Astra → unlimited on remote
     coeff = coefficient_from_config(config)
-    return max(1, int(limit / coeff))
+    used_w = max(0, int(used_weighted_total or 0))
+    used_r = max(0, int(used_raw_on_panel or 0))
+    remaining_w = max(0, limit - used_w)
+    if remaining_w <= 0:
+        # Quota exhausted — freeze remote at current usage (no more traffic)
+        return max(1, used_r) if used_r > 0 else 1
+    more_raw = int(remaining_w / coeff)
+    return max(1, used_r + more_raw)
 
 
 def build_user_payload(
@@ -50,8 +67,10 @@ def build_user_payload(
     *,
     uuid: str | None,
     panel_config: dict | None,
+    used_weighted_total: int | None = None,
+    used_raw_on_panel: int = 0,
 ) -> UserPayload:
-    """Build remote payload with coefficient-scaled data_limit."""
+    """Build remote payload; data_limit uses shared remaining Astra quota."""
     cfg = {
         **(panel_config or {}),
         "proxy_settings": user.proxy_settings or {},
@@ -60,9 +79,19 @@ def build_user_payload(
     explicit_proxies = (user.proxy_settings or {}).get("proxies")
     if isinstance(explicit_proxies, dict) and explicit_proxies:
         cfg["proxies"] = explicit_proxies
+    used_w = (
+        int(used_weighted_total)
+        if used_weighted_total is not None
+        else int(user.used_traffic or 0)
+    )
     return UserPayload(
         username=user.username,
-        data_limit=remote_data_limit_bytes(user.data_limit or 0, cfg),
+        data_limit=remote_data_limit_bytes(
+            user.data_limit or 0,
+            cfg,
+            used_weighted_total=used_w,
+            used_raw_on_panel=used_raw_on_panel,
+        ),
         expire=user.expire or None,
         status=user.status.value,
         note=user.note,
@@ -208,14 +237,14 @@ async def provision_user_on_panels(
 
 
 async def sync_modify_user(db: AsyncSession, user: User) -> None:
+    """Push status + shared remaining quota to every remote panel account."""
     result = await db.execute(
         select(PanelAccount)
         .where(PanelAccount.user_id == user.id)
         .options(selectinload(PanelAccount.panel))
     )
-    accounts = result.scalars().all()
+    accounts = list(result.scalars().all())
 
-    # Merge GroupPanel.config (e.g. limit_ip / coefficient) from user's groups
     ug = await db.execute(select(UserGroup.group_id).where(UserGroup.user_id == user.id))
     group_ids = [row[0] for row in ug.all()]
     panel_cfg: dict[int, dict] = {}
@@ -223,13 +252,25 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
         for panel, cfg in await resolve_panels_for_groups(db, group_ids):
             panel_cfg[panel.id] = cfg
 
+    coeffs = await panel_coefficients_for_user(db, user)
+    weighted = await _weighted_total(accounts, coeffs)
+    user.used_traffic = weighted
+
     jobs: list[tuple[PanelAccount, Panel, UserPayload]] = []
     for account in accounts:
         panel = account.panel
         if not panel or not panel.is_active:
             continue
+        if account.status == PanelAccountStatus.deleted:
+            continue
         merged = dict(panel_cfg.get(panel.id) or {})
-        payload = build_user_payload(user, uuid=account.uuid, panel_config=merged)
+        payload = build_user_payload(
+            user,
+            uuid=account.uuid,
+            panel_config=merged,
+            used_weighted_total=weighted,
+            used_raw_on_panel=int(account.used_traffic or 0),
+        )
         jobs.append((account, panel, payload))
 
     async def _remote(panel: Panel, payload: UserPayload) -> AdapterResult:
@@ -240,15 +281,19 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
             return _fail_result(str(e))
 
     if not jobs:
+        await db.flush()
         return
 
     results = await asyncio.gather(*[_remote(panel, payload) for _, panel, payload in jobs])
     now = datetime.now(timezone.utc)
     for (account, _panel, _payload), res in zip(jobs, results):
         if res.success:
-            account.status = PanelAccountStatus.active
+            # Keep panel account "active" row even when user is limited — remotes get disabled via status
+            if account.status != PanelAccountStatus.error:
+                account.status = PanelAccountStatus.active
             account.links = res.links or account.links
-            account.used_traffic = res.used_traffic or account.used_traffic
+            if res.used_traffic is not None:
+                account.used_traffic = int(res.used_traffic or account.used_traffic or 0)
             account.error_message = None
             account.last_sync_at = now
         else:
@@ -410,7 +455,12 @@ async def usage_breakdown_for_user(db: AsyncSession, user: User) -> list[dict]:
         if coeff < 0.01:
             coeff = 0.01
         weighted = int(round(raw * coeff))
-        remote_limit = remote_data_limit_bytes(user_limit, {"coefficient": coeff})
+        remote_limit = remote_data_limit_bytes(
+            user_limit,
+            {"coefficient": coeff},
+            used_weighted_total=int(user.used_traffic or 0),
+            used_raw_on_panel=raw,
+        )
         n_links = len([x for x in (account.links or []) if x])
         rows.append(
             {
@@ -518,7 +568,11 @@ async def refresh_users_usage_batch(
     force: bool = True,
     concurrency: int = 8,
 ) -> None:
-    """Live-pull usage for many users (admin users page). Bounded parallelism."""
+    """Live-pull usage for many users (admin users page). Bounded parallelism.
+
+    After summing traffic across panels, push remaining caps / disable remotes
+    so a 5GB plan cannot become 5GB×N panels.
+    """
     if not users:
         return
     sem = asyncio.Semaphore(max(1, concurrency))
@@ -527,7 +581,15 @@ async def refresh_users_usage_batch(
         async with sem:
             try:
                 await refresh_usage(db, u, force=force)
-                await enforce_user_quota(db, u)
+                changed = await enforce_user_quota(db, u)
+                blocked = u.status in (
+                    UserStatus.limited,
+                    UserStatus.expired,
+                    UserStatus.disabled,
+                )
+                # Always re-push shared remaining (or disable) after a live pull
+                if changed or blocked or force:
+                    await sync_modify_user(db, u)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("batch usage refresh failed user=%s: %s", u.username, exc)
 
@@ -658,7 +720,7 @@ async def sync_subscription_state(
     *,
     force: bool = False,
 ) -> User:
-    """Throttled usage refresh + quota enforce + remote disable/enable.
+    """Usage refresh + shared-quota enforce + push remaining/disable to remotes.
 
     Safe under concurrent sub clients via per-user lock.
     """
@@ -666,7 +728,6 @@ async def sync_subscription_state(
     async with lock:
         await refresh_usage(db, user, force=force)
         changed = await enforce_user_quota(db, user)
-        # Retry remote push if previous disable/enable left accounts in error
         result = await db.execute(
             select(PanelAccount).where(PanelAccount.user_id == user.id)
         )
@@ -677,7 +738,8 @@ async def sync_subscription_state(
             UserStatus.expired,
             UserStatus.disabled,
         )
-        if changed or (blocked and has_err):
+        # Push disable when blocked; push shrinking remaining on force sync
+        if changed or blocked or has_err or force:
             await sync_modify_user(db, user)
         await db.flush()
         return user

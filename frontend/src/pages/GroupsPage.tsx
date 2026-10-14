@@ -592,8 +592,8 @@ export default function GroupsPage() {
     <div className="admin-page">
       <h1 className="page-title">گروه‌ها</h1>
       <p className="page-sub">
-        کاربر روی همه پنل‌های گروه ساخته می‌شود. ضریب، حجم روی پنل ریموت را تقسیم می‌کند (مثلاً ضریب ۲
-        → نصف حجم روی پنل؛ کاربر همان سقف Astra را می‌بیند).
+        کاربر روی همه پنل‌های گروه ساخته می‌شود. سقف حجم بین پنل‌ها مشترک است (جمع مصرف‌ها). ضریب، سهم
+        هر پنل را وزن می‌دهد (مثلاً ۲ = مصرف دوبرابر نسبت به سقف Astra).
       </p>
 
       <div className="toolbar">
@@ -1065,7 +1065,7 @@ export default function GroupsPage() {
                                 }}
                               />
                               <p className="field-hint" style={{ marginBottom: 0 }}>
-                                ۱ = همان حجم روی پنل · ۲ = نصف حجم روی پنل (۱ گیگ Astra → ۵۱۲ مگ پنل)
+                                ۱ = عادی · ۲ = هر ۱ مگ روی پنل = ۲ مگ از سقف Astra (سقف بین پنل‌ها مشترک است)
                               </p>
                             </div>
                             <div className="field" style={{ marginBottom: 0 }}>
