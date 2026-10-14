@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -9,8 +9,8 @@ import {
   Clock,
   Copy,
   ExternalLink,
-  Gauge,
   Layers,
+  Menu,
   Pencil,
   Plus,
   Power,
@@ -149,6 +149,25 @@ export default function UsersPage() {
   const [qrDataUrl, setQrDataUrl] = useState("");
   const [actionMsg, setActionMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
   const [syncingUsage, setSyncingUsage] = useState(false);
+  const [menuUser, setMenuUser] = useState<string | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!menuUser) return;
+    function onDoc(e: MouseEvent) {
+      const t = e.target as Node;
+      if (menuRef.current && !menuRef.current.contains(t)) setMenuUser(null);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setMenuUser(null);
+    }
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [menuUser]);
 
   const [searchDebounced, setSearchDebounced] = useState(search);
   useEffect(() => {
@@ -630,7 +649,15 @@ export default function UsersPage() {
         </div>
       ) : (
         <>
-        <div className="users-list">
+        <div className="users-table" role="list">
+          <div className="users-table-head" aria-hidden>
+            <span>کاربر</span>
+            <span>گروه</span>
+            <span>حجم</span>
+            <span>انقضا</span>
+            <span>پنل</span>
+            <span />
+          </div>
           {filtered.map((u) => {
             const errors = (u.panel_accounts || []).filter(
               (a) => a.status === "error" || !!a.error_message
@@ -647,156 +674,178 @@ export default function UsersPage() {
               .join("، ");
             const barTone =
               pct == null ? "muted" : pct >= 90 ? "danger" : pct >= 70 ? "warn" : "ok";
-
             const isOff = u.status === "disabled";
+            const menuOpen = menuUser === u.username;
 
             return (
               <article
                 key={u.username}
-                className={`user-card${errors.length ? " has-err" : ""}${isOff ? " is-off" : ""}`}
+                role="listitem"
+                className={`user-row${errors.length ? " has-err" : ""}${isOff ? " is-off" : ""}${menuOpen ? " menu-open" : ""}`}
               >
-                <div className="user-card-top">
-                  <div className="user-card-id">
-                    <div className="user-card-name">
-                      <b dir="ltr">{u.username}</b>
-                      <span className={`badge ${st.tone}`}>{st.text}</span>
-                    </div>
-                    {u.display_name ? (
-                      <div className="user-display-name" title="نام کانفیگ‌ها">
-                        {u.display_name}
-                      </div>
-                    ) : null}
-                    <div className="user-card-meta">
-                      {groupNames ? (
-                        <span className="user-group-chip">
-                          <Layers size={12} />
-                          {groupNames}
-                        </span>
-                      ) : (
-                        <span className="muted">بدون گروه</span>
-                      )}
-                    </div>
+                <div className="user-row-user">
+                  <div className="user-row-name">
+                    <b dir="ltr">{u.username}</b>
+                    <span className={`badge ${st.tone}`}>{st.text}</span>
                   </div>
-                  <div className="user-card-panels">
-                    <span className="badge ok">{toFaDigits(ok)}/{toFaDigits(panels)} پنل</span>
-                    {errors.length > 0 && (
-                      <button
-                        type="button"
-                        className="badge err user-err-btn"
-                        onClick={() => setErrorsUser(u)}
-                      >
-                        {toFaDigits(errors.length)} خطا
-                      </button>
-                    )}
-                  </div>
+                  {u.display_name ? (
+                    <div className="user-row-display" title="نام کانفیگ‌ها">
+                      {u.display_name}
+                    </div>
+                  ) : null}
                 </div>
 
-                <div className="user-stat-grid">
-                  <div className={`user-stat-box ${barTone}`}>
-                    <div className="user-stat-box-head">
-                      <Gauge size={14} />
-                      <span>حجم</span>
-                      <strong className="user-stat-pct">
-                        {pct == null ? "∞" : `${toFaDigits(pct)}٪`}
-                      </strong>
-                    </div>
-                    <div className="user-stat-box-value">
+                <div className="user-row-group" title={groupNames || undefined}>
+                  {groupNames ? (
+                    <span className="user-group-chip">
+                      <Layers size={12} />
+                      {groupNames}
+                    </span>
+                  ) : (
+                    <span className="muted">بدون گروه</span>
+                  )}
+                </div>
+
+                <div className={`user-row-usage ${barTone}`}>
+                  <div className="user-row-usage-top">
+                    <span>
                       {formatTraffic(u.used_traffic, { empty: "۰" })}
-                      <span className="muted"> / {formatDataLimit(u.data_limit)}</span>
-                    </div>
-                    <div className="user-bar" aria-hidden>
-                      <div
-                        className={`user-bar-fill ${barTone}`}
-                        style={{ width: pct == null ? "0%" : `${Math.min(100, pct)}%` }}
-                      />
-                    </div>
-                    <div className="user-stat-box-foot">
-                      {remain != null
-                        ? `باقی‌مانده: ${formatTraffic(remain, { empty: "۰" })}`
-                        : "سقف تعریف نشده"}
-                    </div>
+                      <em> / {formatDataLimit(u.data_limit)}</em>
+                    </span>
+                    <strong>{pct == null ? "∞" : `${toFaDigits(pct)}٪`}</strong>
                   </div>
-                  <div className={`user-stat-box expire ${exp.tone}`}>
-                    <div className="user-stat-box-head">
-                      <Clock size={14} />
-                      <span>مدت</span>
-                    </div>
-                    <div className="user-stat-box-value user-expire-value">{exp.label}</div>
-                    <div className="user-stat-box-foot">
-                      {exp.daysLeft == null
-                        ? "بدون تاریخ انقضا"
-                        : exp.daysLeft === 0
-                          ? "اعتبار تمام شده"
-                          : `${toFaDigits(exp.daysLeft)} روز تا پایان`}
-                    </div>
+                  <div className="user-bar" aria-hidden>
+                    <div
+                      className={`user-bar-fill ${barTone}`}
+                      style={{ width: pct == null ? "0%" : `${Math.min(100, pct)}%` }}
+                    />
+                  </div>
+                  <div className="user-row-usage-foot">
+                    {remain != null
+                      ? `باقی: ${formatTraffic(remain, { empty: "۰" })}`
+                      : "نامحدود"}
                   </div>
                 </div>
 
-                <div className="user-card-actions">
-                  <button
-                    type="button"
-                    className="btn ghost sm user-sub-btn"
-                    onClick={() => setSubUser(u)}
-                  >
-                    <QrCode size={15} />
-                    ساب
-                  </button>
-                  <button
-                    type="button"
-                    className="btn ghost sm"
-                    onClick={() => openEdit(u)}
-                    title="ویرایش نام کانفیگ، حجم و مدت"
-                  >
-                    <Pencil size={14} />
-                    ویرایش
-                  </button>
-                  <button
-                    type="button"
-                    className="btn ghost sm"
-                    onClick={() => void openUsage(u)}
-                    title="مصرف هر پنل"
-                  >
-                    <BarChart3 size={15} />
-                    مصرف
-                  </button>
-                  <button
-                    type="button"
-                    className={`btn sm ${isOff ? "" : "ghost"} user-power-btn`}
-                    onClick={() =>
-                      togglePower.mutate({ username: u.username, enable: isOff })
-                    }
-                    disabled={togglePower.isPending}
-                    title={
-                      isOff
-                        ? "روشن کردن — فعال‌سازی کانفیگ‌ها روی همه پنل‌ها"
-                        : "خاموش کردن — غیرفعال‌سازی کانفیگ‌ها روی همه پنل‌ها"
-                    }
-                  >
-                    {isOff ? <Power size={14} /> : <PowerOff size={14} />}
-                    {isOff ? "روشن" : "خاموش"}
-                  </button>
+                <div className={`user-row-expire ${exp.tone}`}>
+                  <Clock size={13} aria-hidden />
+                  <div>
+                    <strong>{exp.label}</strong>
+                    <span>
+                      {exp.daysLeft == null
+                        ? "بدون انقضا"
+                        : exp.daysLeft === 0
+                          ? "تمام‌شده"
+                          : `${toFaDigits(exp.daysLeft)} روز`}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="user-row-panels">
+                  <span className="badge ok">{toFaDigits(ok)}/{toFaDigits(panels)}</span>
                   {errors.length > 0 && (
                     <button
                       type="button"
-                      className="btn ghost sm"
-                      onClick={() => retry.mutate(u.username)}
-                      disabled={retry.isPending}
+                      className="badge err user-err-btn"
+                      onClick={() => setErrorsUser(u)}
                     >
-                      <RefreshCw size={14} />
-                      تلاش مجدد
+                      {toFaDigits(errors.length)} خطا
                     </button>
                   )}
+                </div>
+
+                <div
+                  className="user-row-menu"
+                  ref={menuOpen ? menuRef : undefined}
+                >
                   <button
                     type="button"
-                    className="btn danger sm"
-                    onClick={() => {
-                      setActionMsg(null);
-                      setConfirmUser(u);
-                    }}
+                    className={`user-menu-btn${menuOpen ? " open" : ""}`}
+                    aria-label="منوی عملیات"
+                    aria-expanded={menuOpen}
+                    aria-haspopup="menu"
+                    onClick={() =>
+                      setMenuUser((cur) => (cur === u.username ? null : u.username))
+                    }
                   >
-                    <Trash2 size={14} />
-                    حذف
+                    <Menu size={18} strokeWidth={2.2} />
                   </button>
+                  {menuOpen && (
+                    <div className="user-menu" role="menu">
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setMenuUser(null);
+                          setSubUser(u);
+                        }}
+                      >
+                        <QrCode size={15} />
+                        لینک ساب
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setMenuUser(null);
+                          openEdit(u);
+                        }}
+                      >
+                        <Pencil size={15} />
+                        ویرایش
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setMenuUser(null);
+                          void openUsage(u);
+                        }}
+                      >
+                        <BarChart3 size={15} />
+                        مصرف پنل‌ها
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        disabled={togglePower.isPending}
+                        onClick={() => {
+                          setMenuUser(null);
+                          togglePower.mutate({ username: u.username, enable: isOff });
+                        }}
+                      >
+                        {isOff ? <Power size={15} /> : <PowerOff size={15} />}
+                        {isOff ? "روشن کردن" : "خاموش کردن"}
+                      </button>
+                      {errors.length > 0 && (
+                        <button
+                          type="button"
+                          role="menuitem"
+                          disabled={retry.isPending}
+                          onClick={() => {
+                            setMenuUser(null);
+                            retry.mutate(u.username);
+                          }}
+                        >
+                          <RefreshCw size={15} />
+                          تلاش مجدد
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="danger"
+                        onClick={() => {
+                          setMenuUser(null);
+                          setActionMsg(null);
+                          setConfirmUser(u);
+                        }}
+                      >
+                        <Trash2 size={15} />
+                        حذف کاربر
+                      </button>
+                    </div>
+                  )}
                 </div>
               </article>
             );
