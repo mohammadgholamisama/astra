@@ -499,98 +499,79 @@ export default function UsersPage() {
   return (
     <div className="users-page">
       <header className="users-head">
-        <div>
+        <div className="users-head-text">
           <h1 className="page-title">کاربران</h1>
-          <p className="page-sub">
-            ساخت کانفیگ روی پنل‌های گروه · لینک ساب تجمیعی
-            {isFetching && !syncingUsage ? " · در حال بارگذاری…" : ""}
-            {syncingUsage ? " · همگام‌سازی مصرف…" : ""}
+          <p className="page-sub users-head-sub">
+            {toFaDigits(stats.total)} کاربر
+            {filterGroupName ? ` · ${filterGroupName}` : ""}
+            {syncingUsage ? " · همگام‌سازی…" : isFetching ? " · بارگذاری…" : ""}
           </p>
         </div>
         <div className="users-head-actions">
           <button
             type="button"
-            className="btn ghost sm"
+            className="btn ghost sm users-sync-btn"
             onClick={() => void syncUsageNow()}
             disabled={isFetching || syncingUsage}
-            title="مصرف زنده همین صفحه از پنل‌ها"
+            title="تازه‌سازی مصرف از پنل‌ها"
+            aria-label="تازه‌سازی مصرف"
           >
-            <RefreshCw size={14} className={syncingUsage ? "spin" : undefined} />
-            {syncingUsage ? "همگام‌سازی…" : "تازه‌سازی مصرف"}
+            <RefreshCw size={15} className={syncingUsage ? "spin" : undefined} />
+            <span className="users-sync-label">تازه‌سازی</span>
           </button>
           <button type="button" className="btn users-add" onClick={() => setOpen(true)}>
             <Plus size={16} />
-            کاربر جدید
+            <span>کاربر جدید</span>
           </button>
         </div>
       </header>
 
       <section className="users-stats" aria-label="آمار کاربران">
         <article className="users-stat">
-          <span className="users-stat-icon">
-            <Users size={18} />
-          </span>
-          <div>
-            <strong>{toFaDigits(stats.total)}</strong>
-            <span>{filterGroupName ? `در «${filterGroupName}»` : "کل کاربران"}</span>
-          </div>
+          <strong>{toFaDigits(stats.total)}</strong>
+          <span>کل</span>
         </article>
         <article className="users-stat ok">
-          <span className="users-stat-icon">
-            <Wifi size={18} />
-          </span>
-          <div>
-            <strong>
-              {toFaDigits(stats.active)}
-              <small>/{toFaDigits(stats.loaded)}</small>
-            </strong>
-            <span>فعال</span>
-          </div>
+          <strong>{toFaDigits(stats.active)}</strong>
+          <span>فعال</span>
         </article>
         <article className={`users-stat ${stats.withError ? "danger" : ""}`}>
-          <span className="users-stat-icon">
-            <AlertTriangle size={18} />
-          </span>
-          <div>
-            <strong>{toFaDigits(stats.withError)}</strong>
-            <span>خطای پنل</span>
-          </div>
+          <strong>{toFaDigits(stats.withError)}</strong>
+          <span>خطا</span>
         </article>
         <article className={`users-stat ${stats.expiringSoon ? "warn" : ""}`}>
-          <span className="users-stat-icon">
-            <Clock size={18} />
-          </span>
-          <div>
-            <strong>{toFaDigits(stats.expiringSoon)}</strong>
-            <span>انقضا تا ۷ روز</span>
-          </div>
+          <strong>{toFaDigits(stats.expiringSoon)}</strong>
+          <span>انقضا ۷روز</span>
         </article>
         <article className="users-stat wide">
-          <span className="users-stat-icon">
-            <BarChart3 size={18} />
-          </span>
-          <div>
-            <strong>{formatTraffic(stats.usedSum, { empty: "۰" })}</strong>
-            <span>
-              مصرف · {toFaDigits(stats.limited)} کاربر با سقف حجم
-            </span>
-          </div>
+          <strong>{formatTraffic(stats.usedSum, { empty: "۰" })}</strong>
+          <span>مصرف صفحه</span>
         </article>
       </section>
 
       <div className="users-toolbar">
-        <div className="users-toolbar-row">
+        <div className="users-toolbar-main">
           <div className="users-search">
-            <Search size={16} />
+            <Search size={15} />
             <input
-              placeholder="جستجوی یوزرنیم…"
+              placeholder="جستجو…"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               dir="ltr"
+              aria-label="جستجوی یوزرنیم"
             />
+            {!!search.trim() && (
+              <button
+                type="button"
+                className="users-search-clear"
+                onClick={() => setSearch("")}
+                aria-label="پاک کردن جستجو"
+              >
+                <X size={14} />
+              </button>
+            )}
           </div>
           <div className="users-group-filter">
-            <Layers size={16} aria-hidden />
             <Select
               value={filterGroupId}
               placeholder="همه گروه‌ها"
@@ -601,46 +582,34 @@ export default function UsersPage() {
               }))}
               onChange={(v) => setFilterGroupId(v)}
             />
-            {filterGroupId !== "" && (
-              <button
-                type="button"
-                className="btn ghost sm users-group-clear"
-                onClick={() => setFilterGroupId("")}
-                title="حذف فیلتر گروه"
-                aria-label="حذف فیلتر گروه"
-              >
-                <X size={14} />
-              </button>
-            )}
           </div>
         </div>
-        <div className="users-toolbar-row users-toolbar-bottom">
-          <div className="users-filters" role="tablist">
-            {filters.map((f) => (
-              <button
-                key={f.key}
-                type="button"
-                role="tab"
-                aria-selected={filter === f.key}
-                className={`users-filter ${filter === f.key ? "active" : ""}`}
-                onClick={() => setFilter(f.key)}
-              >
-                {f.label}
-                <em>{toFaDigits(f.count)}</em>
-              </button>
-            ))}
-          </div>
+        <div className="users-filters" role="tablist" aria-label="فیلتر وضعیت">
+          {filters.map((f) => (
+            <button
+              key={f.key}
+              type="button"
+              role="tab"
+              aria-selected={filter === f.key}
+              className={`users-filter ${filter === f.key ? "active" : ""}`}
+              onClick={() => setFilter(f.key)}
+            >
+              {f.label}
+              <em>{toFaDigits(f.count)}</em>
+            </button>
+          ))}
           {hasExtraFilter && (
             <button
               type="button"
-              className="btn ghost sm users-clear-filters"
+              className="users-filter users-clear-chip"
               onClick={() => {
                 setSearch("");
                 setFilter("all");
                 setFilterGroupId("");
               }}
             >
-              پاک‌کردن فیلترها
+              پاک
+              <X size={12} />
             </button>
           )}
         </div>
@@ -677,15 +646,7 @@ export default function UsersPage() {
         </div>
       ) : (
         <>
-        <div className="users-table" role="list">
-          <div className="users-table-head" aria-hidden>
-            <span>کاربر</span>
-            <span>گروه</span>
-            <span>حجم</span>
-            <span>انقضا</span>
-            <span>پنل</span>
-            <span />
-          </div>
+        <div className="users-list" role="list">
           {filtered.map((u) => {
             const errors = (u.panel_accounts || []).filter(
               (a) => a.status === "error" || !!a.error_message
@@ -704,85 +665,32 @@ export default function UsersPage() {
               pct == null ? "muted" : pct >= 90 ? "danger" : pct >= 70 ? "warn" : "ok";
             const isOff = u.status === "disabled";
             const menuOpen = menuUser?.username === u.username;
-
             return (
               <article
                 key={u.username}
                 role="listitem"
-                className={`user-row${errors.length ? " has-err" : ""}${isOff ? " is-off" : ""}${menuOpen ? " menu-open" : ""}`}
+                className={`user-card${errors.length ? " has-err" : ""}${isOff ? " is-off" : ""}${menuOpen ? " menu-open" : ""}`}
               >
-                <div className="user-row-user">
-                  <div className="user-row-name">
-                    <b dir="ltr">{u.username}</b>
-                    <span className={`badge ${st.tone}`}>{st.text}</span>
-                  </div>
-                  {u.display_name ? (
-                    <div className="user-row-display" title="نام کانفیگ‌ها">
-                      {u.display_name}
+                <div className="user-card-top">
+                  <div className="user-card-who">
+                    <div className="user-card-name">
+                      <b dir="ltr">{u.username}</b>
+                      <span className={`badge ${st.tone}`}>{st.text}</span>
                     </div>
-                  ) : null}
-                </div>
-
-                <div className="user-row-group" title={groupNames || undefined}>
-                  {groupNames ? (
-                    <span className="user-group-chip">
-                      <Layers size={12} />
-                      {groupNames}
-                    </span>
-                  ) : (
-                    <span className="muted">بدون گروه</span>
-                  )}
-                </div>
-
-                <div className={`user-row-usage ${barTone}`}>
-                  <div className="user-row-usage-top">
-                    <span>
-                      {formatTraffic(u.used_traffic, { empty: "۰" })}
-                      <em> / {formatDataLimit(u.data_limit)}</em>
-                    </span>
-                    <strong>{pct == null ? "∞" : `${toFaDigits(pct)}٪`}</strong>
+                    <div className="user-card-meta">
+                      {u.display_name ? (
+                        <span className="user-card-display">{u.display_name}</span>
+                      ) : null}
+                      {groupNames ? (
+                        <span className="user-group-chip" title={groupNames}>
+                          <Layers size={11} />
+                          {groupNames}
+                        </span>
+                      ) : (
+                        <span className="muted">بدون گروه</span>
+                      )}
+                    </div>
                   </div>
-                  <div className="user-bar" aria-hidden>
-                    <div
-                      className={`user-bar-fill ${barTone}`}
-                      style={{ width: pct == null ? "0%" : `${Math.min(100, pct)}%` }}
-                    />
-                  </div>
-                  <div className="user-row-usage-foot">
-                    {remain != null
-                      ? `باقی: ${formatTraffic(remain, { empty: "۰" })}`
-                      : "نامحدود"}
-                  </div>
-                </div>
-
-                <div className={`user-row-expire ${exp.tone}`}>
-                  <Clock size={13} aria-hidden />
-                  <div>
-                    <strong>{exp.label}</strong>
-                    <span>
-                      {exp.daysLeft == null
-                        ? "بدون انقضا"
-                        : exp.daysLeft === 0
-                          ? "تمام‌شده"
-                          : `${toFaDigits(exp.daysLeft)} روز`}
-                    </span>
-                  </div>
-                </div>
-
-                <div className="user-row-panels">
-                  <span className="badge ok">{toFaDigits(ok)}/{toFaDigits(panels)}</span>
-                  {errors.length > 0 && (
-                    <button
-                      type="button"
-                      className="badge err user-err-btn"
-                      onClick={() => setErrorsUser(u)}
-                    >
-                      {toFaDigits(errors.length)} خطا
-                    </button>
-                  )}
-                </div>
-
-                <div className="user-row-menu">
                   <button
                     type="button"
                     className={`user-menu-btn${menuOpen ? " open" : ""}`}
@@ -795,6 +703,48 @@ export default function UsersPage() {
                   >
                     <Menu size={18} strokeWidth={2.2} />
                   </button>
+                </div>
+
+                <div className={`user-card-usage ${barTone}`}>
+                  <div className="user-card-usage-line">
+                    <span>
+                      {formatTraffic(u.used_traffic, { empty: "۰" })}
+                      <em> / {formatDataLimit(u.data_limit)}</em>
+                    </span>
+                    <strong>{pct == null ? "∞" : `${toFaDigits(pct)}٪`}</strong>
+                  </div>
+                  <div className="user-bar" aria-hidden>
+                    <div
+                      className={`user-bar-fill ${barTone}`}
+                      style={{ width: pct == null ? "0%" : `${Math.min(100, pct)}%` }}
+                    />
+                  </div>
+                </div>
+
+                <div className="user-card-foot">
+                  <span className={`user-card-chip ${exp.tone}`}>
+                    <Clock size={12} />
+                    {exp.label}
+                  </span>
+                  <span className="user-card-chip">
+                    <Wifi size={12} />
+                    {toFaDigits(ok)}/{toFaDigits(panels)} پنل
+                  </span>
+                  <span className="user-card-chip muted">
+                    {remain != null
+                      ? `باقی ${formatTraffic(remain, { empty: "۰" })}`
+                      : "حجم نامحدود"}
+                  </span>
+                  {errors.length > 0 && (
+                    <button
+                      type="button"
+                      className="user-card-chip err"
+                      onClick={() => setErrorsUser(u)}
+                    >
+                      <AlertTriangle size={12} />
+                      {toFaDigits(errors.length)} خطا
+                    </button>
+                  )}
                 </div>
               </article>
             );
