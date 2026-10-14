@@ -11,52 +11,60 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
-# UI path suffixes users often paste from the browser address bar
-_UI_SUFFIXES = (
+# UI tails users paste from the address bar (after webBasePath). Keep /moj etc.
+_UI_TAILS = (
+    "/panel/inbounds",
+    "/panel/api-docs",
+    "/panel/settings",
     "/dashboard",
     "/admin",
     "/panel",
     "/ui",
     "/app",
-    "/#",
 )
 
 
 def normalize_panel_base_url(url: str) -> str:
     """
-    Normalize panel base URL to the API root.
-    Example: https://host:8443/dashboard  →  https://host:8443
+    Normalize panel base URL to the API root (keep webBasePath).
+    Example: https://host:2053/moj/panel  →  https://host:2053/moj
+    Example: https://host:2053/moj/       →  https://host:2053/moj
     """
     raw = (url or "").strip()
     if not raw:
         return raw
     parts = urlsplit(raw)
-    path = parts.path or ""
-    # drop trailing slash / hash fragments in path
-    while path.endswith("/"):
-        path = path[:-1]
+    path = (parts.path or "").rstrip("/")
     lower = path.lower()
-    for suffix in _UI_SUFFIXES:
-        if lower.endswith(suffix):
-            path = path[: -len(suffix)]
+    for tail in _UI_TAILS:
+        if lower.endswith(tail):
+            path = path[: -len(tail)].rstrip("/")
             lower = path.lower()
             break
-    # if someone pasted .../api or .../api/admin keep host only for adapters that append /api/...
     for api_tail in ("/api/admin", "/api"):
         if lower.endswith(api_tail):
-            path = path[: -len(api_tail)]
+            path = path[: -len(api_tail)].rstrip("/")
             break
-    while path.endswith("/"):
-        path = path[:-1]
     return urlunsplit((parts.scheme, parts.netloc, path, "", "")).rstrip("/")
 
-
 def make_client(base_url: str, verify_ssl: bool = False) -> httpx.AsyncClient:
+    """
+    httpx client rooted at panel base (including webBasePath).
+
+    Always send browser-like headers so 3x-ui returns real 401 for bad tokens
+    (without X-Requested-With it often masks auth failure as 404).
+    """
+    root = normalize_panel_base_url(base_url).rstrip("/") + "/"
     return httpx.AsyncClient(
-        base_url=normalize_panel_base_url(base_url),
+        base_url=root,
         timeout=settings.ADAPTER_TIMEOUT,
         verify=verify_ssl,
         follow_redirects=True,
+        headers={
+            "User-Agent": "AstraPanel/1.1 (httpx)",
+            "Accept": "application/json, text/plain, */*",
+            "X-Requested-With": "XMLHttpRequest",
+        },
     )
 
 
@@ -64,9 +72,10 @@ def ok_json(resp: httpx.Response) -> tuple[bool, Any]:
     try:
         data = resp.json()
     except Exception:
-        return False, {"text": resp.text[:300]}
+        text = (resp.text or "")[:300]
+        return False, {"text": text, "status_code": resp.status_code}
     if resp.status_code >= 400:
-        return False, data
+        return False, data if isinstance(data, dict) else {"data": data, "status_code": resp.status_code}
     if isinstance(data, dict) and data.get("success") is False:
         return False, data
     return True, data
@@ -74,7 +83,7 @@ def ok_json(resp: httpx.Response) -> tuple[bool, Any]:
 
 def err_msg(data: Any, fallback: str = "Request failed") -> str:
     if isinstance(data, dict):
-        detail = data.get("msg") or data.get("detail") or data.get("error")
+        detail = data.get("msg") or data.get("detail") or data.get("error") or data.get("text")
         if isinstance(detail, list):
             parts = []
             for item in detail:
@@ -83,7 +92,11 @@ def err_msg(data: Any, fallback: str = "Request failed") -> str:
                 else:
                     parts.append(str(item))
             detail = "; ".join(parts) if parts else None
-        return str(detail or fallback)[:400]
+        code = data.get("status_code")
+        msg = str(detail or fallback)[:400]
+        if code and str(code) not in msg:
+            return f"{msg} (HTTP {code})"
+        return msg
     return str(data)[:400]
 
 
@@ -120,7 +133,7 @@ async def expand_subscription_links(
         return links
 
     out: list[str] = []
-    req_headers = {"User-Agent": "AstraPanel/1.0", **(headers or {})}
+    req_headers = {"User-Agent": "AstraPanel/1.1", **(headers or {})}
     for url in subs:
         try:
             resp = await client.get(url, headers=req_headers)

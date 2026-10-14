@@ -76,15 +76,19 @@ async def _fetch_marz_protocols(panel: Panel) -> list[MarzProtocolOut]:
 
 def _validate_credentials(panel_type: PanelType, username: str | None, password: str | None, api_token: str | None) -> None:
     if panel_type == PanelType.sanaei:
-        if not api_token:
+        token = (api_token or "").strip()
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+        has_pass = bool((username or "").strip() and (password or "").strip())
+        if not token and not has_pass:
             raise HTTPException(
                 status_code=400,
-                detail="برای سنایی (3x-ui) فیلد API Token الزامی است (Settings → Security → API Token)",
+                detail="برای سنایی API Token (ترجیحی) یا یوزر/رمز پنل لازم است",
             )
-        if not username or not password:
+        if not token:
             raise HTTPException(
                 status_code=400,
-                detail="برای سنایی نام کاربری و رمز عبور پنل هم لازم است",
+                detail="برای سنایی (3x-ui) API Token الزامی است — Settings → Security → API Token",
             )
     else:
         # marzban / rebecca / pasarguard

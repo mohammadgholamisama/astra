@@ -79,10 +79,10 @@ function protocolsToInboundsMeta(
   return out;
 }
 
-/** Strip UI paths like /dashboard that break API calls */
+/** Strip UI tails; keep webBasePath like /moj for 3x-ui */
 function normalizeBaseUrl(url: string) {
   let u = url.trim().replace(/\/+$/, "");
-  u = u.replace(/\/(dashboard|admin|panel|ui|app)$/i, "");
+  u = u.replace(/\/(panel\/inbounds|panel\/api-docs|panel\/settings|dashboard|admin|panel|ui|app)$/i, "");
   u = u.replace(/\/api(\/admin)?$/i, "");
   return u.replace(/\/+$/, "");
 }
@@ -702,28 +702,44 @@ export default function PanelsPage() {
                     required
                     placeholder={
                       isSanaei
-                        ? "https://ip:2053/path"
+                        ? "https://domain:2053/moj  (با webBasePath)"
                         : "https://panel.example.com:8443  (بدون /dashboard)"
                     }
                     value={form.base_url}
                     onChange={(e) => setForm({ ...form, base_url: e.target.value })}
                     dir="ltr"
                   />
+                  {isSanaei && (
+                    <p className="field-hint">
+                      همان آدرسی که مرورگر باز می‌کند تا قبل از صفحه لاگین، مثل{" "}
+                      <code dir="ltr">https://ir.example.com:2053/moj</code>
+                    </p>
+                  )}
                 </div>
                 <div className="form-grid">
                   <div className="field">
-                    <label>نام کاربری ادمین *</label>
+                    <label>
+                      {isSanaei ? "نام کاربری ادمین (اختیاری)" : "نام کاربری ادمین *"}
+                    </label>
                     <input
-                      required
+                      required={!isSanaei}
                       value={form.username}
                       onChange={(e) => setForm({ ...form, username: e.target.value })}
                       dir="ltr"
                     />
                   </div>
                   <div className="field">
-                    <label>{isEdit ? "رمز عبور (خالی = بدون تغییر)" : "رمز عبور *"}</label>
+                    <label>
+                      {isSanaei
+                        ? isEdit
+                          ? "رمز عبور (اختیاری)"
+                          : "رمز عبور (اختیاری)"
+                        : isEdit
+                          ? "رمز عبور (خالی = بدون تغییر)"
+                          : "رمز عبور *"}
+                    </label>
                     <input
-                      required={!isEdit}
+                      required={!isEdit && !isSanaei}
                       type="password"
                       value={form.password}
                       onChange={(e) => setForm({ ...form, password: e.target.value })}
@@ -743,6 +759,9 @@ export default function PanelsPage() {
                       onChange={(e) => setForm({ ...form, api_token: e.target.value })}
                       dir="ltr"
                     />
+                    <p className="field-hint">
+                      توکن را کامل کپی کنید. اگر اشتباه باشد سنایی اغلب خطای ۴۰۴ می‌دهد (نه ۴۰۱).
+                    </p>
                   </div>
                 )}
               </section>

@@ -1,11 +1,11 @@
 """
 3x-ui / Sanaei adapter — per official docs.sanaei.dev
 
-Auth for programmatic API:
+Auth:
   Authorization: Bearer <API Token>   (Settings → Security → API Token)
+  Optional session cookie via username/password as fallback.
 
-Username/password are also stored (panel login credentials) but Bearer token
-is required for reliable /panel/api/* access (CSRF-safe).
+Note: without X-Requested-With, invalid tokens often look like HTTP 404.
 """
 
 from __future__ import annotations
@@ -14,8 +14,16 @@ import json
 import secrets
 import uuid as uuid_lib
 from typing import Any
+
 from app.adapters.base import AdapterResult, BasePanelAdapter, UserPayload
 from app.adapters.http_utils import err_msg, make_client, ok_json
+
+
+def _clean_token(raw: str | None) -> str:
+    t = (raw or "").strip()
+    if t.lower().startswith("bearer "):
+        t = t[7:].strip()
+    return t
 
 
 class SanaeiAdapter(BasePanelAdapter):
@@ -24,10 +32,13 @@ class SanaeiAdapter(BasePanelAdapter):
         self._client = None
         self._cookies = None
         self._csrf: str | None = None
-        # Optional path prefix already included in base_url by user
+        self._session_ok = False
+
+    def _token(self) -> str:
+        return _clean_token(self.api_token)
 
     def _require_token(self) -> str:
-        token = (self.api_token or "").strip()
+        token = self._token()
         if not token:
             raise RuntimeError(
                 "برای سنایی (3x-ui) API Token الزامی است — از Settings → Security → API Token کپی کنید"
@@ -44,64 +55,90 @@ class SanaeiAdapter(BasePanelAdapter):
             await self._client.aclose()
             self._client = None
 
-    def _bearer_headers(self) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self._require_token()}",
+    def _auth_headers(self, *, with_bearer: bool = True) -> dict[str, str]:
+        headers: dict[str, str] = {
             "Accept": "application/json",
             "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
         }
+        if with_bearer:
+            headers["Authorization"] = f"Bearer {self._require_token()}"
+        if self._csrf:
+            headers["X-CSRF-Token"] = str(self._csrf)
+        return headers
 
     async def _cookie_login(self) -> None:
-        """Optional session login (username/password) for legacy panels without token routes."""
+        """Session login (username/password) — fallback when Bearer fails."""
         if not self.username or not self.password:
-            return
+            raise RuntimeError("نام کاربری/رمز پنل برای لاگین سشن لازم است")
         client = await self._get_client()
-        # 1) CSRF cookie (newer 3x-ui)
-        try:
-            csrf_resp = await client.get("/getCSRFToken")
-            if csrf_resp.status_code == 200:
-                data = csrf_resp.json()
-                self._csrf = (data.get("obj") or data.get("csrf") or data.get("token") or "")
-                if isinstance(self._csrf, dict):
-                    self._csrf = self._csrf.get("token")
-        except Exception:
-            self._csrf = None
+        self._csrf = None
 
-        headers: dict[str, str] = {"Accept": "application/json"}
+        for csrf_path in ("csrf-token", "getCSRFToken", "/csrf-token", "/getCSRFToken"):
+            try:
+                csrf_resp = await client.get(csrf_path.lstrip("/"))
+                if csrf_resp.status_code == 200:
+                    data = csrf_resp.json()
+                    tok = data.get("obj") or data.get("csrf") or data.get("token") or ""
+                    if isinstance(tok, dict):
+                        tok = tok.get("token") or ""
+                    if tok:
+                        self._csrf = str(tok)
+                        break
+            except Exception:
+                continue
+
+        headers: dict[str, str] = {
+            "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        }
         if self._csrf:
             headers["X-CSRF-Token"] = str(self._csrf)
 
-        resp = await client.post(
-            "/login",
-            json={"username": self.username, "password": self.password},
-            headers=headers,
-        )
-        # Some versions expect form body
-        if resp.status_code >= 400:
-            resp = await client.post(
-                "/login",
-                data={"username": self.username, "password": self.password},
-                headers=headers,
-            )
-        self._cookies = resp.cookies
+        body = {"username": self.username, "password": self.password}
+        resp = await client.post("login", json=body, headers=headers)
         ok, data = ok_json(resp)
         if not ok:
-            # Cookie login is best-effort when Bearer exists
-            if self.api_token:
-                return
-            raise RuntimeError(err_msg(data, "Sanaei login failed"))
+            resp = await client.post("login", data=body, headers=headers)
+            ok, data = ok_json(resp)
+        self._cookies = resp.cookies
+        if not ok:
+            raise RuntimeError(err_msg(data, "لاگین سنایی ناموفق — یوزر/پسورد را چک کنید"))
+        self._session_ok = True
 
     async def _request(self, method: str, path: str, **kwargs: Any):
         client = await self._get_client()
-        headers = {**self._bearer_headers(), **kwargs.pop("headers", {})}
-        # Prefer Bearer-only (docs: CSRF skipped for Bearer on /panel/api/*)
-        resp = await client.request(method, path, headers=headers, **kwargs)
-        if resp.status_code in (401, 403) and self.username and self.password:
+        path = path.lstrip("/")
+        headers = {**self._auth_headers(with_bearer=bool(self._token())), **kwargs.pop("headers", {})}
+        cookies = kwargs.pop("cookies", self._cookies)
+
+        # Prefer Bearer when token exists
+        if self._token():
+            resp = await client.request(method, path, headers=headers, cookies=cookies, **kwargs)
+            if resp.status_code in (200, 201) or (
+                resp.status_code < 400 and resp.headers.get("content-type", "").startswith("application/json")
+            ):
+                # still may be success:false
+                return resp
+            if resp.status_code not in (401, 403, 404):
+                return resp
+            # 401/403/404 → try session if we have password
+            if self.username and self.password:
+                try:
+                    await self._cookie_login()
+                except Exception:
+                    return resp
+                headers = self._auth_headers(with_bearer=True)
+                return await client.request(
+                    method, path, headers=headers, cookies=self._cookies, **kwargs
+                )
+            return resp
+
+        # Token-less: session only
+        if not self._session_ok:
             await self._cookie_login()
-            if self._csrf:
-                headers["X-CSRF-Token"] = str(self._csrf)
-            resp = await client.request(method, path, headers=headers, cookies=self._cookies, **kwargs)
-        return resp
+        headers = self._auth_headers(with_bearer=False)
+        return await client.request(method, path, headers=headers, cookies=self._cookies, **kwargs)
 
     def _client_payload(self, payload: UserPayload) -> dict[str, Any]:
         email = payload.username
@@ -117,7 +154,7 @@ class SanaeiAdapter(BasePanelAdapter):
             "email": email,
             "id": client_uuid,
             "subId": sub_id,
-            "totalGB": int(payload.data_limit or 0),  # bytes per 3x-ui docs/examples
+            "totalGB": int(payload.data_limit or 0),
             "expiryTime": expiry_ms,
             "enable": payload.status in ("active", "on_hold"),
             "tgId": tg_id,
@@ -126,16 +163,36 @@ class SanaeiAdapter(BasePanelAdapter):
             "comment": payload.note or "",
         }
 
+    def _explain_fail(self, resp, data: Any) -> str:
+        code = getattr(resp, "status_code", None)
+        base = self.base_url.rstrip("/")
+        hint = err_msg(data, f"HTTP {code}")
+        if code == 401:
+            return (
+                f"{hint} — API Token اشتباه/غیرفعال است یا یوزرپسورد غلط است. "
+                "از Settings → Security → API Token یک توکن جدید بسازید."
+            )
+        if code == 403:
+            return f"{hint} — توکن مجوز این مسیر را ندارد (scope)."
+        if code == 404:
+            return (
+                f"مسیر API پیدا نشد (HTTP 404). آدرس پایه باید شامل webBasePath باشد "
+                f"(مثلاً {base} و API می‌شود {base}/panel/api/...). "
+                "اگر آدرس درست است، معمولاً API Token اشتباه است — سنایی توکن بد را هم 404 می‌دهد. "
+                "توکن را دوباره از پنل کپی کنید."
+            )
+        return hint
+
     async def list_inbounds(self) -> list[dict[str, Any]]:
-        """Fetch all inbounds from remote panel (ignores local meta filter)."""
-        self._require_token()
-        resp = await self._request("GET", "/panel/api/inbounds/list")
+        if not self._token() and not (self.username and self.password):
+            self._require_token()
+        resp = await self._request("GET", "panel/api/inbounds/list")
         ok, data = ok_json(resp)
         if not ok:
-            resp = await self._request("GET", "/panel/api/inbounds/list/slim")
+            resp = await self._request("GET", "panel/api/inbounds/list/slim")
             ok, data = ok_json(resp)
         if not ok:
-            raise RuntimeError(err_msg(data, "Cannot list inbounds"))
+            raise RuntimeError(self._explain_fail(resp, data))
         obj = data.get("obj") if isinstance(data, dict) else data
         if not isinstance(obj, list):
             return []
@@ -162,16 +219,24 @@ class SanaeiAdapter(BasePanelAdapter):
 
     async def test_connection(self) -> AdapterResult:
         try:
-            self._require_token()
-            resp = await self._request("GET", "/panel/api/inbounds/list")
+            if not self._token() and not (self.username and self.password):
+                return AdapterResult(
+                    success=False,
+                    error="API Token یا یوزر/رمز سنایی را وارد کنید",
+                )
+            resp = await self._request("GET", "panel/api/inbounds/list")
             ok, data = ok_json(resp)
             if ok:
                 return AdapterResult(success=True, raw=data)
-            resp2 = await self._request("GET", "/panel/api/clients/list")
+            resp2 = await self._request("GET", "panel/api/inbounds/list/slim")
             ok2, data2 = ok_json(resp2)
             if ok2:
                 return AdapterResult(success=True, raw=data2)
-            return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
+            resp3 = await self._request("GET", "panel/api/server/status")
+            ok3, data3 = ok_json(resp3)
+            if ok3:
+                return AdapterResult(success=True, raw=data3)
+            return AdapterResult(success=False, error=self._explain_fail(resp, data))
         except Exception as e:
             return AdapterResult(success=False, error=str(e))
 
@@ -182,10 +247,9 @@ class SanaeiAdapter(BasePanelAdapter):
             if not inbound_ids:
                 return AdapterResult(success=False, error="هیچ inbound فعالی در سنایی پیدا نشد")
 
-            # Modern API (3x-ui v3+)
             resp = await self._request(
                 "POST",
-                "/panel/api/clients/add",
+                "panel/api/clients/add",
                 json={"client": client_obj, "inboundIds": inbound_ids},
             )
             ok, data = ok_json(resp)
@@ -200,13 +264,12 @@ class SanaeiAdapter(BasePanelAdapter):
                     raw=data,
                 )
 
-            # Legacy fallback: /panel/api/inbounds/addClient
             settings_payload = json.dumps({"clients": [client_obj]})
-            last_err = err_msg(data, "modern add failed")
+            last_err = self._explain_fail(resp, data)
             for iid in inbound_ids:
                 legacy = await self._request(
                     "POST",
-                    "/panel/api/inbounds/addClient",
+                    "panel/api/inbounds/addClient",
                     json={"id": iid, "settings": settings_payload},
                 )
                 lok, ldata = ok_json(legacy)
@@ -222,10 +285,9 @@ class SanaeiAdapter(BasePanelAdapter):
                     )
                 last_err = err_msg(ldata, last_err)
 
-            # Older multi-inbound endpoint
             multi = await self._request(
                 "POST",
-                "/panel/api/inbounds/addClientInbounds",
+                "panel/api/inbounds/addClientInbounds",
                 json={"settings": settings_payload, "inboundIds": inbound_ids},
             )
             mok, mdata = ok_json(multi)
@@ -246,10 +308,9 @@ class SanaeiAdapter(BasePanelAdapter):
     async def modify_user(self, payload: UserPayload) -> AdapterResult:
         try:
             client_obj = self._client_payload(payload)
-            # Full replace by email (modern)
             resp = await self._request(
                 "POST",
-                f"/panel/api/clients/update/{payload.username}",
+                f"panel/api/clients/update/{payload.username}",
                 json=client_obj,
             )
             ok, data = ok_json(resp)
@@ -264,49 +325,42 @@ class SanaeiAdapter(BasePanelAdapter):
                     raw=data,
                 )
 
-            # Legacy updateClient by uuid
             uuid = payload.uuid or client_obj["id"]
             inbound_ids = payload.config.get("inbound_ids") or await self._list_inbound_ids()
             settings_payload = json.dumps({"clients": [client_obj]})
             for iid in inbound_ids:
                 r = await self._request(
                     "POST",
-                    f"/panel/api/inbounds/updateClient/{uuid}",
+                    f"panel/api/inbounds/updateClient/{uuid}",
                     json={"id": iid, "settings": settings_payload},
                 )
                 rok, rdata = ok_json(r)
                 if rok:
-                    return AdapterResult(success=True, remote_username=payload.username, uuid=uuid, raw=rdata)
-            return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
+                    return AdapterResult(
+                        success=True, remote_username=payload.username, uuid=uuid, raw=rdata
+                    )
+            return AdapterResult(success=False, error=self._explain_fail(resp, data))
         except Exception as e:
             return AdapterResult(success=False, error=str(e))
 
     async def delete_user(self, username: str, remote_id: str | None = None) -> AdapterResult:
-        """
-        Remove client from 3x-ui / Sanaei.
-        Tries modern email delete, then legacy per-inbound UUID delete.
-        """
         try:
             email = remote_id or username
             last_err = "delete failed"
 
-            # Modern
-            resp = await self._request("POST", f"/panel/api/clients/del/{email}")
+            resp = await self._request("POST", f"panel/api/clients/del/{email}")
             ok, data = ok_json(resp)
             if ok:
                 return AdapterResult(success=True, raw=data)
             last_err = err_msg(data, f"HTTP {resp.status_code}")
-            # already gone
             low = last_err.lower()
             if any(x in low for x in ("not found", "404", "does not exist")):
                 return AdapterResult(success=True, raw=data)
 
-            # Legacy: delete by UUID from each inbound
             inbound_ids = await self._list_inbound_ids()
-            # Try to discover client UUID via traffic endpoint
             uuid = None
             try:
-                t = await self._request("GET", f"/panel/api/clients/traffic/{email}")
+                t = await self._request("GET", f"panel/api/clients/traffic/{email}")
                 tok, tdata = ok_json(t)
                 if tok and isinstance(tdata, dict):
                     obj = tdata.get("obj") or tdata
@@ -320,7 +374,7 @@ class SanaeiAdapter(BasePanelAdapter):
                 for iid in inbound_ids:
                     r = await self._request(
                         "POST",
-                        f"/panel/api/inbounds/{iid}/delClient/{uuid}",
+                        f"panel/api/inbounds/{iid}/delClient/{uuid}",
                     )
                     rok, rdata = ok_json(r)
                     if rok:
@@ -337,31 +391,33 @@ class SanaeiAdapter(BasePanelAdapter):
     async def get_usage(self, username: str, remote_id: str | None = None) -> AdapterResult:
         try:
             email = remote_id or username
-            # Modern
-            resp = await self._request("GET", f"/panel/api/clients/traffic/{email}")
+            resp = await self._request("GET", f"panel/api/clients/traffic/{email}")
             ok, data = ok_json(resp)
             if ok and isinstance(data, dict):
                 obj = data.get("obj") or data
                 if isinstance(obj, dict):
                     up = int(obj.get("up") or 0)
                     down = int(obj.get("down") or 0)
-                    return AdapterResult(success=True, remote_username=email, used_traffic=up + down, raw=data)
-            # Legacy
-            resp2 = await self._request("GET", f"/panel/api/inbounds/getClientTraffics/{email}")
+                    return AdapterResult(
+                        success=True, remote_username=email, used_traffic=up + down, raw=data
+                    )
+            resp2 = await self._request("GET", f"panel/api/inbounds/getClientTraffics/{email}")
             ok2, data2 = ok_json(resp2)
             if ok2 and isinstance(data2, dict):
                 obj = data2.get("obj") or {}
                 up = int(obj.get("up") or 0)
                 down = int(obj.get("down") or 0)
-                return AdapterResult(success=True, remote_username=email, used_traffic=up + down, raw=data2)
-            return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
+                return AdapterResult(
+                    success=True, remote_username=email, used_traffic=up + down, raw=data2
+                )
+            return AdapterResult(success=False, error=self._explain_fail(resp, data))
         except Exception as e:
             return AdapterResult(success=False, error=str(e))
 
     async def _fetch_links(self, email: str, sub_id: str | None = None) -> list[str]:
         links: list[str] = []
         try:
-            resp = await self._request("GET", f"/panel/api/clients/links/{email}")
+            resp = await self._request("GET", f"panel/api/clients/links/{email}")
             ok, data = ok_json(resp)
             if ok and isinstance(data, dict):
                 obj = data.get("obj") or data
@@ -370,13 +426,12 @@ class SanaeiAdapter(BasePanelAdapter):
             pass
         if sub_id:
             try:
-                resp = await self._request("GET", f"/panel/api/clients/subLinks/{sub_id}")
+                resp = await self._request("GET", f"panel/api/clients/subLinks/{sub_id}")
                 ok, data = ok_json(resp)
                 if ok and isinstance(data, dict):
                     links.extend(self._extract_links(data.get("obj") or data))
             except Exception:
                 pass
-        # unique preserve order
         seen: set[str] = set()
         out: list[str] = []
         for L in links:
