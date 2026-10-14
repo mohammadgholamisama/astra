@@ -1,0 +1,7 @@
+* text=auto
+*.sh text eol=lf
+deploy/astra-helper text eol=lf
+deploy/x-astra text eol=lf
+deploy/sudoers.astra text eol=lf
+deploy/*.tpl text eol=lf
+deploy/*.service text eol=lf
