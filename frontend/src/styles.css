@@ -882,7 +882,6 @@ button, input, select, textarea { font: inherit; }
     min-height: 100dvh;
   }
   .topbar { display: flex; }
-  .topbar-logout { display: inline-flex; }
 
   .sidebar-backdrop {
     display: block;
