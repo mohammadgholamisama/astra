@@ -66,8 +66,8 @@ npm install
 npm run dev
 ```
 
-نمونه env: `.env.example`  
-ورود پیش‌فرض لوکال: `admin` / `admin123`
+نمونه env: `.env.example` (فقط برای توسعه محلی)  
+روی سرور، یوزر و پسورد تصادفی در پایان `install.sh` چاپ می‌شود — هیچ پیش‌فرضی داخل فرم ورود نیست.
 
 - پنل: http://localhost:5173  
 - API Docs: http://localhost:8000/docs  

@@ -144,8 +144,15 @@ rand_hex() {
 }
 
 rand_password() {
-  # readable: letters+digits, 16 chars
-  tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16 || openssl rand -base64 12 | tr -d '/+=' | head -c 16
+  # readable: letters+digits, 32 chars — no fixed defaults on install
+  tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 32 || openssl rand -base64 24 | tr -d '/+=' | head -c 32
+}
+
+rand_username() {
+  # random admin username (never hardcode "admin")
+  local u
+  u="$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c 10 || openssl rand -hex 5)"
+  echo "u${u}"
 }
 
 script_source_dir() {
@@ -361,7 +368,7 @@ write_env() {
   local secret pass
   secret="$(rand_hex)"
   pass="$(rand_password)"
-  ADMIN_USERNAME="admin"
+  ADMIN_USERNAME="$(rand_username)"
   ADMIN_PASSWORD="$pass"
   ASTRA_APP_PORT="$port"
 

@@ -10,8 +10,8 @@ export default function LoginPage() {
   const token = useAuth((s) => s.token);
   const setToken = useAuth((s) => s.setToken);
   const nav = useNavigate();
-  const [username, setUsername] = useState("admin");
-  const [password, setPassword] = useState("admin123");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [btnState, setBtnState] = useState<BtnState>("idle");
 
@@ -102,7 +102,9 @@ export default function LoginPage() {
           <input
             value={username}
             onChange={(e) => setUsername(e.target.value)}
+            autoComplete="username"
             autoFocus
+            placeholder="نام کاربری"
             disabled={btnState === "loading" || btnState === "success"}
           />
         </div>
@@ -112,6 +114,8 @@ export default function LoginPage() {
             type="password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
+            autoComplete="current-password"
+            placeholder="رمز عبور"
             disabled={btnState === "loading" || btnState === "success"}
           />
         </div>
