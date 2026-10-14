@@ -279,21 +279,34 @@ export default function UsersPage() {
   })();
 
   const remove = useMutation({
-    mutationFn: (u: string) => api(`/api/user/${u}`, { method: "DELETE" }),
-    onSuccess: () => {
+    mutationFn: (u: string) =>
+      api<{ detail?: string; warnings?: string[] }>(
+        `/api/user/${encodeURIComponent(u)}`,
+        { method: "DELETE" }
+      ),
+    onSuccess: (data) => {
       qc.invalidateQueries({ queryKey: ["users"] });
       setConfirmUser(null);
-      setActionMsg({ type: "ok", text: "کاربر از همه پنل‌ها حذف شد" });
+      const warns = (data?.warnings || []).filter(Boolean);
+      if (warns.length) {
+        setActionMsg({
+          type: "ok",
+          text: `کاربر حذف شد · بعضی پنل‌ها در دسترس نبودند: ${warns.join("؛ ")}`,
+        });
+      } else {
+        setActionMsg({ type: "ok", text: "کاربر از همه پنل‌ها حذف شد" });
+      }
     },
     onError: (e: Error) => {
       qc.invalidateQueries({ queryKey: ["users"] });
       setConfirmUser(null);
-      setActionMsg({ type: "err", text: e.message });
+      setActionMsg({ type: "err", text: e.message || "خطا در حذف کاربر" });
     },
   });
 
   const retry = useMutation({
-    mutationFn: (u: string) => api(`/api/user/${u}/retry`, { method: "POST" }),
+    mutationFn: (u: string) =>
+      api(`/api/user/${encodeURIComponent(u)}/retry`, { method: "POST" }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["users"] });
       setActionMsg({ type: "ok", text: "تلاش مجدد انجام شد" });

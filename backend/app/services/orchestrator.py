@@ -462,9 +462,11 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
 
 async def sync_delete_user(db: AsyncSession, user: User) -> list[dict]:
     """
-    Delete user from every remote panel.
-    Returns list of {panel_id, panel_name, ok, error} for API feedback.
-    Soft-fails «not found» as success (already gone on remote).
+    Best-effort delete from every remote panel.
+
+    Returns list of {panel_id, panel_name, ok, error, soft}.
+    Soft-ok (ok=True, soft=True): not found / never provisioned / unreachable —
+    local delete may proceed; remote may need manual cleanup.
     """
     result = await db.execute(
         select(PanelAccount)
@@ -475,33 +477,67 @@ async def sync_delete_user(db: AsyncSession, user: User) -> list[dict]:
     if not accounts:
         return []
 
+    def _soft_ok(panel_id: int, name: str, note: str | None = None) -> dict:
+        return {
+            "panel_id": panel_id,
+            "panel_name": name,
+            "ok": True,
+            "soft": True,
+            "error": note,
+        }
+
     async def _remote(account: PanelAccount) -> dict:
         panel = account.panel
         name = panel.name if panel else f"#{account.panel_id}"
+        if account.status == PanelAccountStatus.deleted:
+            return _soft_ok(account.panel_id, name, "قبلاً حذف شده")
+
+        # Never reached remote successfully → nothing to delete there
+        never_on_remote = account.status in (
+            PanelAccountStatus.error,
+            PanelAccountStatus.pending,
+        ) and not (account.remote_id or account.remote_username)
+        if never_on_remote:
+            account.status = PanelAccountStatus.deleted
+            account.error_message = None
+            return _soft_ok(account.panel_id, name, "روی ریموت ساخته نشده بود")
+
         if not panel:
-            return {
-                "panel_id": account.panel_id,
-                "panel_name": name,
-                "ok": False,
-                "error": "پنل پیدا نشد",
-            }
+            account.status = PanelAccountStatus.deleted
+            return _soft_ok(account.panel_id, name, "پنل پیدا نشد")
+
+        if not panel.is_active:
+            account.status = PanelAccountStatus.deleted
+            account.error_message = None
+            return _soft_ok(account.panel_id, name, "پنل غیرفعال — رد شد")
+
         adapter = get_adapter(panel)
+        uname = (account.remote_username or user.username or "").strip()
         try:
             res = await asyncio.wait_for(
-                adapter.delete_user(user.username, account.remote_id or account.remote_username),
-                timeout=15,
+                adapter.delete_user(uname, account.remote_id or account.remote_username),
+                timeout=35,
             )
         except Exception as e:  # noqa: BLE001
-            return {
-                "panel_id": account.panel_id,
-                "panel_name": name,
-                "ok": False,
-                "error": str(e),
-            }
+            # Unreachable / slow panel must not block removing the sale from Astra
+            account.status = PanelAccountStatus.deleted
+            account.error_message = None
+            return _soft_ok(account.panel_id, name, _exc_msg(e))
 
         err = (res.error or "").lower() if not res.success else ""
         already_gone = any(
-            x in err for x in ("not found", "404", "does not exist", "وجود ندارد", "پیدا نشد")
+            x in err
+            for x in (
+                "not found",
+                "404",
+                "does not exist",
+                "وجود ندارد",
+                "پیدا نشد",
+                "timeout",
+                "connect",
+                "network",
+                "unreachable",
+            )
         )
         if res.success or already_gone:
             account.status = PanelAccountStatus.deleted
@@ -510,14 +546,18 @@ async def sync_delete_user(db: AsyncSession, user: User) -> list[dict]:
                 "panel_id": account.panel_id,
                 "panel_name": name,
                 "ok": True,
-                "error": None,
+                "soft": bool(already_gone and not res.success),
+                "error": None if res.success else (res.error or None),
             }
 
+        # Hard remote rejection (auth / permission) — still clear local so admin isn't stuck
+        account.status = PanelAccountStatus.deleted
         account.error_message = res.error
         return {
             "panel_id": account.panel_id,
             "panel_name": name,
-            "ok": False,
+            "ok": True,
+            "soft": True,
             "error": res.error or "حذف از پنل ناموفق بود",
         }
 

@@ -62,7 +62,13 @@ export async function api<T>(
       message = parsed.message;
       code = parsed.code;
     } catch {
-      /* ignore */
+      if (res.status === 502 || res.status === 504) {
+        message = "پاسخ از سرور نرسید (تایم‌اوت) — دوباره تلاش کنید";
+      } else if (res.status >= 500) {
+        message = `خطای سرور (${res.status})`;
+      } else if (!message || message === "Error") {
+        message = "خطای درخواست";
+      }
     }
     // Session expired — force re-login (avoid confusing remote-panel auth errors)
     if (res.status === 401 && !path.includes("/api/admin/token")) {
