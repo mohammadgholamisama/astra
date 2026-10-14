@@ -106,7 +106,7 @@ export default function DashboardPage() {
             <div className="board-strip-update">
               {hasUpdate && (
                 <span className="board-upd-tag">
-                  نسخه {toFaDigits(updateInfo!.remote_version)}
+                  آخرین: {toFaDigits(updateInfo!.remote_version)}
                 </span>
               )}
               {isLatest && !busy && (

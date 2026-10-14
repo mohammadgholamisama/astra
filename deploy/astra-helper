@@ -504,32 +504,84 @@ read_local_version() {
   fi
 }
 
+_ver_ok() {
+  [[ -n "$1" && "$1" =~ ^[0-9A-Za-z._+-]+$ ]]
+}
+
+_ver_newer() {
+  # true if $1 > $2 (semver-ish via sort -V)
+  local a="$1" b="$2"
+  [[ -n "$a" ]] || return 1
+  [[ -z "$b" ]] && return 0
+  [[ "$a" == "$b" ]] && return 1
+  [[ "$(printf '%s\n%s\n' "$b" "$a" | sort -V | tail -n1)" == "$a" ]]
+}
+
+_read_ver_line() {
+  head -n1 2>/dev/null | tr -d '\r' | tr -d ' ' | tr -d '\357\273\277'
+}
+
 fetch_remote_version() {
-  local v="" url bust body
+  # Collect from many sources and keep the HIGHEST semver (CDN often sticks on an old release).
+  local bust sha body v best="" url
   bust="$(date +%s)"
-  # Prefer GitHub API (less CDN cache), then raw, then jsDelivr — all cache-busted
+  sha=""
+
   body="$(curl -fsSL --max-time 15 \
-    -H 'Accept: application/vnd.github.raw' \
+    -H 'Accept: application/vnd.github+json' \
     -H 'Cache-Control: no-cache' \
-    "https://api.github.com/repos/mohammadgholamisama/astra/contents/VERSION?ref=main&_=${bust}" \
+    "https://api.github.com/repos/mohammadgholamisama/astra/commits/main?_=${bust}" \
     2>/dev/null || true)"
-  v="$(printf '%s' "$body" | head -n1 | tr -d '\r' | tr -d ' ' || true)"
-  if [[ -n "$v" && "$v" =~ ^[0-9A-Za-z._+-]+$ ]]; then
-    echo "$v"
-    return 0
+  if [[ -n "$body" ]]; then
+    sha="$(printf '%s' "$body" | sed -n 's/.*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{7,40\}\)".*/\1/p' | head -n1)"
   fi
+  if [[ -z "$sha" ]]; then
+    sha="$(git ls-remote "https://github.com/mohammadgholamisama/astra.git" refs/heads/main 2>/dev/null | awk '{print $1; exit}')"
+  fi
+
+  if [[ -n "$sha" ]]; then
+    for url in \
+      "https://api.github.com/repos/mohammadgholamisama/astra/contents/VERSION?ref=${sha}&_=${bust}" \
+      "https://raw.githubusercontent.com/mohammadgholamisama/astra/${sha}/VERSION?_=${bust}" \
+      "https://cdn.jsdelivr.net/gh/mohammadgholamisama/astra@${sha}/VERSION"
+    do
+      if [[ "$url" == *"/contents/VERSION"* ]]; then
+        v="$(curl -fsSL --max-time 15 \
+          -H 'Accept: application/vnd.github.raw' \
+          -H 'Cache-Control: no-cache' \
+          "$url" 2>/dev/null | _read_ver_line || true)"
+      else
+        v="$(curl -fsSL --max-time 15 -H 'Cache-Control: no-cache' "$url" 2>/dev/null | _read_ver_line || true)"
+      fi
+      if _ver_ok "$v" && _ver_newer "$v" "$best"; then
+        best="$v"
+      fi
+    done
+  fi
+
   for url in \
+    "https://api.github.com/repos/mohammadgholamisama/astra/contents/VERSION?ref=main&_=${bust}" \
     "https://raw.githubusercontent.com/mohammadgholamisama/astra/main/VERSION?_=${bust}" \
     "https://cdn.jsdelivr.net/gh/mohammadgholamisama/astra@main/VERSION?_=${bust}" \
     "https://fastly.jsdelivr.net/gh/mohammadgholamisama/astra@main/VERSION?_=${bust}"
   do
-    v="$(curl -fsSL --max-time 15 -H 'Cache-Control: no-cache' "$url" 2>/dev/null \
-      | head -n1 | tr -d '\r' | tr -d ' ' || true)"
-    if [[ -n "$v" && "$v" =~ ^[0-9A-Za-z._+-]+$ ]]; then
-      echo "$v"
-      return 0
+    if [[ "$url" == *"/contents/VERSION"* ]]; then
+      v="$(curl -fsSL --max-time 15 \
+        -H 'Accept: application/vnd.github.raw' \
+        -H 'Cache-Control: no-cache' \
+        "$url" 2>/dev/null | _read_ver_line || true)"
+    else
+      v="$(curl -fsSL --max-time 15 -H 'Cache-Control: no-cache' "$url" 2>/dev/null | _read_ver_line || true)"
+    fi
+    if _ver_ok "$v" && _ver_newer "$v" "$best"; then
+      best="$v"
     fi
   done
+
+  if [[ -n "$best" ]]; then
+    echo "$best"
+    return 0
+  fi
   echo ""
   return 1
 }
@@ -566,7 +618,7 @@ cmd_check_update() {
   fi
 
   if [[ "$update" == "true" ]]; then
-    msg="نسخه جدید موجود است"
+    msg="آخرین نسخه: ${remote_ver}"
   else
     msg="پنل به‌روز است"
   fi

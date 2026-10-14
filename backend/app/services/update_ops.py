@@ -97,7 +97,19 @@ async def _helper(args: list[str], *, timeout: float, as_root: bool = True) -> t
     return code, out, err
 
 
-async def _curl_version(url: str, *, extra_headers: list[str] | None = None) -> str:
+def _newest_version(*versions: str) -> str:
+    """Return the highest semver among non-empty candidates (never a stale middle release)."""
+    best = ""
+    for v in versions:
+        v = (v or "").strip()
+        if not v or not _SAFE_VER.match(v):
+            continue
+        if not best or is_newer(v, best):
+            best = v
+    return best
+
+
+async def _curl_text(url: str, *, extra_headers: list[str] | None = None) -> str:
     cmd = [
         "curl",
         "-fsSL",
@@ -105,6 +117,8 @@ async def _curl_version(url: str, *, extra_headers: list[str] | None = None) -> 
         "15",
         "-H",
         "Cache-Control: no-cache",
+        "-H",
+        "Pragma: no-cache",
     ]
     for h in extra_headers or []:
         cmd.extend(["-H", h])
@@ -118,37 +132,105 @@ async def _curl_version(url: str, *, extra_headers: list[str] | None = None) -> 
         out_b, _err = await asyncio.wait_for(proc.communicate(), timeout=20)
         if proc.returncode != 0:
             return ""
-        remote = (out_b or b"").decode().strip().splitlines()[0].strip()
-        if remote and _SAFE_VER.match(remote):
-            return remote
+        return (out_b or b"").decode("utf-8", errors="replace")
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _version_from_body(body: str) -> str:
+    if not body:
+        return ""
+    remote = body.strip().splitlines()[0].strip().strip("\ufeff")
+    if remote and _SAFE_VER.match(remote):
+        return remote
+    return ""
+
+
+async def _curl_version(url: str, *, extra_headers: list[str] | None = None) -> str:
+    return _version_from_body(await _curl_text(url, extra_headers=extra_headers))
+
+
+async def _fetch_head_sha() -> str:
+    """Resolve current main tip SHA (bypasses CDN @main cache)."""
+    bust = str(int(__import__("time").time()))
+    # commits API
+    body = await _curl_text(
+        f"https://api.github.com/repos/{_REPO}/commits/main?_={bust}",
+        extra_headers=["Accept: application/vnd.github+json"],
+    )
+    if body:
+        try:
+            data = json.loads(body)
+            sha = str((data or {}).get("sha") or "").strip()
+            if re.fullmatch(r"[0-9a-f]{7,40}", sha):
+                return sha
+        except json.JSONDecodeError:
+            pass
+    # git ls-remote fallback
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "ls-remote",
+            f"https://github.com/{_REPO}.git",
+            "refs/heads/main",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out_b, _err = await asyncio.wait_for(proc.communicate(), timeout=20)
+        if proc.returncode == 0 and out_b:
+            sha = out_b.decode().split()[0].strip()
+            if re.fullmatch(r"[0-9a-f]{7,40}", sha):
+                return sha
+    except Exception:  # noqa: BLE001
+        pass
     return ""
 
 
 async def _fetch_remote_version() -> str:
-    """Fetch VERSION from GitHub with cache-busting (CDN often lagged behind)."""
+    """Fetch the newest VERSION from every reachable source; pick the max semver.
+
+    CDN/@main often lags several releases behind. We resolve HEAD SHA first and
+    read VERSION at that exact commit, then still compare against other mirrors
+    and keep the highest number.
+    """
     bust = str(int(__import__("time").time()))
-    # 1) GitHub API raw contents — least likely to serve a stale VERSION
-    v = await _curl_version(
-        f"https://api.github.com/repos/{_REPO}/contents/VERSION?ref=main&_={bust}",
-        extra_headers=["Accept: application/vnd.github.raw"],
-    )
-    if v:
-        return v
-    for url in (
-        f"{_VERSION_URL}?_={bust}",
-        f"https://cdn.jsdelivr.net/gh/{_REPO}@main/VERSION?_={bust}",
-        f"https://fastly.jsdelivr.net/gh/{_REPO}@main/VERSION?_={bust}",
+    found: list[str] = []
+
+    sha = await _fetch_head_sha()
+    if sha:
+        for url, headers in (
+            (
+                f"https://api.github.com/repos/{_REPO}/contents/VERSION?ref={sha}&_={bust}",
+                ["Accept: application/vnd.github.raw"],
+            ),
+            (f"https://raw.githubusercontent.com/{_REPO}/{sha}/VERSION?_={bust}", None),
+            (f"https://cdn.jsdelivr.net/gh/{_REPO}@{sha}/VERSION", None),
+        ):
+            v = await _curl_version(url, extra_headers=headers)
+            if v:
+                found.append(v)
+
+    for url, headers in (
+        (
+            f"https://api.github.com/repos/{_REPO}/contents/VERSION?ref=main&_={bust}",
+            ["Accept: application/vnd.github.raw"],
+        ),
+        (f"{_VERSION_URL}?_={bust}", None),
+        (f"https://cdn.jsdelivr.net/gh/{_REPO}@main/VERSION?_={bust}", None),
+        (f"https://fastly.jsdelivr.net/gh/{_REPO}@main/VERSION?_={bust}", None),
     ):
-        v = await _curl_version(url)
+        v = await _curl_version(url, extra_headers=headers)
         if v:
-            return v
-    return ""
+            found.append(v)
+
+    best = _newest_version(*found)
+    if best:
+        logger.info("update check remote candidates=%s → %s (sha=%s)", found, best, sha or "-")
+    return best
 
 
 async def check_update() -> dict:
-    """Return update status. check_ok=False means verification failed — not 'up to date'."""
+    """Return update status. Always surfaces the newest remote VERSION available."""
     from app.services.version_info import get_version
 
     local = get_version()
@@ -157,7 +239,7 @@ async def check_update() -> dict:
     check_ok = False
     message = ""
     git_behind = False
-    helper_ok = False
+    candidates: list[str] = []
 
     if available():
         code, out, err = await _helper(["check-update"], timeout=60, as_root=False)
@@ -167,33 +249,26 @@ async def check_update() -> dict:
             try:
                 line = out.strip().splitlines()[-1]
                 data = json.loads(line)
-                remote = str(data.get("remote_version") or "").strip()
+                helper_remote = str(data.get("remote_version") or "").strip()
                 local = str(data.get("local_version") or local).strip() or local
-                update_available = bool(data.get("update_available"))
                 git_behind = bool(data.get("git_behind"))
-                message = str(data.get("message") or "")
-                if "check_ok" in data:
-                    helper_ok = bool(data.get("check_ok"))
-                else:
-                    helper_ok = bool(remote)
+                if helper_remote:
+                    candidates.append(helper_remote)
             except json.JSONDecodeError:
                 logger.warning("check-update bad JSON: %s", out[:400])
 
-    # Always cross-check VERSION over HTTP — helper/CDN can return a stale number
+    # Always gather fresh HTTP candidates and keep the highest version
     http_remote = await _fetch_remote_version()
     if http_remote:
-        if not remote or is_newer(http_remote, remote) or remote == http_remote:
-            remote = http_remote
-        check_ok = True
-    elif helper_ok and remote:
-        check_ok = True
-    else:
-        check_ok = False
+        candidates.append(http_remote)
+
+    remote = _newest_version(*candidates)
+    check_ok = bool(remote)
 
     if check_ok:
         update_available = bool(git_behind) or is_newer(remote, local)
         message = (
-            "نسخه جدید موجود است"
+            f"آخرین نسخه: {remote}"
             if update_available
             else "پنل به‌روز است"
         )
