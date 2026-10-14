@@ -360,19 +360,38 @@ class SanaeiAdapter(BasePanelAdapter):
                     success=False,
                     error="API Token یا یوزر/رمز سنایی را وارد کنید",
                 )
-            resp = await self._request("GET", "panel/api/inbounds/list")
-            ok, data = ok_json(resp)
-            if ok:
-                return AdapterResult(success=True, raw=data)
-            resp2 = await self._request("GET", "panel/api/inbounds/list/slim")
-            ok2, data2 = ok_json(resp2)
-            if ok2:
-                return AdapterResult(success=True, raw=data2)
-            resp3 = await self._request("GET", "panel/api/server/status")
-            ok3, data3 = ok_json(resp3)
-            if ok3:
-                return AdapterResult(success=True, raw=data3)
-            return AdapterResult(success=False, error=self._explain_fail(resp, data))
+            # slim first — full /list often times out on heavy Cloudflare panels
+            last_resp = None
+            last_data: Any = None
+            for path in (
+                "panel/api/inbounds/list/slim",
+                "panel/api/inbounds/list",
+                "panel/api/server/status",
+            ):
+                try:
+                    resp = await self._request("GET", path)
+                    last_resp = resp
+                    ok, data = ok_json(resp)
+                    last_data = data
+                    if ok:
+                        return AdapterResult(success=True, raw=data)
+                except httpx.TimeoutException:
+                    logger.warning("sanaei test_connection timeout on %s", path)
+                    continue
+                except httpx.HTTPError as exc:
+                    logger.warning("sanaei test_connection error on %s: %s", path, exc)
+                    continue
+            if self._token():
+                ok_c, data_c, _st = await self._curl_json(
+                    "panel/api/inbounds/list/slim", max_time=90
+                )
+                if ok_c:
+                    return AdapterResult(success=True, raw=data_c)
+            if last_resp is not None:
+                return AdapterResult(
+                    success=False, error=self._explain_fail(last_resp, last_data)
+                )
+            return AdapterResult(success=False, error="timeout یا عدم دسترسی به API سنایی")
         except Exception as e:
             return AdapterResult(success=False, error=str(e))
 

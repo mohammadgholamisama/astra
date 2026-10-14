@@ -10,7 +10,8 @@ Group=astra
 WorkingDirectory=/opt/astra/backend
 EnvironmentFile=/opt/astra/.env
 Environment=PATH=/opt/astra/backend/.venv/bin:/usr/local/bin:/usr/bin
-ExecStart=/opt/astra/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port ${ASTRA_APP_PORT}
+# ASTRA_BIND_HOST=127.0.0.1 (behind nginx) or 0.0.0.0 (shared server IP:port access)
+ExecStart=/opt/astra/backend/.venv/bin/uvicorn app.main:app --host ${ASTRA_BIND_HOST:-127.0.0.1} --port ${ASTRA_APP_PORT}
 Restart=always
 RestartSec=3
 KillSignal=SIGTERM

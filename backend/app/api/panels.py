@@ -66,7 +66,9 @@ async def _fetch_pasarguard_groups(panel: Panel) -> list[RemoteGroupOut]:
     try:
         rows = await adapter.list_groups()  # type: ignore[attr-defined]
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"دریافت گروه‌ها ناموفق: {exc}") from exc
+        msg = str(exc).strip() or exc.__class__.__name__
+        logger.warning("pasarguard groups failed for %s: %s", panel.base_url, msg)
+        raise HTTPException(status_code=400, detail=f"دریافت گروه‌ها ناموفق: {msg}") from exc
     finally:
         await _close_adapter(adapter)
     return [RemoteGroupOut(**row) for row in rows]
@@ -143,12 +145,11 @@ async def _probe_panel(panel: Panel) -> None:
             except Exception:
                 pass
     if result is None or not result.success:
+        err = (result.error if result else None) or "اطلاعات ورود یا آدرس اشتباه است"
+        logger.warning("panel probe failed type=%s url=%s: %s", panel.type, panel.base_url, err)
         raise HTTPException(
             status_code=400,
-            detail=(
-                "اتصال ناموفق — پنل ذخیره نشد: "
-                f"{(result.error if result else None) or 'اطلاعات ورود یا آدرس اشتباه است'}"
-            ),
+            detail=f"اتصال ناموفق — پنل ذخیره نشد: {err}",
         )
 
 

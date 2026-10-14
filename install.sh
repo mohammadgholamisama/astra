@@ -109,22 +109,48 @@ pick_free_port() {
   die "No free TCP port found for uvicorn."
 }
 
-check_port_80() {
-  if ! is_port_in_use 80; then
-    ok "Port 80 is free (nginx)"
+count_other_nginx_sites() {
+  local n=0 f base
+  shopt -s nullglob
+  for f in /etc/nginx/sites-enabled/*; do
+    base="$(basename "$f")"
+    [[ "$base" == "astra" ]] && continue
+    n=$((n + 1))
+  done
+  shopt -u nullglob
+  echo "$n"
+}
+
+detect_share_mode() {
+  # Shared = existing site(s) or non-nginx already on :80 → never steal default_server
+  ASTRA_SHARE=0
+  local others
+  others="$(count_other_nginx_sites)"
+  if [[ "$others" -gt 0 ]]; then
+    ASTRA_SHARE=1
+    warn "Found $others existing nginx site(s) — shared mode (won't take :80 default)"
     return 0
   fi
-  local who=""
-  if command -v ss >/dev/null 2>&1; then
-    who="$(ss -lntp 2>/dev/null | grep -E ':80\s' || true)"
-  fi
-  if echo "$who" | grep -qi nginx; then
-    warn "Port 80 already used by nginx — will reuse / adjust site"
+  if is_port_in_use 80; then
+    local who=""
+    if command -v ss >/dev/null 2>&1; then
+      who="$(ss -lntp 2>/dev/null | grep -E ':80\s' || true)"
+    fi
+    if echo "$who" | grep -qi nginx; then
+      # nginx on 80 but no other enabled sites yet — exclusive OK
+      ok "Port 80 used by nginx with no other sites — exclusive mode"
+    else
+      ASTRA_SHARE=1
+      warn "Port 80 busy by non-nginx process — shared mode"
+      echo "$who"
+    fi
   else
-    warn "Port 80 is busy by another process:"
-    echo "$who"
-    warn "Certbot / HTTP access may fail until port 80 is free for nginx."
+    ok "Port 80 free — exclusive mode (Astra can use default :80)"
   fi
+}
+
+check_port_80() {
+  detect_share_mode
 }
 
 server_ip() {
@@ -340,16 +366,20 @@ write_env() {
   local port="$1" ip="$2"
   local envf="${ASTRA_ROOT}/.env"
 
+  ensure_env_key() {
+    local k="$1" v="$2"
+    if ! grep -qE "^${k}=" "$envf"; then
+      echo "${k}=${v}" >> "$envf"
+    fi
+  }
+
   if [[ -f "$envf" && "${REFRESH_ONLY:-0}" == "1" ]]; then
-    # ensure helper path + port key exist
-    if ! grep -qE '^ASTRA_HELPER=' "$envf"; then
-      echo "ASTRA_HELPER=${HELPER_BIN}" >> "$envf"
-    fi
-    if ! grep -qE '^ASTRA_APP_PORT=' "$envf"; then
-      echo "ASTRA_APP_PORT=${port}" >> "$envf"
-    fi
+    ensure_env_key ASTRA_HELPER "$HELPER_BIN"
+    ensure_env_key ASTRA_APP_PORT "$port"
+    ensure_env_key ASTRA_NGINX_SHARE "${ASTRA_SHARE:-0}"
+    ensure_env_key ASTRA_BIND_HOST "$([ "${ASTRA_SHARE:-0}" = 1 ] && echo 0.0.0.0 || echo 127.0.0.1)"
+    ensure_env_key DATABASE_URL "sqlite+aiosqlite:////opt/astra/data/astra.db"
     ok "Keeping existing .env"
-    # export for later steps
     ADMIN_USERNAME="$(grep -E '^ADMIN_USERNAME=' "$envf" | cut -d= -f2- | tr -d '\r')"
     ADMIN_PASSWORD="$(grep -E '^ADMIN_PASSWORD=' "$envf" | cut -d= -f2- | tr -d '\r')"
     ASTRA_APP_PORT="$(grep -E '^ASTRA_APP_PORT=' "$envf" | cut -d= -f2- | tr -d '\r')"
@@ -358,6 +388,10 @@ write_env() {
 
   if [[ -f "$envf" ]]; then
     warn ".env exists — not overwriting secrets"
+    ensure_env_key ASTRA_HELPER "$HELPER_BIN"
+    ensure_env_key ASTRA_NGINX_SHARE "${ASTRA_SHARE:-0}"
+    ensure_env_key ASTRA_BIND_HOST "$([ "${ASTRA_SHARE:-0}" = 1 ] && echo 0.0.0.0 || echo 127.0.0.1)"
+    ensure_env_key DATABASE_URL "sqlite+aiosqlite:////opt/astra/data/astra.db"
     ADMIN_USERNAME="$(grep -E '^ADMIN_USERNAME=' "$envf" | cut -d= -f2- | tr -d '\r')"
     ADMIN_PASSWORD="$(grep -E '^ADMIN_PASSWORD=' "$envf" | cut -d= -f2- | tr -d '\r')"
     ASTRA_APP_PORT="$(grep -E '^ASTRA_APP_PORT=' "$envf" | cut -d= -f2- | tr -d '\r')"
@@ -381,6 +415,22 @@ write_env() {
   fi
   panel_url="http://${ip}"
 
+  local share_flag=0 bind_host="127.0.0.1"
+  if [[ "${ASTRA_SHARE:-0}" == "1" ]]; then
+    share_flag=1
+    bind_host="0.0.0.0"
+    panel_url="http://${ip}:${port}"
+    sub_url="http://${ip}:${port}"
+  fi
+
+  # Always isolated SQLite under /opt/astra/data — never touches system PostgreSQL
+  local db_path="/opt/astra/data/astra.db"
+  if [[ -f "$db_path" ]]; then
+    ok "Keeping existing Astra SQLite DB: $db_path"
+  else
+    info "New isolated database will be created: $db_path"
+  fi
+
   cat > "$envf" <<EOF
 DATABASE_URL=sqlite+aiosqlite:////opt/astra/data/astra.db
 SECRET_KEY=${secret}
@@ -391,6 +441,8 @@ SUB_BASE_URL=${sub_url}
 PANEL_BASE_URL=${panel_url}
 CORS_ORIGINS=*
 ASTRA_APP_PORT=${ASTRA_APP_PORT}
+ASTRA_BIND_HOST=${bind_host}
+ASTRA_NGINX_SHARE=${share_flag}
 ASTRA_HELPER=${HELPER_BIN}
 ASTRA_PANEL_DOMAIN=
 ASTRA_SUB_DOMAIN=
@@ -401,7 +453,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES=1440
 EOF
   chmod 640 "$envf"
   chown root:"$ASTRA_USER" "$envf"
-  ok ".env created"
+  ok ".env created (share=${share_flag}, bind=${bind_host})"
 }
 
 install_python_deps() {
@@ -447,17 +499,53 @@ install_systemd() {
 
 install_nginx_site() {
   local port="$1"
+  # Prefer helper (respects shared/exclusive). Falls back to tpl only if helper missing.
+  systemctl enable nginx 2>/dev/null || true
+  if [[ -x "$HELPER_BIN" ]]; then
+    "$HELPER_BIN" write-nginx
+    ok "nginx site via astra-helper (share=${ASTRA_SHARE:-0}, app :${port})"
+    return 0
+  fi
   local tpl="${ASTRA_ROOT}/deploy/nginx-http.conf.tpl"
   [[ -f "$tpl" ]] || die "Missing $tpl"
-  sed "s/__ASTRA_PORT__/${port}/g" "$tpl" > "$NGINX_SITE"
-  ln -sfn "$NGINX_SITE" "$NGINX_LINK"
-  if [[ -L /etc/nginx/sites-enabled/default ]]; then
-    rm -f /etc/nginx/sites-enabled/default
+  if [[ "${ASTRA_SHARE:-0}" == "1" ]]; then
+    # Shared: empty placeholder site — IP access is uvicorn on bind 0.0.0.0:port
+    cat > "$NGINX_SITE" <<EOF
+# Astra shared mode — other sites untouched. Set a domain with x-astra.
+EOF
+  else
+    sed "s/__ASTRA_PORT__/${port}/g" "$tpl" > "$NGINX_SITE"
+    if [[ -L /etc/nginx/sites-enabled/default ]]; then
+      rm -f /etc/nginx/sites-enabled/default
+    fi
   fi
+  ln -sfn "$NGINX_SITE" "$NGINX_LINK"
   nginx -t
-  systemctl enable nginx
   systemctl restart nginx
-  ok "nginx site configured (proxy → 127.0.0.1:${port})"
+  ok "nginx site configured"
+}
+
+init_database() {
+  # Create tables in isolated SQLite only (idempotent; never touches Postgres)
+  info "Initializing Astra database schema…"
+  sudo -u "$ASTRA_USER" bash -c "
+    set -e
+    cd '${ASTRA_ROOT}/backend'
+    . .venv/bin/activate
+    python - <<'PY'
+import asyncio
+from app.core.schema_sync import ensure_schema
+from app.seed import seed_admin
+
+async def main():
+    await ensure_schema()
+    await seed_admin()
+    print('schema+seed ok')
+
+asyncio.run(main())
+PY
+  " || die "Database init failed"
+  ok "Database ready at /opt/astra/data/astra.db"
 }
 
 install_cli_bins() {
@@ -508,39 +596,49 @@ start_services() {
 success_box() {
   local ip="$1" port="$2"
   echo
+  local url share="${ASTRA_SHARE:-0}"
+  if [[ "$share" == "1" ]]; then
+    url="http://${ip}:${port}"
+  else
+    url="http://${ip}"
+  fi
   echo -e "${GREEN}${BOLD}"
   cat <<EOF
 ╔══════════════════════════════════════════════════════════╗
 ║              Astra installed successfully!               ║
-║                 نصب با موفقیت انجام شد                    ║
 ╠══════════════════════════════════════════════════════════╣
-║  Panel URL : http://${ip}
-║  (nginx :80 → app :${port})
+║  Panel URL : ${url}
+║  App port  : ${port}   share_mode=${share}
 ║                                                          ║
 ║  Username  : ${ADMIN_USERNAME}
 ║  Password  : ${ADMIN_PASSWORD}
 ║                                                          ║
 ║  Manage    : x-astra                                     ║
-║  (domain / SSL / port / update)                          ║
+║  (domain / SSL / port / update / uninstall)              ║
 ║                                                          ║
-║  Data      : ${ASTRA_ROOT}/data/astra.db                 ║
+║  Database  : ${ASTRA_ROOT}/data/astra.db (isolated)      ║
 ║  Env       : ${ASTRA_ROOT}/.env                          ║
 ╚══════════════════════════════════════════════════════════╝
 EOF
   echo -e "${NC}"
-  info "Save the password now. / همین الان رمز را ذخیره کنید."
-  info "Run: ${BOLD}x-astra${NC}  to set domain & SSL."
+  info "Save the admin password now."
+  if [[ "$share" == "1" ]]; then
+    warn "Shared server: existing sites untouched. Open firewall for port ${port} if needed."
+    info "Or set a panel domain in x-astra (menu 3) for :80/:443 on that hostname only."
+  fi
+  info "Run: ${BOLD}x-astra${NC}"
 }
 
 # ─── Main ────────────────────────────────────────────────────
 main() {
   REFRESH_ONLY=0
+  ASTRA_SHARE=0
   banner
   require_root
   detect_os
   handle_existing
 
-  step "Install system packages / نصب پکیج‌ها"
+  step "Install system packages"
   install_base_packages
   install_nodejs
 
@@ -548,16 +646,16 @@ main() {
   ensure_user
   deploy_project
 
-  step "Pick free port & check :80"
+  step "Pick free port & detect existing sites"
   local port ip
+  check_port_80
   if [[ "${REFRESH_ONLY}" == "1" && -f "${ASTRA_ROOT}/.env" ]]; then
     port="$(grep -E '^ASTRA_APP_PORT=' "${ASTRA_ROOT}/.env" | cut -d= -f2- | tr -d '\r')"
     port="${port:-$(pick_free_port)}"
   else
     port="$(pick_free_port)"
   fi
-  ok "Selected app port: $port"
-  check_port_80
+  ok "Selected app port: $port (share_mode=${ASTRA_SHARE})"
   ip="$(server_ip)"
   ok "Server IP: $ip"
 
@@ -573,14 +671,15 @@ main() {
   step "Build frontend"
   build_frontend
 
-  step "Install systemd, nginx, CLI, sudoers"
+  step "Install systemd, CLI, sudoers, nginx"
   install_systemd
-  install_nginx_site "$port"
   install_cli_bins
   install_sudoers
+  install_nginx_site "$port"
   fix_perms
 
-  step "Enable & start services"
+  step "Init isolated database + start services"
+  init_database
   start_services
 
   success_box "$ip" "$port"

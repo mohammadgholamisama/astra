@@ -322,10 +322,10 @@ async def collect_links(user: User) -> list[str]:
 
 
 def collect_links_detailed(user: User) -> list[dict]:
-    """All unique share links across panels, with panel label for UI.
+    """All unique share links across panels.
 
-    Group notices (info messages) are prepended first.
-    If user.display_name is set, real config remarks are rewritten (notices kept).
+    Group notices are prepended first.
+    Real config remarks: «اسم 🟢 حجم‌باقی #آیدی» (no panel name).
     """
     from app.services.link_remark import apply_display_name, notice_rows_from_groups
 
@@ -342,7 +342,13 @@ def collect_links_detailed(user: User) -> list[dict]:
             if link and link not in seen:
                 seen.add(link)
                 rows.append({"link": link, "panel": label, "panel_id": account.panel_id})
-    renamed = apply_display_name(rows, getattr(user, "display_name", None))
+    renamed = apply_display_name(
+        rows,
+        getattr(user, "display_name", None),
+        used=int(user.used_traffic or 0),
+        limit=int(user.data_limit or 0),
+        username=getattr(user, "username", None),
+    )
     return notices + renamed
 
 

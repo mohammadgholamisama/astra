@@ -14,6 +14,8 @@ STATE_FILE="${ASTRA_ROOT}/deploy/install-state"
 # Keys astra-helper may change in .env
 ALLOWED_ENV_KEYS=(
   ASTRA_APP_PORT
+  ASTRA_BIND_HOST
+  ASTRA_NGINX_SHARE
   PANEL_BASE_URL
   SUB_BASE_URL
   PANEL_NAME
@@ -169,8 +171,31 @@ locations_for_mode() {
   fi
 }
 
+count_other_nginx_sites() {
+  local n=0 f base
+  shopt -s nullglob
+  for f in /etc/nginx/sites-enabled/*; do
+    base="$(basename "$f")"
+    [[ "$base" == "astra" ]] && continue
+    n=$((n + 1))
+  done
+  shopt -u nullglob
+  echo "$n"
+}
+
+is_share_mode() {
+  local flag
+  flag="$(get_env ASTRA_NGINX_SHARE "")"
+  if [[ "$flag" == "1" || "$flag" == "true" || "$flag" == "yes" ]]; then
+    return 0
+  fi
+  # Auto: other vhosts already present → never steal default_server
+  [[ "$(count_other_nginx_sites)" -gt 0 ]]
+}
+
 http_block_default() {
   local port="$1"
+  # Exclusive install: catch-all on :80 (safe only when no other sites)
   cat <<EOF
 server {
     listen 80 default_server;
@@ -181,6 +206,17 @@ server {
     client_max_body_size 50m;
 $(panel_locations "$port")
 }
+EOF
+}
+
+# Shared hosting: do NOT touch :80 catch-all — IP access is via bind host :app_port
+http_block_share_note() {
+  local port="$1" bind
+  bind="$(get_env ASTRA_BIND_HOST 0.0.0.0)"
+  cat <<EOF
+# Shared mode: other nginx sites left untouched.
+# Panel IP access: http://SERVER_IP:${port}/  (uvicorn bind ${bind})
+# Add a panel domain via x-astra to proxy on :80/:443 for that hostname only.
 EOF
 }
 
@@ -259,20 +295,28 @@ EOF
 }
 
 render_nginx() {
-  local port panel_dom sub_dom ssl_panel ssl_sub
+  local port panel_dom sub_dom ssl_panel ssl_sub share=0
   port="$(read_port)"
   panel_dom="$(get_env ASTRA_PANEL_DOMAIN "")"
   sub_dom="$(get_env ASTRA_SUB_DOMAIN "")"
   ssl_panel="$(get_env ASTRA_SSL_PANEL 0)"
   ssl_sub="$(get_env ASTRA_SSL_SUB 0)"
+  if is_share_mode; then
+    share=1
+  fi
 
   echo "# Managed by astra-helper — do not edit by hand"
   echo "# Generated $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "# mode=$([ "$share" -eq 1 ] && echo shared || echo exclusive)"
   echo
 
-  # Always keep default_server for IP access (full panel)
-  http_block_default "$port"
-  echo
+  if [[ "$share" -eq 1 ]]; then
+    http_block_share_note "$port"
+    echo
+  else
+    http_block_default "$port"
+    echo
+  fi
 
   if [[ -n "$panel_dom" ]]; then
     if [[ "$ssl_panel" == "1" && -f "/etc/letsencrypt/live/${panel_dom}/fullchain.pem" ]]; then
@@ -311,17 +355,73 @@ cmd_write_nginx() {
     render_nginx > "$tmp"
   fi
   nginx -t -c /etc/nginx/nginx.conf 2>/dev/null || true
-  # validate by installing to sites-available and testing
   install -m 644 "$tmp" "$NGINX_SITE"
   rm -f "$tmp"
   ln -sfn "$NGINX_SITE" "$NGINX_LINK"
-  # disable default site if present (avoid port 80 conflict)
-  if [[ -L /etc/nginx/sites-enabled/default ]]; then
-    rm -f /etc/nginx/sites-enabled/default
+
+  # Only disable stock nginx "default" welcome site when Astra owns :80 (exclusive).
+  # Never remove other vhosts.
+  if ! is_share_mode; then
+    if [[ -L /etc/nginx/sites-enabled/default ]]; then
+      rm -f /etc/nginx/sites-enabled/default
+    fi
   fi
+
   nginx -t
-  systemctl reload nginx
-  echo "nginx config written → $NGINX_SITE"
+  systemctl reload nginx || systemctl restart nginx
+  echo "nginx config written → $NGINX_SITE (share=$(is_share_mode && echo yes || echo no))"
+}
+
+cmd_uninstall() {
+  need_root
+  local purge_data="${1:-}"
+  echo "astra-helper: uninstalling Astra (other sites / DBs untouched)…"
+
+  systemctl stop astra 2>/dev/null || true
+  systemctl disable astra 2>/dev/null || true
+  systemctl stop astra-update.service 2>/dev/null || true
+  systemctl disable astra-update.service 2>/dev/null || true
+
+  rm -f /etc/systemd/system/astra.service
+  rm -f /etc/systemd/system/astra-update.service
+  systemctl daemon-reload
+  systemctl reset-failed astra 2>/dev/null || true
+
+  # Remove ONLY Astra nginx site
+  rm -f "$NGINX_LINK"
+  rm -f "$NGINX_SITE"
+  if command -v nginx >/dev/null 2>&1; then
+    nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
+  fi
+
+  rm -f /usr/local/bin/astra-helper
+  rm -f /usr/local/bin/x-astra
+  rm -f /etc/sudoers.d/astra
+
+  # Optional: remove Let's Encrypt certs that belong only to Astra domains
+  local panel_dom sub_dom
+  panel_dom="$(get_env ASTRA_PANEL_DOMAIN "")"
+  sub_dom="$(get_env ASTRA_SUB_DOMAIN "")"
+  if command -v certbot >/dev/null 2>&1; then
+    for d in "$panel_dom" "$sub_dom"; do
+      [[ -n "$d" ]] || continue
+      if [[ -d "/etc/letsencrypt/live/${d}" ]]; then
+        certbot delete --cert-name "$d" --non-interactive 2>/dev/null || true
+      fi
+    done
+  fi
+
+  if [[ "$purge_data" == "--purge" ]]; then
+    rm -rf "$ASTRA_ROOT"
+    if id astra >/dev/null 2>&1; then
+      userdel astra 2>/dev/null || true
+    fi
+    echo "astra-helper: purged /opt/astra and user astra"
+  else
+    # Keep tree but stop serving; leave data for recovery unless purged
+    echo "astra-helper: services/bins removed; data kept at $ASTRA_ROOT (use --purge to delete)"
+  fi
+  echo "astra-helper: uninstall complete"
 }
 
 cmd_issue_ssl() {
@@ -546,6 +646,7 @@ Commands:
   restart-astra
   check-update                 # JSON status (preserves data)
   apply-update                 # pull latest; keeps .env + data/
+  uninstall [--purge]          # remove Astra from server (other apps safe)
 EOF
 }
 
@@ -560,6 +661,7 @@ main() {
     restart-astra) cmd_restart_astra ;;
     check-update)  cmd_check_update ;;
     apply-update)  cmd_apply_update ;;
+    uninstall)     cmd_uninstall "${1:-}" ;;
     ""|-h|--help)  usage ;;
     *)             die "unknown command: $cmd" ;;
   esac

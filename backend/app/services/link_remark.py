@@ -6,6 +6,41 @@ import base64
 import json
 from urllib.parse import quote, unquote
 
+# Persian digits for client-visible remarks
+_FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+
+
+def to_fa_digits(value: object) -> str:
+    return str(value).translate(_FA_DIGITS)
+
+
+def format_bytes_fa(n: int) -> str:
+    n = max(0, int(n or 0))
+    units = [(1024**4, "TB"), (1024**3, "GB"), (1024**2, "MB"), (1024, "KB")]
+    for size, label in units:
+        if n >= size:
+            val = n / size
+            text = f"{val:.1f}".rstrip("0").rstrip(".") + f" {label}"
+            return to_fa_digits(text)
+    return to_fa_digits(f"{n} B")
+
+
+def remain_badge(used: int, limit: int) -> tuple[str, str]:
+    """Return (emoji, remain_label) for subscription remarks."""
+    used_i = max(0, int(used or 0))
+    limit_i = int(limit or 0)
+    if limit_i <= 0:
+        return "♾️", "نامحدود"
+    remain = max(0, limit_i - used_i)
+    pct = (remain / limit_i) if limit_i else 0.0
+    if pct > 0.5:
+        emoji = "🟢"
+    elif pct > 0.2:
+        emoji = "🟡"
+    else:
+        emoji = "🔴"
+    return emoji, format_bytes_fa(remain)
+
 
 def rewrite_link_remark(link: str, remark: str) -> str:
     """Set client-visible name on a share link (fragment / vmess ps)."""
@@ -57,28 +92,55 @@ def link_current_remark(link: str) -> str:
     return ""
 
 
-def apply_display_name(links: list[dict], display_name: str | None) -> list[dict]:
-    """Attach renamed links when user has a custom display_name.
+def build_config_remark(
+    *,
+    name: str,
+    config_id: int,
+    used: int = 0,
+    limit: int = 0,
+) -> str:
+    """Client-visible title: name + remain emoji/volume + #id — no panel name."""
+    base = " ".join((name or "").split()).strip() or "کانفیگ"
+    emoji, remain = remain_badge(used, limit)
+    cid = to_fa_digits(config_id)
+    return f"{base} {emoji} {remain} #{cid}"
 
-    Skips notice/info rows (kind == \"notice\") so messages stay intact.
+
+def apply_display_name(
+    links: list[dict],
+    display_name: str | None,
+    *,
+    used: int = 0,
+    limit: int = 0,
+    username: str | None = None,
+) -> list[dict]:
+    """Rename real configs for clients/sub page.
+
+    Format: «اسم 🟢 حجم‌باقی #آیدی» — never includes panel name.
+    Skips notice/info rows (kind == \"notice\").
     """
-    name = (display_name or "").strip()
-    if not name or not links:
+    if not links:
         return links
 
+    preferred = (display_name or "").strip() or (username or "").strip()
     real = [r for r in links if r.get("kind") != "notice"]
     notices = [r for r in links if r.get("kind") == "notice"]
-    total = len(real)
     out: list[dict] = []
     for i, row in enumerate(real):
         link = row.get("link") or ""
-        if total == 1:
-            remark = name
-        else:
-            panel = (row.get("panel") or "").strip()
-            remark = f"{name} · {panel}" if panel else f"{name} · {i + 1}"
+        original = link_current_remark(link).strip()
+        # Drop stale "name · panel" style if present
+        if " · " in original and preferred:
+            original = ""
+        name = preferred or original or f"کانفیگ"
+        remark = build_config_remark(
+            name=name,
+            config_id=i + 1,
+            used=used,
+            limit=limit,
+        )
         new_link = rewrite_link_remark(link, remark)
-        out.append({**row, "link": new_link, "remark": remark})
+        out.append({**row, "link": new_link, "remark": remark, "config_id": i + 1})
     return notices + out
 
 
@@ -102,7 +164,6 @@ def build_notice_link(text: str) -> str:
     remark = " ".join((text or "").split()).strip()[:200]
     if not remark:
         return ""
-    # Non-routable localhost vless — clients list the #remark as the config name
     return (
         "vless://00000000-0000-0000-0000-000000000001@127.0.0.1:80"
         f"?encryption=none&security=none&type=tcp#{quote(remark, safe='')}"
