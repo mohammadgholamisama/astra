@@ -10,13 +10,19 @@ Note: without X-Requested-With, invalid tokens often look like HTTP 404.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import secrets
 import uuid as uuid_lib
 from typing import Any
 
+import httpx
+
 from app.adapters.base import AdapterResult, BasePanelAdapter, UserPayload
 from app.adapters.http_utils import err_msg, make_client, ok_json
+
+logger = logging.getLogger("astra.sanaei")
 
 
 def _clean_token(raw: str | None) -> str:
@@ -47,13 +53,75 @@ class SanaeiAdapter(BasePanelAdapter):
 
     async def _get_client(self):
         if self._client is None:
-            # 3x-ui /list can be large when many clients exist
+            # Heavy inbound payloads behind Cloudflare often need a long read window
             self._client = make_client(
                 self.base_url,
                 self.meta.get("verify_ssl", False),
-                timeout=60.0,
+                timeout=180.0,
             )
         return self._client
+
+    async def _curl_json(self, path: str, *, max_time: int = 120) -> tuple[bool, Any, int]:
+        """
+        Fallback fetch via curl — on some VPS/Cloudflare paths httpx ReadTimeouts
+        while curl completes fine for the same URL.
+        """
+        token = self._token()
+        if not token:
+            return False, {"msg": "API Token لازم است"}, 0
+        url = f"{self.base_url.rstrip('/')}/{path.lstrip('/')}"
+        cmd = [
+            "curl",
+            "-fsS",
+            "-L",
+            "--max-time",
+            str(max_time),
+            "-H",
+            f"Authorization: Bearer {token}",
+            "-H",
+            "X-Requested-With: XMLHttpRequest",
+            "-H",
+            "Accept: application/json",
+            "-w",
+            "\n__HTTP_STATUS__:%{http_code}",
+            url,
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out_b, err_b = await asyncio.wait_for(
+                proc.communicate(), timeout=max_time + 15
+            )
+        except asyncio.TimeoutError:
+            return False, {"msg": f"curl timeout بعد از {max_time}s"}, 0
+        except FileNotFoundError:
+            return False, {"msg": "curl روی سرور نصب نیست"}, 0
+
+        raw = (out_b or b"").decode("utf-8", errors="replace")
+        err = (err_b or b"").decode("utf-8", errors="replace")
+        status = 0
+        body = raw
+        if "__HTTP_STATUS__:" in raw:
+            body, _, tail = raw.rpartition("__HTTP_STATUS__:")
+            try:
+                status = int(tail.strip().splitlines()[0].strip())
+            except ValueError:
+                status = 0
+            body = body.rstrip("\n")
+        if proc.returncode not in (0, None) and status == 0:
+            return False, {"msg": (err or raw or "curl failed")[:400]}, status
+        try:
+            data = json.loads(body) if body.strip() else {}
+        except json.JSONDecodeError:
+            return False, {"text": body[:300], "msg": "پاسخ JSON نبود"}, status or 200
+        if status >= 400:
+            return False, data if isinstance(data, dict) else {"data": data}, status
+        if isinstance(data, dict) and data.get("success") is False:
+            return False, data, status or 200
+        return True, data, status or 200
 
     async def close(self) -> None:
         if self._client:
@@ -229,26 +297,54 @@ class SanaeiAdapter(BasePanelAdapter):
     async def list_inbounds(self) -> list[dict[str, Any]]:
         if not self._token() and not (self.username and self.password):
             self._require_token()
-        # Prefer slim — full /list embeds every client and can be huge/slow
-        last_resp = None
-        last_data: Any = None
-        for path in (
+
+        paths = (
             "panel/api/inbounds/list/slim",
             "panel/api/inbounds/list",
-        ):
-            resp = await self._request("GET", path)
-            last_resp = resp
-            ok, data = ok_json(resp)
-            last_data = data
+        )
+        errors: list[str] = []
+
+        # 1) httpx — slim first (short), then full (long read)
+        for path in paths:
+            try:
+                resp = await self._request("GET", path)
+                ok, data = ok_json(resp)
+                if not ok:
+                    errors.append(f"{path}: {err_msg(data, f'HTTP {resp.status_code}')}")
+                    continue
+                rows = self._parse_inbounds_obj(data)
+                if rows:
+                    return rows
+                if path.endswith("/slim"):
+                    errors.append(f"{path}: لیست خالی")
+                    continue
+                return rows
+            except httpx.TimeoutException as exc:
+                logger.warning("sanaei httpx timeout on %s: %s", path, exc)
+                errors.append(f"{path}: ReadTimeout (httpx)")
+                continue
+            except httpx.HTTPError as exc:
+                logger.warning("sanaei httpx error on %s: %s", path, exc)
+                errors.append(f"{path}: {exc}")
+                continue
+
+        # 2) curl fallback (often OK through Cloudflare when httpx stalls)
+        for path in paths:
+            ok, data, status = await self._curl_json(
+                path, max_time=90 if path.endswith("/slim") else 180
+            )
             if not ok:
+                errors.append(f"curl {path}: {err_msg(data, f'HTTP {status}')}")
                 continue
             rows = self._parse_inbounds_obj(data)
             if rows or path.endswith("/list"):
+                logger.info("sanaei inbounds via curl fallback (%s) count=%s", path, len(rows))
                 return rows
+
+        detail = " | ".join(errors[-4:]) if errors else "unknown"
         raise RuntimeError(
-            self._explain_fail(last_resp, last_data)
-            if last_resp is not None
-            else "نتوانست لیست اینباند را از سنایی بگیرد"
+            "دریافت اینباند از سنایی ناموفق (پاسخ سنگین/کند از سرور شما). "
+            f"جزئیات: {detail[:500]}"
         )
 
     async def _list_inbound_ids(self) -> list[int]:
