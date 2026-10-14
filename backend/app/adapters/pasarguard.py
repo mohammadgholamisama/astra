@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.adapters.base import AdapterResult, UserPayload
-from app.adapters.http_utils import err_msg, expand_subscription_links, ok_json
+from app.adapters.http_utils import err_msg, ok_json
 from app.adapters.marzban import MarzbanAdapter
 
 
@@ -96,8 +96,7 @@ class PasarGuardAdapter(MarzbanAdapter):
 
         NOTE: GET /api/group is invalid (POST-only create) → 405.
         """
-        client = await self._get_client()
-        headers = await self._headers()
+        client, headers = await self._authed()
         # Operators: read_simple only. Owners: both work.
         attempts: list[tuple[str, dict[str, Any] | None]] = [
             ("/api/groups/simple", {"all": "true"}),
@@ -192,15 +191,9 @@ class PasarGuardAdapter(MarzbanAdapter):
             raw=data,
         )
 
-    async def _finalize_pg(self, result: AdapterResult) -> AdapterResult:
-        client = await self._get_client()
-        result.links = await expand_subscription_links(client, list(result.links or []))
-        return result
-
     async def test_connection(self) -> AdapterResult:
         try:
-            client = await self._get_client()
-            headers = await self._headers()
+            client, headers = await self._authed()
             resp = await client.get("/api/admin", headers=headers)
             ok, data = ok_json(resp)
             if ok:
@@ -212,33 +205,33 @@ class PasarGuardAdapter(MarzbanAdapter):
                 return AdapterResult(success=True, raw=data2)
             return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
         except Exception as e:
-            return AdapterResult(success=False, error=str(e))
+            return AdapterResult(success=False, error=str(e).strip() or e.__class__.__name__)
 
     async def create_user(self, payload: UserPayload) -> AdapterResult:
+        """POST /api/user — PasarGuard docs; no blocking /sub expand."""
         try:
             group_ids = await self._resolve_group_ids(payload)
-            client = await self._get_client()
-            headers = await self._headers()
             body = self._build_pg_body(payload, group_ids)
+            client, headers = await self._authed()
             resp = await client.post("/api/user", headers=headers, json=body)
             ok, data = ok_json(resp)
             if ok and isinstance(data, dict):
-                return await self._finalize_pg(self._from_pg_response(data, payload.username))
+                return self._from_pg_response(data, payload.username)
             return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
         except Exception as e:
-            return AdapterResult(success=False, error=str(e))
+            return AdapterResult(success=False, error=str(e).strip() or e.__class__.__name__)
 
     async def modify_user(self, payload: UserPayload) -> AdapterResult:
+        """PUT /api/user/{username} — PasarGuard docs."""
         try:
             group_ids = await self._resolve_group_ids(payload)
-            client = await self._get_client()
-            headers = await self._headers()
             body = self._build_pg_body(payload, group_ids)
             body.pop("username", None)
+            client, headers = await self._authed()
             resp = await client.put(f"/api/user/{payload.username}", headers=headers, json=body)
             ok, data = ok_json(resp)
             if ok and isinstance(data, dict):
-                return await self._finalize_pg(self._from_pg_response(data, payload.username))
+                return self._from_pg_response(data, payload.username)
             return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
         except Exception as e:
-            return AdapterResult(success=False, error=str(e))
+            return AdapterResult(success=False, error=str(e).strip() or e.__class__.__name__)

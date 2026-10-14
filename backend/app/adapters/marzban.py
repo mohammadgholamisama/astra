@@ -158,6 +158,17 @@ class MarzbanAdapter(BasePanelAdapter):
         token = await self._ensure_token()
         return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
+    async def _authed(self) -> tuple[Any, dict[str, str]]:
+        """Token first, then a live client.
+
+        Critical: never reuse a client reference taken *before* `_ensure_token`,
+        because token retries may `close()` that client →
+        «Cannot send a request, as the client has been closed».
+        """
+        headers = await self._headers()
+        client = await self._get_client()
+        return client, headers
+
     def _selected_protocols(self, payload: UserPayload) -> list[str]:
         """Resolve which protocols to enable from group/panel config (docs order)."""
         raw = payload.config.get("protocols")
@@ -385,9 +396,12 @@ class MarzbanAdapter(BasePanelAdapter):
         Fetch Marzban/Rebecca protocols from GET /api/inbounds.
         Response shape: { "vless": [ProxyInbound...], "vmess": [...], ... }
         """
-        client = await self._get_client()
-        headers = await self._headers()
-        resp = await client.get("/api/inbounds", headers=headers)
+        client, headers = await self._authed()
+        resp = await client.get(
+            "/api/inbounds",
+            headers=headers,
+            timeout=httpx.Timeout(18.0, connect=12.0),
+        )
         ok, data = ok_json(resp)
         if not ok or not isinstance(data, dict):
             raise RuntimeError(err_msg(data, f"HTTP {resp.status_code}"))
@@ -441,8 +455,7 @@ class MarzbanAdapter(BasePanelAdapter):
 
     async def test_connection(self) -> AdapterResult:
         try:
-            client = await self._get_client()
-            headers = await self._headers()
+            client, headers = await self._authed()
             resp = await client.get("/api/admin", headers=headers)
             ok, data = ok_json(resp)
             if ok:
@@ -452,116 +465,137 @@ class MarzbanAdapter(BasePanelAdapter):
             msg = str(e).strip() or e.__class__.__name__
             return AdapterResult(success=False, error=msg)
 
-    async def _finalize_user_result(self, result: AdapterResult, username: str) -> AdapterResult:
-        """Attach share links without blocking create/modify on slow /sub fetches.
-
-        Marzban often returns only subscription_url. Expanding that can be slow;
-        never fail a successful create because link expansion timed out.
-        """
+    async def _finalize_user_result(
+        self, result: AdapterResult, username: str, *, expand: bool = False
+    ) -> AdapterResult:
+        """Optionally expand /sub → share links. Default off for fast create/modify."""
+        if not expand:
+            return result
         from app.adapters.http_utils import is_share_link, is_subscription_ref
 
         links = [str(x).strip() for x in (result.links or []) if x and str(x).strip()]
-        has_share = any(is_share_link(l) for l in links)
-        has_sub = any(is_subscription_ref(l) for l in links)
-
-        # Only re-fetch user when create/modify returned neither shares nor sub URL
-        if not has_share and not has_sub:
-            try:
-                refreshed = await asyncio.wait_for(
-                    self.get_usage(username, expand_links=False), timeout=15
-                )
-                if refreshed.success and refreshed.links:
-                    links = [str(x).strip() for x in (refreshed.links or []) if x]
-                    result.used_traffic = refreshed.used_traffic or result.used_traffic
-                    result.uuid = refreshed.uuid or result.uuid
-                    result.raw = refreshed.raw or result.raw
-                    has_share = any(is_share_link(l) for l in links)
-            except Exception:
-                pass
-
-        if has_share:
+        if any(is_share_link(l) for l in links):
             result.links = [l for l in links if is_share_link(l)]
             return result
-
+        if not any(is_subscription_ref(l) for l in links):
+            return result
         try:
             expanded = await asyncio.wait_for(
-                self._expand_subscription_links(links), timeout=12
+                self._expand_subscription_links(links), timeout=8
             )
             if expanded:
                 result.links = expanded
-            else:
-                # Keep /sub refs — hydrate_share_links can expand later
-                result.links = links
         except Exception:
-            result.links = links
+            pass
         return result
 
     async def create_user(self, payload: UserPayload) -> AdapterResult:
+        """POST /api/user — official Marzban create (no extra /sub round-trips)."""
         try:
-            client = await self._get_client()
-            headers = await self._headers()
+            # Build body before auth so inbound catalog (if needed) uses its own client cycle
             body = await self._build_user_body(payload, include_username=True)
-            resp = await client.post("/api/user", headers=headers, json=body)
+            client, headers = await self._authed()
+            resp = await client.post(
+                "/api/user",
+                headers=headers,
+                json=body,
+                timeout=httpx.Timeout(30.0, connect=15.0),
+            )
             ok, data = ok_json(resp)
             if ok and isinstance(data, dict):
-                result = self._from_user_response(data, payload.username)
-                return await self._finalize_user_result(result, payload.username)
+                # Keep subscription_url/links from create response; hydrate later on sub page
+                return self._from_user_response(data, payload.username)
             return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
         except Exception as e:
             msg = str(e).strip() or e.__class__.__name__
             if isinstance(e, (asyncio.TimeoutError, httpx.TimeoutException)):
                 msg = "Timeout waiting for panel response"
+            if "client has been closed" in msg.lower():
+                msg = "اتصال پنل قطع شد — دوباره تلاش کنید"
             return AdapterResult(success=False, error=msg)
 
     async def modify_user(self, payload: UserPayload) -> AdapterResult:
+        """PUT /api/user/{username} — official Marzban modify."""
         try:
-            client = await self._get_client()
-            headers = await self._headers()
             body = await self._build_user_body(payload, include_username=False)
-            resp = await client.put(f"/api/user/{payload.username}", headers=headers, json=body)
+            client, headers = await self._authed()
+            resp = await client.put(
+                f"/api/user/{payload.username}",
+                headers=headers,
+                json=body,
+                timeout=httpx.Timeout(30.0, connect=15.0),
+            )
             ok, data = ok_json(resp)
             if ok and isinstance(data, dict):
-                result = self._from_user_response(data, payload.username)
-                return await self._finalize_user_result(result, payload.username)
+                return self._from_user_response(data, payload.username)
             return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
         except Exception as e:
             msg = str(e).strip() or e.__class__.__name__
             if isinstance(e, (asyncio.TimeoutError, httpx.TimeoutException)):
                 msg = "Timeout waiting for panel response"
+            if "client has been closed" in msg.lower():
+                msg = "اتصال پنل قطع شد — دوباره تلاش کنید"
             return AdapterResult(success=False, error=msg)
 
     async def delete_user(self, username: str, remote_id: str | None = None) -> AdapterResult:
-        try:
-            client = await self._get_client()
-            headers = await self._headers()
-            resp = await client.delete(f"/api/user/{username}", headers=headers)
-            if resp.status_code in (200, 204, 404):
-                return AdapterResult(success=True)
-            ok, data = ok_json(resp)
-            err = err_msg(data, f"HTTP {resp.status_code}")
-            if "not found" in err.lower():
-                return AdapterResult(success=True)
-            return AdapterResult(success=False, error=err)
-        except Exception as e:
-            return AdapterResult(success=False, error=str(e))
+        """DELETE /api/user/{username} — official Marzban remove (404 = already gone)."""
+        uname = (username or remote_id or "").strip()
+        if not uname:
+            return AdapterResult(success=False, error="username خالی است")
+        last_err = "delete failed"
+        for attempt in range(2):
+            try:
+                client, headers = await self._authed()
+                resp = await client.delete(
+                    f"/api/user/{uname}",
+                    headers=headers,
+                    timeout=httpx.Timeout(25.0, connect=15.0),
+                )
+                if resp.status_code in (200, 204, 404):
+                    return AdapterResult(success=True)
+                ok, data = ok_json(resp)
+                err = err_msg(data, f"HTTP {resp.status_code}")
+                if "not found" in err.lower():
+                    return AdapterResult(success=True)
+                last_err = err
+                # Auth blip — clear token and retry once
+                if resp.status_code in (401, 403) and attempt == 0:
+                    self._token = None
+                    _TOKEN_CACHE.pop(self._cache_key(), None)
+                    await self.close()
+                    continue
+                return AdapterResult(success=False, error=err)
+            except Exception as e:
+                last_err = str(e).strip() or e.__class__.__name__
+                if "client has been closed" in last_err.lower() and attempt == 0:
+                    self._token = None
+                    await self.close()
+                    await asyncio.sleep(0.3)
+                    continue
+                if isinstance(e, (asyncio.TimeoutError, httpx.TimeoutException)):
+                    last_err = "Timeout waiting for panel response"
+                return AdapterResult(success=False, error=last_err)
+        return AdapterResult(success=False, error=last_err)
 
     async def reset_usage(self, username: str, remote_id: str | None = None) -> AdapterResult:
         """POST /api/user/{username}/reset — Marzban / PasarGuard / Rebecca family."""
         try:
-            client = await self._get_client()
-            headers = await self._headers()
-            resp = await client.post(f"/api/user/{username}/reset", headers=headers)
+            client, headers = await self._authed()
+            resp = await client.post(
+                f"/api/user/{username}/reset",
+                headers=headers,
+                timeout=httpx.Timeout(25.0, connect=15.0),
+            )
             ok, data = ok_json(resp)
             if ok:
                 if isinstance(data, dict):
                     return self._from_user_response(data, username)
                 return AdapterResult(success=True, remote_username=username, used_traffic=0)
-            # Some forks only accept PUT with used_traffic=0 — try usage read after 404
             if resp.status_code in (404, 405):
                 return AdapterResult(success=False, error=err_msg(data, "reset endpoint missing"))
             return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
         except Exception as e:
-            return AdapterResult(success=False, error=str(e))
+            return AdapterResult(success=False, error=str(e).strip() or e.__class__.__name__)
 
     async def get_usage(
         self,
@@ -571,9 +605,12 @@ class MarzbanAdapter(BasePanelAdapter):
         expand_links: bool = True,
     ) -> AdapterResult:
         try:
-            client = await self._get_client()
-            headers = await self._headers()
-            resp = await client.get(f"/api/user/{username}", headers=headers)
+            client, headers = await self._authed()
+            resp = await client.get(
+                f"/api/user/{username}",
+                headers=headers,
+                timeout=httpx.Timeout(20.0, connect=12.0),
+            )
             ok, data = ok_json(resp)
             if ok and isinstance(data, dict):
                 result = self._from_user_response(data, username)
@@ -582,7 +619,7 @@ class MarzbanAdapter(BasePanelAdapter):
                 return result
             return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
         except Exception as e:
-            return AdapterResult(success=False, error=str(e))
+            return AdapterResult(success=False, error=str(e).strip() or e.__class__.__name__)
 
     async def get_subscription_links(self, username: str, remote_id: str | None = None) -> AdapterResult:
         return await self.get_usage(username, remote_id, expand_links=True)

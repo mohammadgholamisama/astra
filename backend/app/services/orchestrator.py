@@ -240,8 +240,8 @@ async def provision_user_on_panels(
     async def _remote(panel: Panel, payload: UserPayload) -> AdapterResult:
         adapter = get_adapter(panel)
         try:
-            # Marzban: token + create + optional /sub expand — needs headroom
-            return await asyncio.wait_for(adapter.create_user(payload), timeout=75)
+            # Fast Marzban create is one POST; keep headroom for slow links
+            return await asyncio.wait_for(adapter.create_user(payload), timeout=45)
         except Exception as e:  # noqa: BLE001
             return _fail_result(_exc_msg(e))
 
@@ -462,11 +462,11 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
 
 async def sync_delete_user(db: AsyncSession, user: User) -> list[dict]:
     """
-    Best-effort delete from every remote panel.
+    Always call remote DELETE per panel docs, then clear local account.
 
-    Returns list of {panel_id, panel_name, ok, error, soft}.
-    Soft-ok (ok=True, soft=True): not found / never provisioned / unreachable —
-    local delete may proceed; remote may need manual cleanup.
+    Returns {panel_id, panel_name, ok, soft, error}.
+    ok=True soft=False → remote confirmed deleted (or 404 already gone).
+    ok=True soft=True  → remote failed/unreachable; Astra still removes the user.
     """
     result = await db.execute(
         select(PanelAccount)
@@ -477,80 +477,58 @@ async def sync_delete_user(db: AsyncSession, user: User) -> list[dict]:
     if not accounts:
         return []
 
-    def _soft_ok(panel_id: int, name: str, note: str | None = None) -> dict:
-        return {
-            "panel_id": panel_id,
-            "panel_name": name,
-            "ok": True,
-            "soft": True,
-            "error": note,
-        }
-
     async def _remote(account: PanelAccount) -> dict:
         panel = account.panel
         name = panel.name if panel else f"#{account.panel_id}"
-        if account.status == PanelAccountStatus.deleted:
-            return _soft_ok(account.panel_id, name, "قبلاً حذف شده")
-
-        # Never reached remote successfully → nothing to delete there
-        never_on_remote = account.status in (
-            PanelAccountStatus.error,
-            PanelAccountStatus.pending,
-        ) and not (account.remote_id or account.remote_username)
-        if never_on_remote:
-            account.status = PanelAccountStatus.deleted
-            account.error_message = None
-            return _soft_ok(account.panel_id, name, "روی ریموت ساخته نشده بود")
+        uname = (account.remote_username or user.username or "").strip()
 
         if not panel:
             account.status = PanelAccountStatus.deleted
-            return _soft_ok(account.panel_id, name, "پنل پیدا نشد")
-
-        if not panel.is_active:
-            account.status = PanelAccountStatus.deleted
-            account.error_message = None
-            return _soft_ok(account.panel_id, name, "پنل غیرفعال — رد شد")
+            return {
+                "panel_id": account.panel_id,
+                "panel_name": name,
+                "ok": True,
+                "soft": True,
+                "error": "پنل پیدا نشد",
+            }
 
         adapter = get_adapter(panel)
-        uname = (account.remote_username or user.username or "").strip()
         try:
             res = await asyncio.wait_for(
                 adapter.delete_user(uname, account.remote_id or account.remote_username),
-                timeout=35,
+                timeout=45,
             )
         except Exception as e:  # noqa: BLE001
-            # Unreachable / slow panel must not block removing the sale from Astra
+            try:
+                await adapter.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
             account.status = PanelAccountStatus.deleted
-            account.error_message = None
-            return _soft_ok(account.panel_id, name, _exc_msg(e))
+            return {
+                "panel_id": account.panel_id,
+                "panel_name": name,
+                "ok": True,
+                "soft": True,
+                "error": _exc_msg(e),
+            }
 
-        err = (res.error or "").lower() if not res.success else ""
-        already_gone = any(
-            x in err
-            for x in (
-                "not found",
-                "404",
-                "does not exist",
-                "وجود ندارد",
-                "پیدا نشد",
-                "timeout",
-                "connect",
-                "network",
-                "unreachable",
-            )
-        )
-        if res.success or already_gone:
+        try:
+            await adapter.close()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        if res.success:
             account.status = PanelAccountStatus.deleted
             account.error_message = None
             return {
                 "panel_id": account.panel_id,
                 "panel_name": name,
                 "ok": True,
-                "soft": bool(already_gone and not res.success),
-                "error": None if res.success else (res.error or None),
+                "soft": False,
+                "error": None,
             }
 
-        # Hard remote rejection (auth / permission) — still clear local so admin isn't stuck
+        # Still remove from Astra; surface remote error as warning
         account.status = PanelAccountStatus.deleted
         account.error_message = res.error
         return {
