@@ -258,7 +258,7 @@ class MarzbanAdapter(BasePanelAdapter):
             self._inbounds_cache = shared[0]
             return self._inbounds_cache
         try:
-            rows = await self.list_protocols()
+            rows = await asyncio.wait_for(self.list_protocols(), timeout=18)
             cache = {str(r["protocol"]).lower(): list(r.get("tags") or []) for r in rows}
             self._inbounds_cache = cache
             _INBOUNDS_CACHE[key] = (cache, time.monotonic() + _INBOUNDS_TTL)
@@ -453,16 +453,47 @@ class MarzbanAdapter(BasePanelAdapter):
             return AdapterResult(success=False, error=msg)
 
     async def _finalize_user_result(self, result: AdapterResult, username: str) -> AdapterResult:
-        links = list(result.links or [])
-        share_prefixes = ("vless://", "vmess://", "trojan://", "ss://", "shadowsocks://")
-        if not any(str(l).lower().startswith(share_prefixes) for l in links):
-            refreshed = await self.get_usage(username)
-            if refreshed.success and refreshed.links:
-                links = list(refreshed.links)
-                result.used_traffic = refreshed.used_traffic or result.used_traffic
-                result.uuid = refreshed.uuid or result.uuid
-                result.raw = refreshed.raw or result.raw
-        result.links = await self._expand_subscription_links(links)
+        """Attach share links without blocking create/modify on slow /sub fetches.
+
+        Marzban often returns only subscription_url. Expanding that can be slow;
+        never fail a successful create because link expansion timed out.
+        """
+        from app.adapters.http_utils import is_share_link, is_subscription_ref
+
+        links = [str(x).strip() for x in (result.links or []) if x and str(x).strip()]
+        has_share = any(is_share_link(l) for l in links)
+        has_sub = any(is_subscription_ref(l) for l in links)
+
+        # Only re-fetch user when create/modify returned neither shares nor sub URL
+        if not has_share and not has_sub:
+            try:
+                refreshed = await asyncio.wait_for(
+                    self.get_usage(username, expand_links=False), timeout=15
+                )
+                if refreshed.success and refreshed.links:
+                    links = [str(x).strip() for x in (refreshed.links or []) if x]
+                    result.used_traffic = refreshed.used_traffic or result.used_traffic
+                    result.uuid = refreshed.uuid or result.uuid
+                    result.raw = refreshed.raw or result.raw
+                    has_share = any(is_share_link(l) for l in links)
+            except Exception:
+                pass
+
+        if has_share:
+            result.links = [l for l in links if is_share_link(l)]
+            return result
+
+        try:
+            expanded = await asyncio.wait_for(
+                self._expand_subscription_links(links), timeout=12
+            )
+            if expanded:
+                result.links = expanded
+            else:
+                # Keep /sub refs — hydrate_share_links can expand later
+                result.links = links
+        except Exception:
+            result.links = links
         return result
 
     async def create_user(self, payload: UserPayload) -> AdapterResult:
@@ -477,7 +508,10 @@ class MarzbanAdapter(BasePanelAdapter):
                 return await self._finalize_user_result(result, payload.username)
             return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
         except Exception as e:
-            return AdapterResult(success=False, error=str(e))
+            msg = str(e).strip() or e.__class__.__name__
+            if isinstance(e, (asyncio.TimeoutError, httpx.TimeoutException)):
+                msg = "Timeout waiting for panel response"
+            return AdapterResult(success=False, error=msg)
 
     async def modify_user(self, payload: UserPayload) -> AdapterResult:
         try:
@@ -491,7 +525,10 @@ class MarzbanAdapter(BasePanelAdapter):
                 return await self._finalize_user_result(result, payload.username)
             return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
         except Exception as e:
-            return AdapterResult(success=False, error=str(e))
+            msg = str(e).strip() or e.__class__.__name__
+            if isinstance(e, (asyncio.TimeoutError, httpx.TimeoutException)):
+                msg = "Timeout waiting for panel response"
+            return AdapterResult(success=False, error=msg)
 
     async def delete_user(self, username: str, remote_id: str | None = None) -> AdapterResult:
         try:

@@ -240,7 +240,8 @@ async def provision_user_on_panels(
     async def _remote(panel: Panel, payload: UserPayload) -> AdapterResult:
         adapter = get_adapter(panel)
         try:
-            return await asyncio.wait_for(adapter.create_user(payload), timeout=28)
+            # Marzban: token + create + optional /sub expand — needs headroom
+            return await asyncio.wait_for(adapter.create_user(payload), timeout=75)
         except Exception as e:  # noqa: BLE001
             return _fail_result(_exc_msg(e))
 
@@ -275,7 +276,7 @@ async def provision_user_on_panels(
             if exists_hint or not err:
                 try:
                     adapter = get_adapter(panel)
-                    mod = await asyncio.wait_for(adapter.modify_user(payload), timeout=22)
+                    mod = await asyncio.wait_for(adapter.modify_user(payload), timeout=55)
                     if mod.success:
                         account.status = PanelAccountStatus.active
                         account.remote_username = mod.remote_username or user.username
@@ -289,7 +290,7 @@ async def provision_user_on_panels(
                         recovered = True
                     else:
                         usage = await asyncio.wait_for(
-                            adapter.get_usage(payload.username), timeout=12
+                            adapter.get_usage(payload.username), timeout=20
                         )
                         if usage.success:
                             account.status = PanelAccountStatus.active
@@ -433,7 +434,7 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
     async def _remote(panel: Panel, payload: UserPayload) -> AdapterResult:
         adapter = get_adapter(panel)
         try:
-            return await asyncio.wait_for(adapter.modify_user(payload), timeout=22)
+            return await asyncio.wait_for(adapter.modify_user(payload), timeout=55)
         except Exception as e:  # noqa: BLE001
             return _fail_result(_exc_msg(e))
 

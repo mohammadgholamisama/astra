@@ -205,12 +205,14 @@ async def expand_subscription_links(
         "Accept": "text/plain, */*",
         **(headers or {}),
     }
+    # Short per-sub timeout — never burn the whole ADAPTER_TIMEOUT on one /sub fetch
+    sub_timeout = httpx.Timeout(12.0, connect=10.0)
     for url in subs:
         try:
             path = url
             if path.lower().startswith("sub/") and not path.lower().startswith(("http://", "https://")):
                 path = "/" + path
-            resp = await client.get(path, headers=req_headers)
+            resp = await client.get(path, headers=req_headers, timeout=sub_timeout)
             if resp.status_code >= 400:
                 continue
             text = (resp.text or "").strip()
