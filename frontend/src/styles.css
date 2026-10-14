@@ -353,61 +353,45 @@ button, input, select, textarea { font: inherit; }
   border-color: color-mix(in srgb, var(--danger) 40%, var(--line));
   background: color-mix(in srgb, var(--danger) 8%, transparent);
 }
-.panel-test-wrap {
-  position: relative;
+.panel-float-toast {
+  position: fixed;
+  left: 50%;
+  bottom: calc(22px + env(safe-area-inset-bottom, 0px));
+  transform: translateX(-50%);
+  z-index: 90;
   display: inline-flex;
   align-items: center;
-}
-.panel-test-tip {
-  position: absolute;
-  bottom: calc(100% + 8px);
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 20;
-  max-width: min(220px, 70vw);
-  padding: 7px 10px;
-  border-radius: 10px;
-  font-size: 0.75rem;
+  gap: 10px;
+  max-width: min(420px, calc(100vw - 28px));
+  padding: 12px 16px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: var(--card-solid);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.28);
+  font-size: 0.9rem;
   font-weight: 700;
-  line-height: 1.35;
-  text-align: center;
-  white-space: normal;
-  pointer-events: none;
-  animation: panel-tip-in 0.22s ease both;
-  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
+  line-height: 1.4;
+  animation: panel-toast-in 0.28s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
-.panel-test-tip::after {
-  content: "";
-  position: absolute;
-  top: 100%;
-  left: 50%;
-  transform: translateX(-50%);
-  border: 6px solid transparent;
-}
-.panel-test-tip.ok {
+.panel-float-toast svg { flex-shrink: 0; }
+.panel-float-toast.ok {
   color: var(--ok);
-  background: var(--card-solid);
-  border: 1px solid color-mix(in srgb, var(--ok) 40%, var(--line));
+  border-color: color-mix(in srgb, var(--ok) 42%, var(--line));
+  background: color-mix(in srgb, var(--ok) 10%, var(--card-solid));
 }
-.panel-test-tip.ok::after {
-  border-top-color: color-mix(in srgb, var(--ok) 40%, var(--line));
-}
-.panel-test-tip.err {
+.panel-float-toast.err {
   color: var(--danger);
-  background: var(--card-solid);
-  border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--line));
+  border-color: color-mix(in srgb, var(--danger) 42%, var(--line));
+  background: color-mix(in srgb, var(--danger) 10%, var(--card-solid));
 }
-.panel-test-tip.err::after {
-  border-top-color: color-mix(in srgb, var(--danger) 40%, var(--line));
-}
-@keyframes panel-tip-in {
+@keyframes panel-toast-in {
   from {
     opacity: 0;
-    transform: translateX(-50%) translateY(4px);
+    transform: translateX(-50%) translateY(12px) scale(0.96);
   }
   to {
     opacity: 1;
-    transform: translateX(-50%) translateY(0);
+    transform: translateX(-50%) translateY(0) scale(1);
   }
 }
 

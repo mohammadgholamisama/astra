@@ -1,6 +1,6 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, Plus, Server, Trash2, Wifi } from "lucide-react";
+import { CheckCircle2, Pencil, Plus, Server, Trash2, Wifi, XCircle } from "lucide-react";
 import Select from "../components/Select";
 import { api, Panel, PanelType } from "../lib/api";
 import { toFaDigits } from "../lib/format";
@@ -442,11 +442,26 @@ export default function PanelsPage() {
     },
   });
 
-  const [testTip, setTestTip] = useState<{
-    id: number;
+  const [testToast, setTestToast] = useState<{
     ok: boolean;
     text: string;
   } | null>(null);
+  const testToastTimer = useRef<number | null>(null);
+
+  function showTestToast(ok: boolean, text: string) {
+    if (testToastTimer.current) window.clearTimeout(testToastTimer.current);
+    setTestToast({ ok, text });
+    testToastTimer.current = window.setTimeout(() => {
+      setTestToast(null);
+      testToastTimer.current = null;
+    }, 3200);
+  }
+
+  useEffect(() => {
+    return () => {
+      if (testToastTimer.current) window.clearTimeout(testToastTimer.current);
+    };
+  }, []);
 
   const test = useMutation({
     mutationFn: (id: number) =>
@@ -454,21 +469,19 @@ export default function PanelsPage() {
         method: "POST",
       }),
     onSuccess: (res, id) => {
-      setTestTip({
-        id,
-        ok: !!res.success,
-        text: res.success ? "اتصال موفق بود" : res.error || "اتصال ناموفق",
-      });
+      const panelName = data.find((p) => p.id === id)?.name;
+      showTestToast(
+        !!res.success,
+        res.success
+          ? panelName
+            ? `تست «${panelName}» موفق بود`
+            : "اتصال موفق بود"
+          : res.error || "اتصال ناموفق"
+      );
       qc.invalidateQueries({ queryKey: ["panels"] });
-      window.setTimeout(() => {
-        setTestTip((cur) => (cur?.id === id ? null : cur));
-      }, 2800);
     },
-    onError: (e: Error, id) => {
-      setTestTip({ id, ok: false, text: e.message || "خطای تست" });
-      window.setTimeout(() => {
-        setTestTip((cur) => (cur?.id === id ? null : cur));
-      }, 3200);
+    onError: (e: Error) => {
+      showTestToast(false, e.message || "خطای تست");
     },
   });
 
@@ -539,6 +552,17 @@ export default function PanelsPage() {
         </p>
       )}
 
+      {testToast && (
+        <div
+          className={`panel-float-toast ${testToast.ok ? "ok" : "err"}`}
+          role="status"
+          aria-live="polite"
+        >
+          {testToast.ok ? <CheckCircle2 size={18} /> : <XCircle size={18} />}
+          <span>{testToast.text}</span>
+        </div>
+      )}
+
       {isLoading ? (
         <div className="admin-skel">
           <div className="admin-skel-card" />
@@ -587,31 +611,15 @@ export default function PanelsPage() {
                     <Pencil size={14} />
                     ویرایش
                   </button>
-                  <span className="panel-test-wrap">
-                    <button
-                      type="button"
-                      className={`btn ghost sm${
-                        testTip?.id === p.id ? (testTip.ok ? " tip-ok" : " tip-err") : ""
-                      }`}
-                      onClick={() => test.mutate(p.id)}
-                      disabled={test.isPending && test.variables === p.id}
-                      aria-describedby={
-                        testTip?.id === p.id ? `panel-test-tip-${p.id}` : undefined
-                      }
-                    >
-                      <Wifi size={14} />
-                      {test.isPending && test.variables === p.id ? "…" : "تست"}
-                    </button>
-                    {testTip?.id === p.id && (
-                      <span
-                        id={`panel-test-tip-${p.id}`}
-                        className={`panel-test-tip ${testTip.ok ? "ok" : "err"}`}
-                        role="status"
-                      >
-                        {testTip.text}
-                      </span>
-                    )}
-                  </span>
+                  <button
+                    type="button"
+                    className="btn ghost sm"
+                    onClick={() => test.mutate(p.id)}
+                    disabled={test.isPending && test.variables === p.id}
+                  >
+                    <Wifi size={14} />
+                    {test.isPending && test.variables === p.id ? "…" : "تست"}
+                  </button>
                   <button
                     type="button"
                     className="btn danger sm"
