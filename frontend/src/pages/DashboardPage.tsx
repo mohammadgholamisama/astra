@@ -1,18 +1,27 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import { RefreshCw } from "lucide-react";
+import {
+  Activity,
+  AlertTriangle,
+  ArrowUpRight,
+  CheckCircle2,
+  Download,
+  KeyRound,
+  Layers,
+  RefreshCw,
+  Server,
+  Users,
+} from "lucide-react";
 import { ApiError, api, SystemStats, UpdateStatus } from "../lib/api";
 import { formatTraffic, toFaDigits } from "../lib/format";
 
 export default function DashboardPage() {
   const qc = useQueryClient();
-  const [updateMsg, setUpdateMsg] = useState<{ type: "ok" | "err" | "info"; text: string } | null>(
-    null
-  );
   const [updateInfo, setUpdateInfo] = useState<UpdateStatus | null>(null);
+  const [err, setErr] = useState("");
 
-  const { data, isLoading, error, isFetching, refetch } = useQuery({
+  const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["system"],
     queryFn: () => api<SystemStats>("/api/system"),
     refetchInterval: 30_000,
@@ -22,65 +31,38 @@ export default function DashboardPage() {
     mutationFn: () => api<UpdateStatus>("/api/system/update"),
     onSuccess: (res) => {
       setUpdateInfo(res);
-      setUpdateMsg({
-        type: res.update_available ? "info" : "ok",
-        text: res.message,
-      });
+      setErr("");
     },
     onError: (e: Error) => {
-      setUpdateMsg({
-        type: "err",
-        text: e instanceof ApiError ? e.message : e.message,
-      });
+      setErr(e instanceof ApiError ? e.message : e.message);
     },
   });
 
   const applyUpdate = useMutation({
     mutationFn: () =>
-      api<{ ok: boolean; message: string; local_version: string }>("/api/system/update", {
-        method: "POST",
-      }),
-    onSuccess: async (res) => {
-      setUpdateMsg({ type: "ok", text: res.message || "آپدیت نصب شد" });
+      api<{ ok: boolean; message: string }>("/api/system/update", { method: "POST" }),
+    onSuccess: () => {
       setUpdateInfo(null);
-      // Service restarts — retry stats after a short wait
+      setErr("");
       window.setTimeout(() => {
         qc.invalidateQueries({ queryKey: ["system"] });
         refetch();
       }, 4000);
     },
     onError: (e: Error) => {
-      setUpdateMsg({
-        type: "err",
-        text: e instanceof ApiError ? e.message : e.message,
-      });
+      setErr(e instanceof ApiError ? e.message : e.message);
     },
   });
 
   const healthOk = !!data && data.sync_errors === 0;
   const busy = checkUpdate.isPending || applyUpdate.isPending;
+  const hasUpdate = !!updateInfo?.update_available;
+  const isLatest = !!updateInfo && !updateInfo.update_available;
 
   return (
     <div className="board">
       <header className="board-head">
-        <div>
-          <h1 className="page-title">داشبورد</h1>
-          <p className="board-sub">
-            {data
-              ? healthOk
-                ? "همه‌چیز پایدار است"
-                : `${toFaDigits(data.sync_errors)} مورد نیاز به بررسی دارد`
-              : "در حال آماده‌سازی"}
-          </p>
-        </div>
-        <button
-          type="button"
-          className="btn ghost sm"
-          onClick={() => refetch()}
-          disabled={isFetching}
-        >
-          {isFetching ? "…" : "تازه‌سازی"}
-        </button>
+        <h1 className="page-title">داشبورد</h1>
       </header>
 
       {isLoading && (
@@ -98,43 +80,37 @@ export default function DashboardPage() {
 
       {data && (
         <>
-          <section className="board-status">
-            <div className={`board-pulse ${healthOk ? "ok" : "warn"}`} />
-            <div className="board-status-text">
-              <strong>{healthOk ? "وضعیت سیستم خوب است" : "نیاز به رسیدگی"}</strong>
-              <span>
-                {toFaDigits(data.panels_active)} پنل فعال · {toFaDigits(data.users_active)} کاربر
-                فعال
-              </span>
+          <section className={`board-strip ${healthOk ? "ok" : "warn"}`}>
+            <div className="board-strip-status">
+              <span className={`board-dot ${healthOk ? "ok" : "warn"}`} />
+              <div className="board-strip-text">
+                <strong>{healthOk ? "سیستم پایدار" : "نیاز به بررسی"}</strong>
+                <span>
+                  {toFaDigits(data.panels_active)} پنل · {toFaDigits(data.users_active)} کاربر
+                  {!healthOk ? ` · ${toFaDigits(data.sync_errors)} خطا` : ""}
+                  <span className="board-ver" dir="ltr">
+                    {" "}
+                    · v{data.version}
+                  </span>
+                </span>
+              </div>
             </div>
-            <span className="board-ver">v{toFaDigits(data.version)}</span>
-          </section>
 
-          <section className="board-update">
-            <div className="board-update-text">
-              <strong>بروزرسانی پنل</strong>
-              <span>
-                {updateInfo
-                  ? updateInfo.update_available
-                    ? `نسخه ${toFaDigits(updateInfo.remote_version)} آماده نصب است (فعلی: ${toFaDigits(updateInfo.local_version)})`
-                    : `نسخه فعلی ${toFaDigits(updateInfo.local_version)} آخرین است`
-                  : `نسخه نصب‌شده: ${toFaDigits(data.version)} · دیتابیس و تنظیمات حفظ می‌شوند`}
-              </span>
-            </div>
-            <div className="board-update-actions">
-              <button
-                type="button"
-                className="btn ghost sm"
-                disabled={busy}
-                onClick={() => {
-                  setUpdateMsg(null);
-                  checkUpdate.mutate();
-                }}
-              >
-                <RefreshCw size={14} />
-                {checkUpdate.isPending ? "در حال بررسی…" : "بررسی آپدیت"}
-              </button>
-              {updateInfo?.update_available && (
+            <div className="board-strip-update">
+              {hasUpdate && (
+                <span className="board-upd-tag">
+                  نسخه {toFaDigits(updateInfo!.remote_version)}
+                </span>
+              )}
+              {isLatest && !busy && (
+                <span className="board-upd-ok">
+                  <CheckCircle2 size={14} />
+                  به‌روز
+                </span>
+              )}
+              {applyUpdate.isPending ? (
+                <span className="board-upd-busy">در حال نصب…</span>
+              ) : hasUpdate ? (
                 <button
                   type="button"
                   className="btn sm"
@@ -147,95 +123,120 @@ export default function DashboardPage() {
                     ) {
                       return;
                     }
-                    setUpdateMsg({
-                      type: "info",
-                      text: "در حال دانلود و نصب… ممکن است چند دقیقه طول بکشد",
-                    });
                     applyUpdate.mutate();
                   }}
                 >
-                  {applyUpdate.isPending ? "در حال آپدیت…" : "نصب آپدیت"}
+                  <Download size={14} />
+                  نصب آپدیت
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  disabled={busy}
+                  onClick={() => {
+                    setErr("");
+                    checkUpdate.mutate();
+                  }}
+                >
+                  <RefreshCw
+                    size={14}
+                    className={checkUpdate.isPending ? "spin" : undefined}
+                  />
+                  {checkUpdate.isPending ? "بررسی…" : "بررسی آپدیت"}
                 </button>
               )}
             </div>
-            {updateMsg && (
-              <p className={`admin-toast ${updateMsg.type === "info" ? "ok" : updateMsg.type}`}>
-                {updateMsg.text}
-              </p>
-            )}
           </section>
 
-          <section className="board-grid">
+          {err && <p className="error board-upd-err">{err}</p>}
+
+          <section className="board-grid" aria-label="آمار">
             <article className="board-card board-traffic">
               <header>
-                <span>ترافیک کل</span>
+                <span className="board-card-label">
+                  <Activity size={14} />
+                  ترافیک
+                </span>
               </header>
-              {data.total_used_traffic > 0 ? (
-                <p className="board-big">{formatTraffic(data.total_used_traffic)}</p>
-              ) : (
-                <>
-                  <p className="board-big muted-big">—</p>
-                  <p className="board-note">هنوز مصرفی ثبت نشده</p>
-                </>
-              )}
+              <p className={`board-big${data.total_used_traffic ? "" : " muted-big"}`}>
+                {data.total_used_traffic > 0 ? formatTraffic(data.total_used_traffic) : "—"}
+              </p>
             </article>
 
             <article className="board-card">
               <header>
-                <span>کاربران</span>
-                <Link to="/users">مشاهده</Link>
+                <span className="board-card-label">
+                  <Users size={14} />
+                  کاربران
+                </span>
+                <Link to="/users">
+                  <ArrowUpRight size={13} />
+                </Link>
               </header>
               <p className="board-big">
                 {toFaDigits(data.users_active)}
                 <small>/{toFaDigits(data.users_total)}</small>
               </p>
-              <p className="board-note">فعال از کل</p>
             </article>
 
             <article className="board-card">
               <header>
-                <span>پنل‌ها</span>
-                <Link to="/panels">مدیریت</Link>
+                <span className="board-card-label">
+                  <Server size={14} />
+                  پنل‌ها
+                </span>
+                <Link to="/panels">
+                  <ArrowUpRight size={13} />
+                </Link>
               </header>
               <p className="board-big">
                 {toFaDigits(data.panels_active)}
                 <small>/{toFaDigits(data.panels_total)}</small>
               </p>
-              <p className="board-note">متصل و فعال</p>
             </article>
 
             <article className="board-card">
               <header>
-                <span>گروه‌ها</span>
-                <Link to="/groups">مدیریت</Link>
+                <span className="board-card-label">
+                  <Layers size={14} />
+                  گروه‌ها
+                </span>
+                <Link to="/groups">
+                  <ArrowUpRight size={13} />
+                </Link>
               </header>
               <p className="board-big">{toFaDigits(data.groups_total)}</p>
-              <p className="board-note">مسیر فروش چندمنبعی</p>
             </article>
 
             <article className={`board-card ${data.sync_errors ? "danger" : ""}`}>
               <header>
-                <span>همگام‌سازی</span>
+                <span className="board-card-label">
+                  {data.sync_errors ? <AlertTriangle size={14} /> : <CheckCircle2 size={14} />}
+                  همگام‌سازی
+                </span>
               </header>
               <p className="board-big">{toFaDigits(data.sync_errors)}</p>
-              <p className="board-note">{data.sync_errors ? "خطای باز" : "بدون خطا"}</p>
             </article>
           </section>
 
           <section className="board-quick">
-            <h2>دسترسی سریع</h2>
             <div className="board-quick-row">
               <Link to="/users" className="board-chip">
-                ساخت کاربر
+                <Users size={15} />
+                کاربر
               </Link>
               <Link to="/panels" className="board-chip">
-                افزودن پنل
+                <Server size={15} />
+                پنل
               </Link>
               <Link to="/groups" className="board-chip">
-                ساخت گروه
+                <Layers size={15} />
+                گروه
               </Link>
               <Link to="/api-keys" className="board-chip">
-                کلید API
+                <KeyRound size={15} />
+                API
               </Link>
             </div>
           </section>
