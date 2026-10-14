@@ -97,30 +97,53 @@ async def _helper(args: list[str], *, timeout: float, as_root: bool = True) -> t
     return code, out, err
 
 
+async def _curl_version(url: str, *, extra_headers: list[str] | None = None) -> str:
+    cmd = [
+        "curl",
+        "-fsSL",
+        "--max-time",
+        "15",
+        "-H",
+        "Cache-Control: no-cache",
+    ]
+    for h in extra_headers or []:
+        cmd.extend(["-H", h])
+    cmd.append(url)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out_b, _err = await asyncio.wait_for(proc.communicate(), timeout=20)
+        if proc.returncode != 0:
+            return ""
+        remote = (out_b or b"").decode().strip().splitlines()[0].strip()
+        if remote and _SAFE_VER.match(remote):
+            return remote
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
 async def _fetch_remote_version() -> str:
-    urls = (
-        _VERSION_URL,
-        "https://cdn.jsdelivr.net/gh/mohammadgholamisama/astra@main/VERSION",
+    """Fetch VERSION from GitHub with cache-busting (CDN often lagged behind)."""
+    bust = str(int(__import__("time").time()))
+    # 1) GitHub API raw contents — least likely to serve a stale VERSION
+    v = await _curl_version(
+        f"https://api.github.com/repos/{_REPO}/contents/VERSION?ref=main&_={bust}",
+        extra_headers=["Accept: application/vnd.github.raw"],
     )
-    for url in urls:
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "curl",
-                "-fsSL",
-                "--max-time",
-                "15",
-                url,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            out_b, _err = await asyncio.wait_for(proc.communicate(), timeout=20)
-            if proc.returncode != 0:
-                continue
-            remote = (out_b or b"").decode().strip().splitlines()[0].strip()
-            if remote and _SAFE_VER.match(remote):
-                return remote
-        except Exception:  # noqa: BLE001
-            continue
+    if v:
+        return v
+    for url in (
+        f"{_VERSION_URL}?_={bust}",
+        f"https://cdn.jsdelivr.net/gh/{_REPO}@main/VERSION?_={bust}",
+        f"https://fastly.jsdelivr.net/gh/{_REPO}@main/VERSION?_={bust}",
+    ):
+        v = await _curl_version(url)
+        if v:
+            return v
     return ""
 
 
@@ -134,6 +157,7 @@ async def check_update() -> dict:
     check_ok = False
     message = ""
     git_behind = False
+    helper_ok = False
 
     if available():
         code, out, err = await _helper(["check-update"], timeout=60, as_root=False)
@@ -148,40 +172,32 @@ async def check_update() -> dict:
                 update_available = bool(data.get("update_available"))
                 git_behind = bool(data.get("git_behind"))
                 message = str(data.get("message") or "")
-                # Prefer explicit check_ok; if missing, require remote_version
                 if "check_ok" in data:
-                    check_ok = bool(data.get("check_ok"))
+                    helper_ok = bool(data.get("check_ok"))
                 else:
-                    check_ok = bool(remote)
-                if not check_ok:
-                    update_available = False
-                    message = message or "دریافت نسخه از گیت‌هاب ناموفق"
-                return {
-                    "available": True,
-                    "check_ok": check_ok,
-                    "update_available": update_available if check_ok else False,
-                    "local_version": local,
-                    "remote_version": remote,
-                    "git_behind": git_behind,
-                    "message": message
-                    or (
-                        "نسخه جدید موجود است"
-                        if update_available
-                        else "پنل به‌روز است"
-                        if check_ok
-                        else "بررسی آپدیت ناموفق"
-                    ),
-                }
+                    helper_ok = bool(remote)
             except json.JSONDecodeError:
                 logger.warning("check-update bad JSON: %s", out[:400])
 
-    remote = await _fetch_remote_version()
-    if remote:
+    # Always cross-check VERSION over HTTP — helper/CDN can return a stale number
+    http_remote = await _fetch_remote_version()
+    if http_remote:
+        if not remote or is_newer(http_remote, remote) or remote == http_remote:
+            remote = http_remote
         check_ok = True
-        update_available = is_newer(remote, local)
-        message = "نسخه جدید موجود است" if update_available else "پنل به‌روز است"
+    elif helper_ok and remote:
+        check_ok = True
     else:
         check_ok = False
+
+    if check_ok:
+        update_available = bool(git_behind) or is_newer(remote, local)
+        message = (
+            "نسخه جدید موجود است"
+            if update_available
+            else "پنل به‌روز است"
+        )
+    else:
         update_available = False
         message = "دریافت نسخه از گیت‌هاب ناموفق — دوباره تلاش کنید"
 

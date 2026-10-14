@@ -505,13 +505,26 @@ read_local_version() {
 }
 
 fetch_remote_version() {
-  local v=""
-  local url
+  local v="" url bust body
+  bust="$(date +%s)"
+  # Prefer GitHub API (less CDN cache), then raw, then jsDelivr — all cache-busted
+  body="$(curl -fsSL --max-time 15 \
+    -H 'Accept: application/vnd.github.raw' \
+    -H 'Cache-Control: no-cache' \
+    "https://api.github.com/repos/mohammadgholamisama/astra/contents/VERSION?ref=main&_=${bust}" \
+    2>/dev/null || true)"
+  v="$(printf '%s' "$body" | head -n1 | tr -d '\r' | tr -d ' ' || true)"
+  if [[ -n "$v" && "$v" =~ ^[0-9A-Za-z._+-]+$ ]]; then
+    echo "$v"
+    return 0
+  fi
   for url in \
-    "https://raw.githubusercontent.com/mohammadgholamisama/astra/main/VERSION" \
-    "https://cdn.jsdelivr.net/gh/mohammadgholamisama/astra@main/VERSION"
+    "https://raw.githubusercontent.com/mohammadgholamisama/astra/main/VERSION?_=${bust}" \
+    "https://cdn.jsdelivr.net/gh/mohammadgholamisama/astra@main/VERSION?_=${bust}" \
+    "https://fastly.jsdelivr.net/gh/mohammadgholamisama/astra@main/VERSION?_=${bust}"
   do
-    v="$(curl -fsSL --max-time 15 "$url" 2>/dev/null | head -n1 | tr -d '\r' | tr -d ' ' || true)"
+    v="$(curl -fsSL --max-time 15 -H 'Cache-Control: no-cache' "$url" 2>/dev/null \
+      | head -n1 | tr -d '\r' | tr -d ' ' || true)"
     if [[ -n "$v" && "$v" =~ ^[0-9A-Za-z._+-]+$ ]]; then
       echo "$v"
       return 0
