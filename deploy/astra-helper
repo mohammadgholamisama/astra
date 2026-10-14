@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# Astra root helper — called via sudo from x-astra / panel user.
+# Allowed actions only; no arbitrary shell.
+set -euo pipefail
+
+ASTRA_ROOT="/opt/astra"
+ENV_FILE="${ASTRA_ROOT}/.env"
+NGINX_SITE="/etc/nginx/sites-available/astra"
+NGINX_LINK="/etc/nginx/sites-enabled/astra"
+HTTP_TPL="${ASTRA_ROOT}/deploy/nginx-http.conf.tpl"
+SSL_TPL="${ASTRA_ROOT}/deploy/nginx-ssl.conf.tpl"
+STATE_FILE="${ASTRA_ROOT}/deploy/install-state"
+
+# Keys astra-helper may change in .env
+ALLOWED_ENV_KEYS=(
+  ASTRA_APP_PORT
+  PANEL_BASE_URL
+  SUB_BASE_URL
+  PANEL_NAME
+  CORS_ORIGINS
+  ASTRA_PANEL_DOMAIN
+  ASTRA_SUB_DOMAIN
+  ASTRA_SSL_PANEL
+  ASTRA_SSL_SUB
+  ASTRA_HELPER
+)
+
+die() { echo "astra-helper: $*" >&2; exit 1; }
+
+need_root() {
+  [[ "$(id -u)" -eq 0 ]] || die "must run as root (use sudo)"
+}
+
+valid_domain() {
+  local d="$1"
+  [[ "$d" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$ ]]
+}
+
+valid_port() {
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
+}
+
+get_env() {
+  local key="$1" def="${2:-}"
+  if [[ -f "$ENV_FILE" ]] && grep -qE "^${key}=" "$ENV_FILE"; then
+    sed -n "s/^${key}=//p" "$ENV_FILE" | head -n1 | tr -d '\r'
+  else
+    echo "$def"
+  fi
+}
+
+set_env_key() {
+  local key="$1" val="$2"
+  local allowed=0 k
+  for k in "${ALLOWED_ENV_KEYS[@]}"; do
+    [[ "$k" == "$key" ]] && allowed=1 && break
+  done
+  [[ "$allowed" -eq 1 ]] || die "key not allowed: $key"
+  # reject newlines / shell metachar injection in values
+  [[ "$val" != *$'\n'* && "$val" != *$'\r'* ]] || die "invalid value"
+  touch "$ENV_FILE"
+  if grep -qE "^${key}=" "$ENV_FILE"; then
+    sed -i "s|^${key}=.*|${key}=${val}|" "$ENV_FILE"
+  else
+    echo "${key}=${val}" >> "$ENV_FILE"
+  fi
+}
+
+read_port() {
+  local p
+  p="$(get_env ASTRA_APP_PORT 2086)"
+  valid_port "$p" || p=2086
+  echo "$p"
+}
+
+proxy_locations() {
+  local port="$1"
+  cat <<EOF
+    location /api/ {
+        proxy_pass http://127.0.0.1:${port};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 120s;
+    }
+
+    location /sub {
+        proxy_pass http://127.0.0.1:${port};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 120s;
+    }
+
+    location = /health {
+        proxy_pass http://127.0.0.1:${port};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location = /docs {
+        proxy_pass http://127.0.0.1:${port};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location = /openapi.json {
+        proxy_pass http://127.0.0.1:${port};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+EOF
+}
+
+http_block_default() {
+  local port="$1"
+  cat <<EOF
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    root /opt/astra/frontend/dist;
+    index index.html;
+    client_max_body_size 50m;
+$(proxy_locations "$port")
+}
+EOF
+}
+
+http_block_domain() {
+  local domain="$1" port="$2"
+  cat <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain};
+    root /opt/astra/frontend/dist;
+    index index.html;
+    client_max_body_size 50m;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+$(proxy_locations "$port")
+}
+EOF
+}
+
+ssl_block_domain() {
+  local domain="$1" port="$2"
+  local ssl_opts="" dh=""
+  if [[ -f /etc/letsencrypt/options-ssl-nginx.conf ]]; then
+    ssl_opts="    include /etc/letsencrypt/options-ssl-nginx.conf;"
+  fi
+  if [[ -f /etc/letsencrypt/ssl-dhparams.pem ]]; then
+    dh="    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;"
+  fi
+  cat <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${domain};
+
+    ssl_certificate     /etc/letsencrypt/live/${domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+${ssl_opts}
+${dh}
+
+    root /opt/astra/frontend/dist;
+    index index.html;
+    client_max_body_size 50m;
+$(proxy_locations "$port")
+}
+EOF
+}
+
+render_nginx() {
+  local port panel_dom sub_dom ssl_panel ssl_sub
+  port="$(read_port)"
+  panel_dom="$(get_env ASTRA_PANEL_DOMAIN "")"
+  sub_dom="$(get_env ASTRA_SUB_DOMAIN "")"
+  ssl_panel="$(get_env ASTRA_SSL_PANEL 0)"
+  ssl_sub="$(get_env ASTRA_SSL_SUB 0)"
+
+  echo "# Managed by astra-helper — do not edit by hand"
+  echo "# Generated $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo
+
+  # Always keep default_server for IP access
+  http_block_default "$port"
+  echo
+
+  if [[ -n "$panel_dom" ]]; then
+    if [[ "$ssl_panel" == "1" && -f "/etc/letsencrypt/live/${panel_dom}/fullchain.pem" ]]; then
+      ssl_block_domain "$panel_dom" "$port"
+    else
+      http_block_domain "$panel_dom" "$port"
+    fi
+    echo
+  fi
+
+  if [[ -n "$sub_dom" && "$sub_dom" != "$panel_dom" ]]; then
+    if [[ "$ssl_sub" == "1" && -f "/etc/letsencrypt/live/${sub_dom}/fullchain.pem" ]]; then
+      ssl_block_domain "$sub_dom" "$port"
+    else
+      http_block_domain "$sub_dom" "$port"
+    fi
+    echo
+  fi
+}
+
+cmd_reload_nginx() {
+  need_root
+  nginx -t
+  systemctl reload nginx
+  echo "nginx reloaded"
+}
+
+cmd_write_nginx() {
+  need_root
+  local src="${1:-}"
+  local tmp
+  tmp="$(mktemp)"
+  if [[ -n "$src" && -f "$src" ]]; then
+    cp "$src" "$tmp"
+  else
+    render_nginx > "$tmp"
+  fi
+  nginx -t -c /etc/nginx/nginx.conf 2>/dev/null || true
+  # validate by installing to sites-available and testing
+  install -m 644 "$tmp" "$NGINX_SITE"
+  rm -f "$tmp"
+  ln -sfn "$NGINX_SITE" "$NGINX_LINK"
+  # disable default site if present (avoid port 80 conflict)
+  if [[ -L /etc/nginx/sites-enabled/default ]]; then
+    rm -f /etc/nginx/sites-enabled/default
+  fi
+  nginx -t
+  systemctl reload nginx
+  echo "nginx config written → $NGINX_SITE"
+}
+
+cmd_issue_ssl() {
+  need_root
+  local domain="${1:-}"
+  [[ -n "$domain" ]] || die "usage: issue-ssl <domain>"
+  valid_domain "$domain" || die "invalid domain: $domain"
+
+  mkdir -p /var/www/html
+  local email="admin@${domain}"
+
+  if ! command -v certbot >/dev/null 2>&1; then
+    die "certbot not installed"
+  fi
+
+  # Ensure HTTP server_name exists before certbot --nginx
+  cmd_write_nginx
+
+  certbot --nginx -d "$domain" \
+    --non-interactive --agree-tos \
+    --email "$email" \
+    --redirect \
+    --keep-until-expiring \
+    || certbot certonly --nginx -d "$domain" \
+      --non-interactive --agree-tos \
+      --email "$email"
+
+  # Mark SSL flags
+  local panel_dom sub_dom
+  panel_dom="$(get_env ASTRA_PANEL_DOMAIN "")"
+  sub_dom="$(get_env ASTRA_SUB_DOMAIN "")"
+  if [[ "$domain" == "$panel_dom" ]]; then
+    set_env_key ASTRA_SSL_PANEL 1
+    set_env_key PANEL_BASE_URL "https://${domain}"
+  fi
+  if [[ "$domain" == "$sub_dom" || ( -z "$sub_dom" && "$domain" == "$panel_dom" ) ]]; then
+    if [[ "$domain" == "$sub_dom" ]] || [[ -z "$sub_dom" ]]; then
+      set_env_key ASTRA_SSL_SUB 1
+      set_env_key SUB_BASE_URL "https://${domain}"
+    fi
+  fi
+  if [[ -z "$sub_dom" && "$domain" == "$panel_dom" ]]; then
+    set_env_key SUB_BASE_URL "https://${domain}"
+  fi
+
+  cmd_write_nginx
+  echo "SSL issued for $domain"
+}
+
+cmd_set_env() {
+  need_root
+  local key="${1:-}" val="${2:-}"
+  [[ -n "$key" ]] || die "usage: set-env KEY VALUE"
+  if [[ "$key" == "ASTRA_APP_PORT" ]]; then
+    valid_port "$val" || die "invalid port"
+  fi
+  if [[ "$key" == "ASTRA_PANEL_DOMAIN" || "$key" == "ASTRA_SUB_DOMAIN" ]]; then
+    if [[ -n "$val" ]]; then
+      valid_domain "$val" || die "invalid domain: $val"
+    fi
+  fi
+  set_env_key "$key" "$val"
+  echo "set ${key}"
+}
+
+cmd_restart_astra() {
+  need_root
+  systemctl daemon-reload
+  systemctl restart astra
+  echo "astra restarted"
+}
+
+usage() {
+  cat <<EOF
+Usage: astra-helper <command> [args]
+
+Commands:
+  reload-nginx
+  write-nginx [path-to-conf]   # omit path → render from .env state
+  issue-ssl <domain>
+  set-env <KEY> <VALUE>        # allowed keys only
+  restart-astra
+EOF
+}
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+  case "$cmd" in
+    reload-nginx)  cmd_reload_nginx ;;
+    write-nginx)   cmd_write_nginx "${1:-}" ;;
+    issue-ssl)     cmd_issue_ssl "${1:-}" ;;
+    set-env)       cmd_set_env "${1:-}" "${2:-}" ;;
+    restart-astra) cmd_restart_astra ;;
+    ""|-h|--help)  usage ;;
+    *)             die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

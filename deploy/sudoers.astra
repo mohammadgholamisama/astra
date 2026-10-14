@@ -1,0 +1,2 @@
+# Allow astra user to run astra-helper (nginx / SSL / env) without password
+astra ALL=(root) NOPASSWD: /usr/local/bin/astra-helper *

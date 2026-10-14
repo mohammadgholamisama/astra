@@ -1,0 +1,401 @@
+#!/usr/bin/env bash
+# x-astra — Astra panel management menu (like 3x-ui / PasarGuard)
+set -euo pipefail
+
+ASTRA_ROOT="/opt/astra"
+ENV_FILE="${ASTRA_ROOT}/.env"
+HELPER="/usr/local/bin/astra-helper"
+SERVICE="astra"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+info()  { echo -e "${CYAN}ℹ${NC} $*"; }
+ok()    { echo -e "${GREEN}✔${NC} $*"; }
+warn()  { echo -e "${YELLOW}⚠${NC} $*"; }
+err()   { echo -e "${RED}✖${NC} $*" >&2; }
+
+pause() { echo; read -r -p "Press Enter to continue... / اینتر بزنید... " _; }
+
+confirm() {
+  local q="$1"
+  read -r -p "$(echo -e "${YELLOW}${q} [y/N]: ${NC}")" a
+  [[ "${a,,}" == "y" || "${a,,}" == "yes" ]]
+}
+
+need_install() {
+  if [[ ! -d "$ASTRA_ROOT" || ! -f "$ENV_FILE" ]]; then
+    err "Astra is not installed at $ASTRA_ROOT"
+    err "پنل نصب نشده. ابتدا install.sh را اجرا کنید."
+    exit 1
+  fi
+}
+
+get_env() {
+  local key="$1" def="${2:-}"
+  if [[ -f "$ENV_FILE" ]] && grep -qE "^${key}=" "$ENV_FILE"; then
+    sed -n "s/^${key}=//p" "$ENV_FILE" | head -n1 | tr -d '\r'
+  else
+    echo "$def"
+  fi
+}
+
+run_helper() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$HELPER" "$@"
+  elif sudo -n "$HELPER" "$@" 2>/dev/null; then
+    return 0
+  else
+    sudo "$HELPER" "$@"
+  fi
+}
+
+is_port_free() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ! ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE "[:.]:?${port}$"
+  else
+    ! (echo >/dev/tcp/127.0.0.1/"$port") 2>/dev/null
+  fi
+}
+
+valid_domain() {
+  local d="$1"
+  [[ "$d" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$ ]]
+}
+
+server_ip() {
+  local ip
+  ip="$(curl -4 -fsS --max-time 5 ifconfig.me 2>/dev/null || true)"
+  if [[ -z "$ip" ]]; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+  echo "${ip:-127.0.0.1}"
+}
+
+header() {
+  clear 2>/dev/null || true
+  echo -e "${BOLD}${CYAN}"
+  cat <<'EOF'
+    ___   _____ ________  ___
+   /   | / ___//_  __/ _ \/   |
+  / /| | \__ \  / / / , _/ /| |
+ / ___ |___/ / / / / /| / ___ |
+/_/  |_/____/ /_/ /_/ |_/_/  |_|
+EOF
+  echo -e "${NC}${BOLD}  Astra Panel Manager  ·  x-astra${NC}"
+  echo -e "  ${CYAN}─────────────────────────────────${NC}"
+}
+
+# ─── 1) Status ───────────────────────────────────────────────
+cmd_status() {
+  header
+  echo -e "${BOLD}1) Status / وضعیت${NC}"
+  echo
+  local port panel_dom sub_dom ssl_p ssl_s
+  port="$(get_env ASTRA_APP_PORT "?")"
+  panel_dom="$(get_env ASTRA_PANEL_DOMAIN "(none / بدون دامنه)")"
+  sub_dom="$(get_env ASTRA_SUB_DOMAIN "(none / بدون دامنه)")"
+  ssl_p="$(get_env ASTRA_SSL_PANEL 0)"
+  ssl_s="$(get_env ASTRA_SSL_SUB 0)"
+
+  if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
+    ok "Service astra: active"
+  else
+    err "Service astra: inactive"
+  fi
+  if systemctl is-active --quiet nginx 2>/dev/null; then
+    ok "nginx: active"
+  else
+    warn "nginx: inactive"
+  fi
+
+  echo
+  info "App port (uvicorn): ${port}"
+  info "Panel domain: ${panel_dom}  SSL=${ssl_p}"
+  info "Sub domain:   ${sub_dom}  SSL=${ssl_s}"
+  info "PANEL_BASE_URL=$(get_env PANEL_BASE_URL)"
+  info "SUB_BASE_URL=$(get_env SUB_BASE_URL)"
+  info "Server IP: $(server_ip)"
+
+  echo
+  echo -e "${BOLD}SSL certificates / گواهی‌ها:${NC}"
+  if [[ -d /etc/letsencrypt/live ]]; then
+    ls -1 /etc/letsencrypt/live 2>/dev/null | grep -v README || echo "  (none)"
+  else
+    echo "  (none)"
+  fi
+
+  if [[ -f /etc/nginx/sites-available/astra ]]; then
+    echo
+    ok "nginx site: /etc/nginx/sites-available/astra"
+  fi
+  pause
+}
+
+# ─── 2) Change port ──────────────────────────────────────────
+cmd_change_port() {
+  header
+  echo -e "${BOLD}2) Change panel port / تغییر پورت اپ${NC}"
+  echo
+  local cur new
+  cur="$(get_env ASTRA_APP_PORT 2086)"
+  info "Current / فعلی: $cur"
+  read -r -p "New port / پورت جدید: " new
+  [[ "$new" =~ ^[0-9]+$ ]] && (( new >= 1 && new <= 65535 )) || { err "Invalid port"; pause; return; }
+  if [[ "$new" != "$cur" ]] && ! is_port_free "$new"; then
+    err "Port $new is in use / پورت مشغول است"
+    pause
+    return
+  fi
+  confirm "Update port to $new and restart?" || { info "Cancelled"; pause; return; }
+  run_helper set-env ASTRA_APP_PORT "$new"
+  run_helper write-nginx
+  run_helper restart-astra
+  ok "Port updated to $new"
+  pause
+}
+
+# ─── 3) Panel domain ─────────────────────────────────────────
+cmd_panel_domain() {
+  header
+  echo -e "${BOLD}3) Set panel domain / دامنه پنل${NC}"
+  echo
+  local cur domain do_ssl ip
+  cur="$(get_env ASTRA_PANEL_DOMAIN "")"
+  ip="$(server_ip)"
+  info "Current: ${cur:-"(IP only: http://${ip})"}"
+  echo "DNS A record must point to this server / رکورد A باید به این سرور باشد."
+  read -r -p "Domain (empty=clear / خالی=حذف): " domain
+  if [[ -n "$domain" ]]; then
+    valid_domain "$domain" || { err "Invalid domain"; pause; return; }
+  fi
+  confirm "Apply panel domain='${domain:-cleared}'?" || { info "Cancelled"; pause; return; }
+
+  run_helper set-env ASTRA_PANEL_DOMAIN "$domain"
+  if [[ -n "$domain" ]]; then
+    run_helper set-env PANEL_BASE_URL "http://${domain}"
+    run_helper set-env ASTRA_SSL_PANEL 0
+  else
+    run_helper set-env PANEL_BASE_URL "http://${ip}"
+    run_helper set-env ASTRA_SSL_PANEL 0
+  fi
+  run_helper write-nginx
+
+  if [[ -n "$domain" ]]; then
+    read -r -p "Issue SSL with certbot now? / همین الان SSL؟ [y/N]: " do_ssl
+    if [[ "${do_ssl,,}" == "y" ]]; then
+      run_helper issue-ssl "$domain" || warn "SSL failed — check DNS / فایروال پورت 80"
+    fi
+  fi
+  ok "Panel domain updated"
+  pause
+}
+
+# ─── 4) Sub domain ───────────────────────────────────────────
+cmd_sub_domain() {
+  header
+  echo -e "${BOLD}4) Set subscription domain / دامنه ساب${NC}"
+  echo
+  local cur domain do_ssl ip panel_dom
+  cur="$(get_env ASTRA_SUB_DOMAIN "")"
+  panel_dom="$(get_env ASTRA_PANEL_DOMAIN "")"
+  ip="$(server_ip)"
+  info "Current: ${cur:-"(same as panel / مثل پنل)"}"
+  info "Panel domain: ${panel_dom:-none}"
+  echo "Can be same as panel or a different hostname."
+  read -r -p "Sub domain (empty=clear): " domain
+  if [[ -n "$domain" ]]; then
+    valid_domain "$domain" || { err "Invalid domain"; pause; return; }
+  fi
+  confirm "Apply sub domain='${domain:-cleared}'?" || { info "Cancelled"; pause; return; }
+
+  run_helper set-env ASTRA_SUB_DOMAIN "$domain"
+  if [[ -n "$domain" ]]; then
+    run_helper set-env SUB_BASE_URL "http://${domain}"
+    run_helper set-env ASTRA_SSL_SUB 0
+  else
+    # fall back to panel URL or IP
+    if [[ -n "$panel_dom" ]]; then
+      local ssl_p
+      ssl_p="$(get_env ASTRA_SSL_PANEL 0)"
+      if [[ "$ssl_p" == "1" ]]; then
+        run_helper set-env SUB_BASE_URL "https://${panel_dom}"
+      else
+        run_helper set-env SUB_BASE_URL "http://${panel_dom}"
+      fi
+    else
+      run_helper set-env SUB_BASE_URL "http://${ip}"
+    fi
+    run_helper set-env ASTRA_SSL_SUB 0
+  fi
+  run_helper write-nginx
+
+  if [[ -n "$domain" ]]; then
+    read -r -p "Issue SSL with certbot now? [y/N]: " do_ssl
+    if [[ "${do_ssl,,}" == "y" ]]; then
+      run_helper issue-ssl "$domain" || warn "SSL failed"
+    fi
+  fi
+  ok "Subscription domain updated"
+  pause
+}
+
+# ─── 5/6) SSL ────────────────────────────────────────────────
+cmd_ssl_panel() {
+  header
+  echo -e "${BOLD}5) SSL for panel domain / گواهی دامنه پنل${NC}"
+  echo
+  local domain
+  domain="$(get_env ASTRA_PANEL_DOMAIN "")"
+  [[ -n "$domain" ]] || { err "Set panel domain first (menu 3)"; pause; return; }
+  info "Domain: $domain"
+  confirm "Issue/renew SSL for $domain?" || { info "Cancelled"; pause; return; }
+  run_helper issue-ssl "$domain" && ok "Done" || err "Failed"
+  pause
+}
+
+cmd_ssl_sub() {
+  header
+  echo -e "${BOLD}6) SSL for subscription domain / گواهی دامنه ساب${NC}"
+  echo
+  local domain
+  domain="$(get_env ASTRA_SUB_DOMAIN "")"
+  if [[ -z "$domain" ]]; then
+    domain="$(get_env ASTRA_PANEL_DOMAIN "")"
+    warn "No separate sub domain — using panel domain: ${domain:-?}"
+  fi
+  [[ -n "$domain" ]] || { err "Set a domain first (menu 3 or 4)"; pause; return; }
+  info "Domain: $domain"
+  confirm "Issue/renew SSL for $domain?" || { info "Cancelled"; pause; return; }
+  run_helper issue-ssl "$domain" && ok "Done" || err "Failed"
+  pause
+}
+
+# ─── 7) Restart ──────────────────────────────────────────────
+cmd_restart() {
+  header
+  echo -e "${BOLD}7) Restart services / ری‌استارت${NC}"
+  echo
+  confirm "Restart astra + reload nginx?" || { info "Cancelled"; pause; return; }
+  run_helper restart-astra
+  run_helper reload-nginx || true
+  ok "Services restarted"
+  pause
+}
+
+# ─── 8) Update from git ──────────────────────────────────────
+cmd_update() {
+  header
+  echo -e "${BOLD}8) Update panel from git / به‌روزرسانی${NC}"
+  echo
+  confirm "git pull + rebuild frontend + pip + restart?" || { info "Cancelled"; pause; return; }
+
+  if [[ ! -d "${ASTRA_ROOT}/.git" ]]; then
+    err "No .git in ${ASTRA_ROOT} — cannot pull"
+    pause
+    return
+  fi
+
+  (
+    cd "$ASTRA_ROOT"
+    if [[ "$(id -u)" -eq 0 ]]; then
+      git pull --ff-only
+    else
+      sudo git -C "$ASTRA_ROOT" pull --ff-only
+    fi
+  ) || { err "git pull failed"; pause; return; }
+
+  info "pip install..."
+  if [[ "$(id -u)" -eq 0 ]]; then
+    sudo -u astra bash -c "cd ${ASTRA_ROOT}/backend && . .venv/bin/activate && pip install -r requirements.txt" \
+      || { err "pip failed"; pause; return; }
+  else
+    sudo -u astra bash -c "cd ${ASTRA_ROOT}/backend && . .venv/bin/activate && pip install -r requirements.txt" \
+      || { err "pip failed"; pause; return; }
+  fi
+
+  info "npm build..."
+  sudo bash -c "
+    set -e
+    cd '${ASTRA_ROOT}/frontend'
+    export VITE_API_BASE=
+    if [[ -f package-lock.json ]]; then npm ci || npm install; else npm install; fi
+    npm run build
+    chown -R astra:astra '${ASTRA_ROOT}/frontend/dist' 2>/dev/null || true
+    chmod -R a+rX '${ASTRA_ROOT}/frontend/dist'
+  " || { err "frontend build failed"; pause; return; }
+
+  run_helper restart-astra
+  ok "Updated successfully / به‌روز شد"
+  pause
+}
+
+# ─── 9) Admin / paths ────────────────────────────────────────
+cmd_admin_hint() {
+  header
+  echo -e "${BOLD}9) Admin & paths / ادمین و مسیرها${NC}"
+  echo
+  info "Env file:     $ENV_FILE"
+  info "Install root: $ASTRA_ROOT"
+  info "Helper:       $HELPER"
+  info "Service:      systemctl status astra"
+  info "nginx site:   /etc/nginx/sites-available/astra"
+  echo
+  echo -e "${YELLOW}To reset admin password / ریست رمز ادمین:${NC}"
+  echo "  1. Edit ADMIN_PASSWORD in $ENV_FILE"
+  echo "  2. Delete the admin row from SQLite (or wipe DB carefully), then:"
+  echo "     systemctl restart astra"
+  echo "  Seed recreates admin from ADMIN_USERNAME / ADMIN_PASSWORD on startup"
+  echo "  if that username does not already exist."
+  echo
+  echo "  Current ADMIN_USERNAME=$(get_env ADMIN_USERNAME admin)"
+  echo "  (password is stored in .env — readable by root / astra)"
+  echo
+  warn "Do not share .env — contains SECRET_KEY and admin password."
+  pause
+}
+
+# ─── Main loop ───────────────────────────────────────────────
+main_menu() {
+  need_install
+  while true; do
+    header
+    local port ip
+    port="$(get_env ASTRA_APP_PORT "?")"
+    ip="$(server_ip)"
+    echo -e "  Panel: ${GREEN}http://${ip}${NC}  ·  app :${port}"
+    echo
+    echo "  1) Status / وضعیت"
+    echo "  2) Change panel port / تغییر پورت"
+    echo "  3) Set panel domain (+ optional SSL)"
+    echo "  4) Set subscription domain (+ optional SSL)"
+    echo "  5) Issue/renew SSL — panel domain"
+    echo "  6) Issue/renew SSL — subscription domain"
+    echo "  7) Restart services / ری‌استارت"
+    echo "  8) Update panel from git / به‌روزرسانی"
+    echo "  9) Admin reset hint / مسیرها"
+    echo "  0) Exit / خروج"
+    echo
+    read -r -p "Select / انتخاب: " choice
+    case "$choice" in
+      1) cmd_status ;;
+      2) cmd_change_port ;;
+      3) cmd_panel_domain ;;
+      4) cmd_sub_domain ;;
+      5) cmd_ssl_panel ;;
+      6) cmd_ssl_sub ;;
+      7) cmd_restart ;;
+      8) cmd_update ;;
+      9) cmd_admin_hint ;;
+      0|q|Q) echo "Bye."; exit 0 ;;
+      *) warn "Invalid option"; sleep 1 ;;
+    esac
+  done
+}
+
+main_menu

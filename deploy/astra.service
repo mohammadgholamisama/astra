@@ -1,0 +1,22 @@
+[Unit]
+Description=Astra Panel (uvicorn)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=astra
+Group=astra
+WorkingDirectory=/opt/astra/backend
+EnvironmentFile=/opt/astra/.env
+Environment=PATH=/opt/astra/backend/.venv/bin:/usr/local/bin:/usr/bin
+ExecStart=/opt/astra/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port ${ASTRA_APP_PORT}
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,428 @@
+"""Marzban panel adapter — auth via username/password → POST /api/admin/token.
+
+User create/modify follows official Marzban docs:
+- username: 3–32 chars, a-z 0-9 underscore
+- proxies: { protocol: settings }
+- inbounds: { protocol: [inbound_tags] } — empty/missing tags = all inbounds for that protocol
+"""
+
+from __future__ import annotations
+
+import base64
+import uuid as uuid_lib
+from typing import Any
+
+from app.adapters.base import AdapterResult, BasePanelAdapter, UserPayload
+from app.adapters.http_utils import err_msg, make_client, ok_json
+
+# Protocols Marzban/Rebecca accept in proxies/inbounds
+KNOWN_PROTOCOLS = ("vless", "vmess", "trojan", "shadowsocks")
+
+
+class MarzbanAdapter(BasePanelAdapter):
+    """Official Marzban REST API (also base for Rebecca)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._token: str | None = None
+        self._client = None
+        self._inbounds_cache: dict[str, list[str]] | None = None
+
+    async def _get_client(self):
+        if self._client is None:
+            self._client = make_client(self.base_url, self.meta.get("verify_ssl", False))
+        return self._client
+
+    async def close(self) -> None:
+        if self._client:
+            await self._client.aclose()
+            self._client = None
+
+    async def _ensure_token(self) -> str:
+        if self._token:
+            return self._token
+        if not self.username or not self.password:
+            raise RuntimeError("Marzban/Rebecca نیاز به نام کاربری و رمز عبور دارند")
+        client = await self._get_client()
+        form = {
+            "username": self.username,
+            "password": self.password,
+            "grant_type": "password",
+        }
+        headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
+        resp = await client.post("/api/admin/token", data=form, headers=headers)
+        ok, data = ok_json(resp)
+        if (not ok or not isinstance(data, dict) or not data.get("access_token")) and resp.status_code in (
+            404,
+            405,
+        ):
+            from app.adapters.http_utils import normalize_panel_base_url
+
+            root = normalize_panel_base_url(self.base_url)
+            if root != self.base_url:
+                self.base_url = root
+                await self.close()
+                client = await self._get_client()
+                resp = await client.post("/api/admin/token", data=form, headers=headers)
+                ok, data = ok_json(resp)
+            elif "/dashboard" in self.base_url.lower():
+                self.base_url = self.base_url.lower().replace("/dashboard", "")
+                self.base_url = normalize_panel_base_url(self.base_url)
+                await self.close()
+                client = await self._get_client()
+                resp = await client.post("/api/admin/token", data=form, headers=headers)
+                ok, data = ok_json(resp)
+
+        if not ok or not isinstance(data, dict) or not data.get("access_token"):
+            detail = err_msg(data, f"Login failed HTTP {resp.status_code}")
+            if resp.status_code in (404, 405):
+                detail += (
+                    " — آدرس پایه را بدون /dashboard وارد کنید "
+                    f"(فعلی: {self.base_url})"
+                )
+            raise RuntimeError(detail)
+        self._token = data["access_token"]
+        return self._token
+
+    async def _headers(self) -> dict[str, str]:
+        token = await self._ensure_token()
+        return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+    def _selected_protocols(self, payload: UserPayload) -> list[str]:
+        """Resolve which protocols to enable from group/panel config (docs order)."""
+        raw = payload.config.get("protocols")
+        if isinstance(raw, list) and raw:
+            selected = [str(x).lower().strip() for x in raw if x]
+        else:
+            inbounds = payload.config.get("inbounds")
+            if isinstance(inbounds, dict) and inbounds:
+                selected = [str(k).lower().strip() for k in inbounds.keys()]
+            else:
+                meta_proto = self.meta.get("protocols")
+                if isinstance(meta_proto, list) and meta_proto:
+                    selected = [str(x).lower().strip() for x in meta_proto if x]
+                else:
+                    meta_ib = self.meta.get("inbounds")
+                    if isinstance(meta_ib, dict) and meta_ib:
+                        selected = [str(k).lower().strip() for k in meta_ib.keys()]
+                    else:
+                        selected = list(KNOWN_PROTOCOLS)
+
+        out: list[str] = []
+        for p in selected:
+            if p in KNOWN_PROTOCOLS and p not in out:
+                out.append(p)
+        return out or ["vless"]
+
+    def _proxy_settings_for(self, protocol: str, payload: UserPayload, uid: str) -> dict[str, Any]:
+        """Build per-protocol settings. Marzban fills defaults for empty objects where allowed."""
+        explicit = payload.config.get("proxies")
+        if isinstance(explicit, dict) and isinstance(explicit.get(protocol), dict):
+            settings = dict(explicit[protocol])
+            # Ensure vless/vmess always have id when partial settings provided
+            if protocol in ("vless", "vmess") and not settings.get("id"):
+                settings["id"] = uid
+            if protocol == "vless" and "flow" not in settings:
+                settings["flow"] = payload.config.get("flow", "") or ""
+            return settings
+
+        if protocol == "vless":
+            return {"id": uid, "flow": payload.config.get("flow", "") or ""}
+        if protocol == "vmess":
+            return {"id": uid}
+        if protocol == "trojan":
+            return {}
+        if protocol == "shadowsocks":
+            return {}
+        return {}
+
+    def _build_proxies(self, payload: UserPayload, protocols: list[str]) -> dict[str, Any]:
+        uid = payload.uuid or str(uuid_lib.uuid4())
+        return {p: self._proxy_settings_for(p, payload, uid) for p in protocols}
+
+    def _build_inbounds(
+        self,
+        payload: UserPayload,
+        protocols: list[str],
+        available: dict[str, list[str]] | None = None,
+    ) -> dict[str, list[str]]:
+        """
+        Build inbounds map per docs:
+        - if tags provided for a protocol → use those (intersect with available if known)
+        - if empty/missing → all available tags for that protocol (or [] so panel assigns all)
+        """
+        configured = payload.config.get("inbounds")
+        if not isinstance(configured, dict):
+            configured = self.meta.get("inbounds") if isinstance(self.meta.get("inbounds"), dict) else {}
+
+        out: dict[str, list[str]] = {}
+        for protocol in protocols:
+            raw_tags = configured.get(protocol)
+            tags: list[str] = []
+            if isinstance(raw_tags, list):
+                tags = [str(t) for t in raw_tags if t]
+            elif isinstance(raw_tags, str) and raw_tags.strip():
+                tags = [raw_tags.strip()]
+
+            if available and protocol in available:
+                avail = available[protocol]
+                if tags:
+                    tags = [t for t in tags if t in avail]
+                if not tags:
+                    tags = list(avail)
+
+            out[protocol] = tags
+        return out
+
+    async def _available_inbounds_map(self) -> dict[str, list[str]]:
+        if self._inbounds_cache is not None:
+            return self._inbounds_cache
+        try:
+            rows = await self.list_protocols()
+            cache = {str(r["protocol"]).lower(): list(r.get("tags") or []) for r in rows}
+            self._inbounds_cache = cache
+            return cache
+        except Exception:
+            return {}
+
+    async def _build_user_body(self, payload: UserPayload, *, include_username: bool) -> dict[str, Any]:
+        available = await self._available_inbounds_map()
+        protocols = self._selected_protocols(payload)
+
+        # Drop protocols that are not enabled on the panel (avoid HTTP 400)
+        if available:
+            enabled = [p for p in protocols if available.get(p)]
+            if enabled:
+                protocols = enabled
+            # if catalog empty/failed, keep requested protocols and let panel validate
+
+        proxies = self._build_proxies(payload, protocols)
+        inbounds = self._build_inbounds(payload, protocols, available or None)
+
+        # Marzban: active | disabled | limited | expired | on_hold
+        _ok = ("active", "on_hold", "disabled", "limited", "expired")
+        status = payload.status if payload.status in _ok else "disabled"
+        body: dict[str, Any] = {
+            "proxies": proxies,
+            "inbounds": inbounds,
+            "data_limit": int(payload.data_limit or 0),
+            "data_limit_reset_strategy": payload.config.get("data_limit_reset_strategy", "no_reset"),
+            "status": status,
+            "note": payload.note or "",
+            "expire": int(payload.expire or 0),
+        }
+        if include_username:
+            body["username"] = payload.username
+        # Official Marzban schema has no limit_ip — do not send it (causes 400/422)
+        return body
+
+    def _from_user_response(self, data: dict, fallback_username: str) -> AdapterResult:
+        proxies = data.get("proxies") or {}
+        uuid = None
+        if isinstance(proxies, dict):
+            for proto in ("vless", "vmess"):
+                if isinstance(proxies.get(proto), dict) and proxies[proto].get("id"):
+                    uuid = proxies[proto]["id"]
+                    break
+        links = [str(x) for x in (data.get("links") or []) if x]
+        sub = data.get("subscription_url")
+        if sub and str(sub) not in links:
+            links.append(str(sub))
+        return AdapterResult(
+            success=True,
+            remote_username=data.get("username", fallback_username),
+            remote_id=data.get("username", fallback_username),
+            uuid=uuid,
+            links=links,
+            used_traffic=int(data.get("used_traffic") or 0),
+            raw=data,
+        )
+
+    async def _expand_subscription_links(self, links: list[str]) -> list[str]:
+        """If panel only returned http(s) sub URL, fetch and split into share links."""
+        share_prefixes = (
+            "vless://",
+            "vmess://",
+            "trojan://",
+            "ss://",
+            "shadowsocks://",
+            "tuic://",
+            "hysteria://",
+            "hy2://",
+        )
+        existing_share = [l for l in links if str(l).lower().startswith(share_prefixes)]
+        if existing_share:
+            return existing_share
+
+        subs = [l for l in links if str(l).lower().startswith(("http://", "https://"))]
+        if not subs:
+            return links
+
+        out: list[str] = []
+        client = await self._get_client()
+        for url in subs:
+            try:
+                resp = await client.get(url, headers={"User-Agent": "AstraPanel/1.0"})
+                if resp.status_code >= 400:
+                    continue
+                text = (resp.text or "").strip()
+                if not text:
+                    continue
+                # try base64 subscription payload
+                decoded = text
+                try:
+                    pad = "=" * (-len(text) % 4)
+                    decoded = base64.urlsafe_b64decode(text + pad).decode("utf-8", errors="ignore")
+                except Exception:
+                    decoded = text
+                for line in decoded.replace("\r", "\n").split("\n"):
+                    line = line.strip()
+                    if line and line.lower().startswith(share_prefixes):
+                        out.append(line)
+            except Exception:
+                continue
+        return out or links
+
+    async def list_protocols(self) -> list[dict[str, Any]]:
+        """
+        Fetch Marzban/Rebecca protocols from GET /api/inbounds.
+        Response shape: { "vless": [ProxyInbound...], "vmess": [...], ... }
+        """
+        client = await self._get_client()
+        headers = await self._headers()
+        resp = await client.get("/api/inbounds", headers=headers)
+        ok, data = ok_json(resp)
+        if not ok or not isinstance(data, dict):
+            raise RuntimeError(err_msg(data, f"HTTP {resp.status_code}"))
+        out: list[dict[str, Any]] = []
+        for protocol, items in data.items():
+            if not isinstance(items, list):
+                continue
+            tags: list[str] = []
+            details: list[dict[str, Any]] = []
+            for item in items:
+                if isinstance(item, dict) and item.get("tag"):
+                    tag = str(item["tag"])
+                    tags.append(tag)
+                    details.append(
+                        {
+                            "tag": tag,
+                            "protocol": str(item.get("protocol") or protocol),
+                            "network": str(item.get("network") or ""),
+                            "tls": str(item.get("tls") or ""),
+                            "port": item.get("port"),
+                        }
+                    )
+                elif isinstance(item, str) and item.strip():
+                    tag = item.strip()
+                    tags.append(tag)
+                    details.append(
+                        {
+                            "tag": tag,
+                            "protocol": str(protocol),
+                            "network": "",
+                            "tls": "",
+                            "port": None,
+                        }
+                    )
+            out.append(
+                {
+                    "protocol": str(protocol),
+                    "tags": tags,
+                    "inbound_count": len(tags),
+                    "inbounds": details,
+                }
+            )
+        return out
+
+    async def list_inbounds(self) -> list[dict[str, Any]]:
+        """Flat inbound tags (legacy helper). Prefer list_protocols()."""
+        flat: list[dict[str, Any]] = []
+        for proto in await self.list_protocols():
+            flat.extend(proto.get("inbounds") or [])
+        return flat
+
+    async def test_connection(self) -> AdapterResult:
+        try:
+            client = await self._get_client()
+            headers = await self._headers()
+            resp = await client.get("/api/admin", headers=headers)
+            ok, data = ok_json(resp)
+            if ok:
+                return AdapterResult(success=True, raw=data)
+            return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
+        except Exception as e:
+            return AdapterResult(success=False, error=str(e))
+
+    async def _finalize_user_result(self, result: AdapterResult, username: str) -> AdapterResult:
+        links = list(result.links or [])
+        share_prefixes = ("vless://", "vmess://", "trojan://", "ss://", "shadowsocks://")
+        if not any(str(l).lower().startswith(share_prefixes) for l in links):
+            refreshed = await self.get_usage(username)
+            if refreshed.success and refreshed.links:
+                links = list(refreshed.links)
+                result.used_traffic = refreshed.used_traffic or result.used_traffic
+                result.uuid = refreshed.uuid or result.uuid
+                result.raw = refreshed.raw or result.raw
+        result.links = await self._expand_subscription_links(links)
+        return result
+
+    async def create_user(self, payload: UserPayload) -> AdapterResult:
+        try:
+            client = await self._get_client()
+            headers = await self._headers()
+            body = await self._build_user_body(payload, include_username=True)
+            resp = await client.post("/api/user", headers=headers, json=body)
+            ok, data = ok_json(resp)
+            if ok and isinstance(data, dict):
+                result = self._from_user_response(data, payload.username)
+                return await self._finalize_user_result(result, payload.username)
+            return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
+        except Exception as e:
+            return AdapterResult(success=False, error=str(e))
+
+    async def modify_user(self, payload: UserPayload) -> AdapterResult:
+        try:
+            client = await self._get_client()
+            headers = await self._headers()
+            body = await self._build_user_body(payload, include_username=False)
+            resp = await client.put(f"/api/user/{payload.username}", headers=headers, json=body)
+            ok, data = ok_json(resp)
+            if ok and isinstance(data, dict):
+                result = self._from_user_response(data, payload.username)
+                return await self._finalize_user_result(result, payload.username)
+            return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
+        except Exception as e:
+            return AdapterResult(success=False, error=str(e))
+
+    async def delete_user(self, username: str, remote_id: str | None = None) -> AdapterResult:
+        try:
+            client = await self._get_client()
+            headers = await self._headers()
+            resp = await client.delete(f"/api/user/{username}", headers=headers)
+            if resp.status_code in (200, 204, 404):
+                return AdapterResult(success=True)
+            ok, data = ok_json(resp)
+            err = err_msg(data, f"HTTP {resp.status_code}")
+            if "not found" in err.lower():
+                return AdapterResult(success=True)
+            return AdapterResult(success=False, error=err)
+        except Exception as e:
+            return AdapterResult(success=False, error=str(e))
+
+    async def get_usage(self, username: str, remote_id: str | None = None) -> AdapterResult:
+        try:
+            client = await self._get_client()
+            headers = await self._headers()
+            resp = await client.get(f"/api/user/{username}", headers=headers)
+            ok, data = ok_json(resp)
+            if ok and isinstance(data, dict):
+                result = self._from_user_response(data, username)
+                result.links = await self._expand_subscription_links(list(result.links or []))
+                return result
+            return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
+        except Exception as e:
+            return AdapterResult(success=False, error=str(e))
+
+    async def get_subscription_links(self, username: str, remote_id: str | None = None) -> AdapterResult:
+        return await self.get_usage(username, remote_id)
