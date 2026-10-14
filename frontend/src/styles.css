@@ -57,6 +57,45 @@
 
 * { box-sizing: border-box; }
 html, body, #root { min-height: 100%; }
+
+/* Native-app feel on mobile: no blue tap rectangle from the browser */
+html {
+  -webkit-tap-highlight-color: transparent;
+  -webkit-text-size-adjust: 100%;
+}
+*,
+*::before,
+*::after {
+  -webkit-tap-highlight-color: transparent;
+}
+a,
+button,
+[role="button"],
+input,
+select,
+textarea,
+label,
+summary,
+.btn,
+.user-menu-btn,
+.users-page-btn,
+.users-filter,
+.badge,
+.modal-close,
+.cselect-trigger {
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  touch-action: manipulation;
+}
+/* Keep keyboard focus visible; hide mouse/touch focus ring */
+:focus:not(:focus-visible) {
+  outline: none;
+}
+:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 70%, transparent);
+  outline-offset: 2px;
+}
+
 body {
   margin: 0;
   font-family: var(--font);
