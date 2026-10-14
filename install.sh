@@ -434,8 +434,12 @@ build_frontend() {
 
 install_systemd() {
   local unit_src="${ASTRA_ROOT}/deploy/astra.service"
+  local upd_src="${ASTRA_ROOT}/deploy/astra-update.service"
   [[ -f "$unit_src" ]] || die "Missing $unit_src"
   install -m 644 "$unit_src" /etc/systemd/system/astra.service
+  if [[ -f "$upd_src" ]]; then
+    install -m 644 "$upd_src" /etc/systemd/system/astra-update.service
+  fi
   systemctl daemon-reload
   systemctl enable astra
   ok "systemd unit installed"

@@ -1,0 +1,9 @@
+[Unit]
+Description=Astra Panel one-shot update (preserve data/.env)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Nice=5
+TimeoutStartSec=900
+ExecStart=/usr/local/bin/astra-helper apply-update

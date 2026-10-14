@@ -17,6 +17,18 @@ _REPO = "mohammadgholamisama/astra"
 _VERSION_URL = f"https://raw.githubusercontent.com/{_REPO}/main/VERSION"
 _SAFE_VER = re.compile(r"^[0-9A-Za-z._+-]{1,32}$")
 
+_NNP_HINT = (
+    "سرویس astra با NoNewPrivileges اجرا می‌شود و sudo کار نمی‌کند. "
+    "یک‌بار با root این را بزنید:\n"
+    "cd /opt/astra && sudo git pull && "
+    "sudo install -m 644 deploy/astra.service /etc/systemd/system/astra.service && "
+    "sudo install -m 644 deploy/astra-update.service /etc/systemd/system/astra-update.service && "
+    "sudo install -m 440 deploy/sudoers.astra /etc/sudoers.d/astra && "
+    "sudo install -m 755 deploy/astra-helper /usr/local/bin/astra-helper && "
+    "sudo systemctl daemon-reload && sudo systemctl restart astra && "
+    "sudo astra-helper apply-update"
+)
+
 
 def helper_path() -> str:
     s = get_settings()
@@ -39,13 +51,17 @@ def _parse_semver(v: str) -> tuple[int, ...]:
         elif not chunk:
             continue
         else:
-            # non-numeric suffix → stop
             break
     return tuple(parts) if parts else (0,)
 
 
 def is_newer(remote: str, local: str) -> bool:
     return _parse_semver(remote) > _parse_semver(local)
+
+
+def _sudo_blocked(text: str) -> bool:
+    t = (text or "").lower()
+    return "no new privileges" in t or "nnp" in t
 
 
 async def _run(cmd: list[str], *, timeout: float = 120) -> tuple[int, str, str]:
@@ -67,10 +83,16 @@ async def _run(cmd: list[str], *, timeout: float = 120) -> tuple[int, str, str]:
     )
 
 
-async def _helper(args: list[str], *, timeout: float) -> tuple[int, str, str]:
+async def _helper(args: list[str], *, timeout: float, as_root: bool = True) -> tuple[int, str, str]:
     helper = helper_path()
+    if not as_root:
+        return await _run([helper, *args], timeout=timeout)
+
     code, out, err = await _run(["sudo", "-n", helper, *args], timeout=timeout)
-    if code != 0 and "password" in (err + out).lower():
+    combined = err + out
+    if _sudo_blocked(combined):
+        return code, out, f"{err}\n{_NNP_HINT}"
+    if code != 0 and "password" in combined.lower():
         code, out, err = await _run([helper, *args], timeout=timeout)
     return code, out, err
 
@@ -86,10 +108,12 @@ async def check_update() -> dict:
     git_behind = False
 
     if available():
-        code, out, err = await _helper(["check-update"], timeout=60)
+        # check-update needs no root
+        code, out, err = await _helper(["check-update"], timeout=60, as_root=False)
+        if code != 0:
+            code, out, err = await _helper(["check-update"], timeout=60, as_root=True)
         if code == 0 and out.strip():
             try:
-                # Prefer last JSON line
                 line = out.strip().splitlines()[-1]
                 data = json.loads(line)
                 remote = str(data.get("remote_version") or "").strip()
@@ -113,7 +137,6 @@ async def check_update() -> dict:
             except json.JSONDecodeError:
                 logger.warning("check-update bad JSON: %s", out[:400])
 
-    # Fallback: fetch VERSION from GitHub (local / no helper)
     try:
         proc = await asyncio.create_subprocess_exec(
             "curl",
@@ -154,12 +177,41 @@ async def apply_update() -> dict:
         raise ValueError(
             "آپدیت از پنل فقط روی سرور با نصب رسمی Astra فعال است (astra-helper)"
         )
-    code, out, err = await _helper(["apply-update"], timeout=900)
+
+    # Prefer dedicated oneshot unit (waits until finished; runs as root)
+    for systemctl in ("/bin/systemctl", "/usr/bin/systemctl", "systemctl"):
+        code, out, err = await _run(
+            ["sudo", "-n", systemctl, "start", "astra-update.service"],
+            timeout=900,
+        )
+        combined = err + out
+        if _sudo_blocked(combined):
+            raise RuntimeError(_NNP_HINT)
+        if code == 0:
+            from app.services.version_info import clear_version_cache, get_version
+
+            clear_version_cache()
+            return {
+                "ok": True,
+                "message": "آپدیت نصب شد. دیتابیس و تنظیمات حفظ شدند.",
+                "local_version": get_version(),
+                "remote_version": get_version(),
+            }
+        if code == 5 or "not found" in combined.lower() or "could not be found" in combined.lower():
+            # unit missing → fall through to direct helper
+            break
+        if code != 0:
+            # try next systemctl path / fallback
+            continue
+
+    code, out, err = await _helper(["apply-update"], timeout=900, as_root=True)
     if code != 0:
         msg = (err or out or "update failed").strip()
         logger.error("apply-update failed: %s", msg)
+        if _sudo_blocked(msg):
+            raise RuntimeError(_NNP_HINT)
         raise RuntimeError(msg[:1500])
-    # Try parse final JSON line
+
     remote = ""
     local = ""
     for line in reversed(out.strip().splitlines() or [""]):

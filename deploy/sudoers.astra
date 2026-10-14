@@ -1,2 +1,4 @@
-# Allow astra user to run astra-helper (nginx / SSL / env) without password
+# Allow astra user to run astra-helper (nginx / SSL / env / update) without password
 astra ALL=(root) NOPASSWD: /usr/local/bin/astra-helper *
+astra ALL=(root) NOPASSWD: /bin/systemctl start astra-update.service
+astra ALL=(root) NOPASSWD: /usr/bin/systemctl start astra-update.service

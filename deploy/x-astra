@@ -330,9 +330,19 @@ cmd_update() {
     chmod -R a+rX '${ASTRA_ROOT}/frontend/dist'
   " || { err "frontend build failed"; pause; return; }
 
-  info "Refresh CLI + nginx..."
+  info "Refresh CLI + nginx + systemd..."
   sudo install -m 755 "${ASTRA_ROOT}/deploy/astra-helper" "$HELPER"
   sudo install -m 755 "${ASTRA_ROOT}/deploy/x-astra" /usr/local/bin/x-astra
+  if [[ -f "${ASTRA_ROOT}/deploy/sudoers.astra" ]]; then
+    sudo install -m 440 "${ASTRA_ROOT}/deploy/sudoers.astra" /etc/sudoers.d/astra
+  fi
+  if [[ -f "${ASTRA_ROOT}/deploy/astra.service" ]]; then
+    sudo install -m 644 "${ASTRA_ROOT}/deploy/astra.service" /etc/systemd/system/astra.service
+  fi
+  if [[ -f "${ASTRA_ROOT}/deploy/astra-update.service" ]]; then
+    sudo install -m 644 "${ASTRA_ROOT}/deploy/astra-update.service" /etc/systemd/system/astra-update.service
+  fi
+  sudo systemctl daemon-reload
   run_helper write-nginx
   run_helper restart-astra
   ok "Updated successfully / به‌روز شد"

@@ -15,7 +15,8 @@ Restart=always
 RestartSec=3
 KillSignal=SIGTERM
 TimeoutStopSec=30
-NoNewPrivileges=true
+# Must be false so astra can sudo astra-helper (SSL / update / nginx) via /etc/sudoers.d/astra
+NoNewPrivileges=false
 PrivateTmp=true
 
 [Install]

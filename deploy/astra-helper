@@ -478,11 +478,17 @@ cmd_apply_update() {
   install -m 755 "${ASTRA_ROOT}/deploy/x-astra" /usr/local/bin/x-astra
   if [[ -f "${ASTRA_ROOT}/deploy/sudoers.astra" ]]; then
     install -m 440 "${ASTRA_ROOT}/deploy/sudoers.astra" /etc/sudoers.d/astra
+    if command -v visudo >/dev/null 2>&1; then
+      visudo -cf /etc/sudoers.d/astra >/dev/null || die "invalid sudoers"
+    fi
   fi
   if [[ -f "${ASTRA_ROOT}/deploy/astra.service" ]]; then
     install -m 644 "${ASTRA_ROOT}/deploy/astra.service" /etc/systemd/system/astra.service
-    systemctl daemon-reload
   fi
+  if [[ -f "${ASTRA_ROOT}/deploy/astra-update.service" ]]; then
+    install -m 644 "${ASTRA_ROOT}/deploy/astra-update.service" /etc/systemd/system/astra-update.service
+  fi
+  systemctl daemon-reload
 
   echo "astra-helper: python deps…"
   sudo -u astra bash -c "
