@@ -32,6 +32,68 @@ def coefficient_from_config(config: dict | None) -> float:
     return c
 
 
+def _norm_coeff(raw: float | None, default: float = 1.0) -> float:
+    try:
+        c = float(raw if raw is not None else default)
+    except (TypeError, ValueError):
+        c = default
+    if c < 0.01:
+        c = 0.01
+    return c
+
+
+def account_weighted_usage(account: PanelAccount, coeff: float) -> int:
+    """Astra-facing usage for one panel account under the current coefficient.
+
+    Past traffic locked in coeff_anchor_* keeps the old rate; only (raw - anchor)
+    is multiplied by the live coefficient — so changing 1→2 speeds up usage
+    from that moment onward without rewriting history.
+    """
+    coeff = _norm_coeff(coeff)
+    raw = max(0, int(account.used_traffic or 0))
+    anchor_raw = max(0, int(getattr(account, "coeff_anchor_raw", 0) or 0))
+    anchor_w = max(0, int(getattr(account, "coeff_anchor_weighted", 0) or 0))
+    if raw < anchor_raw:
+        # Traffic reset on remote — drop the period lock
+        return int(round(raw * coeff))
+    return anchor_w + int(round((raw - anchor_raw) * coeff))
+
+
+def apply_coefficient_period(
+    account: PanelAccount, new_coeff: float
+) -> bool:
+    """Lock current weighted usage when the panel coefficient changes.
+
+    Returns True if anchors / applied_coefficient were updated.
+    """
+    new_c = _norm_coeff(new_coeff)
+    raw = max(0, int(account.used_traffic or 0))
+    anchor_raw = max(0, int(getattr(account, "coeff_anchor_raw", 0) or 0))
+    # Remote traffic reset → clear period lock
+    if raw < anchor_raw:
+        account.coeff_anchor_raw = 0
+        account.coeff_anchor_weighted = 0
+        account.applied_coefficient = new_c
+        return True
+
+    applied = getattr(account, "applied_coefficient", None)
+    if applied is None:
+        # First touch after upgrade: keep simple raw×coeff (anchors at 0)
+        account.applied_coefficient = new_c
+        return True
+
+    old_c = _norm_coeff(applied)
+    if abs(old_c - new_c) < 1e-9:
+        return False
+
+    # Finalize weighted under the OLD coefficient, then start a new period
+    locked = account_weighted_usage(account, old_c)
+    account.coeff_anchor_raw = raw
+    account.coeff_anchor_weighted = max(0, locked)
+    account.applied_coefficient = new_c
+    return True
+
+
 def remote_data_limit_bytes(
     user_limit: int,
     config: dict | None,
@@ -42,8 +104,9 @@ def remote_data_limit_bytes(
     """Absolute traffic ceiling to push to one remote panel.
 
     Astra quota is SHARED across all panels:
-      user.used_traffic = Σ (raw_i × coefficient_i)
-      when that sum hits data_limit → subscription ends everywhere.
+      user.used_traffic = Σ weighted_i  (anchor + delta×coeff)
+      when that sum hits data_limit → subscription ends everywhere
+      (remotes get status limited/disabled + data_limit frozen).
 
     Each remote only gets: already_used_on_panel + remaining_astra/coeff
     so one panel cannot silently consume the whole quota on every panel.
@@ -524,11 +587,14 @@ async def hydrate_share_links(db: AsyncSession, user: User) -> int:
 
 
 async def usage_breakdown_for_user(db: AsyncSession, user: User) -> list[dict]:
-    """Per-panel raw usage × coefficient → weighted (admin / internal)."""
+    """Per-panel raw usage with live coefficient → weighted (admin / internal)."""
     coeffs = await panel_coefficients_for_user(db, user)
+    accounts = list(user.panel_accounts or [])
+    _sync_account_coeff_periods(accounts, coeffs)
     user_limit = int(user.data_limit or 0)
+    weighted_total = await _weighted_total(accounts, coeffs)
     rows: list[dict] = []
-    for account in user.panel_accounts or []:
+    for account in accounts:
         if account.status not in (
             PanelAccountStatus.active,
             PanelAccountStatus.error,
@@ -538,14 +604,12 @@ async def usage_breakdown_for_user(db: AsyncSession, user: User) -> list[dict]:
         name = getattr(panel, "name", None) if panel is not None else None
         label = name or f"پنل #{account.panel_id}"
         raw = int(account.used_traffic or 0)
-        coeff = float(coeffs.get(account.panel_id, 1.0) or 1.0)
-        if coeff < 0.01:
-            coeff = 0.01
-        weighted = int(round(raw * coeff))
+        coeff = _norm_coeff(coeffs.get(account.panel_id, 1.0))
+        weighted = account_weighted_usage(account, coeff)
         remote_limit = remote_data_limit_bytes(
             user_limit,
             {"coefficient": coeff},
-            used_weighted_total=int(user.used_traffic or 0),
+            used_weighted_total=weighted_total,
             used_raw_on_panel=raw,
         )
         n_links = len([x for x in (account.links or []) if x])
@@ -606,9 +670,28 @@ async def device_limit_for_user(db: AsyncSession, user: User) -> int:
     return best
 
 
+def _sync_account_coeff_periods(
+    accounts: list[PanelAccount], coeffs: dict[int, float]
+) -> bool:
+    """Apply current group coefficients to account periods. True if any changed."""
+    changed = False
+    for account in accounts:
+        if account.status not in (
+            PanelAccountStatus.active,
+            PanelAccountStatus.error,
+            PanelAccountStatus.pending,
+        ):
+            continue
+        coeff = _norm_coeff(coeffs.get(account.panel_id, 1.0))
+        if apply_coefficient_period(account, coeff):
+            changed = True
+    return changed
+
+
 async def _weighted_total(
     accounts: list[PanelAccount], coeffs: dict[int, float]
 ) -> int:
+    _sync_account_coeff_periods(accounts, coeffs)
     total = 0
     for account in accounts:
         if account.status not in (
@@ -616,11 +699,8 @@ async def _weighted_total(
             PanelAccountStatus.error,
         ):
             continue
-        raw = int(account.used_traffic or 0)
-        coeff = float(coeffs.get(account.panel_id, 1.0) or 1.0)
-        if coeff < 0.01:
-            coeff = 0.01
-        total += int(round(raw * coeff))
+        coeff = _norm_coeff(coeffs.get(account.panel_id, 1.0))
+        total += account_weighted_usage(account, coeff)
     return total
 
 
@@ -670,8 +750,13 @@ async def refresh_users_usage_batch(
             try:
                 await refresh_usage(db, u, force=force)
                 changed = await enforce_user_quota(db, u)
-                # Do NOT push on every list refresh — that made sync extremely slow
-                if changed or push_remotes:
+                blocked = u.status in (
+                    UserStatus.limited,
+                    UserStatus.expired,
+                    UserStatus.disabled,
+                )
+                # Push when quota flipped, already blocked (retry disable), or forced
+                if changed or blocked or push_remotes:
                     await sync_modify_user(db, u)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("batch usage refresh failed user=%s: %s", u.username, exc)
@@ -773,7 +858,7 @@ async def refresh_usage(
 async def enforce_user_quota(db: AsyncSession, user: User) -> bool:
     """Apply expire / data-limit status. Returns True if remotes must be synced.
 
-    - expired / limited → disable on upstream panels
+    - expired / limited → disable on upstream panels (even if remote still has quota)
     - recovers to active when under limit again (not for admin-disabled)
     """
     if user.status == UserStatus.disabled:
@@ -802,7 +887,52 @@ async def enforce_user_quota(db: AsyncSession, user: User) -> bool:
 
     user.status = new
     await db.flush()
+    logger.info(
+        "quota status user=%s %s → %s used=%s limit=%s",
+        user.username,
+        old.value if hasattr(old, "value") else old,
+        new.value if hasattr(new, "value") else new,
+        int(user.used_traffic or 0),
+        int(user.data_limit or 0),
+    )
     return True
+
+
+async def resync_users_for_group(db: AsyncSession, group_id: int) -> int:
+    """After group coefficient / panel config change: reanchor, enforce, push remotes.
+
+    Ensures remotes get the new (usually lower) data_limit and are disabled when
+    Astra quota is already exhausted under the new rate.
+    """
+    ug = await db.execute(select(UserGroup.user_id).where(UserGroup.group_id == group_id))
+    user_ids = [row[0] for row in ug.all()]
+    if not user_ids:
+        return 0
+
+    result = await db.execute(
+        select(User)
+        .where(User.id.in_(user_ids))
+        .options(selectinload(User.panel_accounts).selectinload(PanelAccount.panel))
+    )
+    users = list(result.scalars().unique().all())
+    # Skip local sample probe users
+    from app.services.group_configs import sample_username_for_group
+
+    sample = sample_username_for_group(group_id)
+    users = [u for u in users if u.username != sample]
+    if not users:
+        return 0
+
+    await refresh_users_usage_batch(
+        db, users, force=True, concurrency=8, push_remotes=True
+    )
+    await db.flush()
+    logger.info(
+        "group %s coeff/config resync: %s users pushed to remotes",
+        group_id,
+        len(users),
+    )
+    return len(users)
 
 
 async def sync_subscription_state(
@@ -837,6 +967,8 @@ async def sync_subscription_state(
         )
         do_push = push_remotes
         if do_push is None:
+            # Always push when blocked so remotes stay disabled even if Astra
+            # finished earlier than the upstream panel's own remaining quota.
             do_push = bool(changed or blocked or has_err)
         if do_push:
             await sync_modify_user(db, user)

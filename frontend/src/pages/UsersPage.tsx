@@ -91,16 +91,27 @@ function coeffsFromGroups(groups: Group[], groupIds: number[]): Map<number, numb
   return map;
 }
 
+function accountWeighted(a: User["panel_accounts"][number], coefficient: number): number {
+  const raw = Number(a.used_traffic) || 0;
+  const anchorRaw = Number(a.coeff_anchor_raw) || 0;
+  const anchorW = Number(a.coeff_anchor_weighted) || 0;
+  const coeff = coefficient >= 0.01 ? coefficient : 1;
+  if (raw < anchorRaw) return Math.round(raw * coeff);
+  // Past traffic stays at old rate; only delta uses live coefficient
+  return anchorW + Math.round((raw - anchorRaw) * coeff);
+}
+
 function panelUsageRows(u: User, groups: Group[]): PanelUsageRow[] {
   const coeffs = coeffsFromGroups(groups, u.group_ids || []);
   const astraLimit = Number(u.data_limit) || 0;
   const usedWeighted = Number(u.used_traffic) || 0;
   const rows: PanelUsageRow[] = [];
+
   for (const a of u.panel_accounts || []) {
     if (a.status !== "active" && a.status !== "error") continue;
     const raw = Number(a.used_traffic) || 0;
     const coefficient = coeffs.get(a.panel_id) ?? 1;
-    const weighted = Math.round(raw * coefficient);
+    const weighted = accountWeighted(a, coefficient);
     // Shared remaining: panel ceiling = raw_used + (astra_remaining / coeff)
     let remoteLimit = 0;
     if (astraLimit > 0) {
@@ -1162,7 +1173,7 @@ export default function UsersPage() {
             </header>
 
             <p className="usage-modal-hint">
-              سقف Astra بین همه پنل‌ها مشترک است: جمع (مصرف خام × ضریب) به سقف که برسد اشتراک روی همه
+              سقف Astra بین همه پنل‌ها مشترک است: جمع مصرف وزن‌دار (ضریب از لحظهٔ تغییر) به سقف که برسد اشتراک روی همه
               پنل‌ها بسته می‌شود. هر پنل فقط باقی‌مانده سهم را می‌گیرد تا ۵ گیگ روی سه پنل نشود ۱۵ گیگ.
             </p>
 

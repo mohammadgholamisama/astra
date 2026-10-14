@@ -77,6 +77,9 @@ def to_user_response(user: User, *, include_links: bool = True) -> UserResponse:
                 links=list(raw_links) if include_links else (["x"] * len(raw_links)),
                 error_message=a.error_message,
                 used_traffic=a.used_traffic,
+                coeff_anchor_raw=int(getattr(a, "coeff_anchor_raw", 0) or 0),
+                coeff_anchor_weighted=int(getattr(a, "coeff_anchor_weighted", 0) or 0),
+                applied_coefficient=getattr(a, "applied_coefficient", None),
                 last_sync_at=a.last_sync_at,
             )
         )

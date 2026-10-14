@@ -6,6 +6,7 @@ from sqlalchemy import (
     BigInteger,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     String,
     Text,
@@ -82,6 +83,11 @@ class PanelAccount(Base):
     links: Mapped[list] = mapped_column(JSONType, default=list)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     used_traffic: Mapped[int] = mapped_column(BigInteger, default=0)
+    # Coefficient periods: past usage stays at old rate; only delta uses current coeff.
+    # weighted = coeff_anchor_weighted + (raw - coeff_anchor_raw) * applied_coefficient
+    coeff_anchor_raw: Mapped[int] = mapped_column(BigInteger, default=0)
+    coeff_anchor_weighted: Mapped[int] = mapped_column(BigInteger, default=0)
+    applied_coefficient: Mapped[float | None] = mapped_column(Float, nullable=True)
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

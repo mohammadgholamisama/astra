@@ -44,6 +44,9 @@ class PanelAccountOut(ORMModel):
     links: list[str]
     error_message: str | None
     used_traffic: int
+    coeff_anchor_raw: int = 0
+    coeff_anchor_weighted: int = 0
+    applied_coefficient: float | None = None
     last_sync_at: datetime | None
 
 

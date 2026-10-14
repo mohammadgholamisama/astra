@@ -135,6 +135,10 @@ export interface PanelAccount {
   links: string[];
   error_message: string | null;
   used_traffic: number;
+  /** Bytes already locked before the current coefficient period */
+  coeff_anchor_raw?: number;
+  coeff_anchor_weighted?: number;
+  applied_coefficient?: number | null;
   last_sync_at: string | null;
 }
 

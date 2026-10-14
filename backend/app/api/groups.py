@@ -134,9 +134,24 @@ async def update_group(
         group.is_disabled = body.is_disabled
     if body.notices is not None:
         group.notices = normalize_notices(body.notices)
-    if body.panels is not None:
+    panels_changed = body.panels is not None
+    if panels_changed:
         await _set_panels(db, group, body.panels)
     await db.commit()
+    # Coefficient / panel config change → reanchor usage + push new caps / disable
+    if panels_changed:
+        try:
+            from app.services.orchestrator import resync_users_for_group
+
+            await resync_users_for_group(db, group_id)
+            await db.commit()
+        except Exception as exc:  # noqa: BLE001
+            await db.rollback()
+            # Group save already committed; surface soft failure for admin
+            raise HTTPException(
+                status_code=502,
+                detail=f"گروه ذخیره شد ولی همگام‌سازی ضریب با پنل‌ها ناموفق بود: {exc}",
+            ) from exc
     group = await _load_group(db, group_id)
     return _to_out(group)  # type: ignore[arg-type]
 
