@@ -107,15 +107,15 @@ def _donut_svg(pct: float | None, tone: str) -> str:
 _LINK_META: dict[str, tuple[str, str]] = {
     "channel": (
         "کانال",
-        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h16M4 16h10"/><circle cx="18" cy="16" r="2"/><path d="m22 2-7 20-4-9-9-4Z"/></svg>',
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 11v2a1 1 0 0 0 1 1h1.4l1.7 4.2A1.5 1.5 0 0 0 8.5 20h.7a1 1 0 0 0 1-.8L11 14h1"/><path d="M5 8.5 20.2 4.2a1 1 0 0 1 1.3.9v9.8a1 1 0 0 1-1.3.9L5 11.5"/><path d="M5 8.5v3"/></svg>',
     ),
     "support": (
         "پشتیبان",
-        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/></svg>',
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 13v-1a8 8 0 0 1 16 0v1"/><rect x="2" y="12" width="4" height="7" rx="2"/><rect x="18" y="12" width="4" height="7" rx="2"/><path d="M20 19a4 4 0 0 1-4 4h-2"/><circle cx="12" cy="19" r="1" fill="currentColor" stroke="none"/></svg>',
     ),
     "app": (
-        "دانلود برنامه",
-        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>',
+        "برنامه",
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="7" y="2.5" width="10" height="19" rx="2.2"/><path d="M12 8.2v6.2"/><path d="m9.6 11.8 2.4 2.4 2.4-2.4"/><path d="M11 18.8h2"/></svg>',
     ),
 }
 
@@ -178,22 +178,21 @@ def render_subscription_page(
         href = html.escape(raw, quote=True)
         label_esc = html.escape(label)
         quick_cards.append(
-            f"""<a class="qlink" href="{href}" target="_blank" rel="noopener noreferrer">
-  <span class="qlink-ico">{icon_svg}</span>
-  <span class="qlink-body">
-    <span class="qlink-label">{label_esc}</span>
-    <span class="qlink-hint" dir="ltr">{html.escape(raw if len(raw) <= 42 else raw[:42] + "…")}</span>
-  </span>
-  <span class="qlink-go" aria-hidden="true">↗</span>
-</a>"""
+            f'<a class="qlink qlink-{html.escape(key)}" href="{href}" '
+            f'target="_blank" rel="noopener noreferrer" title="{label_esc}">'
+            f'<span class="qlink-ico">{icon_svg}</span>'
+            f'<span class="qlink-label">{label_esc}</span>'
+            f"</a>"
         )
     quick_html = ""
     if quick_cards:
+        n = len(quick_cards)
         quick_joined = "\n    ".join(quick_cards)
-        quick_html = f"""<section class="card links-card" aria-label="لینک‌های سریع">
-  <h2>دسترسی سریع</h2>
-  <p class="hint">کانال، پشتیبانی و برنامهٔ پیشنهادی</p>
-  <div class="qlink-grid">
+        quick_html = f"""<section class="card links-card" aria-label="دسترسی سریع">
+  <div class="links-head">
+    <h2>دسترسی سریع</h2>
+  </div>
+  <div class="qlink-grid qlink-n{n}">
     {quick_joined}
   </div>
 </section>"""
@@ -462,33 +461,66 @@ body {{
 }}
 .card .hint {{ margin:0 0 14px; color:var(--muted); font-size:.82rem; line-height:1.55 }}
 
+.links-card {{ padding:12px 14px 14px }}
+.links-head {{ margin:0 0 10px }}
+.links-head h2 {{
+  margin:0; font-size:.88rem; font-weight:700; color:var(--muted);
+  font-family:Vazirmatn,sans-serif; letter-spacing:.01em;
+}}
 .qlink-grid {{
-  display:grid; grid-template-columns:repeat(auto-fit, minmax(min(100%, 200px), 1fr)); gap:10px;
+  display:grid; gap:8px;
+  grid-template-columns:repeat(3, minmax(0, 1fr));
 }}
+.qlink-grid.qlink-n1 {{ grid-template-columns:1fr }}
+.qlink-grid.qlink-n2 {{ grid-template-columns:repeat(2, minmax(0, 1fr)) }}
 .qlink {{
-  display:flex; align-items:center; gap:12px; padding:13px 14px; border-radius:16px;
-  border:1px solid var(--line); text-decoration:none; color:inherit;
-  background:color-mix(in srgb, var(--input) 75%, transparent);
-  transition:transform .15s, border-color .15s, background .15s;
+  display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:7px; min-height:0; padding:12px 8px 11px;
+  border-radius:14px; border:1px solid var(--line);
+  text-decoration:none; color:inherit; text-align:center;
+  background:
+    linear-gradient(160deg, color-mix(in srgb, var(--accent) 8%, transparent), transparent 55%),
+    color-mix(in srgb, var(--input) 70%, transparent);
+  transition:transform .14s ease, border-color .14s, background .14s, box-shadow .14s;
+  -webkit-tap-highlight-color:transparent;
 }}
-.qlink:hover {{
-  transform:translateY(-2px);
-  border-color:color-mix(in srgb, var(--accent) 45%, var(--line));
-  background:color-mix(in srgb, var(--accent) 10%, var(--input));
+.qlink:hover, .qlink:focus-visible {{
+  transform:translateY(-1px);
+  border-color:color-mix(in srgb, var(--accent) 50%, var(--line));
+  box-shadow:0 8px 20px color-mix(in srgb, var(--accent) 12%, transparent);
+  outline:none;
 }}
+.qlink:active {{ transform:scale(.97) }}
 .qlink-ico {{
-  flex-shrink:0; width:40px; height:40px; border-radius:12px;
-  display:grid; place-items:center;
-  background:color-mix(in srgb, var(--accent) 14%, transparent);
-  color:var(--accent); border:1px solid color-mix(in srgb, var(--accent) 28%, var(--line));
+  width:36px; height:36px; border-radius:11px;
+  display:grid; place-items:center; flex-shrink:0;
+  color:var(--accent);
+  background:color-mix(in srgb, var(--accent) 16%, transparent);
+  border:1px solid color-mix(in srgb, var(--accent) 26%, transparent);
 }}
-.qlink-ico svg {{ width:20px; height:20px }}
-.qlink-body {{ min-width:0; flex:1; display:flex; flex-direction:column; gap:2px }}
-.qlink-label {{ font-weight:700; font-size:.92rem }}
-.qlink-hint {{
-  font-size:.72rem; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+.qlink-channel .qlink-ico {{
+  color:#38bdf8;
+  background:color-mix(in srgb, #38bdf8 16%, transparent);
+  border-color:color-mix(in srgb, #38bdf8 28%, transparent);
 }}
-.qlink-go {{ color:var(--accent); font-weight:700; font-size:1rem; opacity:.7 }}
+.qlink-support .qlink-ico {{
+  color:#a78bfa;
+  background:color-mix(in srgb, #a78bfa 16%, transparent);
+  border-color:color-mix(in srgb, #a78bfa 28%, transparent);
+}}
+.qlink-app .qlink-ico {{
+  color:#34d399;
+  background:color-mix(in srgb, #34d399 16%, transparent);
+  border-color:color-mix(in srgb, #34d399 28%, transparent);
+}}
+[data-theme="light"] .qlink-channel .qlink-ico {{ color:#0284c7 }}
+[data-theme="light"] .qlink-support .qlink-ico {{ color:#7c3aed }}
+[data-theme="light"] .qlink-app .qlink-ico {{ color:#059669 }}
+.qlink-ico svg {{ width:18px; height:18px; display:block }}
+.qlink-label {{
+  font-weight:700; font-size:.78rem; line-height:1.2;
+  max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}}
 
 .sub-grid {{
   display:grid; grid-template-columns:auto 1fr; gap:18px; align-items:center;
@@ -580,11 +612,23 @@ input#sub {{
   .theme-ico {{ width:15px; height:15px }}
   .theme-ico-moon {{ right:8px }}
   .theme-ico-sun {{ left:8px }}
-  .qlink-grid {{ grid-template-columns:1fr }}
+  .qlink {{ padding:10px 6px 9px; gap:6px }}
+  .qlink-ico {{ width:32px; height:32px; border-radius:10px }}
+  .qlink-ico svg {{ width:16px; height:16px }}
+  .qlink-label {{ font-size:.72rem }}
+}}
+@media (max-width:360px) {{
+  .qlink-grid, .qlink-grid.qlink-n2, .qlink-grid.qlink-n3 {{
+    grid-template-columns:1fr;
+  }}
+  .qlink {{
+    flex-direction:row; justify-content:flex-start; text-align:right;
+    padding:10px 12px; gap:10px;
+  }}
 }}
 @media (prefers-reduced-motion:reduce) {{
   .btn:hover, .toast, .theme-knob, .theme-switch, .theme-ico, .qlink {{ transition:none }}
-  .qlink:hover {{ transform:none }}
+  .qlink:hover, .qlink:focus-visible, .qlink:active {{ transform:none }}
 }}
 </style>
 </head>

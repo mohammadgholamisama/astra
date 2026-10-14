@@ -100,6 +100,18 @@ async def health():
     return {"status": "ok"}
 
 
+# Reserved path prefixes — never serve SPA here (API / Swagger / sub page)
+_SPA_SKIP_PREFIXES = (
+    "api",
+    "sub",
+    "docs",
+    "redoc",
+    "openapi.json",
+    "health",
+    "assets",
+)
+
+
 _FRONTEND = _resolve_frontend_dist()
 if _FRONTEND is not None:
     logger.info("Serving frontend from %s", _FRONTEND)
@@ -113,13 +125,13 @@ if _FRONTEND is not None:
 
     @app.get("/{full_path:path}")
     async def spa_fallback(full_path: str):
-        # Never hijack API / sub / docs
-        if full_path.startswith(
-            ("api/", "sub", "docs", "openapi.json", "health", "assets/")
-        ):
-            from fastapi import HTTPException
+        from fastapi import HTTPException
 
-            raise HTTPException(status_code=404)
+        first = (full_path or "").split("/", 1)[0]
+        # If these hit the catch-all, something overrode FastAPI routes — do not
+        # return index.html (that makes React redirect "/" and hides Swagger).
+        if first in _SPA_SKIP_PREFIXES or full_path in _SPA_SKIP_PREFIXES:
+            raise HTTPException(status_code=404, detail="Not found")
         candidate = (_FRONTEND / full_path).resolve()
         try:
             candidate.relative_to(_FRONTEND)

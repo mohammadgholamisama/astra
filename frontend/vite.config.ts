@@ -9,6 +9,9 @@ export default defineConfig({
       "/api": "http://localhost:8000",
       "/sub": "http://localhost:8000",
       "/health": "http://localhost:8000",
+      "/docs": "http://localhost:8000",
+      "/redoc": "http://localhost:8000",
+      "/openapi.json": "http://localhost:8000",
     },
   },
 });

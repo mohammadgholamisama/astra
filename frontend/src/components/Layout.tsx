@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import {
+  BookOpen,
   DatabaseBackup,
   KeyRound,
   LayoutDashboard,
@@ -12,6 +13,14 @@ import {
 } from "lucide-react";
 import ThemeToggle from "./ThemeToggle";
 import { useAuth } from "../store/auth";
+
+const API_BASE = (import.meta.env.VITE_API_BASE || "").replace(/\/$/, "");
+
+/** Swagger UI on the panel/API host (same domain in production). */
+function docsHref(): string {
+  if (API_BASE) return `${API_BASE}/docs`;
+  return "/docs";
+}
 
 const links = [
   { to: "/", label: "داشبورد", end: true, icon: LayoutDashboard },
@@ -115,6 +124,15 @@ export default function Layout() {
 
         <div className="sidebar-foot">
           <ThemeToggle variant="switch" className="sidebar-theme" />
+          <a
+            className="sidebar-docs"
+            href={docsHref()}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <BookOpen size={17} strokeWidth={2.1} aria-hidden />
+            <span>مستندات API</span>
+          </a>
           <button type="button" className="sidebar-logout" onClick={doLogout}>
             <LogOut size={17} strokeWidth={2.1} aria-hidden />
             <span>خروج از حساب</span>
