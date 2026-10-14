@@ -8,10 +8,13 @@ Type=simple
 User=astra
 Group=astra
 WorkingDirectory=/opt/astra/backend
-EnvironmentFile=/opt/astra/.env
+# Defaults — overridden by EnvironmentFile when keys exist
+Environment=ASTRA_BIND_HOST=127.0.0.1
+Environment=ASTRA_APP_PORT=2086
+EnvironmentFile=-/opt/astra/.env
 Environment=PATH=/opt/astra/backend/.venv/bin:/usr/local/bin:/usr/bin
-# ASTRA_BIND_HOST=127.0.0.1 (behind nginx) or 0.0.0.0 (shared server IP:port access)
-ExecStart=/opt/astra/backend/.venv/bin/uvicorn app.main:app --host ${ASTRA_BIND_HOST:-127.0.0.1} --port ${ASTRA_APP_PORT}
+# IMPORTANT: systemd supports ${VAR} only — NOT bash ${VAR:-default}
+ExecStart=/opt/astra/backend/.venv/bin/uvicorn app.main:app --host ${ASTRA_BIND_HOST} --port ${ASTRA_APP_PORT}
 Restart=always
 RestartSec=3
 KillSignal=SIGTERM
