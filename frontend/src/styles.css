@@ -1826,23 +1826,103 @@ th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
 .users-pagination {
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 14px;
-  margin-top: 18px;
-  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: var(--board-card);
+  box-shadow: var(--shadow);
 }
-.users-pagination-info {
+.users-page-btn {
+  appearance: none;
   display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 38px;
+  padding: 0 14px;
+  border-radius: 11px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+  font: inherit;
+  font-size: 0.86rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, opacity 0.15s;
+}
+.users-page-btn svg {
+  display: block;
+  flex-shrink: 0;
+  width: 15px;
+  height: 15px;
+}
+.users-page-btn span {
+  display: inline-block;
+  line-height: 1;
+  transform: translateY(0.5px);
+}
+.users-page-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+}
+.users-page-btn:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+  color: var(--muted);
+  border-color: var(--line);
+  background: color-mix(in srgb, var(--input, transparent) 60%, transparent);
+}
+.users-pagination-mid {
+  display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 2px;
-  font-size: 0.92rem;
-  color: var(--text);
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+  text-align: center;
 }
-.users-pagination-info em {
-  font-style: normal;
-  font-size: 0.8rem;
+.users-page-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: var(--text);
+  font-size: 0.9rem;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.users-page-chip-sep {
   color: var(--muted);
+  font-weight: 600;
+}
+.users-pagination-range {
+  font-size: 0.75rem;
+  color: var(--muted);
+  line-height: 1.3;
+}
+@media (max-width: 520px) {
+  .users-pagination {
+    gap: 8px;
+    padding: 8px;
+  }
+  .users-page-btn {
+    min-height: 36px;
+    padding: 0 10px;
+    font-size: 0.8rem;
+  }
+  .users-pagination-range {
+    font-size: 0.7rem;
+  }
 }
 .user-card {
   display: flex;

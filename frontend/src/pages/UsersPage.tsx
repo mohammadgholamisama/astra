@@ -806,29 +806,35 @@ export default function UsersPage() {
           <nav className="users-pagination" aria-label="صفحه‌بندی کاربران">
             <button
               type="button"
-              className="btn ghost sm"
+              className="users-page-btn"
               disabled={page <= 0 || isFetching}
               onClick={() => setPage((p) => Math.max(0, p - 1))}
+              aria-label="صفحه قبلی"
             >
-              <ChevronRight size={16} />
-              قبلی
+              <ChevronRight size={15} strokeWidth={2.25} aria-hidden />
+              <span>قبلی</span>
             </button>
-            <span className="users-pagination-info">
-              صفحه {toFaDigits(page + 1)} از {toFaDigits(totalPages)}
-              <em>
-                ({toFaDigits(page * PAGE_SIZE + 1)}–
+            <div className="users-pagination-mid">
+              <span className="users-page-chip">
+                {toFaDigits(page + 1)}
+                <span className="users-page-chip-sep">/</span>
+                {toFaDigits(totalPages)}
+              </span>
+              <span className="users-pagination-range">
+                {toFaDigits(page * PAGE_SIZE + 1)}–
                 {toFaDigits(Math.min((page + 1) * PAGE_SIZE, totalUsers))} از{" "}
-                {toFaDigits(totalUsers)})
-              </em>
-            </span>
+                {toFaDigits(totalUsers)} کاربر
+              </span>
+            </div>
             <button
               type="button"
-              className="btn ghost sm"
+              className="users-page-btn"
               disabled={page + 1 >= totalPages || isFetching}
               onClick={() => setPage((p) => p + 1)}
+              aria-label="صفحه بعدی"
             >
-              بعدی
-              <ChevronLeft size={16} />
+              <span>بعدی</span>
+              <ChevronLeft size={15} strokeWidth={2.25} aria-hidden />
             </button>
           </nav>
         )}
