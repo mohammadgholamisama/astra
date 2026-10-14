@@ -31,9 +31,14 @@ export default function DashboardPage() {
     mutationFn: () => api<UpdateStatus>("/api/system/update"),
     onSuccess: (res) => {
       setUpdateInfo(res);
-      setErr("");
+      if (res.check_ok === false) {
+        setErr(res.message || "بررسی آپدیت ناموفق بود");
+      } else {
+        setErr("");
+      }
     },
     onError: (e: Error) => {
+      setUpdateInfo(null);
       setErr(e instanceof ApiError ? e.message : e.message);
     },
   });
@@ -56,8 +61,10 @@ export default function DashboardPage() {
 
   const healthOk = !!data && data.sync_errors === 0;
   const busy = checkUpdate.isPending || applyUpdate.isPending;
-  const hasUpdate = !!updateInfo?.update_available;
-  const isLatest = !!updateInfo && !updateInfo.update_available;
+  const checkOk = updateInfo?.check_ok !== false;
+  const hasUpdate = !!updateInfo?.update_available && checkOk;
+  const isLatest =
+    !!updateInfo && checkOk && !updateInfo.update_available && !!updateInfo.remote_version;
 
   return (
     <div className="board">

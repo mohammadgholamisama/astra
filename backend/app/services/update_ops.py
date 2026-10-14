@@ -97,18 +97,45 @@ async def _helper(args: list[str], *, timeout: float, as_root: bool = True) -> t
     return code, out, err
 
 
+async def _fetch_remote_version() -> str:
+    urls = (
+        _VERSION_URL,
+        "https://cdn.jsdelivr.net/gh/mohammadgholamisama/astra@main/VERSION",
+    )
+    for url in urls:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "curl",
+                "-fsSL",
+                "--max-time",
+                "15",
+                url,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out_b, _err = await asyncio.wait_for(proc.communicate(), timeout=20)
+            if proc.returncode != 0:
+                continue
+            remote = (out_b or b"").decode().strip().splitlines()[0].strip()
+            if remote and _SAFE_VER.match(remote):
+                return remote
+        except Exception:  # noqa: BLE001
+            continue
+    return ""
+
+
 async def check_update() -> dict:
-    """Return update status. Works with or without helper (HTTP VERSION fetch)."""
+    """Return update status. check_ok=False means verification failed — not 'up to date'."""
     from app.services.version_info import get_version
 
     local = get_version()
     remote = ""
     update_available = False
+    check_ok = False
     message = ""
     git_behind = False
 
     if available():
-        # check-update needs no root
         code, out, err = await _helper(["check-update"], timeout=60, as_root=False)
         if code != 0:
             code, out, err = await _helper(["check-update"], timeout=60, as_root=True)
@@ -121,52 +148,49 @@ async def check_update() -> dict:
                 update_available = bool(data.get("update_available"))
                 git_behind = bool(data.get("git_behind"))
                 message = str(data.get("message") or "")
+                # Prefer explicit check_ok; if missing, require remote_version
+                if "check_ok" in data:
+                    check_ok = bool(data.get("check_ok"))
+                else:
+                    check_ok = bool(remote)
+                if not check_ok:
+                    update_available = False
+                    message = message or "دریافت نسخه از گیت‌هاب ناموفق"
                 return {
                     "available": True,
-                    "update_available": update_available,
+                    "check_ok": check_ok,
+                    "update_available": update_available if check_ok else False,
                     "local_version": local,
-                    "remote_version": remote or local,
+                    "remote_version": remote,
                     "git_behind": git_behind,
                     "message": message
                     or (
                         "نسخه جدید موجود است"
                         if update_available
                         else "پنل به‌روز است"
+                        if check_ok
+                        else "بررسی آپدیت ناموفق"
                     ),
                 }
             except json.JSONDecodeError:
                 logger.warning("check-update bad JSON: %s", out[:400])
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "curl",
-            "-fsSL",
-            "--max-time",
-            "15",
-            _VERSION_URL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=20)
-        if proc.returncode == 0:
-            remote = (out_b or b"").decode().strip().splitlines()[0].strip()
-            if remote and _SAFE_VER.match(remote):
-                update_available = is_newer(remote, local)
-                message = (
-                    "نسخه جدید موجود است" if update_available else "پنل به‌روز است"
-                )
-            else:
-                message = "نسخه ریموت نامعتبر بود"
-        else:
-            message = (err_b or b"").decode()[:200] or "دریافت نسخه ریموت ناموفق"
-    except Exception as exc:  # noqa: BLE001
-        message = f"بررسی آپدیت ممکن نشد: {exc}"
+    remote = await _fetch_remote_version()
+    if remote:
+        check_ok = True
+        update_available = is_newer(remote, local)
+        message = "نسخه جدید موجود است" if update_available else "پنل به‌روز است"
+    else:
+        check_ok = False
+        update_available = False
+        message = "دریافت نسخه از گیت‌هاب ناموفق — دوباره تلاش کنید"
 
     return {
         "available": available(),
+        "check_ok": check_ok,
         "update_available": update_available,
         "local_version": local,
-        "remote_version": remote or local,
+        "remote_version": remote,
         "git_behind": git_behind,
         "message": message,
     }

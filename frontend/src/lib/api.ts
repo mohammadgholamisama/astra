@@ -162,6 +162,7 @@ export interface SystemStats {
 
 export interface UpdateStatus {
   available: boolean;
+  check_ok?: boolean;
   update_available: boolean;
   local_version: string;
   remote_version: string;

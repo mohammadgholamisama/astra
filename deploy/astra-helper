@@ -402,18 +402,34 @@ read_local_version() {
   fi
 }
 
+fetch_remote_version() {
+  local v=""
+  local url
+  for url in \
+    "https://raw.githubusercontent.com/mohammadgholamisama/astra/main/VERSION" \
+    "https://cdn.jsdelivr.net/gh/mohammadgholamisama/astra@main/VERSION"
+  do
+    v="$(curl -fsSL --max-time 15 "$url" 2>/dev/null | head -n1 | tr -d '\r' | tr -d ' ' || true)"
+    if [[ -n "$v" && "$v" =~ ^[0-9A-Za-z._+-]+$ ]]; then
+      echo "$v"
+      return 0
+    fi
+  done
+  echo ""
+  return 1
+}
+
 cmd_check_update() {
-  # May run as root via sudo; prints one JSON line on stdout
-  local local_ver remote_ver git_behind=false update=false msg
+  # Prints one JSON line. check_ok=false means we could NOT verify — never imply "up to date".
+  local local_ver remote_ver git_behind=false update=false check_ok=false msg
   local_ver="$(read_local_version)"
-  remote_ver="$(curl -fsSL --max-time 20 \
-    "https://raw.githubusercontent.com/mohammadgholamisama/astra/main/VERSION" 2>/dev/null \
-    | head -n1 | tr -d '\r' | tr -d ' ' || true)"
+  remote_ver="$(fetch_remote_version || true)"
 
   if [[ -z "$remote_ver" ]]; then
-    printf '%s\n' "{\"local_version\":\"${local_ver}\",\"remote_version\":\"\",\"update_available\":false,\"git_behind\":false,\"message\":\"دریافت نسخه ریموت ناموفق\"}"
+    printf '%s\n' "{\"check_ok\":false,\"local_version\":\"${local_ver}\",\"remote_version\":\"\",\"update_available\":false,\"git_behind\":false,\"message\":\"دریافت نسخه از گیت‌هاب ناموفق — دوباره تلاش کنید\"}"
     return 0
   fi
+  check_ok=true
 
   # Semver-ish compare via sort -V
   if [[ "$(printf '%s\n%s\n' "$local_ver" "$remote_ver" | sort -V | tail -n1)" == "$remote_ver" \
@@ -422,6 +438,7 @@ cmd_check_update() {
   fi
 
   if [[ -d "${ASTRA_ROOT}/.git" ]]; then
+    # fetch may fail for user astra; try anyway (works as root)
     if git -C "$ASTRA_ROOT" fetch origin main --quiet 2>/dev/null; then
       local local_sha remote_sha
       local_sha="$(git -C "$ASTRA_ROOT" rev-parse HEAD 2>/dev/null || true)"
@@ -439,7 +456,7 @@ cmd_check_update() {
     msg="پنل به‌روز است"
   fi
 
-  printf '%s\n' "{\"local_version\":\"${local_ver}\",\"remote_version\":\"${remote_ver}\",\"update_available\":${update},\"git_behind\":${git_behind},\"message\":\"${msg}\"}"
+  printf '%s\n' "{\"check_ok\":true,\"local_version\":\"${local_ver}\",\"remote_version\":\"${remote_ver}\",\"update_available\":${update},\"git_behind\":${git_behind},\"message\":\"${msg}\"}"
 }
 
 cmd_apply_update() {
