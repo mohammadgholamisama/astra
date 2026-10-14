@@ -32,7 +32,8 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ADAPTER_TIMEOUT: float = 25.0
     # Min seconds between remote usage polls per user (sub page / clients)
-    USAGE_REFRESH_SECONDS: int = 60
+    # Client sub feed throttle; HTML/admin use force=True for live pulls
+    USAGE_REFRESH_SECONDS: int = 45
     # Official install helper for SSL / nginx (empty = SSL UI disabled)
     ASTRA_HELPER: str = ""
     ASTRA_APP_PORT: int = 8000

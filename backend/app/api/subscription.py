@@ -1,4 +1,7 @@
+import asyncio
 import base64
+import logging
+import re
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
@@ -24,6 +27,26 @@ from app.services.sub_page import render_subscription_page
 from app.services.users import load_user_by_token, subscription_url
 
 router = APIRouter(tags=["Subscription"])
+logger = logging.getLogger("astra.sub")
+
+# Known subscription / proxy client User-Agents (never serve HTML to these)
+_CLIENT_UA = re.compile(
+    r"v2ray|clash|sing-?box|hiddify|streisand|nekobox|nekoray|shadowrocket|"
+    r"quantumult|surge|loon|stash|okhttp|go-http-client|dart[:/]|cfnetwork|"
+    r"v2box|foxray|napsternet|oneclick|sfa|sfi|sfm|surface|karing|flclash|"
+    r"happ|v2raytun|streisand|pharos|proxy|vpn",
+    re.I,
+)
+_BROWSER_UA = re.compile(
+    r"mozilla/|chrome/|safari/|firefox/|edg/|opr/|crios/|fxios/",
+    re.I,
+)
+
+
+def _header_base64(text: str) -> str:
+    """Encode non-ASCII profile titles the way v2rayNG / Clash expect."""
+    raw = (text or "").strip() or "Astra"
+    return "base64:" + base64.b64encode(raw.encode("utf-8")).decode("ascii")
 
 
 def _sub_headers(user) -> dict[str, str]:
@@ -34,21 +57,52 @@ def _sub_headers(user) -> dict[str, str]:
     expire = int(user.expire or 0)
     brand = get_brand_name()
     title_name = (getattr(user, "display_name", None) or "").strip() or user.username
-    support = get_link_support() or get_sub_base_url()
-    return {
-        "profile-title": f"{brand}-{title_name}",
+    support = (get_link_support() or get_sub_base_url() or "").strip()
+    headers = {
+        "profile-title": _header_base64(f"{brand}-{title_name}"),
         "profile-update-interval": "12",
         "subscription-userinfo": f"upload={upload}; download={download}; total={total}; expire={expire}",
-        "support-url": support,
+        # Help some clients / CDNs
+        "content-disposition": 'attachment; filename="Astra"',
     }
+    if support.startswith("http://") or support.startswith("https://"):
+        headers["support-url"] = support
+    return headers
 
 
-def _is_browser(request: Request) -> bool:
-    accept = (request.headers.get("accept") or "").lower()
-    ua = (request.headers.get("user-agent") or "").lower()
-    if "v2ray" in ua or "clash" in ua or "sing-box" in ua or "hiddify" in ua or "streisand" in ua:
+def _wants_html_page(request: Request) -> bool:
+    """
+    Only real browsers get the pretty HTML page.
+    Default = subscription feed (base64). False positives break client import.
+    """
+    raw = (request.query_params.get("raw") or "").lower()
+    if raw in ("1", "true", "yes"):
         return False
-    return "text/html" in accept
+    html_q = (request.query_params.get("html") or "").lower()
+    if html_q in ("1", "true", "yes"):
+        return True
+
+    ua = request.headers.get("user-agent") or ""
+    if not ua.strip():
+        return False
+    if _CLIENT_UA.search(ua):
+        return False
+    if not _BROWSER_UA.search(ua):
+        return False
+
+    accept = (request.headers.get("accept") or "").lower()
+    # Prefer HTML only when Accept explicitly asks for it
+    if "text/html" not in accept:
+        return False
+    return True
+
+
+def _encode_feed(links: list[str]) -> str:
+    """Standard base64 subscription body (one share-link per line)."""
+    body = "\n".join(x.strip() for x in links if (x or "").strip())
+    if not body:
+        return ""
+    return base64.b64encode(body.encode("utf-8")).decode("ascii")
 
 
 @router.get("/sub/{token}")
@@ -61,24 +115,44 @@ async def get_subscription(
     if not user:
         return PlainTextResponse("Not found", status_code=404)
 
-    # Browser → pretty HTML page (unless ?raw=1 for client import)
-    raw = (request.query_params.get("raw") or "").lower() in ("1", "true", "yes")
-    if _is_browser(request) and not raw:
+    if _wants_html_page(request):
         return await subscription_page(token, db)
 
-    # Mutates user in-place; expire_on_commit=False → no second DB round-trip
-    await sync_subscription_state(db, user)
-    await db.commit()
+    # Fast path for V2Ray clients: never block long on remote usage sync.
+    # Cached links + headers first; usage refresh is best-effort ≤2s.
+    try:
+        await asyncio.wait_for(sync_subscription_state(db, user, force=False), timeout=2.0)
+        await db.commit()
+    except asyncio.TimeoutError:
+        logger.warning("sub sync timeout user=%s — serving cached links", user.username)
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("sub sync error user=%s: %s — serving cached links", user.username, exc)
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
 
     headers = _sub_headers(user)
 
-    # Exhausted / expired / disabled → empty feed so clients drop configs
     if user.status not in (UserStatus.active, UserStatus.on_hold):
-        return Response(content="", media_type="text/plain", headers=headers)
+        return Response(
+            content="",
+            media_type="text/plain; charset=utf-8",
+            headers=headers,
+        )
 
-    links = await collect_links(user)
-    content = base64.b64encode("\n".join(links).encode()).decode()
-    return Response(content=content, media_type="text/plain", headers=headers)
+    # Client feed: real share links only (no fake notice configs — they break imports)
+    links = await collect_links(user, include_notices=False)
+    content = _encode_feed(links)
+    return Response(
+        content=content,
+        media_type="text/plain; charset=utf-8",
+        headers=headers,
+    )
 
 
 @router.get("/sub/{token}/info", response_class=HTMLResponse)
@@ -88,10 +162,17 @@ async def subscription_page(token: str, db: AsyncSession = Depends(get_db)):
         return HTMLResponse("<h1>Not found</h1>", status_code=404)
 
     await ensure_loaded(db)
-    await sync_subscription_state(db, user)
-    await db.commit()
+    try:
+        await asyncio.wait_for(sync_subscription_state(db, user, force=True), timeout=8.0)
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("sub page sync: %s", exc)
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
 
-    configs = collect_links_detailed(user)
+    configs = collect_links_detailed(user, include_notices=True)
     panels_usage = await usage_breakdown_for_user(db, user)
     device_limit = await device_limit_for_user(db, user)
     status = user.status.value if hasattr(user.status, "value") else str(user.status)

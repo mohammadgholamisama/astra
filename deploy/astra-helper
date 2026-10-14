@@ -25,6 +25,8 @@ ALLOWED_ENV_KEYS=(
   ASTRA_SSL_PANEL
   ASTRA_SSL_SUB
   ASTRA_HELPER
+  ADMIN_USERNAME
+  ADMIN_PASSWORD
 )
 
 die() { echo "astra-helper: $*" >&2; exit 1; }
@@ -634,6 +636,76 @@ cmd_apply_update() {
   printf '%s\n' "{\"ok\":true,\"local_version\":\"${ver}\",\"remote_version\":\"${ver}\",\"message\":\"updated\"}"
 }
 
+cmd_set_admin() {
+  need_root
+  local new_user="${1:-}" new_pass="${2:-}"
+  [[ -n "$new_user" && -n "$new_pass" ]] || die "usage: set-admin <username> <password>"
+  [[ "$new_user" =~ ^[A-Za-z0-9_.@-]{3,64}$ ]] || die "invalid username (3-64: letters, digits, _ . @ -)"
+  [[ "${#new_pass}" -ge 8 ]] || die "password must be at least 8 characters"
+  [[ "$new_pass" != *$'\n'* && "$new_pass" != *$'\r'* ]] || die "invalid password"
+  [[ -f "$ENV_FILE" ]] || die ".env missing"
+
+  set_env_key ADMIN_USERNAME "$new_user"
+  set_env_key ADMIN_PASSWORD "$new_pass"
+
+  # Update / create admin row in isolated SQLite (do not touch other DBs)
+  export ADMIN_USERNAME="$new_user"
+  export ADMIN_PASSWORD="$new_pass"
+  # shellcheck disable=SC1091
+  set -a
+  # Load rest of .env for DATABASE_URL / SECRET_KEY without overriding the two we set
+  # shellcheck disable=SC1090
+  source <(grep -vE '^(ADMIN_USERNAME|ADMIN_PASSWORD)=' "$ENV_FILE" | sed 's/\r$//' || true)
+  set +a
+  export ADMIN_USERNAME="$new_user"
+  export ADMIN_PASSWORD="$new_pass"
+
+  sudo -u astra -E bash -c "
+    set -e
+    cd '${ASTRA_ROOT}/backend'
+    . .venv/bin/activate
+    python - <<'PY'
+import asyncio
+import os
+from sqlalchemy import select
+from app.core.database import AsyncSessionLocal
+from app.core.security import hash_password
+from app.models.admin import Admin
+
+new_user = os.environ['ADMIN_USERNAME'].strip()
+new_pass = os.environ['ADMIN_PASSWORD']
+
+async def main():
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(select(Admin).order_by(Admin.id))).scalars().all()
+        target = None
+        for a in rows:
+            if a.is_sudo:
+                target = a
+                break
+        if target is None and rows:
+            target = rows[0]
+        for a in rows:
+            if a is not target and a.username == new_user:
+                await db.delete(a)
+        if target is None:
+            db.add(Admin(username=new_user, hashed_password=hash_password(new_pass), is_sudo=True))
+        else:
+            target.username = new_user
+            target.hashed_password = hash_password(new_pass)
+            target.is_sudo = True
+            target.is_active = True
+        await db.commit()
+        print('admin updated:', new_user)
+
+asyncio.run(main())
+PY
+  " || die "failed to update admin in database"
+
+  cmd_restart_astra
+  echo "astra-helper: admin login set to user=${new_user}"
+}
+
 usage() {
   cat <<EOF
 Usage: astra-helper <command> [args]
@@ -643,6 +715,7 @@ Commands:
   write-nginx [path-to-conf]   # omit path → render from .env state
   issue-ssl <domain>
   set-env <KEY> <VALUE>        # allowed keys only
+  set-admin <username> <password>
   restart-astra
   check-update                 # JSON status (preserves data)
   apply-update                 # pull latest; keeps .env + data/
@@ -658,6 +731,7 @@ main() {
     write-nginx)   cmd_write_nginx "${1:-}" ;;
     issue-ssl)     cmd_issue_ssl "${1:-}" ;;
     set-env)       cmd_set_env "${1:-}" "${2:-}" ;;
+    set-admin)     cmd_set_admin "${1:-}" "${2:-}" ;;
     restart-astra) cmd_restart_astra ;;
     check-update)  cmd_check_update ;;
     apply-update)  cmd_apply_update ;;

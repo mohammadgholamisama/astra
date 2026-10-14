@@ -543,29 +543,67 @@ class SanaeiAdapter(BasePanelAdapter):
         except Exception as e:
             return AdapterResult(success=False, error=str(e))
 
+    @staticmethod
+    def _sum_up_down(obj: Any) -> int | None:
+        """Extract used bytes from traffic payload (dict or list of clients)."""
+        if isinstance(obj, list):
+            total = 0
+            found = False
+            for item in obj:
+                if not isinstance(item, dict):
+                    continue
+                found = True
+                total += int(item.get("up") or 0) + int(item.get("down") or 0)
+            return total if found else None
+        if isinstance(obj, dict):
+            if "up" in obj or "down" in obj:
+                return int(obj.get("up") or 0) + int(obj.get("down") or 0)
+            # nested client / obj
+            nested = obj.get("client") or obj.get("obj")
+            if nested is not None and nested is not obj:
+                return SanaeiAdapter._sum_up_down(nested)
+        return None
+
     async def get_usage(self, username: str, remote_id: str | None = None) -> AdapterResult:
         try:
-            email = remote_id or username
-            resp = await self._request("GET", f"panel/api/clients/traffic/{email}")
-            ok, data = ok_json(resp)
-            if ok and isinstance(data, dict):
-                obj = data.get("obj") or data
-                if isinstance(obj, dict):
-                    up = int(obj.get("up") or 0)
-                    down = int(obj.get("down") or 0)
+            email = (remote_id or username or "").strip()
+            if not email:
+                return AdapterResult(success=False, error="email/username خالی است")
+
+            last_resp = None
+            last_data: Any = None
+            for path in (
+                f"panel/api/clients/traffic/{email}",
+                f"panel/api/inbounds/getClientTraffics/{email}",
+                f"panel/api/inbounds/getClientTrafficsByEmail/{email}",
+            ):
+                try:
+                    resp = await self._request("GET", path)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("sanaei get_usage %s: %s", path, exc)
+                    continue
+                last_resp = resp
+                ok, data = ok_json(resp)
+                last_data = data
+                if not ok:
+                    continue
+                obj: Any = data
+                if isinstance(data, dict):
+                    obj = data.get("obj") if data.get("obj") is not None else data
+                used = self._sum_up_down(obj)
+                if used is not None:
                     return AdapterResult(
-                        success=True, remote_username=email, used_traffic=up + down, raw=data
+                        success=True,
+                        remote_username=email,
+                        used_traffic=used,
+                        raw=data,
                     )
-            resp2 = await self._request("GET", f"panel/api/inbounds/getClientTraffics/{email}")
-            ok2, data2 = ok_json(resp2)
-            if ok2 and isinstance(data2, dict):
-                obj = data2.get("obj") or {}
-                up = int(obj.get("up") or 0)
-                down = int(obj.get("down") or 0)
+
+            if last_resp is not None:
                 return AdapterResult(
-                    success=True, remote_username=email, used_traffic=up + down, raw=data2
+                    success=False, error=self._explain_fail(last_resp, last_data)
                 )
-            return AdapterResult(success=False, error=self._explain_fail(resp, data))
+            return AdapterResult(success=False, error="دریافت ترافیک سنایی ناموفق")
         except Exception as e:
             return AdapterResult(success=False, error=str(e))
 

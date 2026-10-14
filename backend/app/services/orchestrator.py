@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from datetime import datetime, timezone
 
@@ -13,9 +14,61 @@ from app.models.group import GroupPanel, UserGroup
 from app.models.panel import Panel
 from app.models.user import PanelAccount, PanelAccountStatus, User, UserStatus
 
+logger = logging.getLogger("astra.usage")
+
 # Per-user locks to avoid stampede on concurrent sub fetches
 _user_locks: dict[int, asyncio.Lock] = {}
 _locks_guard = asyncio.Lock()
+
+
+def coefficient_from_config(config: dict | None) -> float:
+    raw = (config or {}).get("coefficient", 1)
+    try:
+        c = float(raw if raw is not None else 1)
+    except (TypeError, ValueError):
+        c = 1.0
+    if c < 0.01:
+        c = 0.01
+    return c
+
+
+def remote_data_limit_bytes(user_limit: int, config: dict | None) -> int:
+    """Bytes to set on remote panel = Astra quota ÷ coefficient.
+
+    coeff 1 + 1GiB Astra → 1GiB on panel
+    coeff 2 + 1GiB Astra → 512MiB on panel (user still sees 1GiB in Astra)
+    """
+    limit = int(user_limit or 0)
+    if limit <= 0:
+        return 0
+    coeff = coefficient_from_config(config)
+    return max(1, int(limit / coeff))
+
+
+def build_user_payload(
+    user: User,
+    *,
+    uuid: str | None,
+    panel_config: dict | None,
+) -> UserPayload:
+    """Build remote payload with coefficient-scaled data_limit."""
+    cfg = {
+        **(panel_config or {}),
+        "proxy_settings": user.proxy_settings or {},
+        "data_limit_reset_strategy": user.data_limit_reset_strategy,
+    }
+    explicit_proxies = (user.proxy_settings or {}).get("proxies")
+    if isinstance(explicit_proxies, dict) and explicit_proxies:
+        cfg["proxies"] = explicit_proxies
+    return UserPayload(
+        username=user.username,
+        data_limit=remote_data_limit_bytes(user.data_limit or 0, cfg),
+        expire=user.expire or None,
+        status=user.status.value,
+        note=user.note,
+        uuid=uuid,
+        config=cfg,
+    )
 
 
 async def _lock_for_user(user_id: int) -> asyncio.Lock:
@@ -92,26 +145,9 @@ async def provision_user_on_panels(
             db.add(account)
             await db.flush()
 
-        cfg = {
-            **(config or {}),
-            "proxy_settings": user.proxy_settings or {},
-            "data_limit_reset_strategy": user.data_limit_reset_strategy,
-        }
         # Only pass explicit proxies from user settings — never force vless/vmess.
-        # Marzban/Rebecca build proxies from group protocols/inbounds themselves.
-        explicit_proxies = (user.proxy_settings or {}).get("proxies")
-        if isinstance(explicit_proxies, dict) and explicit_proxies:
-            cfg["proxies"] = explicit_proxies
-
-        payload = UserPayload(
-            username=user.username,
-            data_limit=user.data_limit or 0,
-            expire=user.expire or None,
-            status=user.status.value,
-            note=user.note,
-            uuid=account.uuid,
-            config=cfg,
-        )
+        # data_limit on remote = Astra limit ÷ panel coefficient
+        payload = build_user_payload(user, uuid=account.uuid, panel_config=config)
         jobs.append((account, panel, payload))
 
     # 2) Parallel: remote HTTP only
@@ -193,23 +229,7 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
         if not panel or not panel.is_active:
             continue
         merged = dict(panel_cfg.get(panel.id) or {})
-        cfg = {
-            **merged,
-            "proxy_settings": user.proxy_settings or {},
-            "data_limit_reset_strategy": user.data_limit_reset_strategy,
-        }
-        explicit_proxies = (user.proxy_settings or {}).get("proxies")
-        if isinstance(explicit_proxies, dict) and explicit_proxies:
-            cfg["proxies"] = explicit_proxies
-        payload = UserPayload(
-            username=user.username,
-            data_limit=user.data_limit or 0,
-            expire=user.expire or None,
-            status=user.status.value,
-            note=user.note,
-            uuid=account.uuid,
-            config=cfg,
-        )
+        payload = build_user_payload(user, uuid=account.uuid, panel_config=merged)
         jobs.append((account, panel, payload))
 
     async def _remote(panel: Panel, payload: UserPayload) -> AdapterResult:
@@ -317,20 +337,30 @@ async def retry_failed_accounts(db: AsyncSession, user: User) -> list[PanelAccou
     return await provision_user_on_panels(db, user, panels)
 
 
-async def collect_links(user: User) -> list[str]:
-    return [row["link"] for row in collect_links_detailed(user)]
+async def collect_links(user: User, *, include_notices: bool = False) -> list[str]:
+    return [
+        row["link"]
+        for row in collect_links_detailed(user, include_notices=include_notices)
+        if row.get("link")
+    ]
 
 
-def collect_links_detailed(user: User) -> list[dict]:
+def collect_links_detailed(user: User, *, include_notices: bool = True) -> list[dict]:
     """All unique share links across panels.
 
-    Group notices are prepended first.
+    Notices (fake configs) are for the HTML sub page only — omit them from
+    client subscription feeds so V2Ray apps import real configs cleanly.
     Real config remarks: «اسم 🟢 حجم‌باقی #آیدی» (no panel name).
     """
     from app.services.link_remark import apply_display_name, notice_rows_from_groups
 
-    notices = notice_rows_from_groups(list(user.__dict__.get("groups") or []))
+    notices = (
+        notice_rows_from_groups(list(user.__dict__.get("groups") or []))
+        if include_notices
+        else []
+    )
     rows: list[dict] = []
+    http_fallback: list[dict] = []
     seen: set[str] = set()
     for account in user.panel_accounts or []:
         if account.status != PanelAccountStatus.active:
@@ -339,11 +369,20 @@ def collect_links_detailed(user: User) -> list[dict]:
         panel_name = getattr(panel, "name", None) if panel is not None else None
         label = panel_name or f"پنل #{account.panel_id}"
         for link in account.links or []:
-            if link and link not in seen:
-                seen.add(link)
-                rows.append({"link": link, "panel": label, "panel_id": account.panel_id})
+            text = (link or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            low = text.lower()
+            row = {"link": text, "panel": label, "panel_id": account.panel_id}
+            # Prefer share protocols in client feeds; keep http only as fallback
+            if low.startswith("http://") or low.startswith("https://"):
+                http_fallback.append(row)
+            else:
+                rows.append(row)
+    use_rows = rows if rows else http_fallback
     renamed = apply_display_name(
-        rows,
+        use_rows,
         getattr(user, "display_name", None),
         used=int(user.used_traffic or 0),
         limit=int(user.data_limit or 0),
@@ -353,11 +392,15 @@ def collect_links_detailed(user: User) -> list[dict]:
 
 
 async def usage_breakdown_for_user(db: AsyncSession, user: User) -> list[dict]:
-    """Per-panel raw usage × coefficient → weighted (for sub page chart)."""
+    """Per-panel raw usage × coefficient → weighted (admin / internal)."""
     coeffs = await panel_coefficients_for_user(db, user)
+    user_limit = int(user.data_limit or 0)
     rows: list[dict] = []
     for account in user.panel_accounts or []:
-        if account.status != PanelAccountStatus.active:
+        if account.status not in (
+            PanelAccountStatus.active,
+            PanelAccountStatus.error,
+        ):
             continue
         panel = account.__dict__.get("panel")
         name = getattr(panel, "name", None) if panel is not None else None
@@ -367,6 +410,7 @@ async def usage_breakdown_for_user(db: AsyncSession, user: User) -> list[dict]:
         if coeff < 0.01:
             coeff = 0.01
         weighted = int(round(raw * coeff))
+        remote_limit = remote_data_limit_bytes(user_limit, {"coefficient": coeff})
         n_links = len([x for x in (account.links or []) if x])
         rows.append(
             {
@@ -375,6 +419,7 @@ async def usage_breakdown_for_user(db: AsyncSession, user: User) -> list[dict]:
                 "raw": raw,
                 "coefficient": coeff,
                 "weighted": weighted,
+                "remote_limit": remote_limit,
                 "configs": n_links,
             }
         )
@@ -429,10 +474,15 @@ async def _weighted_total(
 ) -> int:
     total = 0
     for account in accounts:
-        if account.status != PanelAccountStatus.active:
+        if account.status not in (
+            PanelAccountStatus.active,
+            PanelAccountStatus.error,
+        ):
             continue
         raw = int(account.used_traffic or 0)
         coeff = float(coeffs.get(account.panel_id, 1.0) or 1.0)
+        if coeff < 0.01:
+            coeff = 0.01
         total += int(round(raw * coeff))
     return total
 
@@ -468,13 +518,13 @@ async def refresh_usage(
     force: bool = False,
     min_interval: int | None = None,
 ) -> int:
-    """Refresh remote usage and apply per-panel Astra coefficients.
+    """Pull live usage from remote panels and apply Astra coefficients.
 
-    PanelAccount.used_traffic stays raw (from remote).
-    User.used_traffic = sum(raw_i * coefficient_i) across active panels.
+    PanelAccount.used_traffic = raw bytes from panel.
+    User.used_traffic = sum(raw_i * coefficient_i)  (what the end-user sees).
 
-    When not force and last sync is fresh (< min_interval), only recompute
-    weighted total from cached raw values (no remote calls).
+    Remotes already received (quota ÷ coeff) as their data_limit, so when a
+    coeff-2 panel reports 500MB used, Astra shows 1GB — matching the user’s quota.
     """
     settings = get_settings()
     interval = settings.USAGE_REFRESH_SECONDS if min_interval is None else min_interval
@@ -491,26 +541,52 @@ async def refresh_usage(
     if need_remote:
 
         async def _remote(account: PanelAccount) -> tuple[PanelAccount, AdapterResult | None]:
-            if not account.panel or account.status != PanelAccountStatus.active:
+            # Pull usage for active (and error — may still exist on remote)
+            if not account.panel or account.status not in (
+                PanelAccountStatus.active,
+                PanelAccountStatus.error,
+            ):
+                return account, None
+            if not (account.remote_username or account.remote_id or user.username):
                 return account, None
             adapter = get_adapter(account.panel)
+            uname = (account.remote_username or user.username or "").strip()
+            rid = (account.remote_id or account.remote_username or uname or None)
             try:
+                # Short timeout — sub clients must not wait on slow panels
                 res = await asyncio.wait_for(
-                    adapter.get_usage(user.username, account.remote_id),
-                    timeout=20,
+                    adapter.get_usage(uname, rid),
+                    timeout=8 if force else 3,
                 )
                 return account, res
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "get_usage exception user=%s panel=%s: %s",
+                    user.username,
+                    account.panel_id,
+                    exc,
+                )
                 return account, None
 
         outcomes = await asyncio.gather(*[_remote(a) for a in accounts])
         now = datetime.now(timezone.utc)
         for account, res in outcomes:
-            if res and res.success:
+            if res is None:
+                continue
+            if res.success:
                 account.used_traffic = int(res.used_traffic or 0)
                 if res.links:
                     account.links = res.links
                 account.last_sync_at = now
+                if account.panel:
+                    account.panel.last_ok_at = now
+            else:
+                logger.warning(
+                    "get_usage failed user=%s panel=%s: %s",
+                    user.username,
+                    account.panel_id,
+                    res.error,
+                )
 
     total = await _weighted_total(accounts, coeffs)
     user.used_traffic = total

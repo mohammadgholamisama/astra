@@ -140,7 +140,9 @@ async def get_user(
     user = await load_user(db, username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    await orchestrator.sync_subscription_state(db, user)
+    # Live pull from remotes + push coeff-scaled limits
+    await orchestrator.sync_subscription_state(db, user, force=True)
+    await orchestrator.sync_modify_user(db, user)
     await db.commit()
     user = await load_user(db, username)
     return to_user_response(user)  # type: ignore[arg-type]

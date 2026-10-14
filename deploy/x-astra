@@ -354,28 +354,27 @@ cmd_update() {
   pause
 }
 
-# ─── 9) Admin / paths ────────────────────────────────────────
-cmd_admin_hint() {
+# ─── 9) Change admin login ───────────────────────────────────
+cmd_change_admin() {
   header
-  echo -e "${BOLD}9) Admin & paths${NC}"
+  echo -e "${BOLD}9) Change admin login${NC}"
   echo
-  info "Env file:     $ENV_FILE"
-  info "Install root: $ASTRA_ROOT"
-  info "Database:     $(get_env DATABASE_URL)"
-  info "Helper:       $HELPER"
-  info "Service:      systemctl status astra"
-  info "nginx site:   /etc/nginx/sites-available/astra"
+  local cur_user new_user new_pass new_pass2
+  cur_user="$(get_env ADMIN_USERNAME "")"
+  info "Current username: ${cur_user:-"(unknown)"}"
+  info "Panel DB + .env will be updated; service restarts."
   echo
-  echo -e "${YELLOW}Reset admin password:${NC}"
-  echo "  1. Edit ADMIN_PASSWORD in $ENV_FILE"
-  echo "  2. Remove the admin row from SQLite (or wipe only Astra DB), then:"
-  echo "     systemctl restart astra"
-  echo "  Seed recreates admin from ADMIN_USERNAME / ADMIN_PASSWORD on startup"
-  echo "  if that username does not already exist."
+  read -r -p "New username: " new_user
+  [[ -n "$new_user" ]] || { err "Username required"; pause; return; }
+  read -r -s -p "New password (min 8 chars): " new_pass
   echo
-  echo "  Current ADMIN_USERNAME=$(get_env ADMIN_USERNAME admin)"
+  read -r -s -p "Confirm password: " new_pass2
   echo
-  warn "Do not share .env — contains SECRET_KEY and admin password."
+  [[ "$new_pass" == "$new_pass2" ]] || { err "Passwords do not match"; pause; return; }
+  [[ "${#new_pass}" -ge 8 ]] || { err "Password must be at least 8 characters"; pause; return; }
+  confirm "Set login to user='${new_user}'?" || { info "Cancelled"; pause; return; }
+  run_helper set-admin "$new_user" "$new_pass"
+  ok "Admin login updated. Use the new username/password in the panel."
   pause
 }
 
@@ -440,7 +439,7 @@ main_menu() {
     echo "  6) Issue/renew SSL — subscription domain"
     echo "  7) Restart services"
     echo "  8) Update panel from git"
-    echo "  9) Admin & paths"
+    echo "  9) Change admin login (username / password)"
     echo " 10) Uninstall Astra (remove completely)"
     echo "  0) Exit"
     echo
@@ -454,7 +453,7 @@ main_menu() {
       6) cmd_ssl_sub ;;
       7) cmd_restart ;;
       8) cmd_update ;;
-      9) cmd_admin_hint ;;
+      9) cmd_change_admin ;;
       10) cmd_uninstall ;;
       0|q|Q) echo "Bye."; exit 0 ;;
       *) warn "Invalid option"; sleep 1 ;;

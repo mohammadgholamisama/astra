@@ -68,6 +68,7 @@ type PanelUsageRow = {
   raw: number;
   coefficient: number;
   weighted: number;
+  remoteLimit: number;
   configs: number;
 };
 
@@ -88,18 +89,22 @@ function coeffsFromGroups(groups: Group[], groupIds: number[]): Map<number, numb
 
 function panelUsageRows(u: User, groups: Group[]): PanelUsageRow[] {
   const coeffs = coeffsFromGroups(groups, u.group_ids || []);
+  const astraLimit = Number(u.data_limit) || 0;
   const rows: PanelUsageRow[] = [];
   for (const a of u.panel_accounts || []) {
     if (a.status !== "active" && a.status !== "error") continue;
     const raw = Number(a.used_traffic) || 0;
     const coefficient = coeffs.get(a.panel_id) ?? 1;
     const weighted = Math.round(raw * coefficient);
+    const remoteLimit =
+      astraLimit > 0 ? Math.max(1, Math.floor(astraLimit / coefficient)) : 0;
     rows.push({
       panelId: a.panel_id,
       name: a.panel_name || `پنل #${a.panel_id}`,
       raw,
       coefficient,
       weighted,
+      remoteLimit,
       configs: (a.links || []).filter(Boolean).length,
     });
   }
@@ -1011,7 +1016,8 @@ export default function UsersPage() {
             </header>
 
             <p className="usage-modal-hint">
-              مصرف خام هر پنل × ضریب همان پنل = سهم از حجم Astra. جمع این مقادیر برابر مصرف کل است.
+              حجم روی پنل ریموت = سقف Astra ÷ ضریب (کاربر فقط سقف Astra را می‌بیند). مصرف نمایشی =
+              مصرف خام پنل × ضریب. با باز کردن این پنجره، مصرف زنده از پنل‌ها خوانده می‌شود.
             </p>
 
             <div className="usage-modal-total">
@@ -1050,6 +1056,12 @@ export default function UsersPage() {
                       <div className="usage-panel-meta">
                         <span>خام: {formatTraffic(row.raw, { empty: "۰" })}</span>
                         <span>ضریب ×{toFaDigits(coeffLabel)}</span>
+                        <span>
+                          روی پنل:{" "}
+                          {row.remoteLimit > 0
+                            ? formatTraffic(row.remoteLimit, { empty: "۰" })
+                            : "نامحدود"}
+                        </span>
                         <span>{toFaDigits(row.configs)} کانفیگ</span>
                         <span>{toFaDigits(share)}٪ از کل</span>
                       </div>
