@@ -677,24 +677,27 @@ new_pass = os.environ['ADMIN_PASSWORD']
 
 async def main():
     async with AsyncSessionLocal() as db:
-        rows = (await db.execute(select(Admin).order_by(Admin.id))).scalars().all()
-        target = None
+        hashed = hash_password(new_pass)
+        rows = list((await db.execute(select(Admin).order_by(Admin.id))).scalars().all())
+        # Prefer keep first sudo row id (api_keys FK); wipe everyone else first
+        keep = next((a for a in rows if a.is_sudo), rows[0] if rows else None)
         for a in rows:
-            if a.is_sudo:
-                target = a
-                break
-        if target is None and rows:
-            target = rows[0]
-        for a in rows:
-            if a is not target and a.username == new_user:
-                await db.delete(a)
-        if target is None:
-            db.add(Admin(username=new_user, hashed_password=hash_password(new_pass), is_sudo=True))
+            if keep is not None and a.id == keep.id:
+                continue
+            await db.delete(a)
+        await db.flush()  # UNIQUE-safe: conflicts gone before rename
+
+        if keep is None:
+            db.add(Admin(username=new_user, hashed_password=hashed, is_sudo=True, is_active=True))
         else:
-            target.username = new_user
-            target.hashed_password = hash_password(new_pass)
-            target.is_sudo = True
-            target.is_active = True
+            # Temp rename avoids UNIQUE if somehow still colliding mid-flush
+            if keep.username != new_user:
+                keep.username = f\"__tmp_{keep.id}__\"
+                await db.flush()
+            keep.username = new_user
+            keep.hashed_password = hashed
+            keep.is_sudo = True
+            keep.is_active = True
         await db.commit()
         print('admin updated:', new_user)
 
