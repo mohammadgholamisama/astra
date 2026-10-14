@@ -1,6 +1,8 @@
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,6 +25,7 @@ from app.schemas.panel import (
 )
 
 router = APIRouter(tags=["Panel"])
+logger = logging.getLogger("astra.panels")
 
 
 async def _close_adapter(adapter) -> None:
@@ -40,11 +43,20 @@ async def _fetch_sanaei_inbounds(panel: Panel) -> list[InboundOut]:
     adapter = get_adapter(panel)
     try:
         rows = await adapter.list_inbounds()  # type: ignore[attr-defined]
+        out: list[InboundOut] = []
+        for row in rows:
+            try:
+                out.append(InboundOut(**row))
+            except ValidationError as ve:
+                logger.warning("skip inbound row %s: %s", row, ve)
+                continue
+        return out
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"دریافت اینباندها ناموفق: {exc}") from exc
+        msg = str(exc).strip() or exc.__class__.__name__
+        logger.exception("sanaei inbounds failed for %s: %s", panel.base_url, msg)
+        raise HTTPException(status_code=400, detail=f"دریافت اینباندها ناموفق: {msg}") from exc
     finally:
         await _close_adapter(adapter)
-    return [InboundOut(**row) for row in rows]
 
 
 async def _fetch_pasarguard_groups(panel: Panel) -> list[RemoteGroupOut]:

@@ -47,7 +47,12 @@ class SanaeiAdapter(BasePanelAdapter):
 
     async def _get_client(self):
         if self._client is None:
-            self._client = make_client(self.base_url, self.meta.get("verify_ssl", False))
+            # 3x-ui /list can be large when many clients exist
+            self._client = make_client(
+                self.base_url,
+                self.meta.get("verify_ssl", False),
+                timeout=60.0,
+            )
         return self._client
 
     async def close(self) -> None:
@@ -183,16 +188,16 @@ class SanaeiAdapter(BasePanelAdapter):
             )
         return hint
 
-    async def list_inbounds(self) -> list[dict[str, Any]]:
-        if not self._token() and not (self.username and self.password):
-            self._require_token()
-        resp = await self._request("GET", "panel/api/inbounds/list")
-        ok, data = ok_json(resp)
-        if not ok:
-            resp = await self._request("GET", "panel/api/inbounds/list/slim")
-            ok, data = ok_json(resp)
-        if not ok:
-            raise RuntimeError(self._explain_fail(resp, data))
+    @staticmethod
+    def _coerce_port(raw: Any) -> int | None:
+        if raw is None or raw == "":
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_inbounds_obj(self, data: Any) -> list[dict[str, Any]]:
         obj = data.get("obj") if isinstance(data, dict) else data
         if not isinstance(obj, list):
             return []
@@ -200,16 +205,51 @@ class SanaeiAdapter(BasePanelAdapter):
         for item in obj:
             if not isinstance(item, dict) or "id" not in item:
                 continue
+            try:
+                iid = int(item["id"])
+            except (TypeError, ValueError):
+                continue
+            remark = item.get("remark") or item.get("tag") or ""
+            if not isinstance(remark, str):
+                remark = str(remark)
+            protocol = item.get("protocol") or ""
+            if not isinstance(protocol, str):
+                protocol = str(protocol)
             out.append(
                 {
-                    "id": int(item["id"]),
-                    "remark": (item.get("remark") or item.get("tag") or "") or "",
-                    "protocol": (item.get("protocol") or "") or "",
-                    "port": item.get("port"),
+                    "id": iid,
+                    "remark": remark,
+                    "protocol": protocol,
+                    "port": self._coerce_port(item.get("port")),
                     "enable": bool(item.get("enable", True)),
                 }
             )
         return out
+
+    async def list_inbounds(self) -> list[dict[str, Any]]:
+        if not self._token() and not (self.username and self.password):
+            self._require_token()
+        # Prefer slim — full /list embeds every client and can be huge/slow
+        last_resp = None
+        last_data: Any = None
+        for path in (
+            "panel/api/inbounds/list/slim",
+            "panel/api/inbounds/list",
+        ):
+            resp = await self._request("GET", path)
+            last_resp = resp
+            ok, data = ok_json(resp)
+            last_data = data
+            if not ok:
+                continue
+            rows = self._parse_inbounds_obj(data)
+            if rows or path.endswith("/list"):
+                return rows
+        raise RuntimeError(
+            self._explain_fail(last_resp, last_data)
+            if last_resp is not None
+            else "نتوانست لیست اینباند را از سنایی بگیرد"
+        )
 
     async def _list_inbound_ids(self) -> list[int]:
         configured = self.meta.get("inbound_ids") or []

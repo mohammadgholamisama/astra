@@ -47,7 +47,12 @@ def normalize_panel_base_url(url: str) -> str:
             break
     return urlunsplit((parts.scheme, parts.netloc, path, "", "")).rstrip("/")
 
-def make_client(base_url: str, verify_ssl: bool = False) -> httpx.AsyncClient:
+def make_client(
+    base_url: str,
+    verify_ssl: bool = False,
+    *,
+    timeout: float | None = None,
+) -> httpx.AsyncClient:
     """
     httpx client rooted at panel base (including webBasePath).
 
@@ -55,9 +60,12 @@ def make_client(base_url: str, verify_ssl: bool = False) -> httpx.AsyncClient:
     (without X-Requested-With it often masks auth failure as 404).
     """
     root = normalize_panel_base_url(base_url).rstrip("/") + "/"
+    t = float(timeout if timeout is not None else settings.ADAPTER_TIMEOUT)
+    # Connect fast; allow longer read for heavy panels (3x-ui full inbound list)
+    timeout_cfg = httpx.Timeout(t, connect=min(15.0, t))
     return httpx.AsyncClient(
         base_url=root,
-        timeout=settings.ADAPTER_TIMEOUT,
+        timeout=timeout_cfg,
         verify=verify_ssl,
         follow_redirects=True,
         headers={
