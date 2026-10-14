@@ -249,11 +249,16 @@ def render_subscription_page(
 <meta name="color-scheme" content="dark light"/>
 <meta name="theme-color" content="#0b1220"/>
 <title>{brand} · {user_esc}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@600;700&family=Vazirmatn:wght@400;500;600;700;800&display=swap" rel="stylesheet"/>
 <style>
 :root,[data-theme="dark"]{{
   --bg:#0b1220;--card:#121a2b;--line:#243149;--text:#e8eef7;--muted:#8b9bb4;
   --accent:#14b8a6;--danger:#f43f5e;--warn:#f59e0b;--ok:#10b981;--input:#0a101c;
   --shadow:0 1px 0 rgba(255,255,255,.04) inset,0 8px 24px rgba(0,0,0,.28);
+  --font:"Vazirmatn",Tahoma,"Segoe UI",system-ui,sans-serif;
+  --brand:"Fredoka","Vazirmatn",cursive,sans-serif;
   color-scheme:dark;
 }}
 [data-theme="light"]{{
@@ -266,7 +271,7 @@ def render_subscription_page(
 html{{-webkit-text-size-adjust:100%}}
 body{{
   margin:0;color:var(--text);background:var(--bg);
-  font:400 15px/1.55 Tahoma,"Segoe UI",system-ui,-apple-system,sans-serif;
+  font:400 15px/1.65 var(--font);
 }}
 .wrap{{
   max-width:640px;margin:0 auto;
@@ -280,7 +285,10 @@ body{{
 }}
 .hero-bar{{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}}
 .hero-id{{min-width:0;flex:1}}
-.brand{{margin:0;font-size:clamp(1.35rem,5.5vw,1.75rem);font-weight:700;letter-spacing:-.02em;color:var(--text)}}
+.brand{{
+  margin:0;font-size:clamp(1.35rem,5.5vw,1.75rem);font-weight:700;
+  letter-spacing:-.02em;color:var(--text);font-family:var(--brand);
+}}
 .user-pill{{
   display:inline-block;margin-top:8px;padding:5px 10px;border-radius:8px;
   background:var(--input);border:1px solid var(--line);font-size:.82rem;color:var(--muted);

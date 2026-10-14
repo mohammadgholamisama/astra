@@ -23,9 +23,9 @@
   --login-orb: rgba(45, 212, 191, 0.35);
   --login-card: linear-gradient(160deg, rgba(14, 32, 44, 0.78), rgba(8, 18, 28, 0.82));
   --board-card: rgba(10, 24, 34, 0.72);
-  --font: "Vazirmatn", system-ui, sans-serif;
-  --display: "Syne", "Vazirmatn", sans-serif;
-  --brand: "Fredoka", "Syne", cursive, sans-serif;
+  --font: "Vazirmatn", Tahoma, "Segoe UI", system-ui, sans-serif;
+  --display: "Vazirmatn", Tahoma, "Segoe UI", system-ui, sans-serif;
+  --brand: "Fredoka", "Vazirmatn", cursive, sans-serif;
   color-scheme: dark;
 }
 
@@ -99,6 +99,9 @@ summary,
 body {
   margin: 0;
   font-family: var(--font);
+  font-feature-settings: "ss01" 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   color: var(--text);
   background:
     radial-gradient(1000px 520px at 5% -10%, var(--glow-a), transparent 55%),
