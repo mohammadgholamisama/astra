@@ -1,16 +1,64 @@
-import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import { api, SystemStats } from "../lib/api";
+import { RefreshCw } from "lucide-react";
+import { ApiError, api, SystemStats, UpdateStatus } from "../lib/api";
 import { formatTraffic, toFaDigits } from "../lib/format";
 
 export default function DashboardPage() {
+  const qc = useQueryClient();
+  const [updateMsg, setUpdateMsg] = useState<{ type: "ok" | "err" | "info"; text: string } | null>(
+    null
+  );
+  const [updateInfo, setUpdateInfo] = useState<UpdateStatus | null>(null);
+
   const { data, isLoading, error, isFetching, refetch } = useQuery({
     queryKey: ["system"],
     queryFn: () => api<SystemStats>("/api/system"),
     refetchInterval: 30_000,
   });
 
+  const checkUpdate = useMutation({
+    mutationFn: () => api<UpdateStatus>("/api/system/update"),
+    onSuccess: (res) => {
+      setUpdateInfo(res);
+      setUpdateMsg({
+        type: res.update_available ? "info" : "ok",
+        text: res.message,
+      });
+    },
+    onError: (e: Error) => {
+      setUpdateMsg({
+        type: "err",
+        text: e instanceof ApiError ? e.message : e.message,
+      });
+    },
+  });
+
+  const applyUpdate = useMutation({
+    mutationFn: () =>
+      api<{ ok: boolean; message: string; local_version: string }>("/api/system/update", {
+        method: "POST",
+      }),
+    onSuccess: async (res) => {
+      setUpdateMsg({ type: "ok", text: res.message || "آپدیت نصب شد" });
+      setUpdateInfo(null);
+      // Service restarts — retry stats after a short wait
+      window.setTimeout(() => {
+        qc.invalidateQueries({ queryKey: ["system"] });
+        refetch();
+      }, 4000);
+    },
+    onError: (e: Error) => {
+      setUpdateMsg({
+        type: "err",
+        text: e instanceof ApiError ? e.message : e.message,
+      });
+    },
+  });
+
   const healthOk = !!data && data.sync_errors === 0;
+  const busy = checkUpdate.isPending || applyUpdate.isPending;
 
   return (
     <div className="board">
@@ -60,6 +108,61 @@ export default function DashboardPage() {
               </span>
             </div>
             <span className="board-ver">v{toFaDigits(data.version)}</span>
+          </section>
+
+          <section className="board-update">
+            <div className="board-update-text">
+              <strong>بروزرسانی پنل</strong>
+              <span>
+                {updateInfo
+                  ? updateInfo.update_available
+                    ? `نسخه ${toFaDigits(updateInfo.remote_version)} آماده نصب است (فعلی: ${toFaDigits(updateInfo.local_version)})`
+                    : `نسخه فعلی ${toFaDigits(updateInfo.local_version)} آخرین است`
+                  : `نسخه نصب‌شده: ${toFaDigits(data.version)} · دیتابیس و تنظیمات حفظ می‌شوند`}
+              </span>
+            </div>
+            <div className="board-update-actions">
+              <button
+                type="button"
+                className="btn ghost sm"
+                disabled={busy}
+                onClick={() => {
+                  setUpdateMsg(null);
+                  checkUpdate.mutate();
+                }}
+              >
+                <RefreshCw size={14} />
+                {checkUpdate.isPending ? "در حال بررسی…" : "بررسی آپدیت"}
+              </button>
+              {updateInfo?.update_available && (
+                <button
+                  type="button"
+                  className="btn sm"
+                  disabled={busy}
+                  onClick={() => {
+                    if (
+                      !window.confirm(
+                        "پنل به آخرین نسخه آپدیت شود؟ دیتابیس و تنظیمات پاک نمی‌شوند."
+                      )
+                    ) {
+                      return;
+                    }
+                    setUpdateMsg({
+                      type: "info",
+                      text: "در حال دانلود و نصب… ممکن است چند دقیقه طول بکشد",
+                    });
+                    applyUpdate.mutate();
+                  }}
+                >
+                  {applyUpdate.isPending ? "در حال آپدیت…" : "نصب آپدیت"}
+                </button>
+              )}
+            </div>
+            {updateMsg && (
+              <p className={`admin-toast ${updateMsg.type === "info" ? "ok" : updateMsg.type}`}>
+                {updateMsg.text}
+              </p>
+            )}
           </section>
 
           <section className="board-grid">

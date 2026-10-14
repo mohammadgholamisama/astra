@@ -394,6 +394,123 @@ cmd_restart_astra() {
   echo "astra restarted"
 }
 
+read_local_version() {
+  if [[ -f "${ASTRA_ROOT}/VERSION" ]]; then
+    head -n1 "${ASTRA_ROOT}/VERSION" | tr -d '\r' | tr -d ' '
+  else
+    echo "0.0.0"
+  fi
+}
+
+cmd_check_update() {
+  # May run as root via sudo; prints one JSON line on stdout
+  local local_ver remote_ver git_behind=false update=false msg
+  local_ver="$(read_local_version)"
+  remote_ver="$(curl -fsSL --max-time 20 \
+    "https://raw.githubusercontent.com/mohammadgholamisama/astra/main/VERSION" 2>/dev/null \
+    | head -n1 | tr -d '\r' | tr -d ' ' || true)"
+
+  if [[ -z "$remote_ver" ]]; then
+    printf '%s\n' "{\"local_version\":\"${local_ver}\",\"remote_version\":\"\",\"update_available\":false,\"git_behind\":false,\"message\":\"دریافت نسخه ریموت ناموفق\"}"
+    return 0
+  fi
+
+  # Semver-ish compare via sort -V
+  if [[ "$(printf '%s\n%s\n' "$local_ver" "$remote_ver" | sort -V | tail -n1)" == "$remote_ver" \
+        && "$local_ver" != "$remote_ver" ]]; then
+    update=true
+  fi
+
+  if [[ -d "${ASTRA_ROOT}/.git" ]]; then
+    if git -C "$ASTRA_ROOT" fetch origin main --quiet 2>/dev/null; then
+      local local_sha remote_sha
+      local_sha="$(git -C "$ASTRA_ROOT" rev-parse HEAD 2>/dev/null || true)"
+      remote_sha="$(git -C "$ASTRA_ROOT" rev-parse origin/main 2>/dev/null || true)"
+      if [[ -n "$local_sha" && -n "$remote_sha" && "$local_sha" != "$remote_sha" ]]; then
+        git_behind=true
+        update=true
+      fi
+    fi
+  fi
+
+  if [[ "$update" == "true" ]]; then
+    msg="نسخه جدید موجود است"
+  else
+    msg="پنل به‌روز است"
+  fi
+
+  printf '%s\n' "{\"local_version\":\"${local_ver}\",\"remote_version\":\"${remote_ver}\",\"update_available\":${update},\"git_behind\":${git_behind},\"message\":\"${msg}\"}"
+}
+
+cmd_apply_update() {
+  need_root
+  [[ -d "$ASTRA_ROOT" ]] || die "Astra not installed at $ASTRA_ROOT"
+
+  # Never touch data / .env
+  local data_ok=0
+  [[ -f "$ENV_FILE" ]] || die ".env missing — abort"
+  [[ -d "${ASTRA_ROOT}/data" ]] && data_ok=1
+
+  echo "astra-helper: fetching latest code (preserving .env + data)…"
+  if [[ -d "${ASTRA_ROOT}/.git" ]]; then
+    git -C "$ASTRA_ROOT" fetch origin main
+    git -C "$ASTRA_ROOT" reset --hard origin/main
+  else
+    # Fallback: sparse sync via tarball without wiping data/.env
+    local tmp
+    tmp="$(mktemp -d)"
+    curl -fsSL "https://codeload.github.com/mohammadgholamisama/astra/tar.gz/refs/heads/main" \
+      | tar -xz -C "$tmp" --strip-components=1
+    rsync -a \
+      --exclude '.env' \
+      --exclude 'data/' \
+      --exclude 'backend/.venv/' \
+      --exclude 'frontend/node_modules/' \
+      --exclude 'frontend/dist/' \
+      "$tmp"/ "$ASTRA_ROOT"/
+    rm -rf "$tmp"
+  fi
+
+  [[ -f "$ENV_FILE" ]] || die ".env disappeared — abort"
+  [[ "$data_ok" -eq 1 && ! -d "${ASTRA_ROOT}/data" ]] && die "data/ missing after update — abort"
+
+  install -m 755 "${ASTRA_ROOT}/deploy/astra-helper" /usr/local/bin/astra-helper
+  install -m 755 "${ASTRA_ROOT}/deploy/x-astra" /usr/local/bin/x-astra
+  if [[ -f "${ASTRA_ROOT}/deploy/sudoers.astra" ]]; then
+    install -m 440 "${ASTRA_ROOT}/deploy/sudoers.astra" /etc/sudoers.d/astra
+  fi
+  if [[ -f "${ASTRA_ROOT}/deploy/astra.service" ]]; then
+    install -m 644 "${ASTRA_ROOT}/deploy/astra.service" /etc/systemd/system/astra.service
+    systemctl daemon-reload
+  fi
+
+  echo "astra-helper: python deps…"
+  sudo -u astra bash -c "
+    set -e
+    cd '${ASTRA_ROOT}/backend'
+    . .venv/bin/activate
+    pip install -r requirements.txt
+  "
+
+  echo "astra-helper: frontend build…"
+  bash -c "
+    set -e
+    cd '${ASTRA_ROOT}/frontend'
+    export VITE_API_BASE=
+    if [[ -f package-lock.json ]]; then npm ci || npm install; else npm install; fi
+    npm run build
+    chown -R astra:astra '${ASTRA_ROOT}/frontend/dist' 2>/dev/null || true
+    chmod -R a+rX '${ASTRA_ROOT}/frontend/dist'
+  "
+
+  cmd_write_nginx
+  cmd_restart_astra
+
+  local ver
+  ver="$(read_local_version)"
+  printf '%s\n' "{\"ok\":true,\"local_version\":\"${ver}\",\"remote_version\":\"${ver}\",\"message\":\"updated\"}"
+}
+
 usage() {
   cat <<EOF
 Usage: astra-helper <command> [args]
@@ -404,6 +521,8 @@ Commands:
   issue-ssl <domain>
   set-env <KEY> <VALUE>        # allowed keys only
   restart-astra
+  check-update                 # JSON status (preserves data)
+  apply-update                 # pull latest; keeps .env + data/
 EOF
 }
 
@@ -416,6 +535,8 @@ main() {
     issue-ssl)     cmd_issue_ssl "${1:-}" ;;
     set-env)       cmd_set_env "${1:-}" "${2:-}" ;;
     restart-astra) cmd_restart_astra ;;
+    check-update)  cmd_check_update ;;
+    apply-update)  cmd_apply_update ;;
     ""|-h|--help)  usage ;;
     *)             die "unknown command: $cmd" ;;
   esac

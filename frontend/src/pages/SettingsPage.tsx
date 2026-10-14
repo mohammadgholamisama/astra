@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link2, RotateCcw, Save, Settings, ShieldCheck } from "lucide-react";
+import { KeyRound, Link2, RotateCcw, Save, Settings, ShieldCheck } from "lucide-react";
 import { ApiError, api } from "../lib/api";
 
 type SiteSettings = {
@@ -41,6 +41,10 @@ export default function SettingsPage() {
   const [linkApp, setLinkApp] = useState("");
   const [sslPanelDomain, setSslPanelDomain] = useState("");
   const [sslSubDomain, setSslSubDomain] = useState("");
+  const [curPass, setCurPass] = useState("");
+  const [newPass, setNewPass] = useState("");
+  const [newPass2, setNewPass2] = useState("");
+  const [passMsg, setPassMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
   const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
 
   const { data, isLoading, error } = useQuery({
@@ -112,6 +116,26 @@ export default function SettingsPage() {
     },
     onError: (e: Error) => {
       setMsg({ type: "err", text: e instanceof ApiError ? e.message : e.message });
+    },
+  });
+
+  const changePass = useMutation({
+    mutationFn: () =>
+      api<{ ok: boolean; message: string }>("/api/admin/change-password", {
+        method: "POST",
+        body: JSON.stringify({
+          current_password: curPass,
+          new_password: newPass,
+        }),
+      }),
+    onSuccess: (res) => {
+      setPassMsg({ type: "ok", text: res.message || "رمز تغییر کرد" });
+      setCurPass("");
+      setNewPass("");
+      setNewPass2("");
+    },
+    onError: (e: Error) => {
+      setPassMsg({ type: "err", text: e instanceof ApiError ? e.message : e.message });
     },
   });
 
@@ -315,6 +339,69 @@ export default function SettingsPage() {
               </p>
             </div>
           )}
+
+          <div className="settings-card">
+            <header className="settings-card-head">
+              <KeyRound size={20} />
+              <div>
+                <h2>رمز ورود به پنل</h2>
+                <p>تغییر رمز ادمین فعلی · حداقل ۸ کاراکتر</p>
+              </div>
+            </header>
+
+            <div className="field">
+              <label>رمز فعلی</label>
+              <input
+                type="password"
+                value={curPass}
+                onChange={(e) => setCurPass(e.target.value)}
+                autoComplete="current-password"
+                placeholder="رمز فعلی"
+              />
+            </div>
+            <div className="field">
+              <label>رمز جدید</label>
+              <input
+                type="password"
+                value={newPass}
+                onChange={(e) => setNewPass(e.target.value)}
+                autoComplete="new-password"
+                placeholder="حداقل ۸ کاراکتر"
+              />
+            </div>
+            <div className="field">
+              <label>تکرار رمز جدید</label>
+              <input
+                type="password"
+                value={newPass2}
+                onChange={(e) => setNewPass2(e.target.value)}
+                autoComplete="new-password"
+                placeholder="تکرار رمز جدید"
+              />
+            </div>
+            {passMsg && <p className={`admin-toast ${passMsg.type}`}>{passMsg.text}</p>}
+            <button
+              type="button"
+              className="btn"
+              disabled={
+                changePass.isPending ||
+                !curPass ||
+                newPass.trim().length < 8 ||
+                newPass !== newPass2
+              }
+              onClick={() => {
+                setPassMsg(null);
+                if (newPass !== newPass2) {
+                  setPassMsg({ type: "err", text: "تکرار رمز با رمز جدید یکی نیست" });
+                  return;
+                }
+                changePass.mutate();
+              }}
+            >
+              <KeyRound size={16} />
+              {changePass.isPending ? "در حال تغییر…" : "تغییر رمز عبور"}
+            </button>
+          </div>
 
           <div className="settings-card">
             <header className="settings-card-head">

@@ -157,6 +157,16 @@ export interface SystemStats {
   groups_total: number;
   sync_errors: number;
   total_used_traffic: number;
+  update_supported?: boolean;
+}
+
+export interface UpdateStatus {
+  available: boolean;
+  update_available: boolean;
+  local_version: string;
+  remote_version: string;
+  git_behind?: boolean;
+  message: string;
 }
 
 export interface ApiKey {
