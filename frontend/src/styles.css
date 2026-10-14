@@ -3582,3 +3582,75 @@ th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
   }
 }
 
+/* ── Mobile performance: keep look, drop expensive paint ── */
+@media (max-width: 900px) {
+  body {
+    background-attachment: scroll;
+  }
+  .topbar,
+  .sidebar,
+  .card,
+  .board-card,
+  .board-strip,
+  .users-table,
+  .users-pagination,
+  .admin-card,
+  .login-card,
+  .modal {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+  .topbar {
+    background: var(--card-solid);
+  }
+  .sidebar {
+    background: var(--card-solid);
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.28);
+  }
+  .card,
+  .users-table,
+  .users-pagination,
+  .board-strip,
+  .admin-card {
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
+  }
+  .page-title,
+  .page-sub,
+  .card,
+  .board-strip,
+  .user-row,
+  .modal,
+  .user-actions-sheet {
+    animation: none !important;
+  }
+  .user-row {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 96px;
+  }
+  .user-row:hover {
+    background: transparent;
+  }
+  .btn,
+  .user-menu-btn,
+  .nav a,
+  .board-chip {
+    transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease !important;
+  }
+  .btn:active,
+  .user-menu-btn:active,
+  .user-actions-sheet button[role="menuitem"]:active {
+    transform: scale(0.98);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+

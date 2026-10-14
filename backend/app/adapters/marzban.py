@@ -508,6 +508,24 @@ class MarzbanAdapter(BasePanelAdapter):
         except Exception as e:
             return AdapterResult(success=False, error=str(e))
 
+    async def reset_usage(self, username: str, remote_id: str | None = None) -> AdapterResult:
+        """POST /api/user/{username}/reset — Marzban / PasarGuard / Rebecca family."""
+        try:
+            client = await self._get_client()
+            headers = await self._headers()
+            resp = await client.post(f"/api/user/{username}/reset", headers=headers)
+            ok, data = ok_json(resp)
+            if ok:
+                if isinstance(data, dict):
+                    return self._from_user_response(data, username)
+                return AdapterResult(success=True, remote_username=username, used_traffic=0)
+            # Some forks only accept PUT with used_traffic=0 — try usage read after 404
+            if resp.status_code in (404, 405):
+                return AdapterResult(success=False, error=err_msg(data, "reset endpoint missing"))
+            return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
+        except Exception as e:
+            return AdapterResult(success=False, error=str(e))
+
     async def get_usage(
         self,
         username: str,

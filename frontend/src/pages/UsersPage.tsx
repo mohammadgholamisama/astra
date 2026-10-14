@@ -17,6 +17,7 @@ import {
   PowerOff,
   QrCode,
   RefreshCw,
+  RotateCcw,
   Search,
   Trash2,
   Users,
@@ -149,6 +150,7 @@ export default function UsersPage() {
   const [groupId, setGroupId] = useState<number | "">("");
   const [copied, setCopied] = useState("");
   const [confirmUser, setConfirmUser] = useState<User | null>(null);
+  const [resetUser, setResetUser] = useState<User | null>(null);
   const [editUser, setEditUser] = useState<User | null>(null);
   const [editDisplayName, setEditDisplayName] = useState("");
   const [editDataGb, setEditDataGb] = useState("50");
@@ -192,15 +194,15 @@ export default function UsersPage() {
       const qs = new URLSearchParams({
         limit: String(PAGE_SIZE),
         offset: String(page * PAGE_SIZE),
-        // Soft live pull for this page only (no remote PUT) — keeps stats accurate
-        refresh: "true",
+        // Fast list: no live remote pull (use «همگام‌سازی مصرف» for that)
+        refresh: "false",
       });
       if (searchDebounced.trim()) qs.set("search", searchDebounced.trim());
       if (filterGroupId !== "") qs.set("group_id", String(filterGroupId));
       return api<{ users: User[]; total: number }>(`/api/users?${qs}`);
     },
-    staleTime: 15_000,
-    refetchOnMount: true,
+    staleTime: 30_000,
+    refetchOnMount: false,
     refetchOnWindowFocus: false,
     placeholderData: (prev) => prev,
   });
@@ -315,6 +317,25 @@ export default function UsersPage() {
       });
     },
     onError: (e: Error) => setActionMsg({ type: "err", text: e.message }),
+  });
+
+  const resetTraffic = useMutation({
+    mutationFn: (username: string) =>
+      api<User>(`/api/user/${encodeURIComponent(username)}/reset`, {
+        method: "POST",
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["users"] });
+      setResetUser(null);
+      setActionMsg({
+        type: "ok",
+        text: "مصرف بازنشانی شد — روی Astra و پنل‌های اصلی صفر شد",
+      });
+    },
+    onError: (e: Error) => {
+      setResetUser(null);
+      setActionMsg({ type: "err", text: e.message });
+    },
   });
 
   const saveEdit = useMutation({
@@ -956,6 +977,24 @@ export default function UsersPage() {
                     <small>{isOff ? "فعال‌سازی کانفیگ" : "قطع دسترسی کاربر"}</small>
                   </span>
                 </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={resetTraffic.isPending}
+                  onClick={() => {
+                    setMenuUser(null);
+                    setActionMsg(null);
+                    setResetUser(u);
+                  }}
+                >
+                  <span className="user-actions-ico">
+                    <RotateCcw size={18} />
+                  </span>
+                  <span className="user-actions-label">
+                    <strong>بازنشانی مصرف</strong>
+                    <small>صفر کردن حجم مصرف‌شده</small>
+                  </span>
+                </button>
                 {errors.length > 0 && (
                   <button
                     type="button"
@@ -1346,6 +1385,67 @@ export default function UsersPage() {
                 onClick={() => void openUsage(usageUser)}
               >
                 {usageLoading ? "…" : "تازه‌سازی مصرف"}
+              </button>
+            </footer>
+          </div>
+        </div>
+      )}
+
+      {resetUser && (
+        <div
+          className="modal-backdrop sheet-backdrop"
+          onClick={() => !resetTraffic.isPending && setResetUser(null)}
+        >
+          <div className="modal sheet-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="user-actions-handle mobile-only" aria-hidden />
+            <header className="modal-head">
+              <div>
+                <h3>بازنشانی مصرف</h3>
+                <p className="modal-sub">
+                  مصرف کاربر <strong dir="ltr">{resetUser.username}</strong> صفر می‌شود
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setResetUser(null)}
+                aria-label="بستن"
+              >
+                <X size={18} />
+              </button>
+            </header>
+            <p style={{ margin: "0 0 16px", lineHeight: 1.7 }}>
+              حجم مصرف‌شده در Astra و روی همه پنل‌های متصل صفر می‌شود. سقف خرید و تاریخ انقضا عوض
+              نمی‌شود.
+              {(resetUser.panel_accounts || []).length > 0 ? (
+                <>
+                  <br />
+                  <span className="muted" style={{ fontSize: "0.9rem" }}>
+                    {toFaDigits((resetUser.panel_accounts || []).length)} پنل همگام می‌شود.
+                  </span>
+                </>
+              ) : null}
+            </p>
+            {resetTraffic.isError && (
+              <p className="error">{(resetTraffic.error as Error).message}</p>
+            )}
+            <footer className="modal-foot">
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={resetTraffic.isPending}
+                onClick={() => setResetUser(null)}
+              >
+                انصراف
+              </button>
+              <button
+                type="button"
+                className="btn"
+                disabled={resetTraffic.isPending}
+                onClick={() => resetTraffic.mutate(resetUser.username)}
+              >
+                <RotateCcw size={16} />
+                {resetTraffic.isPending ? "در حال بازنشانی…" : "بازنشانی مصرف"}
               </button>
             </footer>
           </div>

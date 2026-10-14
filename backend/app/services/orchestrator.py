@@ -310,6 +310,80 @@ async def provision_user_on_panels(
     return accounts
 
 
+async def reset_user_traffic_on_panels(db: AsyncSession, user: User) -> list[dict]:
+    """Reset used traffic on every remote panel, then clear local counters.
+
+    Returns per-panel {panel_id, panel_name, ok, error}.
+    """
+    result = await db.execute(
+        select(PanelAccount)
+        .where(PanelAccount.user_id == user.id)
+        .options(selectinload(PanelAccount.panel))
+    )
+    accounts = list(result.scalars().all())
+
+    async def _one(account: PanelAccount) -> dict:
+        panel = account.panel
+        name = panel.name if panel else f"#{account.panel_id}"
+        if not panel or not panel.is_active:
+            return {
+                "panel_id": account.panel_id,
+                "panel_name": name,
+                "ok": False,
+                "error": "پنل غیرفعال",
+            }
+        if account.status == PanelAccountStatus.deleted:
+            return {
+                "panel_id": account.panel_id,
+                "panel_name": name,
+                "ok": True,
+                "error": None,
+            }
+        adapter = get_adapter(panel)
+        uname = (account.remote_username or user.username or "").strip()
+        rid = account.remote_id or account.remote_username or uname
+        try:
+            res = await asyncio.wait_for(
+                adapter.reset_usage(uname, rid), timeout=18
+            )
+        except Exception as exc:  # noqa: BLE001
+            res = _fail_result(_exc_msg(exc))
+        if res.success:
+            account.used_traffic = int(res.used_traffic or 0)
+            account.coeff_anchor_raw = 0
+            account.coeff_anchor_weighted = 0
+            account.error_message = None
+            account.last_sync_at = datetime.now(timezone.utc)
+            return {
+                "panel_id": account.panel_id,
+                "panel_name": name,
+                "ok": True,
+                "error": None,
+            }
+        # Local still resets; report remote failure
+        account.used_traffic = 0
+        account.coeff_anchor_raw = 0
+        account.coeff_anchor_weighted = 0
+        return {
+            "panel_id": account.panel_id,
+            "panel_name": name,
+            "ok": False,
+            "error": res.error or "بازنشانی روی پنل ناموفق",
+        }
+
+    outcomes = await asyncio.gather(*[_one(a) for a in accounts]) if accounts else []
+    user.lifetime_used_traffic = int(user.lifetime_used_traffic or 0) + int(
+        user.used_traffic or 0
+    )
+    user.used_traffic = 0
+    if user.status == UserStatus.limited:
+        user.status = UserStatus.active
+    await db.flush()
+    # Re-push fresh shared caps / active status
+    await sync_modify_user(db, user)
+    return list(outcomes)
+
+
 async def sync_modify_user(db: AsyncSession, user: User) -> None:
     """Push status + shared remaining quota to every remote panel account."""
     result = await db.execute(

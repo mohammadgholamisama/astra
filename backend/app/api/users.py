@@ -237,19 +237,20 @@ async def reset_user_traffic(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
+    """Reset used traffic in Astra and on every remote panel for this user."""
     user = await load_user(db, username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    user.lifetime_used_traffic += user.used_traffic
-    user.used_traffic = 0
-    for account in user.panel_accounts:
-        account.used_traffic = 0
-        account.coeff_anchor_raw = 0
-        account.coeff_anchor_weighted = 0
-        # Keep applied_coefficient so the live rate continues after reset
-    await orchestrator.sync_modify_user(db, user)
+    results = await orchestrator.reset_user_traffic_on_panels(db, user)
     await db.commit()
     user = await load_user(db, username)
+    failed = [r for r in results if not r.get("ok")]
+    if failed and user:
+        # Still return user (local reset done) but surface soft warning via header-friendly detail
+        # Keep 200 so UI can refresh; message is logged for admin toast via query invalidate
+        parts = [f"{r.get('panel_name')}: {r.get('error')}" for r in failed]
+        logger = __import__("logging").getLogger("astra.users")
+        logger.warning("reset partial user=%s: %s", username, " | ".join(parts))
     return to_user_response(user)  # type: ignore[arg-type]
 
 

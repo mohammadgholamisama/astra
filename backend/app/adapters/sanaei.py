@@ -564,6 +564,42 @@ class SanaeiAdapter(BasePanelAdapter):
                 return SanaeiAdapter._sum_up_down(nested)
         return None
 
+    async def reset_usage(self, username: str, remote_id: str | None = None) -> AdapterResult:
+        """Best-effort reset client traffic on 3x-ui / Sanaei."""
+        try:
+            email = (remote_id or username or "").strip()
+            if not email:
+                return AdapterResult(success=False, error="email/username خالی است")
+            last_err = "reset failed"
+            # Global-by-email endpoints (common on recent 3x-ui)
+            for path in (
+                f"panel/api/inbounds/resetClientTraffic/{email}",
+                f"panel/api/inbounds/resetClientTraffics/{email}",
+                f"panel/api/clients/reset/{email}",
+            ):
+                resp = await self._request("POST", path)
+                ok, data = ok_json(resp)
+                if ok:
+                    return AdapterResult(success=True, remote_username=email, used_traffic=0, raw=data)
+                last_err = err_msg(data, f"HTTP {resp.status_code}")
+            # Per-inbound fallback
+            inbound_ids = await self._list_inbound_ids()
+            any_ok = False
+            for iid in inbound_ids:
+                resp = await self._request(
+                    "POST", f"panel/api/inbounds/{iid}/resetClientTraffic/{email}"
+                )
+                ok, data = ok_json(resp)
+                if ok:
+                    any_ok = True
+                else:
+                    last_err = err_msg(data, last_err)
+            if any_ok:
+                return AdapterResult(success=True, remote_username=email, used_traffic=0)
+            return AdapterResult(success=False, error=last_err)
+        except Exception as e:
+            return AdapterResult(success=False, error=str(e))
+
     async def get_usage(self, username: str, remote_id: str | None = None) -> AdapterResult:
         try:
             email = (remote_id or username or "").strip()

@@ -56,3 +56,12 @@ class BasePanelAdapter(ABC):
 
     @abstractmethod
     async def get_subscription_links(self, username: str, remote_id: str | None = None) -> AdapterResult: ...
+
+    async def reset_usage(self, username: str, remote_id: str | None = None) -> AdapterResult:
+        """Reset used traffic on the remote panel. Default: unsupported (local-only)."""
+        return AdapterResult(
+            success=False,
+            error="reset_usage not supported on this panel type",
+            remote_username=username,
+            remote_id=remote_id,
+        )
