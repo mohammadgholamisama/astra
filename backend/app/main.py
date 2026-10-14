@@ -2,11 +2,12 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.api import (
     api_keys,
@@ -73,6 +74,39 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+_SUB_HOST_LANDING = """<!DOCTYPE html>
+<html lang="fa" dir="rtl"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Subscription</title>
+<style>
+body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:system-ui,sans-serif;background:#07141e;color:#ecfaf6}
+main{text-align:center;padding:24px;opacity:.85}
+h1{font-size:1.1rem;font-weight:700;margin:0 0 8px}
+p{margin:0;font-size:.9rem;color:#7fa39a}
+</style></head>
+<body><main><h1>دامنه اشتراک</h1><p>این آدرس فقط برای لینک ساب است، نه پنل مدیریت.</p></main></body>
+</html>"""
+
+
+class SubHostGuardMiddleware(BaseHTTPMiddleware):
+    """On dedicated subscription hostname, never serve the admin SPA."""
+
+    async def dispatch(self, request: Request, call_next):
+        sub = (getattr(settings, "ASTRA_SUB_DOMAIN", None) or "").strip().lower()
+        panel = (getattr(settings, "ASTRA_PANEL_DOMAIN", None) or "").strip().lower()
+        if not sub or (panel and sub == panel):
+            return await call_next(request)
+        host = (request.headers.get("host") or "").split(":", 1)[0].strip().lower()
+        if host != sub:
+            return await call_next(request)
+        path = request.url.path or "/"
+        if path.startswith("/sub") or path in ("/health", "/openapi.json"):
+            return await call_next(request)
+        if path.startswith("/docs") or path.startswith("/redoc") or path.startswith("/api"):
+            return Response(status_code=404)
+        return HTMLResponse(_SUB_HOST_LANDING, status_code=200)
+
+
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.add_middleware(
     CORSMiddleware,
@@ -81,6 +115,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(SubHostGuardMiddleware)
 
 app.include_router(auth.router)
 app.include_router(users.router)
