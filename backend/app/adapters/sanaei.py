@@ -72,7 +72,7 @@ class SanaeiAdapter(BasePanelAdapter):
         url = f"{self.base_url.rstrip('/')}/{path.lstrip('/')}"
         cmd = [
             "curl",
-            "-fsS",
+            "-sS",
             "-L",
             "--max-time",
             str(max_time),
