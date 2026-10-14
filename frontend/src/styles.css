@@ -1964,7 +1964,6 @@ th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
   gap: 5px;
 }
 .user-row-menu {
-  position: relative;
   display: flex;
   justify-content: flex-end;
 }
@@ -1988,61 +1987,161 @@ th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
   background: color-mix(in srgb, var(--accent) 14%, transparent);
   color: var(--accent);
 }
-.user-menu {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  z-index: 60;
-  min-width: 188px;
-  padding: 6px;
-  border-radius: 12px;
+
+/* User actions sheet (replaces overflow dropdown) */
+.user-actions-backdrop {
+  align-items: end;
+  place-items: end center;
+  padding: 0;
+  z-index: 70;
+}
+.user-actions-sheet {
+  width: min(420px, 100%);
+  max-height: min(92vh, 640px);
+  margin: 0;
+  border-radius: 20px 20px 0 0;
+  padding: 10px 16px calc(16px + env(safe-area-inset-bottom, 0px));
+  animation: sheet-up 0.28s ease;
+  overflow: auto;
+}
+.user-actions-handle {
+  width: 40px;
+  height: 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--muted) 35%, transparent);
+  margin: 2px auto 12px;
+}
+.mobile-only { display: none; }
+.user-actions-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.user-actions-who {
+  min-width: 0;
+  flex: 1;
+}
+.user-actions-name {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.user-actions-name b {
+  font-size: 1.08rem;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+}
+.user-actions-display {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 0.84rem;
+  line-height: 1.35;
+}
+.user-actions-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-top: 10px;
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+.user-actions-meta span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 999px;
   border: 1px solid var(--line);
-  background: var(--board-card);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22);
+  background: color-mix(in srgb, var(--input, transparent) 40%, transparent);
+}
+.user-actions-meta span.ok { color: var(--ok); }
+.user-actions-meta span.warn { color: var(--warn); }
+.user-actions-meta span.danger { color: var(--danger); }
+.user-actions-list,
+.user-actions-danger {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 4px;
 }
-.user-menu button {
+.user-actions-list {
+  padding: 4px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--input, transparent) 35%, transparent);
+}
+.user-actions-danger {
+  margin-top: 10px;
+  padding: 4px;
+  border-radius: 14px;
+  border: 1px solid color-mix(in srgb, var(--danger) 28%, var(--line));
+  background: color-mix(in srgb, var(--danger) 6%, transparent);
+}
+.user-actions-sheet button[role="menuitem"] {
   appearance: none;
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 12px;
   width: 100%;
-  padding: 9px 10px;
+  padding: 11px 12px;
   border: 0;
-  border-radius: 8px;
+  border-radius: 11px;
   background: transparent;
   color: var(--text);
   font: inherit;
-  font-size: 0.84rem;
-  font-weight: 600;
   text-align: right;
   cursor: pointer;
-  line-height: 1.2;
+  transition: background 0.15s;
 }
-.user-menu button svg {
-  flex-shrink: 0;
-  color: var(--muted);
+.user-actions-sheet button[role="menuitem"]:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
-.user-menu button:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-}
-.user-menu button:hover:not(:disabled) svg {
-  color: var(--accent);
-}
-.user-menu button:disabled {
+.user-actions-sheet button[role="menuitem"]:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
-.user-menu button.danger {
+.user-actions-ico {
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+}
+.user-actions-ico.warn {
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
+  color: var(--warn);
+}
+.user-actions-ico.danger {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
   color: var(--danger);
 }
-.user-menu button.danger svg {
+.user-actions-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.user-actions-label strong {
+  font-size: 0.92rem;
+  font-weight: 700;
+  line-height: 1.25;
+}
+.user-actions-label small {
+  font-size: 0.74rem;
+  color: var(--muted);
+  line-height: 1.3;
+}
+.user-actions-danger button.danger .user-actions-label strong {
   color: var(--danger);
 }
-.user-menu button.danger:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--danger) 12%, transparent);
+@keyframes sheet-up {
+  from { transform: translateY(18px); opacity: 0.6; }
+  to { transform: translateY(0); opacity: 1; }
 }
 .users-pagination {
   display: flex;
@@ -2408,9 +2507,45 @@ th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
   .user-row-usage { grid-area: usage; }
   .user-row-expire { grid-area: expire; }
   .user-row-panels { grid-area: panels; justify-content: flex-end; }
-  .user-menu {
-    left: auto;
-    right: 0;
+  .mobile-only { display: block; }
+  .sheet-backdrop {
+    align-items: end;
+    place-items: end center;
+    padding: 0;
+  }
+  .sheet-modal {
+    width: 100%;
+    max-width: 100%;
+    margin: 0;
+    border-radius: 20px 20px 0 0;
+    max-height: min(92vh, 720px);
+    padding-bottom: calc(18px + env(safe-area-inset-bottom, 0px));
+    animation: sheet-up 0.28s ease;
+  }
+  .user-actions-sheet {
+    width: 100%;
+    max-width: 100%;
+  }
+  .usage-panel-list {
+    max-height: min(42vh, 360px);
+  }
+  .sub-qr {
+    width: min(200px, 56vw);
+  }
+}
+
+@media (min-width: 701px) {
+  .user-actions-backdrop {
+    align-items: center;
+    place-items: center;
+    padding: 16px;
+  }
+  .user-actions-sheet {
+    border-radius: 20px;
+    animation: rise 0.25s ease;
+  }
+  .user-actions-handle {
+    display: none;
   }
 }
 @media (max-width: 420px) {

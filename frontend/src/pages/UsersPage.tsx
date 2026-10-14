@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -160,22 +160,18 @@ export default function UsersPage() {
   const [qrDataUrl, setQrDataUrl] = useState("");
   const [actionMsg, setActionMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
   const [syncingUsage, setSyncingUsage] = useState(false);
-  const [menuUser, setMenuUser] = useState<string | null>(null);
-  const menuRef = useRef<HTMLDivElement | null>(null);
+  const [menuUser, setMenuUser] = useState<User | null>(null);
 
   useEffect(() => {
     if (!menuUser) return;
-    function onDoc(e: MouseEvent) {
-      const t = e.target as Node;
-      if (menuRef.current && !menuRef.current.contains(t)) setMenuUser(null);
-    }
     function onKey(e: KeyboardEvent) {
       if (e.key === "Escape") setMenuUser(null);
     }
-    document.addEventListener("mousedown", onDoc);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
     document.addEventListener("keydown", onKey);
     return () => {
-      document.removeEventListener("mousedown", onDoc);
+      document.body.style.overflow = prev;
       document.removeEventListener("keydown", onKey);
     };
   }, [menuUser]);
@@ -686,7 +682,7 @@ export default function UsersPage() {
             const barTone =
               pct == null ? "muted" : pct >= 90 ? "danger" : pct >= 70 ? "warn" : "ok";
             const isOff = u.status === "disabled";
-            const menuOpen = menuUser === u.username;
+            const menuOpen = menuUser?.username === u.username;
 
             return (
               <article
@@ -765,98 +761,19 @@ export default function UsersPage() {
                   )}
                 </div>
 
-                <div
-                  className="user-row-menu"
-                  ref={menuOpen ? menuRef : undefined}
-                >
+                <div className="user-row-menu">
                   <button
                     type="button"
                     className={`user-menu-btn${menuOpen ? " open" : ""}`}
                     aria-label="منوی عملیات"
                     aria-expanded={menuOpen}
-                    aria-haspopup="menu"
+                    aria-haspopup="dialog"
                     onClick={() =>
-                      setMenuUser((cur) => (cur === u.username ? null : u.username))
+                      setMenuUser((cur) => (cur?.username === u.username ? null : u))
                     }
                   >
                     <Menu size={18} strokeWidth={2.2} />
                   </button>
-                  {menuOpen && (
-                    <div className="user-menu" role="menu">
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          setMenuUser(null);
-                          setSubUser(u);
-                        }}
-                      >
-                        <QrCode size={15} />
-                        لینک ساب
-                      </button>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          setMenuUser(null);
-                          openEdit(u);
-                        }}
-                      >
-                        <Pencil size={15} />
-                        ویرایش
-                      </button>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          setMenuUser(null);
-                          void openUsage(u);
-                        }}
-                      >
-                        <BarChart3 size={15} />
-                        مصرف پنل‌ها
-                      </button>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        disabled={togglePower.isPending}
-                        onClick={() => {
-                          setMenuUser(null);
-                          togglePower.mutate({ username: u.username, enable: isOff });
-                        }}
-                      >
-                        {isOff ? <Power size={15} /> : <PowerOff size={15} />}
-                        {isOff ? "روشن کردن" : "خاموش کردن"}
-                      </button>
-                      {errors.length > 0 && (
-                        <button
-                          type="button"
-                          role="menuitem"
-                          disabled={retry.isPending}
-                          onClick={() => {
-                            setMenuUser(null);
-                            retry.mutate(u.username);
-                          }}
-                        >
-                          <RefreshCw size={15} />
-                          تلاش مجدد
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        role="menuitem"
-                        className="danger"
-                        onClick={() => {
-                          setMenuUser(null);
-                          setActionMsg(null);
-                          setConfirmUser(u);
-                        }}
-                      >
-                        <Trash2 size={15} />
-                        حذف کاربر
-                      </button>
-                    </div>
-                  )}
                 </div>
               </article>
             );
@@ -900,6 +817,190 @@ export default function UsersPage() {
         )}
         </>
       )}
+
+      {menuUser && (() => {
+        const u = menuUser;
+        const st = statusLabel(u);
+        const isOff = u.status === "disabled";
+        const errors = (u.panel_accounts || []).filter(
+          (a) => a.status === "error" || !!a.error_message
+        );
+        const ok = (u.panel_accounts || []).filter((a) => a.status === "active").length;
+        const panels = (u.panel_accounts || []).length;
+        const remain = remainingBytes(u.used_traffic, u.data_limit);
+        const exp = formatExpire(u.expire);
+        const groupNames = (u.group_ids || [])
+          .map((id) => groupsById.get(id)?.name)
+          .filter(Boolean)
+          .join("، ");
+        return (
+          <div
+            className="modal-backdrop user-actions-backdrop"
+            onClick={() => setMenuUser(null)}
+          >
+            <div
+              className="modal user-actions-sheet"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="user-actions-title"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="user-actions-handle" aria-hidden />
+              <header className="user-actions-head">
+                <div className="user-actions-who">
+                  <div className="user-actions-name">
+                    <b id="user-actions-title" dir="ltr">
+                      {u.username}
+                    </b>
+                    <span className={`badge ${st.tone}`}>{st.text}</span>
+                  </div>
+                  {u.display_name ? (
+                    <p className="user-actions-display">{u.display_name}</p>
+                  ) : null}
+                  <div className="user-actions-meta">
+                    {groupNames ? (
+                      <span>
+                        <Layers size={12} />
+                        {groupNames}
+                      </span>
+                    ) : null}
+                    <span>
+                      <Wifi size={12} />
+                      {toFaDigits(ok)}/{toFaDigits(panels)} پنل
+                    </span>
+                    <span>
+                      باقی{" "}
+                      {remain != null
+                        ? formatTraffic(remain, { empty: "۰" })
+                        : "نامحدود"}
+                    </span>
+                    <span className={exp.tone}>
+                      <Clock size={12} />
+                      {exp.label}
+                    </span>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="modal-close"
+                  onClick={() => setMenuUser(null)}
+                  aria-label="بستن"
+                >
+                  <X size={18} />
+                </button>
+              </header>
+
+              <div className="user-actions-list" role="menu">
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setMenuUser(null);
+                    setSubUser(u);
+                  }}
+                >
+                  <span className="user-actions-ico">
+                    <QrCode size={18} />
+                  </span>
+                  <span className="user-actions-label">
+                    <strong>لینک ساب</strong>
+                    <small>QR و کپی لینک اشتراک</small>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setMenuUser(null);
+                    openEdit(u);
+                  }}
+                >
+                  <span className="user-actions-ico">
+                    <Pencil size={18} />
+                  </span>
+                  <span className="user-actions-label">
+                    <strong>ویرایش</strong>
+                    <small>حجم، روز و نام کانفیگ</small>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setMenuUser(null);
+                    void openUsage(u);
+                  }}
+                >
+                  <span className="user-actions-ico">
+                    <BarChart3 size={18} />
+                  </span>
+                  <span className="user-actions-label">
+                    <strong>مصرف پنل‌ها</strong>
+                    <small>جزئیات حجم با ضریب</small>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={togglePower.isPending}
+                  onClick={() => {
+                    setMenuUser(null);
+                    togglePower.mutate({ username: u.username, enable: isOff });
+                  }}
+                >
+                  <span className="user-actions-ico">
+                    {isOff ? <Power size={18} /> : <PowerOff size={18} />}
+                  </span>
+                  <span className="user-actions-label">
+                    <strong>{isOff ? "روشن کردن" : "خاموش کردن"}</strong>
+                    <small>{isOff ? "فعال‌سازی کانفیگ" : "قطع دسترسی کاربر"}</small>
+                  </span>
+                </button>
+                {errors.length > 0 && (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={retry.isPending}
+                    onClick={() => {
+                      setMenuUser(null);
+                      retry.mutate(u.username);
+                    }}
+                  >
+                    <span className="user-actions-ico warn">
+                      <RefreshCw size={18} />
+                    </span>
+                    <span className="user-actions-label">
+                      <strong>تلاش مجدد</strong>
+                      <small>{toFaDigits(errors.length)} خطای پنل</small>
+                    </span>
+                  </button>
+                )}
+              </div>
+
+              <div className="user-actions-danger">
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="danger"
+                  onClick={() => {
+                    setMenuUser(null);
+                    setActionMsg(null);
+                    setConfirmUser(u);
+                  }}
+                >
+                  <span className="user-actions-ico danger">
+                    <Trash2 size={18} />
+                  </span>
+                  <span className="user-actions-label">
+                    <strong>حذف کاربر</strong>
+                    <small>از Astra و همه پنل‌ها</small>
+                  </span>
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {open && (
         <div className="modal-backdrop" onClick={() => !create.isPending && setOpen(false)}>
@@ -1096,11 +1197,12 @@ export default function UsersPage() {
       )}
 
       {subUser && (
-        <div className="modal-backdrop" onClick={() => setSubUser(null)}>
-          <div className="modal sub-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-backdrop sheet-backdrop" onClick={() => setSubUser(null)}>
+          <div className="modal sub-modal sheet-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="user-actions-handle mobile-only" aria-hidden />
             <header className="modal-head">
               <div>
-                <h3>سابسکریپشن</h3>
+                <h3>لینک ساب</h3>
                 <p className="modal-sub">
                   <strong dir="ltr">{subUser.username}</strong>
                   {subUser.display_name ? ` · ${subUser.display_name}` : ""}
@@ -1144,7 +1246,7 @@ export default function UsersPage() {
                 rel="noreferrer"
               >
                 <ExternalLink size={16} />
-                ورود / باز کردن
+                باز کردن
               </a>
             </div>
           </div>
@@ -1152,14 +1254,19 @@ export default function UsersPage() {
       )}
 
       {usageUser && (
-        <div className="modal-backdrop" onClick={() => setUsageUser(null)}>
-          <div className="modal modal-lg usage-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-backdrop sheet-backdrop" onClick={() => setUsageUser(null)}>
+          <div
+            className="modal modal-lg usage-modal sheet-modal"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="user-actions-handle mobile-only" aria-hidden />
             <header className="modal-head">
               <div>
-                <h3>مصرف هر پنل</h3>
+                <h3>مصرف پنل‌ها</h3>
                 <p className="modal-sub">
-                  کاربر <strong dir="ltr">{usageUser.username}</strong>
-                  {usageLoading ? " · در حال همگام‌سازی…" : ""}
+                  <strong dir="ltr">{usageUser.username}</strong>
+                  {usageUser.display_name ? ` · ${usageUser.display_name}` : ""}
+                  {usageLoading ? " · همگام‌سازی…" : ""}
                 </p>
               </div>
               <button
@@ -1173,8 +1280,7 @@ export default function UsersPage() {
             </header>
 
             <p className="usage-modal-hint">
-              سقف Astra بین همه پنل‌ها مشترک است: جمع مصرف وزن‌دار (ضریب از لحظهٔ تغییر) به سقف که برسد اشتراک روی همه
-              پنل‌ها بسته می‌شود. هر پنل فقط باقی‌مانده سهم را می‌گیرد تا ۵ گیگ روی سه پنل نشود ۱۵ گیگ.
+              سقف بین پنل‌ها مشترک است. با رسیدن مصرف وزن‌دار به سقف، کانفیگ روی همه پنل‌ها بسته می‌شود.
             </p>
 
             <div className="usage-modal-total">
