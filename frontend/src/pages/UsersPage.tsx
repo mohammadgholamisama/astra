@@ -147,7 +147,7 @@ export default function UsersPage() {
   const [displayName, setDisplayName] = useState("");
   const [dataGb, setDataGb] = useState("50");
   const [days, setDays] = useState("30");
-  const [groupId, setGroupId] = useState<number | "">("");
+  const [groupIds, setGroupIds] = useState<number[]>([]);
   const [copied, setCopied] = useState("");
   const [confirmUser, setConfirmUser] = useState<User | null>(null);
   const [resetUser, setResetUser] = useState<User | null>(null);
@@ -250,7 +250,7 @@ export default function UsersPage() {
           data_limit: gb > 0 ? gbToBytes(gb) : 0,
           expire,
           status: "active",
-          group_ids: [Number(groupId)],
+          group_ids: groupIds,
         }),
       });
     },
@@ -261,7 +261,7 @@ export default function UsersPage() {
       setDisplayName("");
       setDataGb("50");
       setDays("30");
-      setGroupId("");
+      setGroupIds([]);
       setActionMsg({ type: "ok", text: "کاربر ساخته شد" });
     },
   });
@@ -430,8 +430,14 @@ export default function UsersPage() {
 
   function onSubmit(e: FormEvent) {
     e.preventDefault();
-    if (groupId === "") return;
+    if (groupIds.length === 0) return;
     create.mutate();
+  }
+
+  function toggleCreateGroup(id: number) {
+    setGroupIds((cur) =>
+      cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]
+    );
   }
 
   const users = data?.users || [];
@@ -442,6 +448,30 @@ export default function UsersPage() {
     for (const g of groups) m.set(g.id, g);
     return m;
   }, [groups]);
+
+  const createGroupHint = useMemo(() => {
+    if (!groupIds.length) return "";
+    const panelMap = new Map<number, number>(); // panel_id -> max coeff
+    for (const gid of groupIds) {
+      const g = groupsById.get(gid);
+      for (const gp of g?.panels || []) {
+        const raw = Number(
+          (gp.config as { coefficient?: number } | undefined)?.coefficient ?? 1
+        );
+        const c = !Number.isNaN(raw) && raw >= 0.01 ? raw : 1;
+        const prev = panelMap.get(gp.panel_id);
+        panelMap.set(gp.panel_id, prev == null ? c : Math.max(prev, c));
+      }
+    }
+    const n = panelMap.size;
+    const coeffs = [...panelMap.values()];
+    const multi = coeffs.some((c) => c !== 1);
+    if (!n) return "گروه‌های انتخاب‌شده پنل فعالی ندارند";
+    if (multi) {
+      return `${toFaDigits(n)} پنل · مصرف = جمع (خام × ضریب هر پنل) · سقف خرید مشترک`;
+    }
+    return `${toFaDigits(n)} پنل · سقف حجم بین همه پنل‌ها مشترک است`;
+  }, [groupIds, groupsById]);
 
   const stats = useMemo(() => {
     const total = totalUsers;
@@ -997,7 +1027,9 @@ export default function UsersPage() {
             <header className="modal-head">
               <div>
                 <h3>ساخت کاربر</h3>
-                <p className="modal-sub">کانفیگ روی همه پنل‌های گروه ساخته می‌شود</p>
+                <p className="modal-sub">
+                  چند گروه انتخاب کنید؛ کانفیگ روی پنل‌های همهٔ آن‌ها ساخته می‌شود
+                </p>
               </div>
               <button
                 type="button"
@@ -1032,17 +1064,54 @@ export default function UsersPage() {
                 <p className="field-hint">نامی که در کلاینت‌ها روی کانفیگ‌ها دیده می‌شود</p>
               </div>
               <div className="field">
-                <label>گروه</label>
-                <Select
-                  value={groupId}
-                  placeholder="گروه را انتخاب کنید"
-                  options={groups.map((g) => ({
-                    value: g.id,
-                    label: g.name,
-                    hint: `${g.panels?.length || 0} پنل`,
-                  }))}
-                  onChange={(v) => setGroupId(v)}
-                />
+                <label>
+                  گروه‌ها
+                  {groupIds.length > 0 && (
+                    <span className="badge muted" style={{ marginInlineStart: 8 }}>
+                      {toFaDigits(groupIds.length)} انتخاب‌شده
+                    </span>
+                  )}
+                </label>
+                <div className="check-list user-create-groups">
+                  {groups.length === 0 ? (
+                    <p className="field-hint">ابتدا یک گروه بسازید</p>
+                  ) : (
+                    groups.map((g) => {
+                      const on = groupIds.includes(g.id);
+                      const panelN = g.panels?.length || 0;
+                      const coeffs = (g.panels || [])
+                        .map((gp) => {
+                          const raw = Number(
+                            (gp.config as { coefficient?: number } | undefined)
+                              ?.coefficient ?? 1
+                          );
+                          return !Number.isNaN(raw) && raw >= 0.01 ? raw : 1;
+                        })
+                        .filter((c) => c !== 1);
+                      return (
+                        <label key={g.id} className={`check-item${on ? " on" : ""}`}>
+                          <input
+                            type="checkbox"
+                            checked={on}
+                            onChange={() => toggleCreateGroup(g.id)}
+                          />
+                          <span>
+                            {g.name}{" "}
+                            <span className="badge muted">
+                              {toFaDigits(panelN)} پنل
+                            </span>
+                            {coeffs.length > 0 && (
+                              <span className="badge muted">
+                                ضریب {coeffs.map((c) => toFaDigits(c)).join("، ")}
+                              </span>
+                            )}
+                          </span>
+                        </label>
+                      );
+                    })
+                  )}
+                </div>
+                {createGroupHint && <p className="field-hint">{createGroupHint}</p>}
               </div>
               <div className="user-create-grid">
                 <div className="field">
@@ -1079,7 +1148,10 @@ export default function UsersPage() {
                 <button type="button" className="btn ghost" onClick={() => setOpen(false)}>
                   انصراف
                 </button>
-                <button className="btn" disabled={create.isPending || groupId === ""}>
+                <button
+                  className="btn"
+                  disabled={create.isPending || groupIds.length === 0}
+                >
                   {create.isPending ? "در حال ساخت…" : "ساخت روی همه پنل‌ها"}
                 </button>
               </footer>

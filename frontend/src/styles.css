@@ -1782,7 +1782,7 @@ th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
   border-top: 1px solid var(--line);
 }
 
-.user-create-modal { width: min(440px, 100%); }
+.user-create-modal { width: min(480px, 100%); }
 .user-create-form {
   display: flex;
   flex-direction: column;
@@ -1802,6 +1802,27 @@ th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
 .user-create-form input[type="number"] {
   font-variant-numeric: tabular-nums;
   font-weight: 600;
+}
+.user-create-groups {
+  max-height: 220px;
+  overflow: auto;
+  margin: 6px 0 0;
+  padding: 2px;
+}
+.user-create-groups .check-item {
+  cursor: pointer;
+  margin: 0;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.user-create-groups .check-item.on {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.user-create-groups .check-item span {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
 }
 
 /* —— Users page —— */

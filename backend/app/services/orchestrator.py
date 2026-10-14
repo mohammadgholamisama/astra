@@ -148,7 +148,10 @@ async def _lock_for_user(user_id: int) -> asyncio.Lock:
 
 
 async def resolve_panels_for_groups(db: AsyncSession, group_ids: list[int]) -> list[tuple[Panel, dict]]:
-    """Return unique (panel, merged_config) for all panels in given groups."""
+    """Return unique (panel, merged_config) for all panels in given groups.
+
+    Same panel in multiple groups → one account; coefficient = max across links.
+    """
     if not group_ids:
         return []
     result = await db.execute(
@@ -163,12 +166,18 @@ async def resolve_panels_for_groups(db: AsyncSession, group_ids: list[int]) -> l
         panel = link.panel
         if not panel or not panel.is_active:
             continue
+        cfg = dict(link.config or {})
         if panel.id not in seen:
-            seen[panel.id] = (panel, dict(link.config or {}))
-        else:
-            # merge configs (later groups don't overwrite existing keys)
-            merged = {**(link.config or {}), **seen[panel.id][1]}
-            seen[panel.id] = (panel, merged)
+            seen[panel.id] = (panel, cfg)
+            continue
+        # Merge: keep existing keys, but coefficient always takes the higher value
+        prev_cfg = dict(seen[panel.id][1])
+        merged = {**cfg, **prev_cfg}
+        merged["coefficient"] = max(
+            coefficient_from_config(prev_cfg),
+            coefficient_from_config(cfg),
+        )
+        seen[panel.id] = (panel, merged)
     return list(seen.values())
 
 
