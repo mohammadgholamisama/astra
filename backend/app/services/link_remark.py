@@ -4,48 +4,91 @@ from __future__ import annotations
 
 import base64
 import json
-from urllib.parse import quote, unquote
+import re
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 
-# Persian digits for client-visible remarks
-_FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
-
-
-def to_fa_digits(value: object) -> str:
-    return str(value).translate(_FA_DIGITS)
+# Client remarks must use ASCII digits — Persian digits break some V2Ray parsers
+_FA_TO_EN = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 
 
-def format_bytes_fa(n: int) -> str:
+def to_en_digits(value: object) -> str:
+    return str(value).translate(_FA_TO_EN)
+
+
+def format_bytes_en(n: int) -> str:
     n = max(0, int(n or 0))
     units = [(1024**4, "TB"), (1024**3, "GB"), (1024**2, "MB"), (1024, "KB")]
     for size, label in units:
         if n >= size:
             val = n / size
             text = f"{val:.1f}".rstrip("0").rstrip(".") + f" {label}"
-            return to_fa_digits(text)
-    return to_fa_digits(f"{n} B")
+            return text
+    return f"{n} B"
 
 
 def remain_badge(used: int, limit: int) -> tuple[str, str]:
-    """Return (emoji, remain_label) for subscription remarks."""
+    """Return (tag, remain_label) for subscription remarks — ASCII-safe (no emoji)."""
     used_i = max(0, int(used or 0))
     limit_i = int(limit or 0)
     if limit_i <= 0:
-        return "♾️", "نامحدود"
+        return "OK", "unlimited"
     remain = max(0, limit_i - used_i)
     pct = (remain / limit_i) if limit_i else 0.0
     if pct > 0.5:
-        emoji = "🟢"
+        tag = "OK"
     elif pct > 0.2:
-        emoji = "🟡"
+        tag = "LOW"
     else:
-        emoji = "🔴"
-    return emoji, format_bytes_fa(remain)
+        tag = "CRIT"
+    return tag, format_bytes_en(remain)
+
+
+def sanitize_share_link(link: str) -> str:
+    """
+    Clean share-link query string for picky V2Ray clients:
+    - headerType empty/missing → headerType=none (vless/trojan)
+    - drop empty optional params (path=, host=, sid=, fp=, …)
+    """
+    raw = (link or "").strip()
+    if not raw or "://" not in raw:
+        return raw
+
+    lower = raw.lower()
+    if lower.startswith("vmess://"):
+        return raw
+
+    base, hash_sep, frag = raw.partition("#")
+    parts = urlsplit(base)
+    pairs = parse_qsl(parts.query, keep_blank_values=True)
+
+    cleaned: list[tuple[str, str]] = []
+    saw_header_type = False
+    for key, val in pairs:
+        lk = key.lower()
+        v = (val or "").strip()
+        if lk == "headertype":
+            saw_header_type = True
+            cleaned.append((key, v if v else "none"))
+            continue
+        if not v:
+            # Never keep blank query values (path=, host=, fp=, …)
+            continue
+        cleaned.append((key, v))
+
+    if lower.startswith(("vless://", "trojan://")) and not saw_header_type:
+        cleaned.append(("headerType", "none"))
+
+    new_query = urlencode(cleaned, doseq=True)
+    new_base = urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, ""))
+    if hash_sep:
+        return f"{new_base}#{frag}"
+    return new_base
 
 
 def rewrite_link_remark(link: str, remark: str) -> str:
     """Set client-visible name on a share link (fragment / vmess ps)."""
-    raw = (link or "").strip()
-    name = (remark or "").strip()
+    raw = sanitize_share_link((link or "").strip())
+    name = to_en_digits((remark or "").strip())
     if not raw or not name:
         return raw
 
@@ -58,9 +101,13 @@ def rewrite_link_remark(link: str, remark: str) -> str:
             if not isinstance(data, dict):
                 return raw
             data["ps"] = name
-            encoded = base64.urlsafe_b64encode(
-                json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            ).decode("ascii").rstrip("=")
+            encoded = (
+                base64.urlsafe_b64encode(
+                    json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                )
+                .decode("ascii")
+                .rstrip("=")
+            )
             return f"vmess://{encoded}"
         except Exception:  # noqa: BLE001
             return raw
@@ -99,11 +146,12 @@ def build_config_remark(
     used: int = 0,
     limit: int = 0,
 ) -> str:
-    """Client-visible title: name + remain emoji/volume + #id — no panel name."""
-    base = " ".join((name or "").split()).strip() or "کانفیگ"
-    emoji, remain = remain_badge(used, limit)
-    cid = to_fa_digits(config_id)
-    return f"{base} {emoji} {remain} #{cid}"
+    """Client-visible title — ASCII only (no emoji; picky V2Ray parsers)."""
+    base = " ".join(to_en_digits(name or "").split()).strip() or "config"
+    # Strip leftover emoji / non-ascii symbols from display name
+    base = re.sub(r"[^\w\s.\-]+", "", base, flags=re.UNICODE).strip() or "config"
+    tag, remain = remain_badge(used, limit)
+    return f"{base} [{tag}] {remain} #{int(config_id)}"
 
 
 def apply_display_name(
@@ -114,11 +162,7 @@ def apply_display_name(
     limit: int = 0,
     username: str | None = None,
 ) -> list[dict]:
-    """Rename real configs for clients/sub page.
-
-    Format: «اسم 🟢 حجم‌باقی #آیدی» — never includes panel name.
-    Skips notice/info rows (kind == \"notice\").
-    """
+    """Rename + sanitize real configs for clients/sub page."""
     if not links:
         return links
 
@@ -127,12 +171,11 @@ def apply_display_name(
     notices = [r for r in links if r.get("kind") == "notice"]
     out: list[dict] = []
     for i, row in enumerate(real):
-        link = row.get("link") or ""
+        link = sanitize_share_link(row.get("link") or "")
         original = link_current_remark(link).strip()
-        # Drop stale "name · panel" style if present
         if " · " in original and preferred:
             original = ""
-        name = preferred or original or f"کانفیگ"
+        name = preferred or original or "config"
         remark = build_config_remark(
             name=name,
             config_id=i + 1,
@@ -166,7 +209,7 @@ def build_notice_link(text: str) -> str:
         return ""
     return (
         "vless://00000000-0000-0000-0000-000000000001@127.0.0.1:80"
-        f"?encryption=none&security=none&type=tcp#{quote(remark, safe='')}"
+        f"?encryption=none&security=none&type=tcp&headerType=none#{quote(remark, safe='')}"
     )
 
 

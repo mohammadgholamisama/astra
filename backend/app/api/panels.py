@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -82,10 +83,19 @@ async def _fetch_marz_protocols(panel: Panel) -> list[MarzProtocolOut]:
         rows = await adapter.list_protocols()  # type: ignore[attr-defined]
     except Exception as exc:  # noqa: BLE001
         label = "سرویس‌ها" if panel.type == PanelType.rebecca else "پروتکل‌ها"
-        raise HTTPException(status_code=400, detail=f"دریافت {label} ناموفق: {exc}") from exc
+        msg = str(exc).strip() or exc.__class__.__name__
+        logger.warning("marz protocols failed for %s: %s", panel.base_url, msg)
+        raise HTTPException(status_code=400, detail=f"دریافت {label} ناموفق: {msg}") from exc
     finally:
         await _close_adapter(adapter)
-    return [MarzProtocolOut(**row) for row in rows]
+    out: list[MarzProtocolOut] = []
+    for row in rows:
+        try:
+            out.append(MarzProtocolOut(**row))
+        except ValidationError as ve:
+            logger.warning("skip marz protocol row %s: %s", row, ve)
+            continue
+    return out
 
 
 def _validate_credentials(panel_type: PanelType, username: str | None, password: str | None, api_token: str | None) -> None:
@@ -130,27 +140,44 @@ def _to_out(p: Panel) -> PanelOut:
 
 
 async def _probe_panel(panel: Panel) -> None:
-    """Live-test remote panel; raise 400 if credentials/URL are wrong."""
-    adapter = get_adapter(panel)
-    result = None
-    try:
-        result = await adapter.test_connection()
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"اتصال برقرار نشد: {exc}") from exc
-    finally:
-        close = getattr(adapter, "close", None)
-        if callable(close):
-            try:
-                await close()
-            except Exception:
-                pass
-    if result is None or not result.success:
-        err = (result.error if result else None) or "اطلاعات ورود یا آدرس اشتباه است"
-        logger.warning("panel probe failed type=%s url=%s: %s", panel.type, panel.base_url, err)
-        raise HTTPException(
-            status_code=400,
-            detail=f"اتصال ناموفق — پنل ذخیره نشد: {err}",
+    """Live-test remote panel; raise 400 if credentials/URL are wrong.
+
+    Retries once — Marzban Cloud / distant panels often flake on the first token.
+    """
+    last_err = "اطلاعات ورود یا آدرس اشتباه است"
+    for attempt in range(2):
+        adapter = get_adapter(panel)
+        result = None
+        try:
+            result = await adapter.test_connection()
+        except Exception as exc:  # noqa: BLE001
+            last_err = str(exc).strip() or exc.__class__.__name__
+            logger.warning(
+                "panel probe exception attempt=%s type=%s url=%s: %s",
+                attempt + 1,
+                panel.type,
+                panel.base_url,
+                last_err,
+            )
+            result = None
+        finally:
+            await _close_adapter(adapter)
+
+        if result is not None and result.success:
+            return
+
+        last_err = (
+            (result.error if result else None) or last_err or "اطلاعات ورود یا آدرس اشتباه است"
         )
+        if attempt == 0:
+            # brief pause then fresh adapter/token
+            await asyncio.sleep(1.2)
+
+    logger.warning("panel probe failed type=%s url=%s: %s", panel.type, panel.base_url, last_err)
+    raise HTTPException(
+        status_code=400,
+        detail=f"اتصال ناموفق — پنل ذخیره نشد: {last_err}",
+    )
 
 
 @router.post("/api/panel", response_model=PanelOut)
@@ -169,9 +196,9 @@ async def create_panel(
         name=body.name,
         type=body.type,
         base_url=normalize_panel_base_url(str(body.base_url)),
-        username=body.username,
-        password=body.password,
-        api_token=body.api_token,
+        username=(body.username or "").strip() or None,
+        password=(body.password or "").strip() or None,
+        api_token=(body.api_token or "").strip() or None,
         meta=body.meta or {},
         is_active=body.is_active,
     )
@@ -226,9 +253,9 @@ async def preview_groups(
         name="_preview_pg",
         type=PanelType.pasarguard,
         base_url=normalize_panel_base_url(str(body.base_url)),
-        username=body.username,
-        password=body.password,
-        api_token=body.api_token,
+        username=(body.username or "").strip(),
+        password=(body.password or "").strip(),
+        api_token=(body.api_token or "").strip() or None,
         meta={},
         is_active=True,
     )
@@ -287,6 +314,8 @@ async def update_panel(
     for k, v in data.items():
         if k == "base_url" and v:
             v = normalize_panel_base_url(str(v))
+        elif k in ("username", "password", "api_token") and isinstance(v, str):
+            v = v.strip() or None
         setattr(panel, k, v)
 
     _validate_credentials(panel.type, panel.username, panel.password, panel.api_token)

@@ -31,9 +31,12 @@ class AdapterResult:
 class BasePanelAdapter(ABC):
     def __init__(self, base_url: str, username: str | None, password: str | None, api_token: str | None, meta: dict | None = None):
         self.base_url = normalize_panel_base_url(base_url)
-        self.username = username
-        self.password = password
-        self.api_token = api_token
+        self.username = (username or "").strip() or None
+        self.password = (password or "").strip() or None
+        tok = (api_token or "").strip()
+        if tok.lower().startswith("bearer "):
+            tok = tok[7:].strip()
+        self.api_token = tok or None
         self.meta = meta or {}
 
     @abstractmethod

@@ -1823,6 +1823,27 @@ th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
   grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr));
   gap: 12px;
 }
+.users-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  margin-top: 18px;
+  flex-wrap: wrap;
+}
+.users-pagination-info {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  font-size: 0.92rem;
+  color: var(--text);
+}
+.users-pagination-info em {
+  font-style: normal;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
 .user-card {
   display: flex;
   flex-direction: column;

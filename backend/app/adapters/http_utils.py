@@ -52,27 +52,31 @@ def make_client(
     verify_ssl: bool = False,
     *,
     timeout: float | None = None,
+    xhr: bool = True,
 ) -> httpx.AsyncClient:
     """
     httpx client rooted at panel base (including webBasePath).
 
-    Always send browser-like headers so 3x-ui returns real 401 for bad tokens
-    (without X-Requested-With it often masks auth failure as 404).
+    X-Requested-With helps 3x-ui return real 401 for bad tokens (otherwise often 404).
+    Marzban/PasarGuard/Rebecca should pass xhr=False — some builds are picky about extra headers on /api/admin/token.
     """
     root = normalize_panel_base_url(base_url).rstrip("/") + "/"
     t = float(timeout if timeout is not None else settings.ADAPTER_TIMEOUT)
-    # Connect fast; allow longer read for heavy panels (3x-ui full inbound list)
-    timeout_cfg = httpx.Timeout(t, connect=min(15.0, t))
+    # Marzban Cloud / distant panels often need >15s TCP connect
+    connect_t = min(30.0, max(20.0, t))
+    timeout_cfg = httpx.Timeout(t, connect=connect_t)
+    headers = {
+        "User-Agent": "AstraPanel/1.1 (httpx)",
+        "Accept": "application/json, text/plain, */*",
+    }
+    if xhr:
+        headers["X-Requested-With"] = "XMLHttpRequest"
     return httpx.AsyncClient(
         base_url=root,
         timeout=timeout_cfg,
         verify=verify_ssl,
         follow_redirects=True,
-        headers={
-            "User-Agent": "AstraPanel/1.1 (httpx)",
-            "Accept": "application/json, text/plain, */*",
-            "X-Requested-With": "XMLHttpRequest",
-        },
+        headers=headers,
     )
 
 
@@ -120,46 +124,102 @@ SHARE_LINK_PREFIXES = (
 )
 
 
+def is_share_link(link: str) -> bool:
+    return bool(link) and str(link).strip().lower().startswith(SHARE_LINK_PREFIXES)
+
+
+def is_subscription_ref(link: str) -> bool:
+    """http(s) sub URL or relative panel path like /sub/TOKEN (PasarGuard/Marzban)."""
+    text = str(link or "").strip()
+    if not text:
+        return False
+    low = text.lower()
+    if low.startswith(SHARE_LINK_PREFIXES):
+        return False
+    if low.startswith(("http://", "https://")):
+        return True
+    if low.startswith("/sub/") or low.startswith("sub/"):
+        return True
+    return False
+
+
+def _decode_sub_body(text: str) -> str:
+    import base64
+
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    # Already plain share links / multi-line
+    if any(line.strip().lower().startswith(SHARE_LINK_PREFIXES) for line in raw.replace("\r", "\n").split("\n")):
+        return raw
+    pad = "=" * (-len(raw) % 4)
+    for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+        try:
+            return decoder(raw + pad).decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+    return raw
+
+
+def extract_share_links(text: str) -> list[str]:
+    decoded = _decode_sub_body(text)
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in decoded.replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line or not is_share_link(line) or line in seen:
+            continue
+        seen.add(line)
+        out.append(line)
+    return out
+
+
 async def expand_subscription_links(
     client: httpx.AsyncClient,
     links: list[str],
     *,
     headers: dict[str, str] | None = None,
 ) -> list[str]:
-    """If only http(s) subscription URLs are present, fetch and split into share links."""
-    import base64
+    """
+    Turn panel subscription refs into real share links for V2Ray clients.
 
+    PasarGuard/Marzban often return only `/sub/<token>` or an https sub URL —
+    clients cannot import those; we must fetch and unwrap to vless:// etc.
+    """
     links = [str(x).strip() for x in (links or []) if x and str(x).strip()]
     if not links:
         return []
-    existing_share = [l for l in links if l.lower().startswith(SHARE_LINK_PREFIXES)]
+    existing_share = [l for l in links if is_share_link(l)]
     if existing_share:
         return existing_share
 
-    subs = [l for l in links if l.lower().startswith(("http://", "https://"))]
+    subs = [l for l in links if is_subscription_ref(l)]
     if not subs:
-        return links
+        # Never return bare /sub/... junk to clients
+        return []
 
     out: list[str] = []
-    req_headers = {"User-Agent": "AstraPanel/1.1", **(headers or {})}
+    seen: set[str] = set()
+    req_headers = {
+        "User-Agent": "v2rayNG/1.8 (AstraPanel)",
+        "Accept": "text/plain, */*",
+        **(headers or {}),
+    }
     for url in subs:
         try:
-            resp = await client.get(url, headers=req_headers)
+            path = url
+            if path.lower().startswith("sub/") and not path.lower().startswith(("http://", "https://")):
+                path = "/" + path
+            resp = await client.get(path, headers=req_headers)
             if resp.status_code >= 400:
                 continue
             text = (resp.text or "").strip()
             if not text:
                 continue
-            decoded = text
-            try:
-                pad = "=" * (-len(text) % 4)
-                decoded = base64.urlsafe_b64decode(text + pad).decode("utf-8", errors="ignore")
-            except Exception:
-                decoded = text
-            for line in decoded.replace("\r", "\n").split("\n"):
-                line = line.strip()
-                if line and line.lower().startswith(SHARE_LINK_PREFIXES):
+            for line in extract_share_links(text):
+                if line not in seen:
+                    seen.add(line)
                     out.append(line)
         except Exception:
             continue
-    return out or links
+    return out

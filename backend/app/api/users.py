@@ -140,9 +140,9 @@ async def get_user(
     user = await load_user(db, username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    # Live pull from remotes + push coeff-scaled limits
-    await orchestrator.sync_subscription_state(db, user, force=True)
-    await orchestrator.sync_modify_user(db, user)
+    # Live usage only — avoid extra modify round-trip on every open
+    await orchestrator.refresh_usage(db, user, force=True)
+    await orchestrator.enforce_user_quota(db, user)
     await db.commit()
     user = await load_user(db, username)
     return to_user_response(user)  # type: ignore[arg-type]
@@ -280,12 +280,12 @@ async def retry_provision(
 @router.get("/api/users", response_model=UsersListResponse)
 async def list_users(
     offset: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(10, ge=1, le=100),
     search: str | None = None,
     group_id: int | None = Query(None, ge=1),
     refresh: bool = Query(
-        True,
-        description="Pull live usage from remote panels for this page of users",
+        False,
+        description="Pull live usage from remote panels for this page (read-only; no remote push)",
     ),
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
@@ -308,10 +308,11 @@ async def list_users(
     users = list(result.scalars().unique().all())
 
     if refresh and users:
-        # Live usage for the visible page only (does not touch other apps/DBs)
-        await orchestrator.refresh_users_usage_batch(db, users, force=True, concurrency=8)
+        # Read usage only — never push modify on list refresh (was extremely slow)
+        await orchestrator.refresh_users_usage_batch(
+            db, users, force=True, concurrency=10, push_remotes=False
+        )
         await db.commit()
-        # Reload so response has fresh used_traffic / status after commit
         ids = [u.id for u in users]
         result = await db.execute(
             select(User)

@@ -30,10 +30,11 @@ class Settings(BaseSettings):
     ADMIN_PASSWORD: str = "admin123"
     CORS_ORIGINS: str = "http://localhost:3000,http://localhost:5173"
     ALGORITHM: str = "HS256"
-    ADAPTER_TIMEOUT: float = 25.0
+    ADAPTER_TIMEOUT: float = 35.0
     # Min seconds between remote usage polls per user (sub page / clients)
     # Client sub feed throttle; HTML/admin use force=True for live pulls
-    USAGE_REFRESH_SECONDS: int = 45
+    # Sub clients / admin list force=True anyway; this only gates soft refreshes
+    USAGE_REFRESH_SECONDS: int = 20
     # Official install helper for SSL / nginx (empty = SSL UI disabled)
     ASTRA_HELPER: str = ""
     ASTRA_APP_PORT: int = 8000

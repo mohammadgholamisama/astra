@@ -134,10 +134,20 @@ async def resolve_panels_for_groups(db: AsyncSession, group_ids: list[int]) -> l
     return list(seen.values())
 
 
+def _exc_msg(exc: BaseException) -> str:
+    """TimeoutError and some OS errors have empty str() — always return something useful."""
+    msg = str(exc).strip()
+    if msg:
+        return msg
+    if isinstance(exc, asyncio.TimeoutError):
+        return "Timeout waiting for panel response"
+    return exc.__class__.__name__
+
+
 def _fail_result(error: str) -> AdapterResult:
     return AdapterResult(
         success=False,
-        error=error,
+        error=error or "Unknown panel error",
         links=[],
         used_traffic=0,
         remote_username=None,
@@ -183,9 +193,9 @@ async def provision_user_on_panels(
     async def _remote(panel: Panel, payload: UserPayload) -> AdapterResult:
         adapter = get_adapter(panel)
         try:
-            return await asyncio.wait_for(adapter.create_user(payload), timeout=45)
+            return await asyncio.wait_for(adapter.create_user(payload), timeout=28)
         except Exception as e:  # noqa: BLE001
-            return _fail_result(str(e))
+            return _fail_result(_exc_msg(e))
 
     results = await asyncio.gather(*[_remote(panel, payload) for _, panel, payload in jobs])
 
@@ -204,12 +214,16 @@ async def provision_user_on_panels(
             account.last_sync_at = now
             panel.last_ok_at = now
         else:
-            # If user already exists on remote, try modify to recover links
+            # Recover: already-exists / create timed out after remote accepted
             err = (result.error or "").lower()
-            if any(x in err for x in ("exist", "already", "duplicate", "تکرار", "موجود")):
+            exists_hint = any(
+                x in err for x in ("exist", "already", "duplicate", "تکرار", "موجود", "timeout")
+            )
+            recovered = False
+            if exists_hint or not err:
                 try:
                     adapter = get_adapter(panel)
-                    mod = await asyncio.wait_for(adapter.modify_user(payload), timeout=45)
+                    mod = await asyncio.wait_for(adapter.modify_user(payload), timeout=22)
                     if mod.success:
                         account.status = PanelAccountStatus.active
                         account.remote_username = mod.remote_username or user.username
@@ -220,16 +234,33 @@ async def provision_user_on_panels(
                         account.error_message = None
                         account.last_sync_at = now
                         panel.last_ok_at = now
-                        accounts.append(account)
-                        continue
-                    account.status = PanelAccountStatus.error
-                    account.error_message = mod.error or result.error
+                        recovered = True
+                    else:
+                        usage = await asyncio.wait_for(
+                            adapter.get_usage(payload.username), timeout=12
+                        )
+                        if usage.success:
+                            account.status = PanelAccountStatus.active
+                            account.remote_username = usage.remote_username or user.username
+                            account.remote_id = usage.remote_id or account.remote_id
+                            account.uuid = usage.uuid or account.uuid
+                            account.links = usage.links or account.links or []
+                            account.used_traffic = usage.used_traffic or 0
+                            account.error_message = None
+                            account.last_sync_at = now
+                            panel.last_ok_at = now
+                            recovered = True
+                        else:
+                            account.status = PanelAccountStatus.error
+                            account.error_message = (
+                                mod.error or usage.error or result.error or "ایجاد در پنل ناموفق"
+                            )
                 except Exception as e:  # noqa: BLE001
                     account.status = PanelAccountStatus.error
-                    account.error_message = f"{result.error} | modify: {e}"
-            else:
+                    account.error_message = f"{result.error or 'create failed'} | recover: {_exc_msg(e)}"
+            if not recovered and account.status != PanelAccountStatus.active:
                 account.status = PanelAccountStatus.error
-                account.error_message = result.error
+                account.error_message = result.error or "ایجاد در پنل ناموفق"
         accounts.append(account)
 
     await db.flush()
@@ -276,9 +307,9 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
     async def _remote(panel: Panel, payload: UserPayload) -> AdapterResult:
         adapter = get_adapter(panel)
         try:
-            return await asyncio.wait_for(adapter.modify_user(payload), timeout=45)
+            return await asyncio.wait_for(adapter.modify_user(payload), timeout=22)
         except Exception as e:  # noqa: BLE001
-            return _fail_result(str(e))
+            return _fail_result(_exc_msg(e))
 
     if not jobs:
         await db.flush()
@@ -288,17 +319,17 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
     now = datetime.now(timezone.utc)
     for (account, _panel, _payload), res in zip(jobs, results):
         if res.success:
-            # Keep panel account "active" row even when user is limited — remotes get disabled via status
-            if account.status != PanelAccountStatus.error:
-                account.status = PanelAccountStatus.active
+            # Successful push clears prior error — remotes get disabled via status field
+            account.status = PanelAccountStatus.active
             account.links = res.links or account.links
             if res.used_traffic is not None:
                 account.used_traffic = int(res.used_traffic or account.used_traffic or 0)
             account.error_message = None
             account.last_sync_at = now
         else:
+            # Keep links if we already have them; still mark error for UI
             account.status = PanelAccountStatus.error
-            account.error_message = res.error
+            account.error_message = res.error or "به‌روزرسانی پنل ناموفق"
     await db.flush()
 
 
@@ -331,7 +362,7 @@ async def sync_delete_user(db: AsyncSession, user: User) -> list[dict]:
         try:
             res = await asyncio.wait_for(
                 adapter.delete_user(user.username, account.remote_id or account.remote_username),
-                timeout=35,
+                timeout=15,
             )
         except Exception as e:  # noqa: BLE001
             return {
@@ -396,7 +427,10 @@ def collect_links_detailed(user: User, *, include_notices: bool = True) -> list[
     Notices (fake configs) are for the HTML sub page only — omit them from
     client subscription feeds so V2Ray apps import real configs cleanly.
     Real config remarks: «اسم 🟢 حجم‌باقی #آیدی» (no panel name).
+
+    Only protocol share links (vless:// …) are returned — never raw /sub/ paths.
     """
+    from app.adapters.http_utils import is_share_link
     from app.services.link_remark import apply_display_name, notice_rows_from_groups
 
     notices = (
@@ -405,35 +439,88 @@ def collect_links_detailed(user: User, *, include_notices: bool = True) -> list[
         else []
     )
     rows: list[dict] = []
-    http_fallback: list[dict] = []
     seen: set[str] = set()
     for account in user.panel_accounts or []:
-        if account.status != PanelAccountStatus.active:
+        # error accounts often still have working share links (sync flag only) —
+        # skipping them made client feeds return Content-Length: 0 while HTML looked fine after refresh.
+        if account.status not in (PanelAccountStatus.active, PanelAccountStatus.error):
             continue
         panel = account.__dict__.get("panel")
         panel_name = getattr(panel, "name", None) if panel is not None else None
         label = panel_name or f"پنل #{account.panel_id}"
         for link in account.links or []:
             text = (link or "").strip()
-            if not text or text in seen:
+            if not text or text in seen or not is_share_link(text):
                 continue
             seen.add(text)
-            low = text.lower()
-            row = {"link": text, "panel": label, "panel_id": account.panel_id}
-            # Prefer share protocols in client feeds; keep http only as fallback
-            if low.startswith("http://") or low.startswith("https://"):
-                http_fallback.append(row)
-            else:
-                rows.append(row)
-    use_rows = rows if rows else http_fallback
+            rows.append({"link": text, "panel": label, "panel_id": account.panel_id})
     renamed = apply_display_name(
-        use_rows,
+        rows,
         getattr(user, "display_name", None),
         used=int(user.used_traffic or 0),
         limit=int(user.data_limit or 0),
         username=getattr(user, "username", None),
     )
     return notices + renamed
+
+
+async def hydrate_share_links(db: AsyncSession, user: User) -> int:
+    """
+    If panel accounts only stored /sub/... or https subscription URLs,
+    fetch remote user and expand into real share links. Returns updated account count.
+    """
+    from app.adapters.http_utils import is_share_link, is_subscription_ref
+
+    updated = 0
+    for account in user.panel_accounts or []:
+        if account.status not in (PanelAccountStatus.active, PanelAccountStatus.error, PanelAccountStatus.pending):
+            continue
+        if not account.panel:
+            continue
+        links = [str(x).strip() for x in (account.links or []) if x and str(x).strip()]
+        # Already have real share links — keep them (even if account flagged error)
+        if any(is_share_link(x) for x in links):
+            if account.status == PanelAccountStatus.error:
+                account.status = PanelAccountStatus.active
+                updated += 1
+            continue
+        # Empty or only /sub/... refs → fetch & expand from remote panel
+        if links and not any(is_subscription_ref(x) for x in links):
+            continue
+        adapter = get_adapter(account.panel)
+        uname = (account.remote_username or user.username or "").strip()
+        rid = account.remote_id or account.remote_username or uname or None
+        res = None
+        try:
+            res = await asyncio.wait_for(adapter.get_usage(uname, rid), timeout=12)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "hydrate links failed user=%s panel=%s: %s",
+                user.username,
+                account.panel_id,
+                exc,
+            )
+            continue
+        finally:
+            close = getattr(adapter, "close", None)
+            if callable(close):
+                try:
+                    await close()
+                except Exception:  # noqa: BLE001
+                    pass
+        if not res or not res.success:
+            continue
+        new_links = [x for x in (res.links or []) if is_share_link(str(x))]
+        if not new_links:
+            continue
+        account.links = new_links
+        account.status = PanelAccountStatus.active
+        account.used_traffic = int(res.used_traffic or account.used_traffic or 0)
+        account.last_sync_at = datetime.now(timezone.utc)
+        updated += 1
+    if updated:
+        await db.flush()
+    return updated
 
 
 async def usage_breakdown_for_user(db: AsyncSession, user: User) -> list[dict]:
@@ -565,13 +652,14 @@ async def refresh_users_usage_batch(
     db: AsyncSession,
     users: list[User],
     *,
-    force: bool = True,
-    concurrency: int = 8,
+    force: bool = False,
+    concurrency: int = 10,
+    push_remotes: bool = False,
 ) -> None:
     """Live-pull usage for many users (admin users page). Bounded parallelism.
 
-    After summing traffic across panels, push remaining caps / disable remotes
-    so a 5GB plan cannot become 5GB×N panels.
+    By default only reads usage (fast). Push to remotes only when quota status
+    changes, or when push_remotes=True (manual full sync).
     """
     if not users:
         return
@@ -582,13 +670,8 @@ async def refresh_users_usage_batch(
             try:
                 await refresh_usage(db, u, force=force)
                 changed = await enforce_user_quota(db, u)
-                blocked = u.status in (
-                    UserStatus.limited,
-                    UserStatus.expired,
-                    UserStatus.disabled,
-                )
-                # Always re-push shared remaining (or disable) after a live pull
-                if changed or blocked or force:
+                # Do NOT push on every list refresh — that made sync extremely slow
+                if changed or push_remotes:
                     await sync_modify_user(db, u)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("batch usage refresh failed user=%s: %s", u.username, exc)
@@ -638,30 +721,38 @@ async def refresh_usage(
             uname = (account.remote_username or user.username or "").strip()
             rid = (account.remote_id or account.remote_username or uname or None)
             try:
-                # Short timeout — sub clients must not wait on slow panels
-                res = await asyncio.wait_for(
-                    adapter.get_usage(uname, rid),
-                    timeout=8 if force else 3,
-                )
+                # Usage-only: skip subscription expand (was the main sync bottleneck)
+                try:
+                    coro = adapter.get_usage(uname, rid, expand_links=False)  # type: ignore[call-arg]
+                except TypeError:
+                    coro = adapter.get_usage(uname, rid)
+                res = await asyncio.wait_for(coro, timeout=12 if force else 6)
                 return account, res
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "get_usage exception user=%s panel=%s: %s",
                     user.username,
                     account.panel_id,
-                    exc,
+                    _exc_msg(exc),
                 )
                 return account, None
 
         outcomes = await asyncio.gather(*[_remote(a) for a in accounts])
         now = datetime.now(timezone.utc)
+        from app.adapters.http_utils import is_share_link
+
         for account, res in outcomes:
             if res is None:
                 continue
             if res.success:
+                # Trust live panel value (source of truth)
                 account.used_traffic = int(res.used_traffic or 0)
-                if res.links:
-                    account.links = res.links
+                # Never replace real share links with raw /sub refs from usage pulls
+                new_shares = [
+                    str(x) for x in (res.links or []) if x and is_share_link(str(x))
+                ]
+                if new_shares:
+                    account.links = new_shares
                 account.last_sync_at = now
                 if account.panel:
                     account.panel.last_ok_at = now
@@ -719,10 +810,16 @@ async def sync_subscription_state(
     user: User,
     *,
     force: bool = False,
+    push_remotes: bool | None = None,
 ) -> User:
-    """Usage refresh + shared-quota enforce + push remaining/disable to remotes.
+    """Usage refresh + shared-quota enforce + optional push to remotes.
 
     Safe under concurrent sub clients via per-user lock.
+
+    push_remotes:
+      None  → push only when quota/status changed or account errors (fast path for sub)
+      True  → always push remaining caps
+      False → never push (usage read only)
     """
     lock = await _lock_for_user(user.id)
     async with lock:
@@ -738,8 +835,10 @@ async def sync_subscription_state(
             UserStatus.expired,
             UserStatus.disabled,
         )
-        # Push disable when blocked; push shrinking remaining on force sync
-        if changed or blocked or has_err or force:
+        do_push = push_remotes
+        if do_push is None:
+            do_push = bool(changed or blocked or has_err)
+        if do_push:
             await sync_modify_user(db, user)
         await db.flush()
         return user

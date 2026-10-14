@@ -188,7 +188,7 @@ class PasarGuardAdapter(MarzbanAdapter):
             remote_id=str(data.get("id") or data.get("username") or fallback),
             uuid=None,
             links=links,
-            used_traffic=int(data.get("used_traffic") or 0),
+            used_traffic=self._parse_used_traffic(data),
             raw=data,
         )
 

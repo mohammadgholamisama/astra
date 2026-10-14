@@ -4,6 +4,8 @@ import {
   AlertTriangle,
   BarChart3,
   Check,
+  ChevronLeft,
+  ChevronRight,
   Clock,
   Copy,
   ExternalLink,
@@ -43,6 +45,8 @@ import {
 } from "../lib/format";
 
 type FilterKey = "all" | "active" | "error" | "expired";
+
+const PAGE_SIZE = 10;
 
 function userHasErrors(u: User) {
   return (u.panel_accounts || []).some((a) => a.status === "error" || !!a.error_message);
@@ -124,6 +128,7 @@ export default function UsersPage() {
   const qc = useQueryClient();
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
+  const [page, setPage] = useState(0);
   const [filter, setFilter] = useState<FilterKey>("all");
   const [filterGroupId, setFilterGroupId] = useState<number | "">("");
   const [username, setUsername] = useState("");
@@ -143,6 +148,7 @@ export default function UsersPage() {
   const [usageLoading, setUsageLoading] = useState(false);
   const [qrDataUrl, setQrDataUrl] = useState("");
   const [actionMsg, setActionMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+  const [syncingUsage, setSyncingUsage] = useState(false);
 
   const [searchDebounced, setSearchDebounced] = useState(search);
   useEffect(() => {
@@ -150,19 +156,51 @@ export default function UsersPage() {
     return () => window.clearTimeout(t);
   }, [search]);
 
-  const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["users", searchDebounced, filterGroupId],
+  useEffect(() => {
+    setPage(0);
+  }, [searchDebounced, filterGroupId]);
+
+  const { data, isLoading, isFetching } = useQuery({
+    queryKey: ["users", searchDebounced, filterGroupId, page],
     queryFn: () => {
-      const qs = new URLSearchParams({ limit: "100", refresh: "true" });
+      const qs = new URLSearchParams({
+        limit: String(PAGE_SIZE),
+        offset: String(page * PAGE_SIZE),
+        // Soft live pull for this page only (no remote PUT) — keeps stats accurate
+        refresh: "true",
+      });
       if (searchDebounced.trim()) qs.set("search", searchDebounced.trim());
       if (filterGroupId !== "") qs.set("group_id", String(filterGroupId));
       return api<{ users: User[]; total: number }>(`/api/users?${qs}`);
     },
-    staleTime: 0,
-    refetchOnMount: "always",
-    refetchOnWindowFocus: true,
+    staleTime: 15_000,
+    refetchOnMount: true,
+    refetchOnWindowFocus: false,
     placeholderData: (prev) => prev,
   });
+
+  async function syncUsageNow() {
+    setSyncingUsage(true);
+    try {
+      const qs = new URLSearchParams({
+        limit: String(PAGE_SIZE),
+        offset: String(page * PAGE_SIZE),
+        refresh: "true",
+      });
+      if (searchDebounced.trim()) qs.set("search", searchDebounced.trim());
+      if (filterGroupId !== "") qs.set("group_id", String(filterGroupId));
+      const fresh = await api<{ users: User[]; total: number }>(`/api/users?${qs}`);
+      qc.setQueryData(["users", searchDebounced, filterGroupId, page], fresh);
+      setActionMsg({ type: "ok", text: "مصرف این صفحه همگام شد" });
+    } catch (e) {
+      setActionMsg({
+        type: "err",
+        text: e instanceof Error ? e.message : "همگام‌سازی ناموفق",
+      });
+    } finally {
+      setSyncingUsage(false);
+    }
+  }
   const { data: groups = [] } = useQuery({
     queryKey: ["groups"],
     queryFn: () => api<Group[]>("/api/groups"),
@@ -350,6 +388,8 @@ export default function UsersPage() {
   }
 
   const users = data?.users || [];
+  const totalUsers = data?.total ?? 0;
+  const totalPages = Math.max(1, Math.ceil(totalUsers / PAGE_SIZE));
   const groupsById = useMemo(() => {
     const m = new Map<number, Group>();
     for (const g of groups) m.set(g.id, g);
@@ -357,7 +397,7 @@ export default function UsersPage() {
   }, [groups]);
 
   const stats = useMemo(() => {
-    const total = data?.total ?? users.length;
+    const total = totalUsers;
     let active = 0;
     let withError = 0;
     let expired = 0;
@@ -375,7 +415,7 @@ export default function UsersPage() {
       if (exp > now && exp - now <= 7 * 86400) expiringSoon += 1;
     }
     return { total, active, withError, expired, expiringSoon, usedSum, limited, loaded: users.length };
-  }, [users, data?.total]);
+  }, [users, totalUsers]);
 
   const filtered = useMemo(() => {
     return users.filter((u) => {
@@ -385,6 +425,10 @@ export default function UsersPage() {
       return true;
     });
   }, [users, filter]);
+
+  useEffect(() => {
+    if (page > 0 && page >= totalPages) setPage(Math.max(0, totalPages - 1));
+  }, [page, totalPages]);
 
   const errorAccounts: PanelAccount[] = useMemo(() => {
     if (!errorsUser) return [];
@@ -412,19 +456,20 @@ export default function UsersPage() {
           <h1 className="page-title">کاربران</h1>
           <p className="page-sub">
             ساخت کانفیگ روی پنل‌های گروه · لینک ساب تجمیعی
-            {isFetching ? " · در حال همگام‌سازی مصرف از پنل‌ها…" : ""}
+            {isFetching && !syncingUsage ? " · در حال بارگذاری…" : ""}
+            {syncingUsage ? " · همگام‌سازی مصرف…" : ""}
           </p>
         </div>
         <div className="users-head-actions">
           <button
             type="button"
             className="btn ghost sm"
-            onClick={() => refetch()}
-            disabled={isFetching}
-            title="مصرف زنده از پنل‌ها خوانده می‌شود"
+            onClick={() => void syncUsageNow()}
+            disabled={isFetching || syncingUsage}
+            title="مصرف زنده همین صفحه از پنل‌ها"
           >
-            <RefreshCw size={14} className={isFetching ? "spin" : undefined} />
-            {isFetching ? "همگام‌سازی…" : "تازه‌سازی مصرف"}
+            <RefreshCw size={14} className={syncingUsage ? "spin" : undefined} />
+            {syncingUsage ? "همگام‌سازی…" : "تازه‌سازی مصرف"}
           </button>
           <button type="button" className="btn users-add" onClick={() => setOpen(true)}>
             <Plus size={16} />
@@ -584,6 +629,7 @@ export default function UsersPage() {
           )}
         </div>
       ) : (
+        <>
         <div className="users-list">
           {filtered.map((u) => {
             const errors = (u.panel_accounts || []).filter(
@@ -756,6 +802,37 @@ export default function UsersPage() {
             );
           })}
         </div>
+        {totalUsers > 0 && (
+          <nav className="users-pagination" aria-label="صفحه‌بندی کاربران">
+            <button
+              type="button"
+              className="btn ghost sm"
+              disabled={page <= 0 || isFetching}
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+            >
+              <ChevronRight size={16} />
+              قبلی
+            </button>
+            <span className="users-pagination-info">
+              صفحه {toFaDigits(page + 1)} از {toFaDigits(totalPages)}
+              <em>
+                ({toFaDigits(page * PAGE_SIZE + 1)}–
+                {toFaDigits(Math.min((page + 1) * PAGE_SIZE, totalUsers))} از{" "}
+                {toFaDigits(totalUsers)})
+              </em>
+            </span>
+            <button
+              type="button"
+              className="btn ghost sm"
+              disabled={page + 1 >= totalPages || isFetching}
+              onClick={() => setPage((p) => p + 1)}
+            >
+              بعدی
+              <ChevronLeft size={16} />
+            </button>
+          </nav>
+        )}
+        </>
       )}
 
       {open && (

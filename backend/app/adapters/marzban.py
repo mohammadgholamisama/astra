@@ -8,15 +8,24 @@ User create/modify follows official Marzban docs:
 
 from __future__ import annotations
 
-import base64
+import asyncio
+import time
 import uuid as uuid_lib
 from typing import Any
+
+import httpx
 
 from app.adapters.base import AdapterResult, BasePanelAdapter, UserPayload
 from app.adapters.http_utils import err_msg, make_client, ok_json
 
 # Protocols Marzban/Rebecca accept in proxies/inbounds
 KNOWN_PROTOCOLS = ("vless", "vmess", "trojan", "shadowsocks")
+
+# Shared across adapter instances (batch refresh / multi-user ops)
+_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
+_INBOUNDS_CACHE: dict[str, tuple[dict[str, list[str]], float]] = {}
+_TOKEN_TTL = 240.0  # seconds
+_INBOUNDS_TTL = 120.0
 
 
 class MarzbanAdapter(BasePanelAdapter):
@@ -28,9 +37,17 @@ class MarzbanAdapter(BasePanelAdapter):
         self._client = None
         self._inbounds_cache: dict[str, list[str]] | None = None
 
+    def _cache_key(self) -> str:
+        return f"{self.base_url}|{(self.username or '').strip()}"
+
     async def _get_client(self):
         if self._client is None:
-            self._client = make_client(self.base_url, self.meta.get("verify_ssl", False))
+            # No X-Requested-With — Marzban/PasarGuard token endpoint is OAuth2 form, not 3x-ui
+            self._client = make_client(
+                self.base_url,
+                self.meta.get("verify_ssl", False),
+                xhr=False,
+            )
         return self._client
 
     async def close(self) -> None:
@@ -38,50 +55,103 @@ class MarzbanAdapter(BasePanelAdapter):
             await self._client.aclose()
             self._client = None
 
+    async def _post_token(self, client, form: dict[str, str]):
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        }
+        return await client.post("/api/admin/token", data=form, headers=headers)
+
     async def _ensure_token(self) -> str:
         if self._token:
             return self._token
-        if not self.username or not self.password:
-            raise RuntimeError("Marzban/Rebecca نیاز به نام کاربری و رمز عبور دارند")
+        user = (self.username or "").strip()
+        password = (self.password or "").strip()
+        if not user or not password:
+            raise RuntimeError("Marzban/Rebecca/PasarGuard نیاز به نام کاربری و رمز عبور دارند")
+        self.username = user
+        self.password = password
+
+        cache_key = self._cache_key()
+        cached = _TOKEN_CACHE.get(cache_key)
+        if cached and time.monotonic() < cached[1]:
+            self._token = cached[0]
+            return self._token
+
+        # Official OAuth2 password grant; some forks reject unknown fields — try variants
+        attempts: list[dict[str, str]] = [
+            {"grant_type": "password", "username": user, "password": password},
+            {"grant_type": "password", "username": user, "password": password, "scope": ""},
+            {"username": user, "password": password},
+        ]
+
         client = await self._get_client()
-        form = {
-            "username": self.username,
-            "password": self.password,
-            "grant_type": "password",
-        }
-        headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
-        resp = await client.post("/api/admin/token", data=form, headers=headers)
-        ok, data = ok_json(resp)
-        if (not ok or not isinstance(data, dict) or not data.get("access_token")) and resp.status_code in (
+        resp = None
+        ok = False
+        data: Any = None
+        last_detail = "Login failed"
+
+        for form in attempts:
+            for net_try in range(2):
+                try:
+                    resp = await self._post_token(client, form)
+                    break
+                except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as exc:
+                    last_detail = f"شبکه پنل: {exc.__class__.__name__}"
+                    if net_try < 1:
+                        await self.close()
+                        await asyncio.sleep(0.6)
+                        client = await self._get_client()
+                        continue
+                    raise RuntimeError(last_detail) from exc
+            if resp is None:
+                continue
+            ok, data = ok_json(resp)
+            if ok and isinstance(data, dict) and data.get("access_token"):
+                break
+            last_detail = err_msg(data, f"Login failed HTTP {resp.status_code}")
+            # Wrong password — no point trying other form shapes against same URL
+            if resp.status_code == 401:
+                break
+
+        if (not ok or not isinstance(data, dict) or not data.get("access_token")) and resp is not None and resp.status_code in (
             404,
             405,
         ):
             from app.adapters.http_utils import normalize_panel_base_url
 
             root = normalize_panel_base_url(self.base_url)
+            retried = False
             if root != self.base_url:
                 self.base_url = root
-                await self.close()
-                client = await self._get_client()
-                resp = await client.post("/api/admin/token", data=form, headers=headers)
-                ok, data = ok_json(resp)
+                retried = True
             elif "/dashboard" in self.base_url.lower():
-                self.base_url = self.base_url.lower().replace("/dashboard", "")
-                self.base_url = normalize_panel_base_url(self.base_url)
+                self.base_url = normalize_panel_base_url(
+                    self.base_url.lower().replace("/dashboard", "")
+                )
+                retried = True
+            if retried:
                 await self.close()
                 client = await self._get_client()
-                resp = await client.post("/api/admin/token", data=form, headers=headers)
-                ok, data = ok_json(resp)
+                for form in attempts:
+                    resp = await self._post_token(client, form)
+                    ok, data = ok_json(resp)
+                    if ok and isinstance(data, dict) and data.get("access_token"):
+                        break
+                    last_detail = err_msg(data, f"Login failed HTTP {resp.status_code}")
+                    if resp.status_code == 401:
+                        break
 
         if not ok or not isinstance(data, dict) or not data.get("access_token"):
-            detail = err_msg(data, f"Login failed HTTP {resp.status_code}")
-            if resp.status_code in (404, 405):
+            detail = last_detail
+            if resp is not None and resp.status_code in (404, 405):
                 detail += (
                     " — آدرس پایه را بدون /dashboard وارد کنید "
                     f"(فعلی: {self.base_url})"
                 )
             raise RuntimeError(detail)
         self._token = data["access_token"]
+        _TOKEN_CACHE[cache_key] = (self._token, time.monotonic() + _TOKEN_TTL)
         return self._token
 
     async def _headers(self) -> dict[str, str]:
@@ -133,7 +203,12 @@ class MarzbanAdapter(BasePanelAdapter):
         if protocol == "trojan":
             return {}
         if protocol == "shadowsocks":
-            return {}
+            # Empty → Marzban generates password; method optional (panel default)
+            ss: dict[str, Any] = {}
+            method = payload.config.get("shadowsocks_method") or self.meta.get("shadowsocks_method")
+            if method:
+                ss["method"] = str(method)
+            return ss
         return {}
 
     def _build_proxies(self, payload: UserPayload, protocols: list[str]) -> dict[str, Any]:
@@ -177,17 +252,43 @@ class MarzbanAdapter(BasePanelAdapter):
     async def _available_inbounds_map(self) -> dict[str, list[str]]:
         if self._inbounds_cache is not None:
             return self._inbounds_cache
+        key = self._cache_key()
+        shared = _INBOUNDS_CACHE.get(key)
+        if shared and time.monotonic() < shared[1]:
+            self._inbounds_cache = shared[0]
+            return self._inbounds_cache
         try:
             rows = await self.list_protocols()
             cache = {str(r["protocol"]).lower(): list(r.get("tags") or []) for r in rows}
             self._inbounds_cache = cache
+            _INBOUNDS_CACHE[key] = (cache, time.monotonic() + _INBOUNDS_TTL)
             return cache
         except Exception:
             return {}
 
+    def _config_has_inbound_tags(self, payload: UserPayload, protocols: list[str]) -> bool:
+        """True when every protocol already has explicit inbound tags (skip catalog GET)."""
+        configured = payload.config.get("inbounds")
+        if not isinstance(configured, dict):
+            configured = self.meta.get("inbounds") if isinstance(self.meta.get("inbounds"), dict) else {}
+        if not isinstance(configured, dict) or not protocols:
+            return False
+        for protocol in protocols:
+            raw = configured.get(protocol)
+            if isinstance(raw, list) and any(str(t).strip() for t in raw):
+                continue
+            if isinstance(raw, str) and raw.strip():
+                continue
+            return False
+        return True
+
     async def _build_user_body(self, payload: UserPayload, *, include_username: bool) -> dict[str, Any]:
-        available = await self._available_inbounds_map()
         protocols = self._selected_protocols(payload)
+        # Skip GET /api/inbounds when group/panel already pinned inbound tags
+        if self._config_has_inbound_tags(payload, protocols):
+            available: dict[str, list[str]] = {}
+        else:
+            available = await self._available_inbounds_map()
 
         # Drop protocols that are not enabled on the panel (avoid HTTP 400)
         if available:
@@ -199,9 +300,12 @@ class MarzbanAdapter(BasePanelAdapter):
         proxies = self._build_proxies(payload, protocols)
         inbounds = self._build_inbounds(payload, protocols, available or None)
 
-        # Marzban: active | disabled | limited | expired | on_hold
-        _ok = ("active", "on_hold", "disabled", "limited", "expired")
-        status = payload.status if payload.status in _ok else "disabled"
+        # Create API only allows active|on_hold; modify allows disabled|limited|expired too
+        if include_username:
+            status = payload.status if payload.status in ("active", "on_hold") else "active"
+        else:
+            _ok = ("active", "on_hold", "disabled", "limited", "expired")
+            status = payload.status if payload.status in _ok else "disabled"
         body: dict[str, Any] = {
             "proxies": proxies,
             "inbounds": inbounds,
@@ -215,6 +319,37 @@ class MarzbanAdapter(BasePanelAdapter):
             body["username"] = payload.username
         # Official Marzban schema has no limit_ip — do not send it (causes 400/422)
         return body
+
+    @staticmethod
+    def _parse_used_traffic(data: dict) -> int:
+        """Best-effort used bytes from Marzban / PasarGuard / forks."""
+        vals: list[int] = []
+        for key in ("used_traffic", "lifetime_used_traffic", "total_traffic"):
+            raw = data.get(key)
+            if raw is None or raw == "":
+                continue
+            try:
+                vals.append(max(0, int(raw)))
+            except (TypeError, ValueError):
+                continue
+        traffic = data.get("traffic")
+        if isinstance(traffic, dict):
+            for key in ("used", "used_traffic", "download", "down", "uplink", "download_bytes"):
+                raw = traffic.get(key)
+                if raw is None or raw == "":
+                    continue
+                try:
+                    vals.append(max(0, int(raw)))
+                except (TypeError, ValueError):
+                    continue
+            try:
+                up = int(traffic.get("upload") or traffic.get("up") or 0)
+                down = int(traffic.get("download") or traffic.get("down") or 0)
+                if up or down:
+                    vals.append(max(0, up + down))
+            except (TypeError, ValueError):
+                pass
+        return max(vals) if vals else 0
 
     def _from_user_response(self, data: dict, fallback_username: str) -> AdapterResult:
         proxies = data.get("proxies") or {}
@@ -234,54 +369,16 @@ class MarzbanAdapter(BasePanelAdapter):
             remote_id=data.get("username", fallback_username),
             uuid=uuid,
             links=links,
-            used_traffic=int(data.get("used_traffic") or 0),
+            used_traffic=self._parse_used_traffic(data),
             raw=data,
         )
 
     async def _expand_subscription_links(self, links: list[str]) -> list[str]:
-        """If panel only returned http(s) sub URL, fetch and split into share links."""
-        share_prefixes = (
-            "vless://",
-            "vmess://",
-            "trojan://",
-            "ss://",
-            "shadowsocks://",
-            "tuic://",
-            "hysteria://",
-            "hy2://",
-        )
-        existing_share = [l for l in links if str(l).lower().startswith(share_prefixes)]
-        if existing_share:
-            return existing_share
+        """Resolve /sub/... or https sub URLs into vless/vmess share links."""
+        from app.adapters.http_utils import expand_subscription_links
 
-        subs = [l for l in links if str(l).lower().startswith(("http://", "https://"))]
-        if not subs:
-            return links
-
-        out: list[str] = []
         client = await self._get_client()
-        for url in subs:
-            try:
-                resp = await client.get(url, headers={"User-Agent": "AstraPanel/1.0"})
-                if resp.status_code >= 400:
-                    continue
-                text = (resp.text or "").strip()
-                if not text:
-                    continue
-                # try base64 subscription payload
-                decoded = text
-                try:
-                    pad = "=" * (-len(text) % 4)
-                    decoded = base64.urlsafe_b64decode(text + pad).decode("utf-8", errors="ignore")
-                except Exception:
-                    decoded = text
-                for line in decoded.replace("\r", "\n").split("\n"):
-                    line = line.strip()
-                    if line and line.lower().startswith(share_prefixes):
-                        out.append(line)
-            except Exception:
-                continue
-        return out or links
+        return await expand_subscription_links(client, list(links or []))
 
     async def list_protocols(self) -> list[dict[str, Any]]:
         """
@@ -352,7 +449,8 @@ class MarzbanAdapter(BasePanelAdapter):
                 return AdapterResult(success=True, raw=data)
             return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
         except Exception as e:
-            return AdapterResult(success=False, error=str(e))
+            msg = str(e).strip() or e.__class__.__name__
+            return AdapterResult(success=False, error=msg)
 
     async def _finalize_user_result(self, result: AdapterResult, username: str) -> AdapterResult:
         links = list(result.links or [])
@@ -410,7 +508,13 @@ class MarzbanAdapter(BasePanelAdapter):
         except Exception as e:
             return AdapterResult(success=False, error=str(e))
 
-    async def get_usage(self, username: str, remote_id: str | None = None) -> AdapterResult:
+    async def get_usage(
+        self,
+        username: str,
+        remote_id: str | None = None,
+        *,
+        expand_links: bool = True,
+    ) -> AdapterResult:
         try:
             client = await self._get_client()
             headers = await self._headers()
@@ -418,11 +522,12 @@ class MarzbanAdapter(BasePanelAdapter):
             ok, data = ok_json(resp)
             if ok and isinstance(data, dict):
                 result = self._from_user_response(data, username)
-                result.links = await self._expand_subscription_links(list(result.links or []))
+                if expand_links:
+                    result.links = await self._expand_subscription_links(list(result.links or []))
                 return result
             return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
         except Exception as e:
             return AdapterResult(success=False, error=str(e))
 
     async def get_subscription_links(self, username: str, remote_id: str | None = None) -> AdapterResult:
-        return await self.get_usage(username, remote_id)
+        return await self.get_usage(username, remote_id, expand_links=True)

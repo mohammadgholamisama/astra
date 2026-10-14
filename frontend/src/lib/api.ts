@@ -64,6 +64,13 @@ export async function api<T>(
     } catch {
       /* ignore */
     }
+    // Session expired — force re-login (avoid confusing remote-panel auth errors)
+    if (res.status === 401 && !path.includes("/api/admin/token")) {
+      localStorage.removeItem("astra_token");
+      if (typeof window !== "undefined" && !window.location.pathname.startsWith("/login")) {
+        window.location.assign("/login");
+      }
+    }
     throw new ApiError(res.status, message, code);
   }
   if (res.status === 204) return undefined as T;

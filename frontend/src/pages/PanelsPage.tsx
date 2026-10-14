@@ -252,9 +252,9 @@ export default function PanelsPage() {
           method: "POST",
           body: JSON.stringify({
             base_url: normalizeBaseUrl(form.base_url),
-            username: form.username,
-            password: form.password,
-            api_token: form.api_token || null,
+            username: form.username.trim(),
+            password: form.password.trim(),
+            api_token: form.api_token.trim() || null,
           }),
         });
       }
@@ -723,6 +723,8 @@ export default function PanelsPage() {
                     </label>
                     <input
                       required={!isSanaei}
+                      name="panel_admin_username"
+                      autoComplete="off"
                       value={form.username}
                       onChange={(e) => setForm({ ...form, username: e.target.value })}
                       dir="ltr"
@@ -741,6 +743,7 @@ export default function PanelsPage() {
                     <input
                       required={!isEdit && !isSanaei}
                       type="password"
+                      name="panel_admin_password"
                       value={form.password}
                       onChange={(e) => setForm({ ...form, password: e.target.value })}
                       dir="ltr"
