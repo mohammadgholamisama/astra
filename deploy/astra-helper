@@ -706,7 +706,32 @@ PY
   " || die "failed to update admin in database"
 
   cmd_restart_astra
-  echo "astra-helper: admin login set to user=${new_user}"
+  sleep 2
+  if ! systemctl is-active --quiet astra; then
+    echo "astra-helper: WARNING — astra service is not active after restart" >&2
+    systemctl status astra --no-pager -l | head -n 40 >&2 || true
+    journalctl -u astra -n 40 --no-pager >&2 || true
+    die "astra failed to start — fix service before login"
+  fi
+  # Live auth check against local uvicorn
+  local port code
+  port="$(read_port)"
+  code="$(
+    curl -sS -o /tmp/astra-login-test.json -w '%{http_code}' --max-time 8 \
+      -X POST "http://127.0.0.1:${port}/api/admin/token" \
+      -H 'Content-Type: application/x-www-form-urlencoded' \
+      --data-urlencode "username=${new_user}" \
+      --data-urlencode "password=${new_pass}" \
+      || echo 000
+  )"
+  if [[ "$code" != "200" ]]; then
+    echo "astra-helper: login self-test HTTP ${code}" >&2
+    head -c 300 /tmp/astra-login-test.json 2>/dev/null >&2 || true
+    echo >&2
+    die "password saved but API login failed — check journalctl -u astra"
+  fi
+  rm -f /tmp/astra-login-test.json
+  echo "astra-helper: admin login set to user=${new_user} (API login OK)"
 }
 
 usage() {

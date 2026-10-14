@@ -63,8 +63,13 @@ async def get_current_admin(
 
 
 async def authenticate_admin(db: AsyncSession, username: str, password: str) -> Admin | None:
-    result = await db.execute(select(Admin).where(Admin.username == username))
+    uname = (username or "").strip()
+    if not uname:
+        return None
+    result = await db.execute(select(Admin).where(Admin.username == uname))
     admin = result.scalar_one_or_none()
-    if not admin or not verify_password(password, admin.hashed_password):
+    if not admin or not admin.is_active:
+        return None
+    if not verify_password(password or "", admin.hashed_password):
         return None
     return admin
