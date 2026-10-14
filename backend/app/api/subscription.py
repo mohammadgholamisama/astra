@@ -147,14 +147,20 @@ async def _ensure_share_links(db: AsyncSession, token: str, user):
 
 async def _pull_live_usage(db: AsyncSession, user, *, push: bool = False) -> None:
     """
-    Pull used_traffic from remotes and commit.
+    Pull used_traffic from remotes, apply Σ(raw×coeff), enforce Astra quota, commit.
 
-    Important: commit usage BEFORE any slow modify push — otherwise a timeout
-    would rollback and the UI/clients keep showing stale (too-low) traffic.
+    Always pushes remotes when Astra is limited/expired (even if push=False) so
+    upstream configs turn off when the sale finishes earlier than the main panel.
+    Multi-panel / coefficient users also get remaining-cap pushes when push=True
+    or when status just flipped.
     """
+    from app.models.user import UserStatus
+    from app.services.orchestrator import should_push_remotes
+
+    status_changed = False
     try:
         await asyncio.wait_for(refresh_usage(db, user, force=True), timeout=12.0)
-        await enforce_user_quota(db, user)
+        status_changed = await enforce_user_quota(db, user)
         await db.commit()
     except Exception as exc:  # noqa: BLE001
         logger.warning("sub usage refresh: %s", exc)
@@ -164,9 +170,24 @@ async def _pull_live_usage(db: AsyncSession, user, *, push: bool = False) -> Non
             pass
         return
 
-    if not push:
-        return
+    blocked = user.status in (
+        UserStatus.limited,
+        UserStatus.expired,
+        UserStatus.disabled,
+    )
     try:
+        need = push or status_changed or blocked
+        if not need:
+            # Multi-panel: shrink sibling caps as usage accrues
+            need = await should_push_remotes(
+                db,
+                user,
+                status_changed=False,
+                force=False,
+                shrink_shared_caps=True,
+            )
+        if not need:
+            return
         await asyncio.wait_for(sync_modify_user(db, user), timeout=15.0)
         await db.commit()
     except Exception as exc:  # noqa: BLE001

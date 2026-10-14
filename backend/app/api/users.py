@@ -140,9 +140,12 @@ async def get_user(
     user = await load_user(db, username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    # Live usage only — avoid extra modify round-trip on every open
     await orchestrator.refresh_usage(db, user, force=True)
-    await orchestrator.enforce_user_quota(db, user)
+    changed = await orchestrator.enforce_user_quota(db, user)
+    if await orchestrator.should_push_remotes(
+        db, user, status_changed=changed, shrink_shared_caps=True
+    ):
+        await orchestrator.sync_modify_user(db, user)
     await db.commit()
     user = await load_user(db, username)
     return to_user_response(user)  # type: ignore[arg-type]
