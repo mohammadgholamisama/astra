@@ -462,11 +462,13 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
 
 async def sync_delete_user(db: AsyncSession, user: User) -> list[dict]:
     """
-    Always call remote DELETE per panel docs, then clear local account.
+    Delete user on every remote panel (docs DELETE). Strict result:
 
-    Returns {panel_id, panel_name, ok, soft, error}.
-    ok=True soft=False → remote confirmed deleted (or 404 already gone).
-    ok=True soft=True  → remote failed/unreachable; Astra still removes the user.
+    ok=True  → remote confirmed gone (DELETE ok or already 404)
+    ok=False → remote still has the user / unreachable — caller must NOT
+               delete the Astra user.
+
+    Does not mark accounts deleted on failure (so retry can try again).
     """
     result = await db.execute(
         select(PanelAccount)
@@ -483,13 +485,19 @@ async def sync_delete_user(db: AsyncSession, user: User) -> list[dict]:
         uname = (account.remote_username or user.username or "").strip()
 
         if not panel:
-            account.status = PanelAccountStatus.deleted
             return {
                 "panel_id": account.panel_id,
                 "panel_name": name,
-                "ok": True,
-                "soft": True,
-                "error": "پنل پیدا نشد",
+                "ok": False,
+                "error": "پنل پیدا نشد — حذف لغو شد",
+            }
+
+        if not uname:
+            return {
+                "panel_id": account.panel_id,
+                "panel_name": name,
+                "ok": False,
+                "error": "یوزرنیم ریموت خالی است",
             }
 
         adapter = get_adapter(panel)
@@ -503,13 +511,12 @@ async def sync_delete_user(db: AsyncSession, user: User) -> list[dict]:
                 await adapter.close()  # type: ignore[attr-defined]
             except Exception:
                 pass
-            account.status = PanelAccountStatus.deleted
+            account.error_message = _exc_msg(e)
             return {
                 "panel_id": account.panel_id,
                 "panel_name": name,
-                "ok": True,
-                "soft": True,
-                "error": _exc_msg(e),
+                "ok": False,
+                "error": account.error_message,
             }
 
         try:
@@ -524,19 +531,15 @@ async def sync_delete_user(db: AsyncSession, user: User) -> list[dict]:
                 "panel_id": account.panel_id,
                 "panel_name": name,
                 "ok": True,
-                "soft": False,
                 "error": None,
             }
 
-        # Still remove from Astra; surface remote error as warning
-        account.status = PanelAccountStatus.deleted
-        account.error_message = res.error
+        account.error_message = res.error or "حذف از پنل ناموفق بود"
         return {
             "panel_id": account.panel_id,
             "panel_name": name,
-            "ok": True,
-            "soft": True,
-            "error": res.error or "حذف از پنل ناموفق بود",
+            "ok": False,
+            "error": account.error_message,
         }
 
     outcomes = list(await asyncio.gather(*[_remote(a) for a in accounts]))

@@ -280,27 +280,21 @@ export default function UsersPage() {
 
   const remove = useMutation({
     mutationFn: (u: string) =>
-      api<{ detail?: string; warnings?: string[] }>(
-        `/api/user/${encodeURIComponent(u)}`,
-        { method: "DELETE" }
-      ),
-    onSuccess: (data) => {
+      api<{ detail?: string }>(`/api/user/${encodeURIComponent(u)}`, {
+        method: "DELETE",
+      }),
+    onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["users"] });
       setConfirmUser(null);
-      const warns = (data?.warnings || []).filter(Boolean);
-      if (warns.length) {
-        setActionMsg({
-          type: "ok",
-          text: `کاربر حذف شد · بعضی پنل‌ها در دسترس نبودند: ${warns.join("؛ ")}`,
-        });
-      } else {
-        setActionMsg({ type: "ok", text: "کاربر از همه پنل‌ها حذف شد" });
-      }
+      setActionMsg({ type: "ok", text: "کاربر از Astra و همه پنل‌های اصلی حذف شد" });
     },
     onError: (e: Error) => {
       qc.invalidateQueries({ queryKey: ["users"] });
-      setConfirmUser(null);
-      setActionMsg({ type: "err", text: e.message || "خطا در حذف کاربر" });
+      // Keep confirm open so admin sees the remote failure and can retry
+      setActionMsg({
+        type: "err",
+        text: e.message || "حذف از پنل اصلی ناموفق — کاربر در Astra باقی ماند",
+      });
     },
   });
 

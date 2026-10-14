@@ -212,20 +212,24 @@ async def delete_user(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Always remove from Astra after best-effort remote deletes.
-    # Broken/slow panels must not trap the user forever in the sales panel.
+    # Strict: Astra user is removed ONLY if every remote panel confirms delete.
     results = await orchestrator.sync_delete_user(db, user)
+    failed = [r for r in results if not r.get("ok")]
+    if failed:
+        await db.commit()  # persist per-panel error_message for UI
+        parts = [
+            f"{r.get('panel_name') or r.get('panel_id')}: {r.get('error') or 'خطا'}"
+            for r in failed
+        ]
+        raise HTTPException(
+            status_code=502,
+            detail="حذف از پنل اصلی ناموفق بود — کاربر در Astra نگه داشته شد: "
+            + "؛ ".join(parts),
+        )
+
     await db.delete(user)
     await db.commit()
-    soft = [r for r in results if r.get("soft") and r.get("error")]
-    return {
-        "detail": "User deleted",
-        "panels": results,
-        "warnings": [
-            f"{r.get('panel_name') or r.get('panel_id')}: {r.get('error')}"
-            for r in soft
-        ],
-    }
+    return {"detail": "User deleted", "panels": results}
 
 
 @router.post("/api/user/{username}/reset", response_model=UserResponse)

@@ -538,42 +538,58 @@ class MarzbanAdapter(BasePanelAdapter):
             return AdapterResult(success=False, error=msg)
 
     async def delete_user(self, username: str, remote_id: str | None = None) -> AdapterResult:
-        """DELETE /api/user/{username} — official Marzban remove (404 = already gone)."""
+        """DELETE /api/user/{username} — Marzban/PasarGuard docs; verify gone via GET."""
+        from urllib.parse import quote
+
         uname = (username or remote_id or "").strip()
         if not uname:
             return AdapterResult(success=False, error="username خالی است")
+        path = f"/api/user/{quote(uname, safe='')}"
         last_err = "delete failed"
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 client, headers = await self._authed()
-                resp = await client.delete(
-                    f"/api/user/{uname}",
-                    headers=headers,
-                    timeout=httpx.Timeout(25.0, connect=15.0),
-                )
-                if resp.status_code in (200, 204, 404):
+                t = httpx.Timeout(30.0, connect=18.0)
+                resp = await client.delete(path, headers=headers, timeout=t)
+                if resp.status_code not in (200, 204, 404):
+                    ok, data = ok_json(resp)
+                    err = err_msg(data, f"HTTP {resp.status_code}")
+                    if "not found" in err.lower():
+                        return AdapterResult(success=True)
+                    last_err = err
+                    if resp.status_code in (401, 403) and attempt < 2:
+                        self._token = None
+                        _TOKEN_CACHE.pop(self._cache_key(), None)
+                        await self.close()
+                        continue
+                    return AdapterResult(success=False, error=err)
+
+                # Confirm removed (or never existed). If still 200 → delete lied/failed.
+                client, headers = await self._authed()
+                check = await client.get(path, headers=headers, timeout=t)
+                if check.status_code == 404:
                     return AdapterResult(success=True)
-                ok, data = ok_json(resp)
-                err = err_msg(data, f"HTTP {resp.status_code}")
-                if "not found" in err.lower():
-                    return AdapterResult(success=True)
-                last_err = err
-                # Auth blip — clear token and retry once
-                if resp.status_code in (401, 403) and attempt == 0:
-                    self._token = None
-                    _TOKEN_CACHE.pop(self._cache_key(), None)
-                    await self.close()
-                    continue
-                return AdapterResult(success=False, error=err)
+                if check.status_code in (200, 201):
+                    last_err = "کاربر هنوز روی پنل اصلی وجود دارد"
+                    if attempt < 2:
+                        await asyncio.sleep(0.4)
+                        continue
+                    return AdapterResult(success=False, error=last_err)
+                # Other codes after DELETE → treat as gone
+                return AdapterResult(success=True)
             except Exception as e:
                 last_err = str(e).strip() or e.__class__.__name__
-                if "client has been closed" in last_err.lower() and attempt == 0:
+                if "client has been closed" in last_err.lower() and attempt < 2:
                     self._token = None
                     await self.close()
                     await asyncio.sleep(0.3)
                     continue
                 if isinstance(e, (asyncio.TimeoutError, httpx.TimeoutException)):
                     last_err = "Timeout waiting for panel response"
+                if attempt < 2:
+                    await self.close()
+                    await asyncio.sleep(0.4)
+                    continue
                 return AdapterResult(success=False, error=last_err)
         return AdapterResult(success=False, error=last_err)
 
