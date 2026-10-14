@@ -283,6 +283,10 @@ async def list_users(
     limit: int = Query(50, ge=1, le=500),
     search: str | None = None,
     group_id: int | None = Query(None, ge=1),
+    refresh: bool = Query(
+        True,
+        description="Pull live usage from remote panels for this page of users",
+    ),
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
@@ -301,8 +305,26 @@ async def list_users(
         )
     total = (await db.execute(count_q)).scalar() or 0
     result = await db.execute(q.order_by(User.id.desc()).offset(offset).limit(limit))
-    users = result.scalars().unique().all()
-    # Slim payloads for list (no full share links / proxies) — scale-friendly
+    users = list(result.scalars().unique().all())
+
+    if refresh and users:
+        # Live usage for the visible page only (does not touch other apps/DBs)
+        await orchestrator.refresh_users_usage_batch(db, users, force=True, concurrency=8)
+        await db.commit()
+        # Reload so response has fresh used_traffic / status after commit
+        ids = [u.id for u in users]
+        result = await db.execute(
+            select(User)
+            .where(User.id.in_(ids))
+            .options(
+                selectinload(User.groups),
+                selectinload(User.panel_accounts).selectinload(PanelAccount.panel),
+            )
+            .order_by(User.id.desc())
+        )
+        by_id = {u.id: u for u in result.scalars().unique().all()}
+        users = [by_id[i] for i in ids if i in by_id]
+
     return UsersListResponse(
         users=[to_user_response(u, include_links=False) for u in users],
         total=total,

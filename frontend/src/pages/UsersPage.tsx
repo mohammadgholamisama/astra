@@ -145,12 +145,14 @@ export default function UsersPage() {
   const { data, isLoading, isFetching, refetch } = useQuery({
     queryKey: ["users", searchDebounced, filterGroupId],
     queryFn: () => {
-      const qs = new URLSearchParams({ limit: "100" });
+      const qs = new URLSearchParams({ limit: "100", refresh: "true" });
       if (searchDebounced.trim()) qs.set("search", searchDebounced.trim());
       if (filterGroupId !== "") qs.set("group_id", String(filterGroupId));
       return api<{ users: User[]; total: number }>(`/api/users?${qs}`);
     },
-    staleTime: 15_000,
+    staleTime: 0,
+    refetchOnMount: "always",
+    refetchOnWindowFocus: true,
     placeholderData: (prev) => prev,
   });
   const { data: groups = [] } = useQuery({
@@ -400,7 +402,10 @@ export default function UsersPage() {
       <header className="users-head">
         <div>
           <h1 className="page-title">کاربران</h1>
-          <p className="page-sub">ساخت کانفیگ روی پنل‌های گروه · لینک ساب تجمیعی</p>
+          <p className="page-sub">
+            ساخت کانفیگ روی پنل‌های گروه · لینک ساب تجمیعی
+            {isFetching ? " · در حال همگام‌سازی مصرف از پنل‌ها…" : ""}
+          </p>
         </div>
         <div className="users-head-actions">
           <button
@@ -408,9 +413,10 @@ export default function UsersPage() {
             className="btn ghost sm"
             onClick={() => refetch()}
             disabled={isFetching}
+            title="مصرف زنده از پنل‌ها خوانده می‌شود"
           >
             <RefreshCw size={14} className={isFetching ? "spin" : undefined} />
-            تازه‌سازی
+            {isFetching ? "همگام‌سازی…" : "تازه‌سازی مصرف"}
           </button>
           <button type="button" className="btn users-add" onClick={() => setOpen(true)}>
             <Plus size={16} />

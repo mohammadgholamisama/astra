@@ -511,6 +511,29 @@ def _accounts_need_remote_refresh(accounts: list[PanelAccount], interval: int) -
     return False
 
 
+async def refresh_users_usage_batch(
+    db: AsyncSession,
+    users: list[User],
+    *,
+    force: bool = True,
+    concurrency: int = 8,
+) -> None:
+    """Live-pull usage for many users (admin users page). Bounded parallelism."""
+    if not users:
+        return
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def _one(u: User) -> None:
+        async with sem:
+            try:
+                await refresh_usage(db, u, force=force)
+                await enforce_user_quota(db, u)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("batch usage refresh failed user=%s: %s", u.username, exc)
+
+    await asyncio.gather(*[_one(u) for u in users])
+
+
 async def refresh_usage(
     db: AsyncSession,
     user: User,
