@@ -297,10 +297,26 @@ async def provision_user_on_panels(
     async def _remote(panel: Panel, payload: UserPayload) -> AdapterResult:
         adapter = get_adapter(panel)
         try:
-            # Marzban Cloud is flaky — adapter does short connect + many retries
-            return await asyncio.wait_for(adapter.create_user(payload), timeout=75)
+            # Adapter already retries; keep outer budget high so we don't cancel
+            # AFTER Marzban accepted the user but before the response returns.
+            return await asyncio.wait_for(adapter.create_user(payload), timeout=120)
         except Exception as e:  # noqa: BLE001
-            return _fail_result(_exc_msg(e))
+            # Outer timeout / cancel — still try to confirm remote exists
+            err = _exc_msg(e)
+            try:
+                for _ in range(5):
+                    try:
+                        usage = await asyncio.wait_for(
+                            adapter.get_usage(payload.username), timeout=15
+                        )
+                        if usage.success:
+                            return usage
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.4)
+            except Exception:
+                pass
+            return _fail_result(err)
         finally:
             try:
                 await adapter.close()  # type: ignore[attr-defined]
@@ -349,24 +365,34 @@ async def provision_user_on_panels(
                 )
             )
             recovered = False
+            # Always try recover for timeout/network — user often exists on Marzban
             if exists_hint or not err:
                 adapter = get_adapter(panel)
                 try:
-                    # 1) Maybe POST succeeded but response timed out
-                    usage = await asyncio.wait_for(
-                        adapter.get_usage(payload.username), timeout=20
-                    )
-                    if usage.success:
-                        # Align limits/status with our payload
-                        mod = await asyncio.wait_for(
-                            adapter.modify_user(payload), timeout=40
-                        )
-                        await _mark_ok(mod if mod.success else usage)
+                    usage = None
+                    for _ in range(5):
+                        try:
+                            usage = await asyncio.wait_for(
+                                adapter.get_usage(payload.username), timeout=18
+                            )
+                            if usage.success:
+                                break
+                        except Exception:
+                            usage = None
+                        await asyncio.sleep(0.4)
+                    if usage and usage.success:
+                        # Prefer modify to sync limits; usage alone is enough for OK
+                        try:
+                            mod = await asyncio.wait_for(
+                                adapter.modify_user(payload), timeout=40
+                            )
+                            await _mark_ok(mod if mod.success else usage)
+                        except Exception:
+                            await _mark_ok(usage)
                         recovered = True
                     else:
-                        # 2) Not on remote yet — one more create
                         retry = await asyncio.wait_for(
-                            adapter.create_user(payload), timeout=55
+                            adapter.create_user(payload), timeout=90
                         )
                         if retry.success:
                             await _mark_ok(retry)
@@ -753,42 +779,56 @@ def collect_links_detailed(user: User, *, include_notices: bool = True) -> list[
 
 
 async def hydrate_share_links(db: AsyncSession, user: User) -> int:
-    """
-    If panel accounts only stored /sub/... or https subscription URLs,
-    fetch remote user and expand into real share links. Returns updated account count.
+    """Fetch+expand share links for every panel account that still lacks them.
+
+    Runs panels in parallel so multi-group subs get Marzban+PasarGuard+Sanaei+Rebecca
+    configs together — not only the first panel that already had vless:// links.
     """
     from app.adapters.http_utils import is_share_link, is_subscription_ref
 
-    updated = 0
+    targets: list[PanelAccount] = []
     for account in user.panel_accounts or []:
-        if account.status not in (PanelAccountStatus.active, PanelAccountStatus.error, PanelAccountStatus.pending):
+        if account.status not in (
+            PanelAccountStatus.active,
+            PanelAccountStatus.error,
+            PanelAccountStatus.pending,
+        ):
             continue
         if not account.panel:
             continue
         links = [str(x).strip() for x in (account.links or []) if x and str(x).strip()]
-        # Already have real share links — keep them (even if account flagged error)
         if any(is_share_link(x) for x in links):
             if account.status == PanelAccountStatus.error:
                 account.status = PanelAccountStatus.active
-                updated += 1
             continue
-        # Empty or only /sub/... refs → fetch & expand from remote panel
+        # Empty, or only /sub/... / https subscription refs
         if links and not any(is_subscription_ref(x) for x in links):
             continue
+        targets.append(account)
+
+    if not targets:
+        await db.flush()
+        return 0
+
+    async def _one(account: PanelAccount) -> bool:
         adapter = get_adapter(account.panel)
         uname = (account.remote_username or user.username or "").strip()
         rid = account.remote_id or account.remote_username or uname or None
         res = None
         try:
-            res = await asyncio.wait_for(adapter.get_usage(uname, rid), timeout=12)
+            try:
+                coro = adapter.get_usage(uname, rid, expand_links=True)  # type: ignore[call-arg]
+            except TypeError:
+                coro = adapter.get_usage(uname, rid)
+            res = await asyncio.wait_for(coro, timeout=25)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "hydrate links failed user=%s panel=%s: %s",
                 user.username,
                 account.panel_id,
-                exc,
+                _exc_msg(exc),
             )
-            continue
+            return False
         finally:
             close = getattr(adapter, "close", None)
             if callable(close):
@@ -797,15 +837,29 @@ async def hydrate_share_links(db: AsyncSession, user: User) -> int:
                 except Exception:  # noqa: BLE001
                     pass
         if not res or not res.success:
-            continue
+            return False
         new_links = [x for x in (res.links or []) if is_share_link(str(x))]
         if not new_links:
-            continue
+            # Keep subscription refs for a later pass; mark active if remote exists
+            if res.links:
+                account.links = list(res.links)
+            account.status = PanelAccountStatus.active
+            account.error_message = None
+            account.remote_username = res.remote_username or account.remote_username or uname
+            account.used_traffic = int(res.used_traffic or account.used_traffic or 0)
+            account.last_sync_at = datetime.now(timezone.utc)
+            return True
         account.links = new_links
         account.status = PanelAccountStatus.active
+        account.error_message = None
+        account.remote_username = res.remote_username or account.remote_username or uname
+        account.remote_id = res.remote_id or account.remote_id
         account.used_traffic = int(res.used_traffic or account.used_traffic or 0)
         account.last_sync_at = datetime.now(timezone.utc)
-        updated += 1
+        return True
+
+    outcomes = await asyncio.gather(*[_one(a) for a in targets])
+    updated = sum(1 for ok in outcomes if ok)
     if updated:
         await db.flush()
     return updated

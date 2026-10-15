@@ -227,11 +227,14 @@ class PasarGuardAdapter(MarzbanAdapter):
                 )
                 ok, data = ok_json(resp)
                 if ok and isinstance(data, dict):
-                    return self._from_pg_response(data, payload.username)
+                    result = self._from_pg_response(data, payload.username)
+                    return await self._finalize_user_result(
+                        result, payload.username, expand=True
+                    )
                 err = err_msg(data, f"HTTP {resp.status_code}")
                 low = err.lower()
                 if any(x in low for x in ("exist", "already", "duplicate", "تکرار", "موجود")):
-                    existing = await self.get_usage(payload.username, expand_links=False)
+                    existing = await self.get_usage(payload.username, expand_links=True)
                     if existing.success:
                         return existing
                     return AdapterResult(success=False, error=err)

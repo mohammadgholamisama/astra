@@ -117,15 +117,16 @@ def _feed_response(body: bytes, headers: dict[str, str]) -> Response:
 
 
 async def _ensure_share_links(db: AsyncSession, token: str, user):
-    """Collect share links; heal error accounts / expand /sub refs when feed would be empty."""
-    links = await collect_links(user, include_notices=False)
-    if links:
-        return user, links
+    """Ensure EVERY panel account has real share links in the sub feed.
+
+    Always hydrate accounts that only have /sub refs or empty links — do not
+    return early just because *some* panels already have vless:// links.
+    """
     try:
-        n = await asyncio.wait_for(hydrate_share_links(db, user), timeout=12.0)
-        await db.commit()
-        user = await load_user_by_token(db, token) or user
+        n = await asyncio.wait_for(hydrate_share_links(db, user), timeout=60.0)
         if n:
+            await db.commit()
+            user = await load_user_by_token(db, token) or user
             logger.info("sub hydrated user=%s accounts=%s", user.username, n)
     except Exception as exc:  # noqa: BLE001
         logger.warning("sub hydrate user=%s: %s", getattr(user, "username", "?"), exc)

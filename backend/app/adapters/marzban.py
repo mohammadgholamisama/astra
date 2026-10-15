@@ -481,7 +481,7 @@ class MarzbanAdapter(BasePanelAdapter):
             return result
         try:
             expanded = await asyncio.wait_for(
-                self._expand_subscription_links(links), timeout=8
+                self._expand_subscription_links(links), timeout=15
             )
             if expanded:
                 result.links = expanded
@@ -489,11 +489,31 @@ class MarzbanAdapter(BasePanelAdapter):
             pass
         return result
 
+    async def _fetch_existing_user(self, username: str) -> AdapterResult | None:
+        """Retry GET /api/user — used when create timed out but remote may have accepted."""
+        for i in range(6):
+            try:
+                existing = await asyncio.wait_for(
+                    self.get_usage(username, expand_links=True), timeout=12
+                )
+                if existing.success:
+                    return existing
+            except Exception:
+                pass
+            self._token = None
+            _TOKEN_CACHE.pop(self._cache_key(), None)
+            await self.close()
+            await asyncio.sleep(0.3 + i * 0.2)
+        return None
+
     async def create_user(self, payload: UserPayload) -> AdapterResult:
-        """POST /api/user — official Marzban create (retry on flaky Marzban Cloud)."""
+        """POST /api/user — official Marzban create (retry on flaky Marzban Cloud).
+
+        If POST is accepted but the response times out, we still treat it as success
+        when GET /api/user finds the username (common on Marzban Cloud).
+        """
         body = await self._build_user_body(payload, include_username=True)
         last_err = "create failed"
-        # Marzban Cloud often drops first connects; fail-fast + many quick retries
         req_timeout = httpx.Timeout(20.0, connect=5.0)
 
         for attempt in range(6):
@@ -507,14 +527,17 @@ class MarzbanAdapter(BasePanelAdapter):
                 )
                 ok, data = ok_json(resp)
                 if ok and isinstance(data, dict):
-                    return self._from_user_response(data, payload.username)
+                    result = self._from_user_response(data, payload.username)
+                    # Expand /sub → share links so Astra sub feed includes this panel
+                    return await self._finalize_user_result(
+                        result, payload.username, expand=True
+                    )
 
                 err = err_msg(data, f"HTTP {resp.status_code}")
                 low = err.lower()
-                # Already exists → fetch and treat as success (idempotent create)
                 if any(x in low for x in ("exist", "already", "duplicate", "تکرار", "موجود")):
-                    existing = await self.get_usage(payload.username, expand_links=False)
-                    if existing.success:
+                    existing = await self._fetch_existing_user(payload.username)
+                    if existing:
                         return existing
                     return AdapterResult(success=False, error=err)
 
@@ -532,15 +555,10 @@ class MarzbanAdapter(BasePanelAdapter):
                 if "client has been closed" in last_err.lower():
                     last_err = "اتصال پنل قطع شد — دوباره تلاش کنید"
 
-                # Response may have been accepted — quick exists check (short budget)
-                try:
-                    existing = await asyncio.wait_for(
-                        self.get_usage(payload.username, expand_links=False), timeout=8
-                    )
-                    if existing.success:
-                        return existing
-                except Exception:
-                    pass
+                # POST often succeeded — confirm by GET before retrying create
+                existing = await self._fetch_existing_user(payload.username)
+                if existing:
+                    return existing
 
                 if attempt < 5:
                     self._token = None
@@ -550,6 +568,10 @@ class MarzbanAdapter(BasePanelAdapter):
                     continue
                 return AdapterResult(success=False, error=last_err)
 
+        # Last resort: maybe created on an earlier attempt
+        existing = await self._fetch_existing_user(payload.username)
+        if existing:
+            return existing
         return AdapterResult(success=False, error=last_err)
 
     async def modify_user(self, payload: UserPayload) -> AdapterResult:
