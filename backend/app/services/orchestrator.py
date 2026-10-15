@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import re
+import secrets
 import time
 from datetime import datetime, timezone
 
@@ -16,6 +18,9 @@ from app.models.user import PanelAccount, PanelAccountStatus, User, UserStatus
 from app.services import quota as quota_math
 
 logger = logging.getLogger("astra.usage")
+
+# Marzban / PasarGuard username: 3–32 of [a-z0-9_]
+_REMOTE_USER_RE = re.compile(r"^[a-z0-9_]{3,32}$")
 
 # Per-user locks to avoid stampede on concurrent sub fetches
 _user_locks: dict[int, asyncio.Lock] = {}
@@ -50,6 +55,65 @@ def _is_not_found_err(err: str | None) -> bool:
     )
 
 
+def _is_username_taken_err(err: str | None) -> bool:
+    """Remote rejected create because username is reserved / owned elsewhere."""
+    low = (err or "").lower()
+    if "409" in low:
+        return True
+    return any(
+        x in low
+        for x in (
+            "already exist",
+            "already exists",
+            "user already",
+            "duplicate",
+            "تکرار",
+            "موجود",
+        )
+    )
+
+
+def sanitize_remote_username(name: str) -> str:
+    """Force Marzban-family username rules (a-z 0-9 _, 3–32)."""
+    s = re.sub(r"[^a-z0-9_]", "_", (name or "").strip().lower())
+    s = re.sub(r"_+", "_", s).strip("_")
+    if len(s) < 3:
+        s = (s + "usr")[:3]
+    return s[:32]
+
+
+def make_remote_username_alias(
+    astra_username: str,
+    *,
+    panel_id: int,
+    attempt: int = 0,
+) -> str:
+    """Unique remote name clearly tied to Astra user + panel.
+
+    attempt 0 → `{base}_p{panel_id}`  e.g. testttt_p2
+    attempt 1+ → `{base}_p{panel_id}{hex}` so retries never collide
+    """
+    base = sanitize_remote_username(astra_username)
+    if attempt <= 0:
+        suffix = f"_p{int(panel_id)}"
+    else:
+        suffix = f"_p{int(panel_id)}{secrets.token_hex(1)}"
+    keep = max(3, 32 - len(suffix))
+    candidate = f"{base[:keep]}{suffix}"
+    return sanitize_remote_username(candidate)[:32]
+
+
+def _astra_note(user: User, remote_username: str) -> str:
+    """Tag remote note so panel admins see Astra ownership."""
+    base = (user.note or "").strip()
+    tag = f"Astra:{user.username}"
+    if remote_username and remote_username != user.username:
+        tag = f"{tag}→{remote_username}"
+    if tag in base:
+        return base
+    return f"{tag} | {base}".strip(" |") if base else tag
+
+
 def _format_remote_error(
     panel: Panel | None,
     *,
@@ -74,7 +138,13 @@ def _format_remote_error(
         parts.append(f"یوزرنیم ریموت: {username}")
     if base:
         parts.append(f"آدرس: {base}")
-    if _is_not_found_err(detail):
+    if _is_username_taken_err(detail):
+        parts.append(
+            "علت: یوزرنیم روی این پنل تکراری/رزرو است "
+            "(احتمالاً ادمین دیگر). Astra باید با نام یکتا مثل name_p{panel} بسازد."
+        )
+        parts.append(f"پاسخ پنل: {detail}")
+    elif _is_not_found_err(detail):
         parts.append(
             "علت: کاربر روی این پنل وجود ندارد "
             "(هنوز ساخته نشده یا از پنل حذف شده)."
@@ -150,12 +220,15 @@ def build_user_payload(
     panel_config: dict | None,
     used_weighted_total: int | None = None,
     used_raw_on_panel: int = 0,
+    remote_username: str | None = None,
 ) -> UserPayload:
     """Build remote payload.
 
     Active: every panel gets the full Astra data_limit (e.g. 4GB everywhere).
     Limited/expired/disabled: freeze at current raw + disabled status on ALL panels.
     Coefficient only affects Astra usage Σ(raw×coeff), not create caps.
+
+    remote_username: optional per-panel alias when Astra name is taken on that panel.
     """
     cfg = {
         **(panel_config or {}),
@@ -182,15 +255,108 @@ def build_user_payload(
         used_r = max(0, int(used_raw_on_panel or 0))
         if int(user.data_limit or 0) > 0:
             data_limit = max(1, used_r) if used_r > 0 else 1
+    uname = sanitize_remote_username(remote_username or user.username)
     return UserPayload(
-        username=user.username,
+        username=uname,
         data_limit=data_limit,
         expire=user.expire or None,
         status=status,
-        note=user.note,
+        note=_astra_note(user, uname),
         uuid=uuid,
         config=cfg,
     )
+
+
+async def create_user_with_collision_alias(
+    adapter,
+    payload: UserPayload,
+    *,
+    astra_username: str,
+    panel_id: int,
+    timeout: float = 30.0,
+) -> AdapterResult:
+    """Create on remote; if username taken/unreadable, retry with `{name}_p{panel}` aliases.
+
+    Ensures Astra never stuck on 409 from another admin's reserved name.
+    """
+    preferred = sanitize_remote_username(payload.username or astra_username)
+    payload.username = preferred
+    payload.note = payload.note  # already tagged in build_user_payload
+
+    last = _fail_result("create failed")
+    # attempt -1 = preferred name; 0..3 = aliases
+    for attempt in range(-1, 4):
+        if attempt >= 0:
+            alias = make_remote_username_alias(
+                astra_username, panel_id=panel_id, attempt=attempt
+            )
+            if alias == payload.username:
+                alias = make_remote_username_alias(
+                    astra_username, panel_id=panel_id, attempt=attempt + 1
+                )
+            payload.username = alias
+            # Refresh note tag for new alias
+            # (payload.note may already contain Astra: — keep short)
+            if payload.note and "Astra:" in str(payload.note):
+                payload.note = re.sub(
+                    r"Astra:\S+",
+                    f"Astra:{astra_username}→{alias}",
+                    str(payload.note),
+                    count=1,
+                )
+            else:
+                payload.note = f"Astra:{astra_username}→{alias}"
+            logger.info(
+                "create alias retry panel=%s astra=%s remote=%s attempt=%s",
+                panel_id,
+                astra_username,
+                alias,
+                attempt,
+            )
+        try:
+            last = await asyncio.wait_for(adapter.create_user(payload), timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            last = _fail_result(_exc_msg(e))
+            # Timeout: confirm preferred/alias might already exist
+            try:
+                usage = await asyncio.wait_for(
+                    adapter.get_usage(payload.username, expand_links=False),  # type: ignore[call-arg]
+                    timeout=8,
+                )
+                if usage and usage.success:
+                    return usage
+            except TypeError:
+                try:
+                    usage = await asyncio.wait_for(
+                        adapter.get_usage(payload.username), timeout=8
+                    )
+                    if usage and usage.success:
+                        return usage
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            continue
+
+        if last.success:
+            # Ensure remote_username is the name we actually used
+            if not last.remote_username:
+                last.remote_username = payload.username
+            return last
+
+        # Readable "already exists" that we could use would have succeeded inside adapter.
+        # Taken / conflict → try alias. Other errors → stop (except first preferred try).
+        if _is_username_taken_err(last.error) or (
+            attempt < 0 and _is_not_found_err(last.error)
+        ):
+            continue
+        # Non-collision failure on preferred name: still try one alias (some panels
+        # return opaque errors for taken names)
+        if attempt < 0:
+            continue
+        break
+
+    return last
 
 
 async def _lock_for_user(user_id: int) -> asyncio.Lock:
@@ -348,7 +514,14 @@ async def provision_user_on_panels(
             db.add(account)
             by_panel[panel.id] = account
             created_any = True
-        payload = build_user_payload(user, uuid=account.uuid, panel_config=config)
+        # Prefer stored alias if this panel already collided before
+        preferred = (account.remote_username or user.username or "").strip()
+        payload = build_user_payload(
+            user,
+            uuid=account.uuid,
+            panel_config=config,
+            remote_username=preferred,
+        )
         jobs.append((account, panel, payload))
 
     if created_any:
@@ -356,54 +529,28 @@ async def provision_user_on_panels(
 
     sem = _remote_sem()
 
-    async def _confirm(adapter, username: str) -> AdapterResult | None:
-        """GET after timeout — Marzban Cloud often created the user already."""
-        try:
-            fetch = getattr(adapter, "_fetch_existing_user", None)
-            if callable(fetch):
-                existing = await asyncio.wait_for(fetch(username), timeout=12)
-                if existing and existing.success:
-                    return existing
-        except Exception:
-            pass
-        try:
-            try:
-                usage = await asyncio.wait_for(
-                    adapter.get_usage(username, expand_links=False),  # type: ignore[call-arg]
-                    timeout=10,
-                )
-            except TypeError:
-                usage = await asyncio.wait_for(adapter.get_usage(username), timeout=10)
-            if usage and usage.success:
-                return usage
-        except Exception:
-            pass
-        return None
-
     async def _remote(panel: Panel, payload: UserPayload) -> AdapterResult:
         adapter = get_adapter(panel)
         t0 = time.monotonic()
-        # Marzban Cloud / distant panels need headroom; create still confirms via GET
         create_timeout = 30.0
         ptype = getattr(panel.type, "value", panel.type)
         if ptype in ("marzban", "pasarguard", "rebecca"):
             create_timeout = 35.0
         try:
             async with sem:
-                try:
-                    return await asyncio.wait_for(
-                        adapter.create_user(payload), timeout=create_timeout
-                    )
-                except Exception as e:  # noqa: BLE001
-                    confirmed = await _confirm(adapter, payload.username)
-                    if confirmed is not None:
-                        return confirmed
-                    return _fail_result(_exc_msg(e))
+                return await create_user_with_collision_alias(
+                    adapter,
+                    payload,
+                    astra_username=user.username,
+                    panel_id=panel.id,
+                    timeout=create_timeout,
+                )
         finally:
             logger.info(
-                "provision panel=%s type=%s user=%s dt=%.2fs",
+                "provision panel=%s type=%s astra=%s remote=%s dt=%.2fs",
                 panel.name,
                 getattr(panel.type, "value", panel.type),
+                user.username,
                 payload.username,
                 time.monotonic() - t0,
             )
@@ -422,7 +569,10 @@ async def provision_user_on_panels(
         coeff = coefficient_from_config(payload.config or {})
         if result.success:
             account.status = PanelAccountStatus.active
-            account.remote_username = result.remote_username or user.username
+            # Persist the name actually used on remote (may be alias)
+            account.remote_username = (
+                result.remote_username or payload.username or user.username
+            )
             account.remote_id = result.remote_id or account.remote_id
             account.uuid = result.uuid or account.uuid
             account.links = result.links or account.links or []
@@ -588,18 +738,22 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
             continue
         # Still push disable/limits to error accounts — they often exist on remote
         merged = dict(panel_cfg.get(panel.id) or {})
+        rem_name = (account.remote_username or user.username or "").strip()
         payload = build_user_payload(
             user,
             uuid=account.uuid,
             panel_config=merged,
             used_weighted_total=weighted,
             used_raw_on_panel=int(account.used_traffic or 0),
+            remote_username=rem_name,
         )
         jobs.append((account, panel, payload))
 
     sem = _remote_sem()
 
-    async def _remote(panel: Panel, payload: UserPayload) -> AdapterResult:
+    async def _remote(
+        panel: Panel, payload: UserPayload, account: PanelAccount
+    ) -> AdapterResult:
         attempts = 2 if blocked else 1
         last = _fail_result("modify failed")
         for i in range(attempts):
@@ -611,19 +765,18 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
                     )
                 if last.success:
                     return last
-                # Missing on remote → create (edit/add-group / stale error rows)
-                if _is_not_found_err(last.error):
-                    try:
-                        created = await asyncio.wait_for(
-                            adapter.create_user(payload), timeout=30
-                        )
-                        if created.success:
-                            return created
-                        last = created
-                    except Exception as ce:  # noqa: BLE001
-                        last = _fail_result(
-                            f"modify: user not found; create: {_exc_msg(ce)}"
-                        )
+                # Missing / reserved name → create with collision aliases
+                if _is_not_found_err(last.error) or _is_username_taken_err(last.error):
+                    created = await create_user_with_collision_alias(
+                        adapter,
+                        payload,
+                        astra_username=user.username,
+                        panel_id=panel.id,
+                        timeout=30.0,
+                    )
+                    if created.success:
+                        return created
+                    last = created
             except Exception as e:  # noqa: BLE001
                 last = _fail_result(_exc_msg(e))
             finally:
@@ -639,12 +792,19 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
         await db.flush()
         return
 
-    results = await asyncio.gather(*[_remote(panel, payload) for _, panel, payload in jobs])
+    results = await asyncio.gather(
+        *[_remote(panel, payload, account) for account, panel, payload in jobs]
+    )
     now = datetime.now(timezone.utc)
     for (account, panel, payload), res in zip(jobs, results):
         if res.success:
             account.status = PanelAccountStatus.active
-            account.remote_username = res.remote_username or account.remote_username or user.username
+            account.remote_username = (
+                res.remote_username
+                or payload.username
+                or account.remote_username
+                or user.username
+            )
             account.remote_id = res.remote_id or account.remote_id
             if res.uuid:
                 account.uuid = res.uuid

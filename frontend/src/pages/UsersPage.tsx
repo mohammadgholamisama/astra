@@ -54,7 +54,10 @@ function userHasErrors(u: User) {
   return (u.panel_accounts || []).some((a) => a.status === "error");
 }
 
-function formatPanelErrorDetail(a: User["panel_accounts"][number]): string {
+function formatPanelErrorDetail(
+  a: User["panel_accounts"][number],
+  astraUsername?: string
+): string {
   const lines: string[] = [];
   if (a.error_message?.trim()) {
     lines.push(a.error_message.trim());
@@ -62,7 +65,11 @@ function formatPanelErrorDetail(a: User["panel_accounts"][number]): string {
     lines.push("پیام خطایی ثبت نشده");
   }
   if (a.remote_username) {
-    lines.push(`یوزرنیم ریموت: ${a.remote_username}`);
+    const alias =
+      astraUsername && a.remote_username !== astraUsername
+        ? ` (نام یکتای این پنل برای کاربر Astra «${astraUsername}»)`
+        : "";
+    lines.push(`یوزرنیم ریموت: ${a.remote_username}${alias}`);
   }
   if (a.panel_base_url) {
     lines.push(`آدرس پنل: ${a.panel_base_url}`);
@@ -1872,7 +1879,7 @@ export default function UsersPage() {
                       {a.panel_type && <span className="badge muted">{a.panel_type}</span>}
                     </div>
                     <pre className="user-err-body" dir="auto">
-                      {formatPanelErrorDetail(a)}
+                      {formatPanelErrorDetail(a, errorsUser.username)}
                     </pre>
                   </div>
                 ))}
