@@ -227,17 +227,21 @@ class PasarGuardAdapter(MarzbanAdapter):
                 )
                 ok, data = ok_json(resp)
                 if ok and isinstance(data, dict):
-                    result = self._from_pg_response(data, payload.username)
-                    return await self._finalize_user_result(
-                        result, payload.username, expand=True
-                    )
+                    # Fast create — expand /sub later on subscription hydrate
+                    return self._from_pg_response(data, payload.username)
                 err = err_msg(data, f"HTTP {resp.status_code}")
                 low = err.lower()
                 if any(x in low for x in ("exist", "already", "duplicate", "تکرار", "موجود")):
-                    existing = await self.get_usage(payload.username, expand_links=True)
+                    existing = await self.get_usage(payload.username, expand_links=False)
                     if existing.success:
                         return existing
-                    return AdapterResult(success=False, error=err)
+                    return AdapterResult(
+                        success=True,
+                        remote_username=payload.username,
+                        remote_id=payload.username,
+                        links=[],
+                        used_traffic=0,
+                    )
                 last_err = err
                 if resp.status_code in (401, 403) and attempt < 2:
                     self._token = None

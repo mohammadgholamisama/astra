@@ -265,14 +265,11 @@ async def provision_user_on_panels(
     user: User,
     panels: list[tuple[Panel, dict]],
 ) -> list[PanelAccount]:
-    """
-    Ensure PanelAccount rows (sequential DB), then create users on remotes in parallel
-    (HTTP only), then write results back sequentially.
-    """
+    """Create on all remotes in parallel — wall time ≈ slowest panel, not sum."""
     if not panels:
         return []
 
-    # 1) Sequential: prepare local account rows + payloads (no concurrent DB use)
+    t_prov = time.monotonic()
     jobs: list[tuple[PanelAccount, Panel, UserPayload]] = []
     for panel, config in panels:
         existing = await db.execute(
@@ -288,20 +285,16 @@ async def provision_user_on_panels(
             db.add(account)
             await db.flush()
 
-        # Only pass explicit proxies from user settings — never force vless/vmess.
-        # data_limit on remote = Astra limit ÷ panel coefficient
         payload = build_user_payload(user, uuid=account.uuid, panel_config=config)
         jobs.append((account, panel, payload))
 
-    # 2) Parallel: remote HTTP only
     async def _remote(panel: Panel, payload: UserPayload) -> AdapterResult:
         adapter = get_adapter(panel)
+        t0 = time.monotonic()
         try:
-            # Adapter already retries; keep outer budget high so we don't cancel
-            # AFTER Marzban accepted the user but before the response returns.
-            return await asyncio.wait_for(adapter.create_user(payload), timeout=120)
+            # Tight budget: adapters are already fast; don't stall the whole gather
+            return await asyncio.wait_for(adapter.create_user(payload), timeout=35)
         except Exception as e:  # noqa: BLE001
-            # Outer timeout / cancel — confirm remote exists (no expand = fast)
             err = _exc_msg(e)
             try:
                 fetch = getattr(adapter, "_fetch_existing_user", None)
@@ -309,20 +302,22 @@ async def provision_user_on_panels(
                     existing = await fetch(payload.username)
                     if existing and existing.success:
                         return existing
-                for _ in range(6):
-                    try:
-                        usage = await asyncio.wait_for(
-                            adapter.get_usage(payload.username), timeout=12
-                        )
-                        if usage.success:
-                            return usage
-                    except Exception:
-                        pass
-                    await asyncio.sleep(0.3)
+                usage = await asyncio.wait_for(
+                    adapter.get_usage(payload.username), timeout=8
+                )
+                if usage.success:
+                    return usage
             except Exception:
                 pass
             return _fail_result(err)
         finally:
+            logger.info(
+                "provision panel=%s type=%s user=%s dt=%.2fs",
+                panel.name,
+                getattr(panel.type, "value", panel.type),
+                payload.username,
+                time.monotonic() - t0,
+            )
             try:
                 await adapter.close()  # type: ignore[attr-defined]
             except Exception:
@@ -330,32 +325,31 @@ async def provision_user_on_panels(
 
     results = await asyncio.gather(*[_remote(panel, payload) for _, panel, payload in jobs])
 
-    # 3) Sequential: persist outcomes (+ recover timeout/exists without needing UI retry)
+    # Persist + light parallel recover only for failures (no modify — keeps create fast)
     accounts: list[PanelAccount] = []
     now = datetime.now(timezone.utc)
+    recover_jobs: list[tuple[PanelAccount, Panel, UserPayload, str]] = []
+
     for (account, panel, payload), result in zip(jobs, results):
         cfg = dict(payload.config or {})
         coeff = coefficient_from_config(cfg)
 
-        async def _mark_ok(res: AdapterResult) -> None:
+        if result.success:
             account.status = PanelAccountStatus.active
-            account.remote_username = res.remote_username or user.username
-            account.remote_id = res.remote_id or account.remote_id
-            account.uuid = res.uuid or account.uuid
-            account.links = res.links or account.links or []
-            account.used_traffic = int(res.used_traffic or account.used_traffic or 0)
+            account.remote_username = result.remote_username or user.username
+            account.remote_id = result.remote_id or account.remote_id
+            account.uuid = result.uuid or account.uuid
+            account.links = result.links or account.links or []
+            account.used_traffic = int(result.used_traffic or 0)
             account.coeff_anchor_raw = 0
             account.coeff_anchor_weighted = 0
             account.applied_coefficient = coeff
             account.error_message = None
             account.last_sync_at = now
             panel.last_ok_at = now
-
-        if result.success:
-            await _mark_ok(result)
         else:
             err = (result.error or "").lower()
-            exists_hint = any(
+            if any(
                 x in err
                 for x in (
                     "exist",
@@ -368,78 +362,84 @@ async def provision_user_on_panels(
                     "network",
                     "قطع",
                 )
-            )
-            recovered = False
-            # Always try recover for timeout/network — user often exists on Marzban
-            if exists_hint or not err:
-                adapter = get_adapter(panel)
-                try:
-                    usage = None
-                    for _ in range(5):
-                        try:
-                            usage = await asyncio.wait_for(
-                                adapter.get_usage(payload.username), timeout=18
-                            )
-                            if usage.success:
-                                break
-                        except Exception:
-                            usage = None
-                        await asyncio.sleep(0.4)
-                    if usage and usage.success:
-                        # Prefer modify to sync limits; usage alone is enough for OK
-                        try:
-                            mod = await asyncio.wait_for(
-                                adapter.modify_user(payload), timeout=40
-                            )
-                            await _mark_ok(mod if mod.success else usage)
-                        except Exception:
-                            await _mark_ok(usage)
-                        recovered = True
-                    else:
-                        retry = await asyncio.wait_for(
-                            adapter.create_user(payload), timeout=90
-                        )
-                        if retry.success:
-                            await _mark_ok(retry)
-                            recovered = True
-                        else:
-                            err2 = (retry.error or "").lower()
-                            if any(
-                                x in err2
-                                for x in ("exist", "already", "duplicate", "تکرار", "موجود")
-                            ):
-                                mod = await asyncio.wait_for(
-                                    adapter.modify_user(payload), timeout=40
-                                )
-                                if mod.success:
-                                    await _mark_ok(mod)
-                                    recovered = True
-                                else:
-                                    account.status = PanelAccountStatus.error
-                                    account.error_message = (
-                                        mod.error or retry.error or result.error
-                                    )
-                            else:
-                                account.status = PanelAccountStatus.error
-                                account.error_message = (
-                                    retry.error or result.error or "ایجاد در پنل ناموفق"
-                                )
-                except Exception as e:  # noqa: BLE001
-                    account.status = PanelAccountStatus.error
-                    account.error_message = (
-                        f"{result.error or 'create failed'} | recover: {_exc_msg(e)}"
-                    )
-                finally:
-                    try:
-                        await adapter.close()  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
-            if not recovered and account.status != PanelAccountStatus.active:
+            ) or not err:
+                recover_jobs.append((account, panel, payload, result.error or ""))
+            else:
                 account.status = PanelAccountStatus.error
                 account.error_message = result.error or "ایجاد در پنل ناموفق"
         accounts.append(account)
 
+    async def _recover(
+        account: PanelAccount, panel: Panel, payload: UserPayload, orig_err: str
+    ) -> None:
+        adapter = get_adapter(panel)
+        coeff = coefficient_from_config(payload.config or {})
+        try:
+            usage = None
+            fetch = getattr(adapter, "_fetch_existing_user", None)
+            if callable(fetch):
+                usage = await fetch(payload.username)
+            if not (usage and usage.success):
+                try:
+                    usage = await asyncio.wait_for(
+                        adapter.get_usage(payload.username), timeout=8
+                    )
+                except Exception:
+                    usage = None
+            if usage and usage.success:
+                account.status = PanelAccountStatus.active
+                account.remote_username = usage.remote_username or user.username
+                account.remote_id = usage.remote_id or account.remote_id
+                account.uuid = usage.uuid or account.uuid
+                account.links = usage.links or account.links or []
+                account.used_traffic = int(usage.used_traffic or 0)
+                account.coeff_anchor_raw = 0
+                account.coeff_anchor_weighted = 0
+                account.applied_coefficient = coeff
+                account.error_message = None
+                account.last_sync_at = now
+                panel.last_ok_at = now
+                return
+            # One quick recreate
+            retry = await asyncio.wait_for(adapter.create_user(payload), timeout=25)
+            if retry.success:
+                account.status = PanelAccountStatus.active
+                account.remote_username = retry.remote_username or user.username
+                account.remote_id = retry.remote_id or account.remote_id
+                account.uuid = retry.uuid or account.uuid
+                account.links = retry.links or []
+                account.used_traffic = int(retry.used_traffic or 0)
+                account.coeff_anchor_raw = 0
+                account.coeff_anchor_weighted = 0
+                account.applied_coefficient = coeff
+                account.error_message = None
+                account.last_sync_at = now
+                panel.last_ok_at = now
+                return
+            account.status = PanelAccountStatus.error
+            account.error_message = retry.error or orig_err or "ایجاد در پنل ناموفق"
+        except Exception as e:  # noqa: BLE001
+            account.status = PanelAccountStatus.error
+            account.error_message = f"{orig_err or 'create failed'} | recover: {_exc_msg(e)}"
+        finally:
+            try:
+                await adapter.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+    if recover_jobs:
+        await asyncio.gather(
+            *[_recover(a, p, pl, err) for a, p, pl, err in recover_jobs]
+        )
+
     await db.flush()
+    logger.info(
+        "provision done user=%s panels=%s recover=%s total=%.2fs",
+        user.username,
+        len(jobs),
+        len(recover_jobs),
+        time.monotonic() - t_prov,
+    )
     return accounts
 
 

@@ -490,39 +490,33 @@ class MarzbanAdapter(BasePanelAdapter):
         return result
 
     async def _fetch_existing_user(self, username: str) -> AdapterResult | None:
-        """Fast GET /api/user (no /sub expand) — prove the user exists on Marzban."""
-        for i in range(8):
+        """Fast GET /api/user only — no /sub expand (create path must stay quick)."""
+        for i in range(3):
             try:
                 existing = await asyncio.wait_for(
-                    self.get_usage(username, expand_links=False), timeout=10
+                    self.get_usage(username, expand_links=False), timeout=6
                 )
                 if existing.success:
-                    # Best-effort expand; never fail existence because /sub is slow
-                    return await self._finalize_user_result(
-                        existing, username, expand=True
-                    )
+                    return existing
             except Exception:
                 pass
             self._token = None
             _TOKEN_CACHE.pop(self._cache_key(), None)
             await self.close()
-            await asyncio.sleep(0.2 + i * 0.15)
+            await asyncio.sleep(0.15 + i * 0.1)
         return None
 
     async def create_user(self, payload: UserPayload) -> AdapterResult:
-        """POST /api/user — fast path + confirm-by-GET on Marzban Cloud timeouts.
+        """POST /api/user — parallel-friendly fast create.
 
-        Strategy:
-        1) POST once (short timeouts)
-        2) On success → return (optional link expand)
-        3) On timeout/network → GET user; if found → success (no manual retry needed)
-        4) Retry a few more POSTs only if GET says not found
+        No /sub expand here (hydrate on subscription). On timeout, one quick GET
+        confirms acceptance so Astra does not wait on Marzban Cloud retries.
         """
         body = await self._build_user_body(payload, include_username=True)
         last_err = "create failed"
-        req_timeout = httpx.Timeout(12.0, connect=4.0)
+        req_timeout = httpx.Timeout(8.0, connect=3.0)
 
-        for attempt in range(5):
+        for attempt in range(3):
             try:
                 client, headers = await self._authed()
                 resp = await client.post(
@@ -533,10 +527,8 @@ class MarzbanAdapter(BasePanelAdapter):
                 )
                 ok, data = ok_json(resp)
                 if ok and isinstance(data, dict):
-                    result = self._from_user_response(data, payload.username)
-                    return await self._finalize_user_result(
-                        result, payload.username, expand=True
-                    )
+                    # Return immediately — links hydrated later on /sub
+                    return self._from_user_response(data, payload.username)
 
                 err = err_msg(data, f"HTTP {resp.status_code}")
                 low = err.lower()
@@ -544,7 +536,6 @@ class MarzbanAdapter(BasePanelAdapter):
                     existing = await self._fetch_existing_user(payload.username)
                     if existing:
                         return existing
-                    # Exists but GET flaky — still OK for Astra (retry UI not needed)
                     return AdapterResult(
                         success=True,
                         remote_username=payload.username,
@@ -554,12 +545,11 @@ class MarzbanAdapter(BasePanelAdapter):
                     )
 
                 last_err = err
-                if resp.status_code in (401, 403) and attempt < 4:
+                if resp.status_code in (401, 403) and attempt < 2:
                     self._token = None
                     _TOKEN_CACHE.pop(self._cache_key(), None)
                     await self.close()
                     continue
-                # Hard API rejection — still check exists (race)
                 existing = await self._fetch_existing_user(payload.username)
                 if existing:
                     return existing
@@ -571,16 +561,15 @@ class MarzbanAdapter(BasePanelAdapter):
                 if "client has been closed" in last_err.lower():
                     last_err = "اتصال پنل قطع شد — دوباره تلاش کنید"
 
-                # Most common Marzban Cloud case: POST accepted, response lost
                 existing = await self._fetch_existing_user(payload.username)
                 if existing:
                     return existing
 
-                if attempt < 4:
+                if attempt < 2:
                     self._token = None
                     _TOKEN_CACHE.pop(self._cache_key(), None)
                     await self.close()
-                    await asyncio.sleep(0.2 + attempt * 0.15)
+                    await asyncio.sleep(0.15)
                     continue
 
         existing = await self._fetch_existing_user(payload.username)

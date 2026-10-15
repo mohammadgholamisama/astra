@@ -102,10 +102,9 @@ async def create_user(
         )
 
     try:
+        # Parallel create on all panels — do NOT sync_modify here (doubles latency).
+        # Create payload already carries shared remaining caps per panel.
         await orchestrator.provision_user_on_panels(db, user, panels)
-        # Align shared remaining caps across all panel types right after create
-        if len(panels) > 1:
-            await orchestrator.sync_modify_user(db, user)
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
