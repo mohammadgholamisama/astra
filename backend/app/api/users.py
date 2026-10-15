@@ -11,7 +11,7 @@ from app.api.deps import get_current_admin
 from app.core.database import get_db
 from app.models.group import Group, UserGroup
 from app.models.template import UserTemplate
-from app.models.user import PanelAccount, User, UserStatus, generate_sub_token
+from app.models.user import PanelAccount, PanelAccountStatus, User, UserStatus, generate_sub_token
 from app.schemas.user import UserCreate, UserFromTemplate, UserModify, UserResponse, UsersListResponse
 from app.services import orchestrator
 from app.services.users import load_user, to_user_response
@@ -227,13 +227,28 @@ async def modify_user(
         acc_rows = await db.execute(
             select(PanelAccount).where(PanelAccount.user_id == user.id)
         )
-        existing_panel_ids = {a.panel_id for a in acc_rows.scalars().all()}
-        new_panels = [(p, c) for p, c in panels if p.id not in existing_panel_ids]
-        if new_panels:
-            # Create only on newly attached panels — existing configs / sub URL stay
-            await orchestrator.provision_user_on_panels(db, user, new_panels)
+        by_panel = {a.panel_id: a for a in acc_rows.scalars().all()}
+        # Create on brand-new panels AND retry error/pending rows for group panels
+        # so added-group configs actually land on remotes and /sub.
+        need_provision: list[tuple] = []
+        for panel, cfg in panels:
+            acc = by_panel.get(panel.id)
+            if acc is None or acc.status in (
+                PanelAccountStatus.error,
+                PanelAccountStatus.pending,
+            ):
+                need_provision.append((panel, cfg))
+        if need_provision:
+            await orchestrator.provision_user_on_panels(db, user, need_provision)
+            # Expand share links for new panels without touching existing raw usage
+            try:
+                fresh = await load_user(db, username)
+                if fresh:
+                    await orchestrator.hydrate_share_links(db, fresh)
+            except Exception:  # noqa: BLE001
+                pass
         elif added:
-            # Same panels already present: still push merged group configs (inbounds)
+            # Same panels already active: sync_modify below pushes merged inbounds
             pass
 
     # After admin re-enable, re-apply expire/limit before pushing remotes
@@ -241,7 +256,7 @@ async def modify_user(
         await orchestrator.enforce_user_quota(db, user)
 
     # Push full purchased data_limit + status to ALL remotes (coeff is usage-only).
-    # Also refreshes merged inbounds when a group was added to an existing panel.
+    # Upserts missing remotes (create-if-not-found) without wiping usage math.
     await orchestrator.sync_modify_user(db, user)
     await db.commit()
     user = await load_user(db, username)

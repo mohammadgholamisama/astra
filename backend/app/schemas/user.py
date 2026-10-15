@@ -39,6 +39,7 @@ class PanelAccountOut(ORMModel):
     panel_id: int
     panel_name: str | None = None
     panel_type: str | None = None
+    panel_base_url: str | None = None
     remote_username: str | None
     status: PanelAccountStatus
     links: list[str]
@@ -48,6 +49,7 @@ class PanelAccountOut(ORMModel):
     coeff_anchor_weighted: int = 0
     applied_coefficient: float | None = None
     last_sync_at: datetime | None
+    configs_count: int = 0
 
 
 class UserResponse(ORMModel):

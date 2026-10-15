@@ -50,7 +50,29 @@ type FilterKey = "all" | "active" | "error" | "expired";
 const PAGE_SIZE = 10;
 
 function userHasErrors(u: User) {
-  return (u.panel_accounts || []).some((a) => a.status === "error" || !!a.error_message);
+  // Only real error status — never treat leftover error_message on active as error
+  return (u.panel_accounts || []).some((a) => a.status === "error");
+}
+
+function formatPanelErrorDetail(a: User["panel_accounts"][number]): string {
+  const lines: string[] = [];
+  if (a.error_message?.trim()) {
+    lines.push(a.error_message.trim());
+  } else {
+    lines.push("پیام خطایی ثبت نشده");
+  }
+  if (a.remote_username) {
+    lines.push(`یوزرنیم ریموت: ${a.remote_username}`);
+  }
+  if (a.panel_base_url) {
+    lines.push(`آدرس پنل: ${a.panel_base_url}`);
+  }
+  const n = a.configs_count ?? (a.links || []).filter(Boolean).length;
+  lines.push(`کانفیگ ذخیره‌شده: ${n}`);
+  if (a.last_sync_at) {
+    lines.push(`آخرین همگام‌سازی: ${a.last_sync_at}`);
+  }
+  return lines.join("\n");
 }
 
 function userIsExpired(u: User) {
@@ -620,9 +642,7 @@ export default function UsersPage() {
 
   const errorAccounts: PanelAccount[] = useMemo(() => {
     if (!errorsUser) return [];
-    return (errorsUser.panel_accounts || []).filter(
-      (a) => a.status === "error" || !!a.error_message
-    );
+    return (errorsUser.panel_accounts || []).filter((a) => a.status === "error");
   }, [errorsUser]);
 
   const filterGroupName =
@@ -789,9 +809,7 @@ export default function UsersPage() {
         <>
         <div className="users-list" role="list">
           {filtered.map((u) => {
-            const errors = (u.panel_accounts || []).filter(
-              (a) => a.status === "error" || !!a.error_message
-            );
+            const errors = (u.panel_accounts || []).filter((a) => a.status === "error");
             const ok = (u.panel_accounts || []).filter((a) => a.status === "active").length;
             const panels = (u.panel_accounts || []).length;
             const pct = usagePercent(u.used_traffic, u.data_limit);
@@ -934,9 +952,7 @@ export default function UsersPage() {
         const u = menuUser;
         const st = statusLabel(u);
         const isOff = u.status === "disabled";
-        const errors = (u.panel_accounts || []).filter(
-          (a) => a.status === "error" || !!a.error_message
-        );
+        const errors = (u.panel_accounts || []).filter((a) => a.status === "error");
         const ok = (u.panel_accounts || []).filter((a) => a.status === "active").length;
         const panels = (u.panel_accounts || []).length;
         const remain = remainingBytes(u.used_traffic, u.data_limit);
@@ -1845,18 +1861,18 @@ export default function UsersPage() {
             </header>
 
             {errorAccounts.length === 0 ? (
-              <p className="muted">خطایی ثبت نشده</p>
+              <p className="muted">خطای واقعی روی هیچ پنلی ثبت نشده</p>
             ) : (
               <div className="user-err-list">
                 {errorAccounts.map((a) => (
                   <div key={a.id || a.panel_id} className="user-err-item">
                     <div className="user-err-head">
                       <strong>{a.panel_name || `پنل #${a.panel_id}`}</strong>
-                      <span className="badge err">{a.status}</span>
+                      <span className="badge err">خطا</span>
                       {a.panel_type && <span className="badge muted">{a.panel_type}</span>}
                     </div>
                     <pre className="user-err-body" dir="auto">
-                      {a.error_message || "بدون پیام خطا"}
+                      {formatPanelErrorDetail(a)}
                     </pre>
                   </div>
                 ))}

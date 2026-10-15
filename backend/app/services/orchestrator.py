@@ -33,6 +33,58 @@ def _remote_sem() -> asyncio.Semaphore:
     return _panel_remote_sem
 
 
+def _is_not_found_err(err: str | None) -> bool:
+    low = (err or "").lower()
+    return any(
+        x in low
+        for x in (
+            "not found",
+            "does not exist",
+            "doesn't exist",
+            "user not found",
+            "404",
+            "یافت نشد",
+            "پیدا نشد",
+            "وجود ندارد",
+        )
+    )
+
+
+def _format_remote_error(
+    panel: Panel | None,
+    *,
+    action: str,
+    err: str | None,
+    username: str | None = None,
+) -> str:
+    """Human-readable panel error for admin UI (Persian + original detail)."""
+    pname = (panel.name if panel else None) or "پنل"
+    ptype = ""
+    if panel is not None:
+        raw = getattr(panel, "type", None)
+        ptype = raw.value if hasattr(raw, "value") else (str(raw) if raw else "")
+    base = ""
+    if panel is not None:
+        base = str(getattr(panel, "base_url", "") or "").rstrip("/")
+    detail = (err or "").strip() or "خطای نامشخص"
+    parts = [f"عملیات: {action}", f"پنل: {pname}"]
+    if ptype:
+        parts.append(f"نوع: {ptype}")
+    if username:
+        parts.append(f"یوزرنیم ریموت: {username}")
+    if base:
+        parts.append(f"آدرس: {base}")
+    if _is_not_found_err(detail):
+        parts.append(
+            "علت: کاربر روی این پنل وجود ندارد "
+            "(هنوز ساخته نشده یا از پنل حذف شده)."
+        )
+        parts.append(f"پاسخ پنل: {detail}")
+    else:
+        parts.append(f"پاسخ پنل: {detail}")
+    return "\n".join(parts)
+
+
 def coefficient_from_config(config: dict | None) -> float:
     return quota_math.norm_coeff((config or {}).get("coefficient", 1))
 
@@ -383,7 +435,12 @@ async def provision_user_on_panels(
             panel.last_ok_at = now
         else:
             account.status = PanelAccountStatus.error
-            account.error_message = result.error or "ایجاد در پنل ناموفق"
+            account.error_message = _format_remote_error(
+                panel,
+                action="ساخت کاربر",
+                err=result.error or "ایجاد در پنل ناموفق",
+                username=payload.username,
+            )
         accounts.append(account)
 
     await db.flush()
@@ -522,6 +579,13 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
             continue
         if account.status == PanelAccountStatus.deleted:
             continue
+        # Skip orphan panel rows (no longer in user's groups) unless freezing all
+        if panel.id not in panel_cfg and not blocked:
+            # Drop noisy false errors from leftover accounts of removed groups
+            if account.status == PanelAccountStatus.error and not (account.links or []):
+                account.status = PanelAccountStatus.deleted
+                account.error_message = None
+            continue
         # Still push disable/limits to error accounts — they often exist on remote
         merged = dict(panel_cfg.get(panel.id) or {})
         payload = build_user_payload(
@@ -547,6 +611,19 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
                     )
                 if last.success:
                     return last
+                # Missing on remote → create (edit/add-group / stale error rows)
+                if _is_not_found_err(last.error):
+                    try:
+                        created = await asyncio.wait_for(
+                            adapter.create_user(payload), timeout=30
+                        )
+                        if created.success:
+                            return created
+                        last = created
+                    except Exception as ce:  # noqa: BLE001
+                        last = _fail_result(
+                            f"modify: user not found; create: {_exc_msg(ce)}"
+                        )
             except Exception as e:  # noqa: BLE001
                 last = _fail_result(_exc_msg(e))
             finally:
@@ -564,29 +641,59 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
 
     results = await asyncio.gather(*[_remote(panel, payload) for _, panel, payload in jobs])
     now = datetime.now(timezone.utc)
-    for (account, _panel, _payload), res in zip(jobs, results):
+    for (account, panel, payload), res in zip(jobs, results):
         if res.success:
-            # Account row stays "active" (= provisioned); traffic cut is user.status
-            if account.status != PanelAccountStatus.error:
-                account.status = PanelAccountStatus.active
-            elif blocked:
-                # Disable push succeeded — clear stale create error
-                account.status = PanelAccountStatus.active
-            account.links = res.links or account.links
-            if res.used_traffic is not None:
-                account.used_traffic = int(res.used_traffic or account.used_traffic or 0)
+            account.status = PanelAccountStatus.active
+            account.remote_username = res.remote_username or account.remote_username or user.username
+            account.remote_id = res.remote_id or account.remote_id
+            if res.uuid:
+                account.uuid = res.uuid
+            if res.links:
+                account.links = res.links
+            # Only update raw usage when panel returned a real reading — never wipe
+            if res.used_traffic is not None and int(res.used_traffic) >= 0:
+                # Prefer max so a create-on-missing (0) does not erase prior raw
+                prev = int(account.used_traffic or 0)
+                got = int(res.used_traffic or 0)
+                account.used_traffic = max(prev, got) if prev > 0 and got == 0 else got
             account.error_message = None
             account.last_sync_at = now
+            if panel:
+                panel.last_ok_at = now
         else:
-            account.status = PanelAccountStatus.error
-            account.error_message = res.error or "به‌روزرسانی پنل ناموفق"
+            # Soft: keep active + links if we already have share configs and
+            # failure is not a hard "missing user" after create attempt.
+            had_links = bool(account.links)
+            was_ok = account.status == PanelAccountStatus.active and had_links
+            msg = _format_remote_error(
+                panel,
+                action="به‌روزرسانی / ساخت",
+                err=res.error or "به‌روزرسانی پنل ناموفق",
+                username=payload.username,
+            )
+            if was_ok and not _is_not_found_err(res.error):
+                # Transient modify fail — keep active, store detail for admin
+                account.error_message = None
+                logger.warning(
+                    "soft modify fail kept active user=%s panel=%s: %s",
+                    user.username,
+                    account.panel_id,
+                    msg,
+                )
+            else:
+                account.status = PanelAccountStatus.error
+                account.error_message = msg
             if blocked:
                 logger.warning(
                     "failed to freeze remote user=%s panel=%s: %s",
                     user.username,
                     account.panel_id,
-                    account.error_message,
+                    account.error_message or msg,
                 )
+    await db.flush()
+    # Recompute weighted usage after any raw changes (existing panels unchanged)
+    coeffs = await panel_coefficients_for_user(db, user)
+    user.used_traffic = await _weighted_total(accounts, coeffs)
     await db.flush()
 
 

@@ -213,11 +213,17 @@ class PasarGuardAdapter(MarzbanAdapter):
 
         import httpx
 
-        group_ids = await self._resolve_group_ids(payload)
+        try:
+            group_ids = await self._resolve_group_ids(payload)
+        except Exception as e:
+            return AdapterResult(
+                success=False,
+                error=f"resolve group_ids: {str(e).strip() or e.__class__.__name__}",
+            )
         body = self._build_pg_body(payload, group_ids)
         last_err = "create failed"
-        req_timeout = httpx.Timeout(10.0, connect=4.0)
-        for attempt in range(2):
+        req_timeout = httpx.Timeout(22.0, connect=8.0)
+        for attempt in range(3):
             try:
                 client, headers = await self._authed()
                 resp = await client.post(
@@ -243,35 +249,42 @@ class PasarGuardAdapter(MarzbanAdapter):
                         links=[],
                         used_traffic=0,
                     )
-                last_err = err
-                if resp.status_code in (401, 403) and attempt < 1:
+                last_err = f"{err} (group_ids={group_ids})"
+                if resp.status_code in (401, 403) and attempt < 2:
                     self._token = None
                     from app.adapters.marzban import _TOKEN_CACHE
 
                     _TOKEN_CACHE.pop(self._cache_key(), None)
                     await self.close()
                     continue
-                return AdapterResult(success=False, error=err)
+                if attempt < 2 and resp.status_code >= 500:
+                    await self.close()
+                    await asyncio.sleep(0.3)
+                    continue
+                return AdapterResult(success=False, error=last_err)
             except Exception as e:
                 last_err = str(e).strip() or e.__class__.__name__
                 try:
                     existing = await asyncio.wait_for(
-                        self.get_usage(payload.username, expand_links=False), timeout=5
+                        self.get_usage(payload.username, expand_links=False), timeout=6
                     )
                     if existing.success:
                         return existing
                 except Exception:
                     pass
-                if attempt < 1:
+                if attempt < 2:
                     self._token = None
                     from app.adapters.marzban import _TOKEN_CACHE
 
                     _TOKEN_CACHE.pop(self._cache_key(), None)
                     await self.close()
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.25 + attempt * 0.2)
                     continue
-                return AdapterResult(success=False, error=last_err)
-        return AdapterResult(success=False, error=last_err)
+                return AdapterResult(
+                    success=False,
+                    error=f"{last_err} (group_ids={group_ids})",
+                )
+        return AdapterResult(success=False, error=f"{last_err} (group_ids={group_ids})")
 
     async def modify_user(self, payload: UserPayload) -> AdapterResult:
         """PUT /api/user/{username} — PasarGuard docs."""
@@ -280,10 +293,19 @@ class PasarGuardAdapter(MarzbanAdapter):
             body = self._build_pg_body(payload, group_ids)
             body.pop("username", None)
             client, headers = await self._authed()
-            resp = await client.put(f"/api/user/{payload.username}", headers=headers, json=body)
+            resp = await client.put(
+                f"/api/user/{payload.username}",
+                headers=headers,
+                json=body,
+                timeout=__import__("httpx").Timeout(22.0, connect=8.0),
+            )
             ok, data = ok_json(resp)
             if ok and isinstance(data, dict):
                 return self._from_pg_response(data, payload.username)
-            return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
+            err = err_msg(data, f"HTTP {resp.status_code}")
+            return AdapterResult(
+                success=False,
+                error=f"{err} (group_ids={group_ids})",
+            )
         except Exception as e:
             return AdapterResult(success=False, error=str(e).strip() or e.__class__.__name__)

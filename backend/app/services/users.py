@@ -2,7 +2,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy import select
 
-from app.models.user import User
+from app.models.user import PanelAccountStatus, User
 from app.schemas.user import PanelAccountOut, UserResponse
 from app.services.site_settings import get_sub_base_url
 
@@ -58,29 +58,37 @@ def to_user_response(user: User, *, include_links: bool = True) -> UserResponse:
 
     panel_accounts = []
     for a in accounts:
+        if a.status == PanelAccountStatus.deleted:
+            continue
         # Only use panel if already loaded — never trigger async lazy IO
         panel = a.__dict__.get("panel")
         panel_type = None
+        panel_base = None
         if panel is not None:
             ptype = getattr(panel, "type", None)
             panel_type = ptype.value if hasattr(ptype, "value") else (str(ptype) if ptype else None)
+            panel_base = getattr(panel, "base_url", None) or getattr(panel, "url", None)
         raw_links = [x for x in (a.links or []) if x]
+        # Never surface stale error_message on healthy accounts (UI false positives)
+        err = a.error_message if a.status == PanelAccountStatus.error else None
         panel_accounts.append(
             PanelAccountOut(
                 id=a.id,
                 panel_id=a.panel_id,
                 panel_name=getattr(panel, "name", None) if panel is not None else None,
                 panel_type=panel_type,
+                panel_base_url=str(panel_base).rstrip("/") if panel_base else None,
                 remote_username=a.remote_username,
                 status=a.status,
                 # List view: keep count only (placeholder) — avoid shipping huge URLs
                 links=list(raw_links) if include_links else (["x"] * len(raw_links)),
-                error_message=a.error_message,
+                error_message=err,
                 used_traffic=a.used_traffic,
                 coeff_anchor_raw=int(getattr(a, "coeff_anchor_raw", 0) or 0),
                 coeff_anchor_weighted=int(getattr(a, "coeff_anchor_weighted", 0) or 0),
                 applied_coefficient=getattr(a, "applied_coefficient", None),
                 last_sync_at=a.last_sync_at,
+                configs_count=len(raw_links),
             )
         )
 

@@ -136,6 +136,7 @@ export interface PanelAccount {
   panel_id: number;
   panel_name?: string | null;
   panel_type?: string | null;
+  panel_base_url?: string | null;
   remote_username: string | null;
   status: string;
   links: string[];
@@ -146,6 +147,7 @@ export interface PanelAccount {
   coeff_anchor_weighted?: number;
   applied_coefficient?: number | null;
   last_sync_at: string | null;
+  configs_count?: number;
 }
 
 export interface User {
