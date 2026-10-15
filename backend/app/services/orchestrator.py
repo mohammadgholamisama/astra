@@ -487,7 +487,11 @@ async def reset_user_traffic_on_panels(db: AsyncSession, user: User) -> list[dic
 
 
 async def sync_modify_user(db: AsyncSession, user: User) -> None:
-    """Push status + shared remaining quota to every remote panel account."""
+    """Push status + shared remaining quota to every remote panel account.
+
+    When Astra is limited/expired/disabled, every panel type (Marzban / PasarGuard /
+    Sanaei / Rebecca) must receive the freeze — with retries on flaky links.
+    """
     result = await db.execute(
         select(PanelAccount)
         .where(PanelAccount.user_id == user.id)
@@ -506,6 +510,12 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
     weighted = await _weighted_total(accounts, coeffs)
     user.used_traffic = weighted
 
+    blocked = user.status in (
+        UserStatus.limited,
+        UserStatus.expired,
+        UserStatus.disabled,
+    )
+
     jobs: list[tuple[PanelAccount, Panel, UserPayload]] = []
     for account in accounts:
         panel = account.panel
@@ -513,6 +523,7 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
             continue
         if account.status == PanelAccountStatus.deleted:
             continue
+        # Still push disable/limits to error accounts — they often exist on remote
         merged = dict(panel_cfg.get(panel.id) or {})
         payload = build_user_payload(
             user,
@@ -524,11 +535,24 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
         jobs.append((account, panel, payload))
 
     async def _remote(panel: Panel, payload: UserPayload) -> AdapterResult:
-        adapter = get_adapter(panel)
-        try:
-            return await asyncio.wait_for(adapter.modify_user(payload), timeout=55)
-        except Exception as e:  # noqa: BLE001
-            return _fail_result(_exc_msg(e))
+        attempts = 3 if blocked else 1
+        last = _fail_result("modify failed")
+        for i in range(attempts):
+            adapter = get_adapter(panel)
+            try:
+                last = await asyncio.wait_for(adapter.modify_user(payload), timeout=55)
+                if last.success:
+                    return last
+            except Exception as e:  # noqa: BLE001
+                last = _fail_result(_exc_msg(e))
+            finally:
+                try:
+                    await adapter.close()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            if i + 1 < attempts:
+                await asyncio.sleep(0.35 + i * 0.25)
+        return last
 
     if not jobs:
         await db.flush()
@@ -538,17 +562,27 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
     now = datetime.now(timezone.utc)
     for (account, _panel, _payload), res in zip(jobs, results):
         if res.success:
-            # Successful push clears prior error — remotes get disabled via status field
-            account.status = PanelAccountStatus.active
+            # Account row stays "active" (= provisioned); traffic cut is user.status
+            if account.status != PanelAccountStatus.error:
+                account.status = PanelAccountStatus.active
+            elif blocked:
+                # Disable push succeeded — clear stale create error
+                account.status = PanelAccountStatus.active
             account.links = res.links or account.links
             if res.used_traffic is not None:
                 account.used_traffic = int(res.used_traffic or account.used_traffic or 0)
             account.error_message = None
             account.last_sync_at = now
         else:
-            # Keep links if we already have them; still mark error for UI
             account.status = PanelAccountStatus.error
             account.error_message = res.error or "به‌روزرسانی پنل ناموفق"
+            if blocked:
+                logger.warning(
+                    "failed to freeze remote user=%s panel=%s: %s",
+                    user.username,
+                    account.panel_id,
+                    account.error_message,
+                )
     await db.flush()
 
 
@@ -649,7 +683,21 @@ async def retry_failed_accounts(db: AsyncSession, user: User) -> list[PanelAccou
         .options(selectinload(PanelAccount.panel))
     )
     failed = result.scalars().all()
-    panels = [(a.panel, {}) for a in failed if a.panel]
+    if not failed:
+        return []
+
+    ug = await db.execute(select(UserGroup.group_id).where(UserGroup.user_id == user.id))
+    group_ids = [row[0] for row in ug.all()]
+    cfg_by_panel: dict[int, dict] = {}
+    if group_ids:
+        for panel, cfg in await resolve_panels_for_groups(db, group_ids):
+            cfg_by_panel[panel.id] = cfg
+
+    panels = [
+        (a.panel, dict(cfg_by_panel.get(a.panel_id) or {}))
+        for a in failed
+        if a.panel
+    ]
     return await provision_user_on_panels(db, user, panels)
 
 
@@ -962,8 +1010,20 @@ async def refresh_users_usage_batch(
             try:
                 await refresh_usage(db, u, force=force)
                 changed = await enforce_user_quota(db, u)
+                result = await db.execute(
+                    select(PanelAccount).where(PanelAccount.user_id == u.id)
+                )
+                accounts = list(result.scalars().all())
+                multi = len(_active_accounts(accounts)) > 1
+                # Multi-panel sales MUST shrink shared remaining (Σ raw×coeff),
+                # otherwise each remote keeps the full Astra ceiling.
                 if await should_push_remotes(
-                    db, u, status_changed=changed, force=push_remotes
+                    db,
+                    u,
+                    accounts,
+                    status_changed=changed,
+                    force=bool(push_remotes),
+                    shrink_shared_caps=multi,
                 ):
                     await sync_modify_user(db, u)
             except Exception as exc:  # noqa: BLE001

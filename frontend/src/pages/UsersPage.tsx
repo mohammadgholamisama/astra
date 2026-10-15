@@ -475,9 +475,9 @@ export default function UsersPage() {
     const multi = coeffs.some((c) => c !== 1);
     if (!n) return "گروه‌های انتخاب‌شده پنل فعالی ندارند";
     if (multi) {
-      return `${toFaDigits(n)} پنل · مصرف = جمع (خام × ضریب هر پنل) · سقف خرید مشترک`;
+      return `${toFaDigits(n)} پنل (مرزبان/پاسارگاد/سنایی/ربکا) · مصرف = جمع (خام × ضریب) · با پر شدن سقف همه خاموش می‌شوند`;
     }
-    return `${toFaDigits(n)} پنل · سقف حجم بین همه پنل‌ها مشترک است`;
+    return `${toFaDigits(n)} پنل · حجم خرید بین همه مشترک است · با تمام شدن حجم همه خاموش می‌شوند`;
   }, [groupIds, groupsById]);
 
   const stats = useMemo(() => {
@@ -1133,7 +1133,9 @@ export default function UsersPage() {
                     dir="ltr"
                     placeholder="0.1"
                   />
-                  <p className="field-hint">۰ = نامحدود · اعشار مجاز (مثلاً ۰.۱)</p>
+                  <p className="field-hint">
+                    ۰ = نامحدود · سقف مشترک همه پنل‌ها (با ضریب) · اعشار مجاز
+                  </p>
                 </div>
                 <div className="field">
                   <label>روز اعتبار</label>
