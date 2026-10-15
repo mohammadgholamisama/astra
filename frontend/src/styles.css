@@ -1853,6 +1853,25 @@ th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
   line-height: 1.2;
 }
 .user-create-chip:hover { filter: brightness(1.05); }
+.user-create-chip.locked {
+  cursor: default;
+  opacity: 0.92;
+  border-color: var(--line);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+}
+.user-create-chip.locked:hover { filter: none; }
+.user-create-group-card.locked {
+  cursor: default;
+  opacity: 0.72;
+}
+.user-create-group-card.locked:hover {
+  border-color: var(--line);
+  background: color-mix(in srgb, var(--text) 3.5%, transparent);
+  transform: none;
+}
+.user-create-group-card:disabled {
+  cursor: default;
+}
 .user-create-groups {
   max-height: min(280px, 42vh);
   overflow: auto;

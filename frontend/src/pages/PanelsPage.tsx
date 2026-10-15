@@ -487,16 +487,16 @@ export default function PanelsPage() {
 
   function onSubmit(e: FormEvent) {
     e.preventDefault();
+    if (!form.username.trim()) {
+      setMsg("نام کاربری الزامی است");
+      return;
+    }
+    if (!isEdit && !form.password.trim()) {
+      setMsg("رمز عبور الزامی است");
+      return;
+    }
     if (!isEdit && isSanaei && !form.api_token.trim()) {
       setMsg("برای سنایی API Token الزامی است");
-      return;
-    }
-    if (!isEdit && (!form.username.trim() || !form.password.trim())) {
-      setMsg("نام کاربری و رمز عبور الزامی است");
-      return;
-    }
-    if (isEdit && !form.username.trim()) {
-      setMsg("نام کاربری الزامی است");
       return;
     }
     save.mutate();
@@ -760,11 +760,9 @@ export default function PanelsPage() {
                 </div>
                 <div className="form-grid">
                   <div className="field">
-                    <label>
-                      {isSanaei ? "نام کاربری ادمین (اختیاری)" : "نام کاربری ادمین *"}
-                    </label>
+                    <label>نام کاربری ادمین *</label>
                     <input
-                      required={!isSanaei}
+                      required
                       name="panel_admin_username"
                       autoComplete="off"
                       value={form.username}
@@ -774,16 +772,10 @@ export default function PanelsPage() {
                   </div>
                   <div className="field">
                     <label>
-                      {isSanaei
-                        ? isEdit
-                          ? "رمز عبور (اختیاری)"
-                          : "رمز عبور (اختیاری)"
-                        : isEdit
-                          ? "رمز عبور (خالی = بدون تغییر)"
-                          : "رمز عبور *"}
+                      {isEdit ? "رمز عبور (خالی = بدون تغییر)" : "رمز عبور *"}
                     </label>
                     <input
-                      required={!isEdit && !isSanaei}
+                      required={!isEdit}
                       type="password"
                       name="panel_admin_password"
                       value={form.password}

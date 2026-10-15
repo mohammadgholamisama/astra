@@ -245,6 +245,52 @@ class RebeccaAdapter(MarzbanAdapter):
         result.links = links
         return result
 
+    async def get_usage(
+        self,
+        username: str,
+        remote_id: str | None = None,
+        *,
+        expand_links: bool = True,
+    ) -> AdapterResult:
+        """Prefer Rebecca dashboard v2; fall back to legacy /api/user."""
+        import asyncio
+
+        import httpx
+
+        uname = (username or remote_id or "").strip()
+        if not uname:
+            return AdapterResult(success=False, error="username خالی است")
+        last_err = "get usage failed"
+        try:
+            client = await self._get_client()
+            headers = await self._headers()
+            t = httpx.Timeout(20.0, connect=10.0)
+            for path in (f"/api/v2/users/{uname}", f"/api/user/{uname}"):
+                try:
+                    resp = await client.get(path, headers=headers, timeout=t)
+                except Exception as exc:  # noqa: BLE001
+                    last_err = str(exc).strip() or exc.__class__.__name__
+                    continue
+                ok, data = ok_json(resp)
+                if ok and isinstance(data, dict):
+                    result = self._from_user_response(data, uname)
+                    if expand_links:
+                        try:
+                            result.links = await asyncio.wait_for(
+                                self._expand_subscription_links(list(result.links or [])),
+                                timeout=8,
+                            )
+                        except Exception:
+                            pass
+                    return result
+                last_err = err_msg(data, f"HTTP {resp.status_code} {path}")
+                if resp.status_code in (401, 403):
+                    self._token = None
+                    break
+            return AdapterResult(success=False, error=last_err)
+        except Exception as e:
+            return AdapterResult(success=False, error=str(e).strip() or e.__class__.__name__)
+
     async def _finalize_user_result(self, result: AdapterResult, username: str) -> AdapterResult:
         links = list(result.links or [])
         client = await self._get_client()

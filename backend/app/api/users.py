@@ -32,7 +32,7 @@ def _username_exists_error(username: str) -> HTTPException:
 
 
 async def _attach_groups(db: AsyncSession, user: User, group_ids: list[int]) -> None:
-    """Link user↔groups via UserGroup rows — never assign user.groups (async lazy-load 500)."""
+    """Replace user↔groups via UserGroup rows — never assign user.groups (async lazy-load 500)."""
     result = await db.execute(select(Group.id).where(Group.id.in_(group_ids)))
     found = {row[0] for row in result.all()}
     if found != set(group_ids):
@@ -44,6 +44,33 @@ async def _attach_groups(db: AsyncSession, user: User, group_ids: list[int]) -> 
     for gid in group_ids:
         db.add(UserGroup(user_id=user.id, group_id=gid))
     await db.flush()
+
+
+async def _add_groups_only(db: AsyncSession, user: User, group_ids: list[int]) -> list[int]:
+    """Append groups to the user — never remove existing memberships.
+
+    Returns newly added group ids (empty if nothing new).
+    """
+    wanted = [int(g) for g in group_ids if g is not None]
+    if not wanted:
+        return []
+    result = await db.execute(select(Group.id).where(Group.id.in_(wanted)))
+    found = {row[0] for row in result.all()}
+    if found != set(wanted):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "GROUP_NOT_FOUND", "message": "یک یا چند گروه پیدا نشد"},
+        )
+    existing = await db.execute(
+        select(UserGroup.group_id).where(UserGroup.user_id == user.id)
+    )
+    have = {row[0] for row in existing.all()}
+    added = [gid for gid in wanted if gid not in have]
+    for gid in added:
+        db.add(UserGroup(user_id=user.id, group_id=gid))
+    if added:
+        await db.flush()
+    return added
 
 
 @router.post("/api/user", response_model=UserResponse, status_code=status.HTTP_200_OK)
@@ -144,8 +171,10 @@ async def get_user(
         raise HTTPException(status_code=404, detail="User not found")
     await orchestrator.refresh_usage(db, user, force=True)
     changed = await orchestrator.enforce_user_quota(db, user)
+    # Force push so remotes keep the FULL purchased data_limit (coeff does not shrink),
+    # and freeze/disable all panels when Astra weighted usage is exhausted.
     if await orchestrator.should_push_remotes(
-        db, user, status_changed=changed, shrink_shared_caps=True
+        db, user, status_changed=changed, force=True
     ):
         await orchestrator.sync_modify_user(db, user)
     await db.commit()
@@ -186,18 +215,33 @@ async def modify_user(
             ps.update(body.proxy_settings)
         user.proxy_settings = ps
     if body.group_ids is not None:
-        await _attach_groups(db, user, body.group_ids)
-        # provision any new panels
-        panels = await orchestrator.resolve_panels_for_groups(db, body.group_ids)
-        existing_panel_ids = {a.panel_id for a in user.panel_accounts}
+        # Edit may only ADD groups — never drop existing ones or rotate sub_token.
+        added = await _add_groups_only(db, user, body.group_ids)
+        # Reload memberships for panel resolve
+        ug = await db.execute(
+            select(UserGroup.group_id).where(UserGroup.user_id == user.id)
+        )
+        all_gids = [row[0] for row in ug.all()]
+        panels = await orchestrator.resolve_panels_for_groups(db, all_gids)
+        # Fresh load of accounts (avoid stale relationship after prior ops)
+        acc_rows = await db.execute(
+            select(PanelAccount).where(PanelAccount.user_id == user.id)
+        )
+        existing_panel_ids = {a.panel_id for a in acc_rows.scalars().all()}
         new_panels = [(p, c) for p, c in panels if p.id not in existing_panel_ids]
         if new_panels:
+            # Create only on newly attached panels — existing configs / sub URL stay
             await orchestrator.provision_user_on_panels(db, user, new_panels)
+        elif added:
+            # Same panels already present: still push merged group configs (inbounds)
+            pass
 
     # After admin re-enable, re-apply expire/limit before pushing remotes
     if body.status == UserStatus.active:
         await orchestrator.enforce_user_quota(db, user)
 
+    # Push full purchased data_limit + status to ALL remotes (coeff is usage-only).
+    # Also refreshes merged inbounds when a group was added to an existing panel.
     await orchestrator.sync_modify_user(db, user)
     await db.commit()
     user = await load_user(db, username)
@@ -318,9 +362,9 @@ async def list_users(
     users = list(result.scalars().unique().all())
 
     if refresh and users:
-        # Read usage only — never push modify on list refresh (was extremely slow)
+        # Fail-fast parallel pull for this page only (UI paints DB first, then patches)
         await orchestrator.refresh_users_usage_batch(
-            db, users, force=True, concurrency=10, push_remotes=False
+            db, users, force=True, concurrency=16, push_remotes=False, quick=True
         )
         await db.commit()
         ids = [u.id for u in users]

@@ -1,14 +1,15 @@
 """
 Shared Astra traffic quota across remote panels.
 
-Formula (what the end-user / admin sees):
+Create / remote caps:
+    Every panel gets the FULL purchased data_limit (e.g. 4GB → 4GB on all).
+    Coefficient does NOT shrink the remote create/modify data_limit.
+
+Usage (what the end-user / admin sees):
     used_astra = Σ over panels  (raw_i × coefficient_i)
 
-Rules:
-  - coefficient defaults to 1; each GroupPanel may set its own
-  - even with coefficient=1, usage is the SUM of all panels (not max, not one panel)
-  - when used_astra >= data_limit → status=limited and remotes are frozen/disabled
-  - remotes may still show leftover bytes; Astra decides when the sale is finished
+When used_astra >= data_limit → status=limited and ALL remotes are frozen/disabled.
+Remotes may still show leftover raw bytes; Astra is the source of truth.
 
 Coefficient periods (mid-flight change 1→2):
   past raw stays at the old rate via anchors; only new raw uses the new coefficient.
@@ -72,30 +73,24 @@ def remaining_weighted(used: int, limit: int) -> int:
 def remote_data_limit(
     astra_limit: int,
     *,
-    used_weighted_total: int,
-    used_raw_on_panel: int,
-    coefficient: float,
+    used_weighted_total: int = 0,
+    used_raw_on_panel: int = 0,
+    coefficient: float = 1.0,
 ) -> int:
-    """Absolute traffic ceiling (bytes) to push to one remote panel.
+    """Traffic ceiling (bytes) pushed to one remote panel while user is active.
 
-    Shared remaining is converted to raw allowance on this panel:
-        more_raw = remaining_astra / coefficient
-        remote_limit = used_raw + more_raw
+    Always the full purchased Astra quota — coefficient is for usage accounting
+    only, not for shrinking remote caps. Exhaustion is handled by freezing
+    remotes (status=limited) in build_user_payload / sync_modify.
 
-    When Astra quota is exhausted → freeze at current raw (no more traffic).
     Unlimited Astra (limit<=0) → 0 (unlimited on remote).
     """
     limit = int(astra_limit or 0)
     if limit <= 0:
         return 0
-    coeff = norm_coeff(coefficient)
-    used_w = max(0, int(used_weighted_total or 0))
-    used_r = max(0, int(used_raw_on_panel or 0))
-    rem = max(0, limit - used_w)
-    if rem <= 0:
-        return max(1, used_r) if used_r > 0 else 1
-    more_raw = int(rem / coeff)
-    return max(1, used_r + more_raw)
+    # Keep unused kwargs for call-site compatibility
+    _ = (used_weighted_total, used_raw_on_panel, coefficient)
+    return limit
 
 
 def needs_remote_cap_sync(
@@ -109,13 +104,11 @@ def needs_remote_cap_sync(
 ) -> bool:
     """Whether remotes must receive an updated data_limit / status push.
 
-    - Always when blocked (limited/expired/disabled) or status just flipped
-    - When shrink_shared_caps=True and 2+ panels: push so sibling remaining shrinks
-    - Single panel is self-enforcing on the remote absolute limit (limit/coeff)
+    Push when blocked (limited/expired/disabled), status flipped, or forced.
+    Do NOT shrink remote data_limit mid-flight for coefficients — remotes keep
+    the full purchase; Astra disables all panels when weighted usage hits limit.
     """
     if force or status_changed or blocked:
         return True
-    if shrink_shared_caps and active_panel_count > 1:
-        return True
-    _ = coefficients  # reserved for future per-coeff heuristics
+    _ = (active_panel_count, coefficients, shrink_shared_caps)
     return False

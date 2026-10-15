@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -8,6 +9,8 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from app.api import (
     api_keys,
@@ -25,6 +28,7 @@ from app.api import (
 # ensure new models are registered for schema sync
 from app.models import group_config as _group_config_model  # noqa: F401
 from app.models import site_setting as _site_setting_model  # noqa: F401
+from app.models.user import PanelAccount, User, UserStatus
 from app.core.config import get_settings
 from app.core.database import AsyncSessionLocal
 from app.core.schema_sync import ensure_schema
@@ -34,6 +38,40 @@ from app.services.site_settings import refresh_cache as refresh_site_settings
 settings = get_settings()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("astra")
+
+
+async def _usage_sync_loop() -> None:
+    """Keep Astra used_traffic fresh so the admin list is not stuck at 0."""
+    from app.services.orchestrator import refresh_users_usage_batch
+
+    await asyncio.sleep(8)
+    while True:
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(User)
+                    .where(User.status.in_((UserStatus.active, UserStatus.on_hold, UserStatus.limited)))
+                    .options(selectinload(User.panel_accounts).selectinload(PanelAccount.panel))
+                    .order_by(User.id.desc())
+                    .limit(200)
+                )
+                users = list(result.scalars().unique().all())
+                if users:
+                    await refresh_users_usage_batch(
+                        db,
+                        users,
+                        force=True,
+                        concurrency=12,
+                        push_remotes=False,
+                        quick=True,
+                    )
+                    await db.commit()
+                    logger.info("usage sync loop: refreshed %s users", len(users))
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("usage sync loop failed")
+        await asyncio.sleep(30)
 
 
 def _resolve_frontend_dist() -> Path | None:
@@ -64,7 +102,15 @@ async def lifespan(_app: FastAPI):
     await seed_admin()
     async with AsyncSessionLocal() as db:
         await refresh_site_settings(db)
-    yield
+    usage_task = asyncio.create_task(_usage_sync_loop(), name="astra-usage-sync")
+    try:
+        yield
+    finally:
+        usage_task.cancel()
+        try:
+            await usage_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(

@@ -600,6 +600,65 @@ class SanaeiAdapter(BasePanelAdapter):
         except Exception as e:
             return AdapterResult(success=False, error=str(e))
 
+    async def _raw_inbounds_for_usage(self) -> list[dict[str, Any]]:
+        """Full inbound objects (with clientStats) — not the slim UI catalog."""
+        try:
+            resp = await self._request("GET", "panel/api/inbounds/list")
+            ok, data = ok_json(resp)
+            if not ok:
+                return []
+            obj = data.get("obj") if isinstance(data, dict) else data
+            return [x for x in obj if isinstance(x, dict)] if isinstance(obj, list) else []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("sanaei raw inbounds failed: %s", exc)
+            return []
+
+    async def _usage_from_inbounds_scan(self, email: str) -> int | None:
+        """Sum up+down for this email across every inbound (multi-inbound clients)."""
+        try:
+            inbounds = await self._raw_inbounds_for_usage()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("sanaei inbound scan failed: %s", exc)
+            return None
+        total = 0
+        found = False
+        email_l = email.lower()
+        for inbound in inbounds or []:
+            if not isinstance(inbound, dict):
+                continue
+            # Prefer clientStats (live counters). Don't also add settings.clients
+            # for the same inbound — that would double-count.
+            stats = inbound.get("clientStats") or []
+            hit_stats = False
+            if isinstance(stats, list):
+                for stat in stats:
+                    if not isinstance(stat, dict):
+                        continue
+                    if str(stat.get("email") or "").strip().lower() != email_l:
+                        continue
+                    found = True
+                    hit_stats = True
+                    total += int(stat.get("up") or 0) + int(stat.get("down") or 0)
+            if hit_stats:
+                continue
+            settings_raw = inbound.get("settings")
+            settings: Any = settings_raw
+            if isinstance(settings_raw, str):
+                try:
+                    settings = json.loads(settings_raw)
+                except Exception:
+                    settings = {}
+            if not isinstance(settings, dict):
+                continue
+            for client in settings.get("clients") or []:
+                if not isinstance(client, dict):
+                    continue
+                if str(client.get("email") or "").strip().lower() != email_l:
+                    continue
+                found = True
+                total += int(client.get("up") or 0) + int(client.get("down") or 0)
+        return total if found else None
+
     async def get_usage(self, username: str, remote_id: str | None = None) -> AdapterResult:
         try:
             email = (remote_id or username or "").strip()
@@ -608,6 +667,8 @@ class SanaeiAdapter(BasePanelAdapter):
 
             last_resp = None
             last_data: Any = None
+            best: int | None = None
+            best_raw: Any = None
             for path in (
                 f"panel/api/clients/traffic/{email}",
                 f"panel/api/inbounds/getClientTraffics/{email}",
@@ -627,13 +688,25 @@ class SanaeiAdapter(BasePanelAdapter):
                 if isinstance(data, dict):
                     obj = data.get("obj") if data.get("obj") is not None else data
                 used = self._sum_up_down(obj)
-                if used is not None:
-                    return AdapterResult(
-                        success=True,
-                        remote_username=email,
-                        used_traffic=used,
-                        raw=data,
-                    )
+                if used is None:
+                    continue
+                # Keep the largest — some endpoints return one inbound only
+                if best is None or used > best:
+                    best = used
+                    best_raw = data
+
+            scanned = await self._usage_from_inbounds_scan(email)
+            if scanned is not None and (best is None or scanned > best):
+                best = scanned
+                best_raw = {"scanned": True, "used": scanned}
+
+            if best is not None:
+                return AdapterResult(
+                    success=True,
+                    remote_username=email,
+                    used_traffic=int(best),
+                    raw=best_raw,
+                )
 
             if last_resp is not None:
                 return AdapterResult(

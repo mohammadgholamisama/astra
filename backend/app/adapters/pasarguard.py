@@ -216,14 +216,15 @@ class PasarGuardAdapter(MarzbanAdapter):
         group_ids = await self._resolve_group_ids(payload)
         body = self._build_pg_body(payload, group_ids)
         last_err = "create failed"
-        for attempt in range(3):
+        req_timeout = httpx.Timeout(10.0, connect=4.0)
+        for attempt in range(2):
             try:
                 client, headers = await self._authed()
                 resp = await client.post(
                     "/api/user",
                     headers=headers,
                     json=body,
-                    timeout=httpx.Timeout(25.0, connect=10.0),
+                    timeout=req_timeout,
                 )
                 ok, data = ok_json(resp)
                 if ok and isinstance(data, dict):
@@ -243,7 +244,7 @@ class PasarGuardAdapter(MarzbanAdapter):
                         used_traffic=0,
                     )
                 last_err = err
-                if resp.status_code in (401, 403) and attempt < 2:
+                if resp.status_code in (401, 403) and attempt < 1:
                     self._token = None
                     from app.adapters.marzban import _TOKEN_CACHE
 
@@ -255,19 +256,19 @@ class PasarGuardAdapter(MarzbanAdapter):
                 last_err = str(e).strip() or e.__class__.__name__
                 try:
                     existing = await asyncio.wait_for(
-                        self.get_usage(payload.username, expand_links=False), timeout=15
+                        self.get_usage(payload.username, expand_links=False), timeout=5
                     )
                     if existing.success:
                         return existing
                 except Exception:
                     pass
-                if attempt < 2:
+                if attempt < 1:
                     self._token = None
                     from app.adapters.marzban import _TOKEN_CACHE
 
                     _TOKEN_CACHE.pop(self._cache_key(), None)
                     await self.close()
-                    await asyncio.sleep(0.5 + attempt * 0.4)
+                    await asyncio.sleep(0.2)
                     continue
                 return AdapterResult(success=False, error=last_err)
         return AdapterResult(success=False, error=last_err)

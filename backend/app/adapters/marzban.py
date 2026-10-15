@@ -269,10 +269,12 @@ class MarzbanAdapter(BasePanelAdapter):
             self._inbounds_cache = shared[0]
             return self._inbounds_cache
         try:
-            rows = await asyncio.wait_for(self.list_protocols(), timeout=18)
+            rows = await asyncio.wait_for(self.list_protocols(), timeout=14)
             cache = {str(r["protocol"]).lower(): list(r.get("tags") or []) for r in rows}
-            self._inbounds_cache = cache
-            _INBOUNDS_CACHE[key] = (cache, time.monotonic() + _INBOUNDS_TTL)
+            # Never cache empty — flaky Cloud responses must not poison retries
+            if cache:
+                self._inbounds_cache = cache
+                _INBOUNDS_CACHE[key] = (cache, time.monotonic() + _INBOUNDS_TTL)
             return cache
         except Exception:
             return {}
@@ -295,8 +297,9 @@ class MarzbanAdapter(BasePanelAdapter):
 
     async def _build_user_body(self, payload: UserPayload, *, include_username: bool) -> dict[str, Any]:
         protocols = self._selected_protocols(payload)
-        # Skip GET /api/inbounds when group/panel already pinned inbound tags
-        if self._config_has_inbound_tags(payload, protocols):
+        # Skip GET /api/inbounds when tags pinned, or on create (empty tags → panel defaults).
+        # Catalog fetch is slow on Marzban Cloud and blocks parallel multi-panel create.
+        if include_username or self._config_has_inbound_tags(payload, protocols):
             available: dict[str, list[str]] = {}
         else:
             available = await self._available_inbounds_map()
@@ -333,34 +336,46 @@ class MarzbanAdapter(BasePanelAdapter):
 
     @staticmethod
     def _parse_used_traffic(data: dict) -> int:
-        """Best-effort used bytes from Marzban / PasarGuard / forks."""
-        vals: list[int] = []
-        for key in ("used_traffic", "lifetime_used_traffic", "total_traffic"):
-            raw = data.get(key)
+        """Current-period used bytes from Marzban / PasarGuard / Rebecca forks.
+
+        Prefer `used_traffic` (resets with plan). Do NOT take max with
+        `lifetime_used_traffic` — that inflates Astra quota after resets.
+        """
+        def _as_int(raw: object) -> int | None:
             if raw is None or raw == "":
-                continue
+                return None
             try:
-                vals.append(max(0, int(raw)))
+                return max(0, int(raw))
             except (TypeError, ValueError):
-                continue
+                return None
+
+        # 1) Canonical current usage
+        for key in ("used_traffic", "current_usage", "total_usage"):
+            got = _as_int(data.get(key))
+            if got is not None:
+                return got
+
+        # 2) Nested traffic object
         traffic = data.get("traffic")
         if isinstance(traffic, dict):
-            for key in ("used", "used_traffic", "download", "down", "uplink", "download_bytes"):
-                raw = traffic.get(key)
-                if raw is None or raw == "":
-                    continue
-                try:
-                    vals.append(max(0, int(raw)))
-                except (TypeError, ValueError):
-                    continue
+            for key in ("used", "used_traffic", "total"):
+                got = _as_int(traffic.get(key))
+                if got is not None:
+                    return got
             try:
                 up = int(traffic.get("upload") or traffic.get("up") or 0)
                 down = int(traffic.get("download") or traffic.get("down") or 0)
                 if up or down:
-                    vals.append(max(0, up + down))
+                    return max(0, up + down)
             except (TypeError, ValueError):
                 pass
-        return max(vals) if vals else 0
+
+        # 3) Last resort — lifetime (only if current missing)
+        for key in ("lifetime_used_traffic", "total_traffic"):
+            got = _as_int(data.get(key))
+            if got is not None:
+                return got
+        return 0
 
     def _from_user_response(self, data: dict, fallback_username: str) -> AdapterResult:
         proxies = data.get("proxies") or {}
@@ -396,55 +411,75 @@ class MarzbanAdapter(BasePanelAdapter):
         Fetch Marzban/Rebecca protocols from GET /api/inbounds.
         Response shape: { "vless": [ProxyInbound...], "vmess": [...], ... }
         """
-        client, headers = await self._authed()
-        resp = await client.get(
-            "/api/inbounds",
-            headers=headers,
-            timeout=httpx.Timeout(18.0, connect=12.0),
-        )
-        ok, data = ok_json(resp)
-        if not ok or not isinstance(data, dict):
-            raise RuntimeError(err_msg(data, f"HTTP {resp.status_code}"))
-        out: list[dict[str, Any]] = []
-        for protocol, items in data.items():
-            if not isinstance(items, list):
-                continue
-            tags: list[str] = []
-            details: list[dict[str, Any]] = []
-            for item in items:
-                if isinstance(item, dict) and item.get("tag"):
-                    tag = str(item["tag"])
-                    tags.append(tag)
-                    details.append(
+        last_err = "inbounds failed"
+        for attempt in range(3):
+            try:
+                client, headers = await self._authed()
+                resp = await client.get(
+                    "/api/inbounds",
+                    headers=headers,
+                    timeout=httpx.Timeout(22.0, connect=10.0),
+                )
+                ok, data = ok_json(resp)
+                if not ok or not isinstance(data, dict):
+                    last_err = err_msg(data, f"HTTP {resp.status_code}")
+                    if resp.status_code in (401, 403) and attempt < 2:
+                        self._token = None
+                        _TOKEN_CACHE.pop(self._cache_key(), None)
+                        await self.close()
+                        await asyncio.sleep(0.3 + attempt * 0.2)
+                        continue
+                    raise RuntimeError(last_err)
+                out: list[dict[str, Any]] = []
+                for protocol, items in data.items():
+                    if not isinstance(items, list):
+                        continue
+                    tags: list[str] = []
+                    details: list[dict[str, Any]] = []
+                    for item in items:
+                        if isinstance(item, dict) and item.get("tag"):
+                            tag = str(item["tag"])
+                            tags.append(tag)
+                            details.append(
+                                {
+                                    "tag": tag,
+                                    "protocol": str(item.get("protocol") or protocol),
+                                    "network": str(item.get("network") or ""),
+                                    "tls": str(item.get("tls") or ""),
+                                    "port": item.get("port"),
+                                }
+                            )
+                        elif isinstance(item, str) and item.strip():
+                            tag = item.strip()
+                            tags.append(tag)
+                            details.append(
+                                {
+                                    "tag": tag,
+                                    "protocol": str(protocol),
+                                    "network": "",
+                                    "tls": "",
+                                    "port": None,
+                                }
+                            )
+                    out.append(
                         {
-                            "tag": tag,
-                            "protocol": str(item.get("protocol") or protocol),
-                            "network": str(item.get("network") or ""),
-                            "tls": str(item.get("tls") or ""),
-                            "port": item.get("port"),
-                        }
-                    )
-                elif isinstance(item, str) and item.strip():
-                    tag = item.strip()
-                    tags.append(tag)
-                    details.append(
-                        {
-                            "tag": tag,
                             "protocol": str(protocol),
-                            "network": "",
-                            "tls": "",
-                            "port": None,
+                            "tags": tags,
+                            "inbound_count": len(tags),
+                            "inbounds": details,
                         }
                     )
-            out.append(
-                {
-                    "protocol": str(protocol),
-                    "tags": tags,
-                    "inbound_count": len(tags),
-                    "inbounds": details,
-                }
-            )
-        return out
+                return out
+            except Exception as e:
+                last_err = str(e).strip() or e.__class__.__name__
+                if attempt < 2:
+                    self._token = None
+                    _TOKEN_CACHE.pop(self._cache_key(), None)
+                    await self.close()
+                    await asyncio.sleep(0.35 + attempt * 0.25)
+                    continue
+                raise RuntimeError(last_err) from e
+        raise RuntimeError(last_err)
 
     async def list_inbounds(self) -> list[dict[str, Any]]:
         """Flat inbound tags (legacy helper). Prefer list_protocols()."""
@@ -454,16 +489,67 @@ class MarzbanAdapter(BasePanelAdapter):
         return flat
 
     async def test_connection(self) -> AdapterResult:
-        try:
-            client, headers = await self._authed()
-            resp = await client.get("/api/admin", headers=headers)
-            ok, data = ok_json(resp)
-            if ok:
-                return AdapterResult(success=True, raw=data)
-            return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
-        except Exception as e:
-            msg = str(e).strip() or e.__class__.__name__
-            return AdapterResult(success=False, error=msg)
+        """Prove admin token works.
+
+        Prefer GET /api/admin (docs); fall back to GET /api/inbounds — some
+        cloud/proxy setups flake on /api/admin while inbounds still works.
+        """
+        last_err = "اتصال ناموفق"
+        for attempt in range(3):
+            try:
+                client, headers = await self._authed()
+                resp = await client.get(
+                    "/api/admin",
+                    headers=headers,
+                    timeout=httpx.Timeout(18.0, connect=10.0),
+                )
+                ok, data = ok_json(resp)
+                if ok:
+                    return AdapterResult(success=True, raw=data if isinstance(data, dict) else {})
+
+                # Token valid but /api/admin flaky → inbounds is enough
+                if resp.status_code in (401, 403):
+                    last_err = err_msg(data, f"HTTP {resp.status_code}")
+                    self._token = None
+                    _TOKEN_CACHE.pop(self._cache_key(), None)
+                    await self.close()
+                    if attempt < 2:
+                        await asyncio.sleep(0.4 + attempt * 0.3)
+                        continue
+                    return AdapterResult(success=False, error=last_err)
+
+                try:
+                    client2, headers2 = await self._authed()
+                    resp2 = await client2.get(
+                        "/api/inbounds",
+                        headers=headers2,
+                        timeout=httpx.Timeout(18.0, connect=10.0),
+                    )
+                    ok2, data2 = ok_json(resp2)
+                    if ok2 and isinstance(data2, dict):
+                        return AdapterResult(success=True, raw={"inbounds_ok": True})
+                    last_err = err_msg(data2, err_msg(data, f"HTTP {resp.status_code}"))
+                except Exception as inner:
+                    last_err = str(inner).strip() or err_msg(data, f"HTTP {resp.status_code}")
+
+                if attempt < 2:
+                    await self.close()
+                    await asyncio.sleep(0.45 + attempt * 0.35)
+                    continue
+                return AdapterResult(success=False, error=last_err)
+            except Exception as e:
+                last_err = str(e).strip() or e.__class__.__name__
+                low = last_err.lower()
+                if "client has been closed" in low:
+                    last_err = "اتصال پنل قطع شد — دوباره تلاش کنید"
+                self._token = None
+                _TOKEN_CACHE.pop(self._cache_key(), None)
+                await self.close()
+                if attempt < 2:
+                    await asyncio.sleep(0.5 + attempt * 0.4)
+                    continue
+                return AdapterResult(success=False, error=last_err)
+        return AdapterResult(success=False, error=last_err)
 
     async def _finalize_user_result(
         self, result: AdapterResult, username: str, *, expand: bool = False
@@ -506,17 +592,96 @@ class MarzbanAdapter(BasePanelAdapter):
             await asyncio.sleep(0.15 + i * 0.1)
         return None
 
-    async def create_user(self, payload: UserPayload) -> AdapterResult:
-        """POST /api/user — parallel-friendly fast create.
+    async def _drop_disabled_protocols(self, payload: UserPayload, err: str) -> bool:
+        """If Marzban says a protocol is disabled, prune it from config and rebuild.
 
-        No /sub expand here (hydrate on subscription). On timeout, one quick GET
-        confirms acceptance so Astra does not wait on Marzban Cloud retries.
+        Official API: HTTP 400 detail like 'Protocol vmess is disabled on your server'
+        See: https://gozargah.github.io/marzban/fa/docs/introduction + POST /api/user
         """
+        low = (err or "").lower()
+        if "disabled" not in low and "غیرفعال" not in err:
+            return False
+        try:
+            available = await self._available_inbounds_map()
+        except Exception:
+            available = {}
+        if not available:
+            return False
+
+        selected = self._selected_protocols(payload)
+        kept = [p for p in selected if available.get(p)]
+        if not kept:
+            kept = [p for p in KNOWN_PROTOCOLS if available.get(p)]
+        if not kept or kept == selected:
+            return False
+
+        # Mutate payload.config so next _build_user_body uses enabled protocols only
+        cfg = dict(payload.config or {})
+        cfg["protocols"] = kept
+        inbounds = cfg.get("inbounds") if isinstance(cfg.get("inbounds"), dict) else {}
+        # Empty tag list ⇒ Marzban assigns ALL inbounds for that protocol (official docs)
+        cfg["inbounds"] = {
+            p: list((inbounds or {}).get(p) or []) for p in kept
+        }
+        payload.config = cfg
+        return True
+
+    async def _fix_bad_inbound_tags(self, payload: UserPayload, err: str) -> bool:
+        """Inbound {tag} doesn't exist → clear/filter tags (empty = all inbounds per docs)."""
+        low = (err or "").lower()
+        looks_inbound = (
+            "inbound" in low
+            or "doesn't exist" in low
+            or "does not exist" in low
+            or "وجود" in err
+            or "tag" in low
+        )
+        if not looks_inbound:
+            return False
+        selected = self._selected_protocols(payload)
+        if not selected:
+            return False
+        try:
+            available = await self._available_inbounds_map()
+        except Exception:
+            available = {}
+        cfg = dict(payload.config or {})
+        cfg["protocols"] = selected
+        if available:
+            fixed: dict[str, list[str]] = {}
+            prev = cfg.get("inbounds") if isinstance(cfg.get("inbounds"), dict) else {}
+            for p in selected:
+                avail = list(available.get(p) or [])
+                raw = prev.get(p) if isinstance(prev, dict) else None
+                tags = [str(t) for t in (raw or []) if t] if isinstance(raw, list) else []
+                tags = [t for t in tags if t in avail]
+                fixed[p] = tags  # [] → Marzban assigns all
+            cfg["inbounds"] = fixed
+        else:
+            cfg["inbounds"] = {p: [] for p in selected}
+        payload.config = cfg
+        return True
+
+    async def create_user(self, payload: UserPayload) -> AdapterResult:
+        """POST /api/user — create without waiting on /sub expand.
+
+        Marzban Cloud often accepts the user (HTTP 200) but is slow to return the
+        large links body. Use a longer read timeout; on timeout/error, GET the user
+        and treat as success when already created.
+
+        Docs (Gozargah): proxies required; inbounds empty = all; 409 = already exists;
+        400 = protocol disabled / bad inbound tag.
+        """
+        # Username rule: 3–32, a-z 0-9 underscore
+        uname = (payload.username or "").strip().lower()
+        payload.username = uname
+
         body = await self._build_user_body(payload, include_username=True)
         last_err = "create failed"
-        req_timeout = httpx.Timeout(8.0, connect=3.0)
+        # Connect short, read long — Cloud panels often need >8s for big responses
+        req_timeout = httpx.Timeout(35.0, connect=12.0)
 
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 client, headers = await self._authed()
                 resp = await client.post(
@@ -532,7 +697,10 @@ class MarzbanAdapter(BasePanelAdapter):
 
                 err = err_msg(data, f"HTTP {resp.status_code}")
                 low = err.lower()
-                if any(x in low for x in ("exist", "already", "duplicate", "تکرار", "موجود")):
+                # 409 User already exists (official) + forks wording
+                if resp.status_code == 409 or any(
+                    x in low for x in ("exist", "already", "duplicate", "تکرار", "موجود")
+                ):
                     existing = await self._fetch_existing_user(payload.username)
                     if existing:
                         return existing
@@ -544,8 +712,19 @@ class MarzbanAdapter(BasePanelAdapter):
                         used_traffic=0,
                     )
 
+                rebuilt = False
+                if resp.status_code in (400, 422):
+                    if await self._drop_disabled_protocols(payload, err):
+                        rebuilt = True
+                    elif await self._fix_bad_inbound_tags(payload, err):
+                        rebuilt = True
+                    if rebuilt:
+                        body = await self._build_user_body(payload, include_username=True)
+                        last_err = err
+                        continue
+
                 last_err = err
-                if resp.status_code in (401, 403) and attempt < 2:
+                if resp.status_code in (401, 403) and attempt < 3:
                     self._token = None
                     _TOKEN_CACHE.pop(self._cache_key(), None)
                     await self.close()
@@ -553,6 +732,15 @@ class MarzbanAdapter(BasePanelAdapter):
                 existing = await self._fetch_existing_user(payload.username)
                 if existing:
                     return existing
+                if attempt < 3 and resp.status_code >= 500:
+                    await self.close()
+                    await asyncio.sleep(0.4 + attempt * 0.2)
+                    continue
+                if attempt < 3 and resp.status_code in (400, 422):
+                    # Last resort: empty inbounds (all) for selected protocols
+                    if await self._fix_bad_inbound_tags(payload, "Inbound doesn't exist"):
+                        body = await self._build_user_body(payload, include_username=True)
+                        continue
                 return AdapterResult(success=False, error=err)
             except Exception as e:
                 last_err = str(e).strip() or e.__class__.__name__
@@ -561,20 +749,25 @@ class MarzbanAdapter(BasePanelAdapter):
                 if "client has been closed" in last_err.lower():
                     last_err = "اتصال پنل قطع شد — دوباره تلاش کنید"
 
+                # POST may have succeeded server-side while the client timed out
+                await asyncio.sleep(0.4)
                 existing = await self._fetch_existing_user(payload.username)
                 if existing:
                     return existing
 
-                if attempt < 2:
+                if attempt < 3:
                     self._token = None
                     _TOKEN_CACHE.pop(self._cache_key(), None)
                     await self.close()
-                    await asyncio.sleep(0.15)
+                    await asyncio.sleep(0.4 + attempt * 0.3)
                     continue
 
-        existing = await self._fetch_existing_user(payload.username)
-        if existing:
-            return existing
+        # Final confirm — Cloud may still be processing
+        for _ in range(3):
+            await asyncio.sleep(0.5)
+            existing = await self._fetch_existing_user(payload.username)
+            if existing:
+                return existing
         return AdapterResult(success=False, error=last_err)
 
     async def modify_user(self, payload: UserPayload) -> AdapterResult:
@@ -609,8 +802,9 @@ class MarzbanAdapter(BasePanelAdapter):
             return AdapterResult(success=False, error="username خالی است")
         path = f"/api/user/{quote(uname, safe='')}"
         last_err = "delete failed"
-        t = httpx.Timeout(20.0, connect=5.0)
-        for attempt in range(6):
+        # Fast delete: 2 attempts, short timeouts — parallel across panels
+        t = httpx.Timeout(6.0, connect=2.5)
+        for attempt in range(2):
             try:
                 client, headers = await self._authed()
                 resp = await client.delete(path, headers=headers, timeout=t)
@@ -620,38 +814,50 @@ class MarzbanAdapter(BasePanelAdapter):
                     if "not found" in err.lower():
                         return AdapterResult(success=True)
                     last_err = err
-                    if resp.status_code in (401, 403) and attempt < 5:
+                    if resp.status_code in (401, 403) and attempt < 1:
                         self._token = None
                         _TOKEN_CACHE.pop(self._cache_key(), None)
                         await self.close()
                         continue
                     return AdapterResult(success=False, error=err)
 
-                # Confirm removed (or never existed). If still 200 → delete lied/failed.
-                client, headers = await self._authed()
-                check = await client.get(path, headers=headers, timeout=t)
+                # Confirm removed. DELETE already accepted — soft on verify timeout.
+                try:
+                    client, headers = await self._authed()
+                    check = await client.get(path, headers=headers, timeout=t)
+                except (asyncio.TimeoutError, httpx.TimeoutException):
+                    # DELETE returned 200/204/404; slow GET verify → treat as gone
+                    return AdapterResult(success=True)
                 if check.status_code == 404:
                     return AdapterResult(success=True)
                 if check.status_code in (200, 201):
                     last_err = "کاربر هنوز روی پنل اصلی وجود دارد"
-                    if attempt < 5:
-                        await asyncio.sleep(0.3)
+                    if attempt < 1:
+                        await asyncio.sleep(0.1)
                         continue
                     return AdapterResult(success=False, error=last_err)
                 # Other codes after DELETE → treat as gone
                 return AdapterResult(success=True)
             except Exception as e:
                 last_err = str(e).strip() or e.__class__.__name__
-                if "client has been closed" in last_err.lower() and attempt < 5:
+                if "client has been closed" in last_err.lower() and attempt < 1:
                     self._token = None
                     await self.close()
-                    await asyncio.sleep(0.25)
+                    await asyncio.sleep(0.1)
                     continue
                 if isinstance(e, (asyncio.TimeoutError, httpx.TimeoutException)):
                     last_err = "Timeout waiting for panel response"
-                if attempt < 5:
+                    # If DELETE itself timed out, one quick GET — 404 means gone
+                    try:
+                        client, headers = await self._authed()
+                        check = await client.get(path, headers=headers, timeout=t)
+                        if check.status_code == 404:
+                            return AdapterResult(success=True)
+                    except Exception:
+                        pass
+                if attempt < 1:
                     await self.close()
-                    await asyncio.sleep(0.25 + attempt * 0.15)
+                    await asyncio.sleep(0.1)
                     continue
                 return AdapterResult(success=False, error=last_err)
         return AdapterResult(success=False, error=last_err)

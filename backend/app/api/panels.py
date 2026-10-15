@@ -103,11 +103,12 @@ def _validate_credentials(panel_type: PanelType, username: str | None, password:
         token = (api_token or "").strip()
         if token.lower().startswith("bearer "):
             token = token[7:].strip()
-        has_pass = bool((username or "").strip() and (password or "").strip())
-        if not token and not has_pass:
+        user = (username or "").strip()
+        pwd = (password or "").strip()
+        if not user or not pwd:
             raise HTTPException(
                 status_code=400,
-                detail="برای سنایی API Token (ترجیحی) یا یوزر/رمز پنل لازم است",
+                detail="برای سنایی نام کاربری و رمز عبور ادمین الزامی است",
             )
         if not token:
             raise HTTPException(
@@ -142,13 +143,27 @@ def _to_out(p: Panel) -> PanelOut:
 async def _probe_panel(panel: Panel) -> None:
     """Live-test remote panel; raise 400 if credentials/URL are wrong.
 
-    Retries once — Marzban Cloud / distant panels often flake on the first token.
+    Marzban Cloud / distant hosts often flake on the first token — retry with backoff.
     """
     last_err = "اطلاعات ورود یا آدرس اشتباه است"
-    for attempt in range(2):
+    # Marzban/Rebecca: more attempts (token + /api/admin can be slow/flaky)
+    tries = 4 if panel.type in (PanelType.marzban, PanelType.rebecca) else 2
+    for attempt in range(tries):
         adapter = get_adapter(panel)
         result = None
         try:
+            # Drop any stale shared token before a fresh probe
+            clear = getattr(adapter, "_token", None)
+            if clear is not None:
+                adapter._token = None  # type: ignore[attr-defined]
+            cache = getattr(adapter, "_cache_key", None)
+            if callable(cache):
+                try:
+                    from app.adapters import marzban as marz_mod
+
+                    marz_mod._TOKEN_CACHE.pop(adapter._cache_key(), None)  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001
+                    pass
             result = await adapter.test_connection()
         except Exception as exc:  # noqa: BLE001
             last_err = str(exc).strip() or exc.__class__.__name__
@@ -169,9 +184,8 @@ async def _probe_panel(panel: Panel) -> None:
         last_err = (
             (result.error if result else None) or last_err or "اطلاعات ورود یا آدرس اشتباه است"
         )
-        if attempt == 0:
-            # brief pause then fresh adapter/token
-            await asyncio.sleep(1.2)
+        if attempt + 1 < tries:
+            await asyncio.sleep(0.8 + attempt * 0.7)
 
     logger.warning("panel probe failed type=%s url=%s: %s", panel.type, panel.base_url, last_err)
     raise HTTPException(

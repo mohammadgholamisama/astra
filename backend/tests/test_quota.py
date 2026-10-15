@@ -45,48 +45,41 @@ def test_quota_exhausted_marks_limited():
     assert is_quota_exhausted(100, 0) is False  # unlimited
 
 
-def test_remote_limit_coeff_two_fresh_user():
+def test_remote_limit_full_purchase_ignores_coeff():
     gb = 1024**3
-    # Astra 10GB, coeff 2, unused → remote may use 5GB raw
-    assert remote_data_limit(
-        10 * gb, used_weighted_total=0, used_raw_on_panel=0, coefficient=2
-    ) == 5 * gb
+    # 4GB purchase + coeff 2 → still 4GB on remote (not 2GB)
+    assert (
+        remote_data_limit(
+            4 * gb, used_weighted_total=0, used_raw_on_panel=0, coefficient=2
+        )
+        == 4 * gb
+    )
+    # Mid-usage still full purchase on remote
+    assert (
+        remote_data_limit(
+            10 * gb,
+            used_weighted_total=8 * gb,
+            used_raw_on_panel=4 * gb,
+            coefficient=2,
+        )
+        == 10 * gb
+    )
 
 
-def test_remote_limit_freeze_when_astra_done():
-    gb = 1024**3
-    # Astra finished; panel already used 3GB raw → freeze at 3GB
-    assert remote_data_limit(
-        10 * gb,
-        used_weighted_total=10 * gb,
-        used_raw_on_panel=3 * gb,
-        coefficient=2,
-    ) == 3 * gb
-
-
-def test_remote_limit_shared_remaining_multi_panel():
-    gb = 1024**3
-    # Used 8GB weighted of 10GB; panel raw 4GB; coeff 1 → remote ceiling 4+2=6GB
-    assert remote_data_limit(
-        10 * gb,
-        used_weighted_total=8 * gb,
-        used_raw_on_panel=4 * gb,
-        coefficient=1,
-    ) == 6 * gb
+def test_remote_limit_unlimited():
+    assert remote_data_limit(0, used_weighted_total=0, used_raw_on_panel=0, coefficient=5) == 0
 
 
 def test_coeff_period_keeps_past_at_old_rate():
     gb = 1024**3
     # Locked 4GB at coeff 1, then +1GB raw at coeff 2 → 4 + 2 = 6GB
     assert (
-        weighted_bytes(
-            5 * gb, 2, anchor_raw=4 * gb, anchor_weighted=4 * gb
-        )
+        weighted_bytes(5 * gb, 2, anchor_raw=4 * gb, anchor_weighted=4 * gb)
         == 6 * gb
     )
 
 
-def test_push_when_blocked_or_multi_panel():
+def test_push_only_when_blocked_or_forced():
     assert needs_remote_cap_sync(
         status_changed=False,
         blocked=True,
@@ -101,27 +94,19 @@ def test_push_when_blocked_or_multi_panel():
         active_panel_count=1,
         coefficients=[1],
     )
+    # No mid-flight shrink for multi-panel coefficients
+    assert not needs_remote_cap_sync(
+        status_changed=False,
+        blocked=False,
+        force=False,
+        active_panel_count=2,
+        coefficients=[1, 2],
+        shrink_shared_caps=True,
+    )
     assert needs_remote_cap_sync(
         status_changed=False,
         blocked=False,
-        force=False,
+        force=True,
         active_panel_count=2,
         coefficients=[1, 1],
-        shrink_shared_caps=True,
-    )
-    assert not needs_remote_cap_sync(
-        status_changed=False,
-        blocked=False,
-        force=False,
-        active_panel_count=2,
-        coefficients=[1, 1],
-        shrink_shared_caps=False,
-    )
-    assert not needs_remote_cap_sync(
-        status_changed=False,
-        blocked=False,
-        force=False,
-        active_panel_count=1,
-        coefficients=[2],
-        shrink_shared_caps=True,
     )

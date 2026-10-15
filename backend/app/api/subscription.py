@@ -116,14 +116,11 @@ def _feed_response(body: bytes, headers: dict[str, str]) -> Response:
     )
 
 
-async def _ensure_share_links(db: AsyncSession, token: str, user):
-    """Ensure EVERY panel account has real share links in the sub feed.
-
-    Always hydrate accounts that only have /sub refs or empty links — do not
-    return early just because *some* panels already have vless:// links.
-    """
+async def _ensure_share_links(db: AsyncSession, token: str, user, *, timeout: float = 14.0):
+    """Ensure share links from ALL panels are in the feed (parallel hydrate)."""
     try:
-        n = await asyncio.wait_for(hydrate_share_links(db, user), timeout=60.0)
+        # hydrate waves need headroom for PasarGuard/Marzban /sub expand
+        n = await asyncio.wait_for(hydrate_share_links(db, user), timeout=timeout)
         if n:
             await db.commit()
             user = await load_user_by_token(db, token) or user
@@ -160,7 +157,8 @@ async def _pull_live_usage(db: AsyncSession, user, *, push: bool = False) -> Non
 
     status_changed = False
     try:
-        await asyncio.wait_for(refresh_usage(db, user, force=True), timeout=12.0)
+        # Parallel panel pulls need headroom (Marzban Cloud / multi-panel groups)
+        await asyncio.wait_for(refresh_usage(db, user, force=True), timeout=28.0)
         status_changed = await enforce_user_quota(db, user)
         await db.commit()
     except Exception as exc:  # noqa: BLE001
@@ -201,11 +199,15 @@ async def _pull_live_usage(db: AsyncSession, user, *, push: bool = False) -> Non
 
 async def _render_info_page(db: AsyncSession, token: str, user) -> HTMLResponse:
     await ensure_loaded(db)
-    # Usage first (committed); optional remote push must not wipe stats on timeout
-    await _pull_live_usage(db, user, push=True)
-
-    user = await load_user_by_token(db, token) or user
-    user, _links = await _ensure_share_links(db, token, user)
+    # 1) Share links from every panel  2) Live raw usage × coefficients
+    # Sequential on one DB session (SQLAlchemy async is not concurrency-safe).
+    user, _links = await _ensure_share_links(db, token, user, timeout=12.0)
+    try:
+        await asyncio.wait_for(_pull_live_usage(db, user, push=False), timeout=30.0)
+        user = await load_user_by_token(db, token) or user
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("sub page usage: %s", exc)
+        user = await load_user_by_token(db, token) or user
 
     configs = collect_links_detailed(user, include_notices=True)
     panels_usage = await usage_breakdown_for_user(db, user)
@@ -225,7 +227,13 @@ async def _render_info_page(db: AsyncSession, token: str, user) -> HTMLResponse:
         device_limit=device_limit,
         public_links=get_public_links(),
     )
-    return HTMLResponse(html)
+    return HTMLResponse(
+        html,
+        headers={
+            "cache-control": "no-store",
+            "content-disposition": "inline",
+        },
+    )
 
 
 @router.get("/sub/{token}")
@@ -246,11 +254,19 @@ async def get_subscription(
     if _wants_html_page(request):
         return await _render_info_page(db, token, user)
 
-    # Client feed: refresh usage so subscription-userinfo matches the panel
-    await _pull_live_usage(db, user, push=False)
-    user = await load_user_by_token(db, token) or user
-
+    # Client feed: hydrate configs; refresh usage when stale (header userinfo).
     user, links = await _ensure_share_links(db, token, user)
+    try:
+        await asyncio.wait_for(refresh_usage(db, user, force=False), timeout=10.0)
+        await db.commit()
+        user = await load_user_by_token(db, token) or user
+        links = await collect_links(user, include_notices=False) or links
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("sub feed usage: %s", exc)
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
     headers = _sub_headers(user)
 
     if user.status not in (UserStatus.active, UserStatus.on_hold):

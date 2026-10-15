@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -176,7 +177,7 @@ def extract_share_links(text: str) -> list[str]:
 
 
 async def expand_subscription_links(
-    client: httpx.AsyncClient,
+    client: httpx.AsyncClient | None,
     links: list[str],
     *,
     headers: dict[str, str] | None = None,
@@ -186,43 +187,113 @@ async def expand_subscription_links(
 
     PasarGuard/Marzban often return only `/sub/<token>` or an https sub URL —
     clients cannot import those; we must fetch and unwrap to vless:// etc.
+
+    Absolute http(s) URLs are fetched with a dedicated client (no panel base),
+    so CDN/sub-domain hosts work even when panel base_url differs.
     """
     links = [str(x).strip() for x in (links or []) if x and str(x).strip()]
     if not links:
         return []
     existing_share = [l for l in links if is_share_link(l)]
-    if existing_share:
-        return existing_share
-
     subs = [l for l in links if is_subscription_ref(l)]
+    # PasarGuard/Marzban often return a few share links (or notice vless) PLUS
+    # subscription_url with the full set. Always expand /sub when present.
     if not subs:
-        # Never return bare /sub/... junk to clients
-        return []
+        return existing_share
 
     out: list[str] = []
     seen: set[str] = set()
+    for line in existing_share:
+        if line not in seen:
+            seen.add(line)
+            out.append(line)
     req_headers = {
         "User-Agent": "v2rayNG/1.8 (AstraPanel)",
         "Accept": "text/plain, */*",
         **(headers or {}),
     }
-    # Short per-sub timeout — never burn the whole ADAPTER_TIMEOUT on one /sub fetch
-    sub_timeout = httpx.Timeout(12.0, connect=10.0)
-    for url in subs:
+    # Short per-sub timeout — sub page must stay snappy with many panels
+    sub_timeout = httpx.Timeout(5.0, connect=3.0)
+
+    async def _fetch_absolute(url: str) -> list[str]:
+        # Fail fast on dead CDN hosts so we can fall back to panel /sub
+        abs_timeout = httpx.Timeout(4.0, connect=2.5)
+        try:
+            async with httpx.AsyncClient(
+                timeout=abs_timeout,
+                verify=False,
+                follow_redirects=True,
+                headers=req_headers,
+            ) as bare:
+                resp = await bare.get(url)
+                if resp.status_code >= 400:
+                    return []
+                text = (resp.text or "").strip()
+                return extract_share_links(text) if text else []
+        except Exception:
+            return []
+
+    async def _fetch_relative(url: str) -> list[str]:
+        if client is None:
+            return []
         try:
             path = url
-            if path.lower().startswith("sub/") and not path.lower().startswith(("http://", "https://")):
+            if path.lower().startswith("sub/") and not path.lower().startswith(
+                ("http://", "https://")
+            ):
                 path = "/" + path
             resp = await client.get(path, headers=req_headers, timeout=sub_timeout)
             if resp.status_code >= 400:
-                continue
+                return []
             text = (resp.text or "").strip()
             if not text:
-                continue
-            for line in extract_share_links(text):
-                if line not in seen:
-                    seen.add(line)
-                    out.append(line)
+                return []
+            return extract_share_links(text)
         except Exception:
+            return []
+
+    def _relative_sub_path(url: str) -> str | None:
+        """https://cdn/sub/TOKEN → /sub/TOKEN (fallback via panel base)."""
+        try:
+            parts = urlsplit(url)
+        except Exception:
+            return None
+        path = parts.path or ""
+        low = path.lower()
+        idx = low.find("/sub/")
+        if idx < 0:
+            if low.startswith("sub/"):
+                path = "/" + path
+                idx = 0
+            else:
+                return None
+            idx = path.lower().find("/sub/")
+        if idx < 0:
+            return None
+        rel = path[idx:]
+        if parts.query:
+            rel = f"{rel}?{parts.query}"
+        return rel
+
+    async def _fetch_one(url: str) -> list[str]:
+        low = url.lower()
+        if low.startswith(("http://", "https://")):
+            got = await _fetch_absolute(url)
+            if got:
+                return got
+            # CDN/sub-domain unreachable from server → try same /sub path on panel
+            rel = _relative_sub_path(url)
+            if rel:
+                return await _fetch_relative(rel)
+            return []
+        return await _fetch_relative(url)
+
+    batches = await asyncio.gather(*[_fetch_one(u) for u in subs], return_exceptions=True)
+    for lines in batches:
+        if isinstance(lines, BaseException):
             continue
+        for line in lines:
+            if line not in seen:
+                seen.add(line)
+                out.append(line)
     return out

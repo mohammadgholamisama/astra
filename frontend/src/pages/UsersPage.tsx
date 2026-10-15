@@ -113,14 +113,12 @@ function panelUsageRows(u: User, groups: Group[]): PanelUsageRow[] {
     const raw = Number(a.used_traffic) || 0;
     const coefficient = coeffs.get(a.panel_id) ?? 1;
     const weighted = accountWeighted(a, coefficient);
-    // Shared remaining: panel ceiling = raw_used + (astra_remaining / coeff)
+    // Remotes get the full purchased quota; coefficient only weights Astra usage.
+    // When Astra quota is exhausted, freeze at current raw on that panel.
     let remoteLimit = 0;
     if (astraLimit > 0) {
-      const remaining = Math.max(0, astraLimit - usedWeighted);
-      remoteLimit =
-        remaining <= 0
-          ? Math.max(1, raw || 1)
-          : Math.max(1, raw + Math.floor(remaining / coefficient));
+      const exhausted = usedWeighted >= astraLimit;
+      remoteLimit = exhausted ? Math.max(1, raw || 1) : astraLimit;
     }
     rows.push({
       panelId: a.panel_id,
@@ -156,6 +154,10 @@ export default function UsersPage() {
   const [editDisplayName, setEditDisplayName] = useState("");
   const [editDataGb, setEditDataGb] = useState("50");
   const [editDays, setEditDays] = useState("30");
+  /** Current + newly selected groups (existing ones are locked — add only). */
+  const [editGroupIds, setEditGroupIds] = useState<number[]>([]);
+  const [editLockedGroupIds, setEditLockedGroupIds] = useState<number[]>([]);
+  const [editGroupSearch, setEditGroupSearch] = useState("");
   const [errorsUser, setErrorsUser] = useState<User | null>(null);
   const [subUser, setSubUser] = useState<User | null>(null);
   const [usageUser, setUsageUser] = useState<User | null>(null);
@@ -189,26 +191,29 @@ export default function UsersPage() {
     setPage(0);
   }, [searchDebounced, filterGroupId]);
 
-  const { data, isLoading, isFetching } = useQuery({
-    queryKey: ["users", searchDebounced, filterGroupId, page],
+  const usersQueryKey = ["users", searchDebounced, filterGroupId, page] as const;
+
+  const { data, isLoading, isFetching, isSuccess } = useQuery({
+    queryKey: usersQueryKey,
     queryFn: () => {
       const qs = new URLSearchParams({
         limit: String(PAGE_SIZE),
         offset: String(page * PAGE_SIZE),
-        // Fast list: no live remote pull (use «همگام‌سازی مصرف» for that)
+        // Instant list from DB — live usage patches in right after
         refresh: "false",
       });
       if (searchDebounced.trim()) qs.set("search", searchDebounced.trim());
       if (filterGroupId !== "") qs.set("group_id", String(filterGroupId));
       return api<{ users: User[]; total: number }>(`/api/users?${qs}`);
     },
-    staleTime: 30_000,
-    refetchOnMount: false,
-    refetchOnWindowFocus: false,
+    staleTime: 15_000,
+    refetchInterval: 60_000,
+    refetchOnMount: true,
+    refetchOnWindowFocus: true,
     placeholderData: (prev) => prev,
   });
 
-  async function syncUsageNow() {
+  async function syncUsageNow(silent = false) {
     setSyncingUsage(true);
     try {
       const qs = new URLSearchParams({
@@ -219,17 +224,36 @@ export default function UsersPage() {
       if (searchDebounced.trim()) qs.set("search", searchDebounced.trim());
       if (filterGroupId !== "") qs.set("group_id", String(filterGroupId));
       const fresh = await api<{ users: User[]; total: number }>(`/api/users?${qs}`);
-      qc.setQueryData(["users", searchDebounced, filterGroupId, page], fresh);
-      setActionMsg({ type: "ok", text: "مصرف این صفحه همگام شد" });
+      qc.setQueryData(usersQueryKey, fresh);
+      if (!silent) {
+        setActionMsg({ type: "ok", text: "مصرف این صفحه همگام شد" });
+      }
     } catch (e) {
-      setActionMsg({
-        type: "err",
-        text: e instanceof Error ? e.message : "همگام‌سازی ناموفق",
-      });
+      if (!silent) {
+        setActionMsg({
+          type: "err",
+          text: e instanceof Error ? e.message : "همگام‌سازی ناموفق",
+        });
+      }
     } finally {
       setSyncingUsage(false);
     }
   }
+
+  // After fast paint: pull live usage/configs for this page in parallel (non-blocking)
+  useEffect(() => {
+    if (!isSuccess || !data?.users?.length) return;
+    let cancelled = false;
+    const t = window.setTimeout(() => {
+      if (cancelled) return;
+      void syncUsageNow(true);
+    }, 30);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(t);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSuccess, searchDebounced, filterGroupId, page]);
   const { data: groups = [] } = useQuery({
     queryKey: ["groups"],
     queryFn: () => api<Group[]>("/api/groups"),
@@ -355,20 +379,26 @@ export default function UsersPage() {
       const expire =
         dayN > 0 ? Math.floor(Date.now() / 1000) + Math.floor(dayN * 86400) : 0;
       const dn = editDisplayName.trim();
+      // Always send full membership (locked + added). Backend only ADDS.
+      const body: Record<string, unknown> = {
+        display_name: dn || null,
+        clear_display_name: !dn,
+        data_limit: gb > 0 ? gbToBytes(gb) : 0,
+        expire,
+        group_ids: editGroupIds,
+      };
       return api<User>(`/api/user/${encodeURIComponent(editUser.username)}`, {
         method: "PUT",
-        body: JSON.stringify({
-          display_name: dn || null,
-          clear_display_name: !dn,
-          data_limit: gb > 0 ? gbToBytes(gb) : 0,
-          expire,
-        }),
+        body: JSON.stringify(body),
       });
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["users"] });
       setEditUser(null);
-      setActionMsg({ type: "ok", text: "کاربر به‌روز شد — تغییرات روی پنل‌ها اعمال شد" });
+      setActionMsg({
+        type: "ok",
+        text: "ذخیره شد — گروه جدید ساخته شد، لینک ساب و کانفیگ‌های قبلی ثابت ماند",
+      });
     },
     onError: (e: Error) => setActionMsg({ type: "err", text: e.message }),
   });
@@ -379,6 +409,17 @@ export default function UsersPage() {
     setEditDisplayName(u.display_name || "");
     setEditDataGb(bytesToGbInput(u.data_limit));
     setEditDays(expireToDaysInput(u.expire));
+    const locked = [...(u.group_ids || [])];
+    setEditLockedGroupIds(locked);
+    setEditGroupIds(locked);
+    setEditGroupSearch("");
+  }
+
+  function toggleEditGroup(id: number) {
+    if (editLockedGroupIds.includes(id)) return; // add-only
+    setEditGroupIds((cur) =>
+      cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]
+    );
   }
 
   useEffect(() => {
@@ -475,6 +516,24 @@ export default function UsersPage() {
       );
     });
   }, [activeGroups, groupSearch]);
+
+  const filteredEditGroups = useMemo(() => {
+    const q = editGroupSearch.trim().toLowerCase();
+    if (!q) return activeGroups;
+    return activeGroups.filter((g) => {
+      if (g.name.toLowerCase().includes(q)) return true;
+      return (g.panels || []).some(
+        (gp) =>
+          (gp.panel_name || "").toLowerCase().includes(q) ||
+          (gp.panel_type || "").toLowerCase().includes(q)
+      );
+    });
+  }, [activeGroups, editGroupSearch]);
+
+  const editAddedCount = useMemo(
+    () => editGroupIds.filter((id) => !editLockedGroupIds.includes(id)).length,
+    [editGroupIds, editLockedGroupIds]
+  );
 
   const createPanelSummary = useMemo(() => {
     const panelMap = new Map<
@@ -1372,6 +1431,109 @@ export default function UsersPage() {
                   <p className="field-hint">۰ = نامحدود · از لحظه ذخیره محاسبه می‌شود</p>
                 </div>
               </div>
+
+              <div className="field user-create-groups-field">
+                <div className="user-create-groups-head">
+                  <label>افزودن گروه</label>
+                </div>
+                <p className="field-hint">
+                  گروه‌های فعلی قفل‌اند. فقط گروه جدید می‌توانید اضافه کنید — لینک ساب و
+                  کانفیگ‌های قبلی عوض نمی‌شود.
+                  {editAddedCount > 0
+                    ? ` · ${toFaDigits(editAddedCount)} گروه جدید انتخاب شد`
+                    : ""}
+                </p>
+                <div className="user-create-groups-search">
+                  <Search size={16} aria-hidden />
+                  <input
+                    type="search"
+                    value={editGroupSearch}
+                    onChange={(e) => setEditGroupSearch(e.target.value)}
+                    placeholder="جستجوی گروه برای افزودن…"
+                  />
+                </div>
+                {editLockedGroupIds.length > 0 && (
+                  <div className="user-create-selected">
+                    {editLockedGroupIds.map((id) => {
+                      const g = groupsById.get(id);
+                      if (!g) return null;
+                      return (
+                        <span key={id} className="user-create-chip locked" title="گروه فعلی">
+                          {g.name}
+                        </span>
+                      );
+                    })}
+                    {editGroupIds
+                      .filter((id) => !editLockedGroupIds.includes(id))
+                      .map((id) => {
+                        const g = groupsById.get(id);
+                        if (!g) return null;
+                        return (
+                          <button
+                            key={id}
+                            type="button"
+                            className="user-create-chip"
+                            onClick={() => toggleEditGroup(id)}
+                            title="برداشتن از افزوده‌ها"
+                          >
+                            {g.name}
+                            <X size={14} aria-hidden />
+                          </button>
+                        );
+                      })}
+                  </div>
+                )}
+                <div className="user-create-groups" role="group" aria-label="افزودن گروه">
+                  {filteredEditGroups.length === 0 ? (
+                    <p className="field-hint user-create-empty">نتیجه‌ای پیدا نشد</p>
+                  ) : (
+                    filteredEditGroups.map((g) => {
+                      const locked = editLockedGroupIds.includes(g.id);
+                      const on = editGroupIds.includes(g.id);
+                      const types = [
+                        ...new Set(
+                          (g.panels || [])
+                            .map((gp) => gp.panel_type || "")
+                            .filter(Boolean)
+                        ),
+                      ];
+                      return (
+                        <button
+                          key={g.id}
+                          type="button"
+                          className={`user-create-group-card${on ? " on" : ""}${
+                            locked ? " locked" : ""
+                          }`}
+                          onClick={() => toggleEditGroup(g.id)}
+                          aria-pressed={on}
+                          disabled={locked}
+                          title={
+                            locked
+                              ? "گروه فعلی — قابل حذف نیست"
+                              : on
+                                ? "حذف از افزوده‌ها"
+                                : "افزودن گروه"
+                          }
+                        >
+                          <span className={`user-create-check${on ? " on" : ""}`}>
+                            {on ? <Check size={14} strokeWidth={2.5} /> : null}
+                          </span>
+                          <span className="user-create-group-body">
+                            <span className="user-create-group-name">{g.name}</span>
+                            <span className="user-create-group-meta">
+                              {locked ? "فعلی · " : ""}
+                              {types
+                                .map((t) => panelTypeLabel[t] || t)
+                                .join(" · ") || "بدون پنل"}
+                            </span>
+                          </span>
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+
               {saveEdit.isError && (
                 <p className="error">
                   {saveEdit.error instanceof Error
