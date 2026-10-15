@@ -301,19 +301,24 @@ async def provision_user_on_panels(
             # AFTER Marzban accepted the user but before the response returns.
             return await asyncio.wait_for(adapter.create_user(payload), timeout=120)
         except Exception as e:  # noqa: BLE001
-            # Outer timeout / cancel — still try to confirm remote exists
+            # Outer timeout / cancel — confirm remote exists (no expand = fast)
             err = _exc_msg(e)
             try:
-                for _ in range(5):
+                fetch = getattr(adapter, "_fetch_existing_user", None)
+                if callable(fetch):
+                    existing = await fetch(payload.username)
+                    if existing and existing.success:
+                        return existing
+                for _ in range(6):
                     try:
                         usage = await asyncio.wait_for(
-                            adapter.get_usage(payload.username), timeout=15
+                            adapter.get_usage(payload.username), timeout=12
                         )
                         if usage.success:
                             return usage
                     except Exception:
                         pass
-                    await asyncio.sleep(0.4)
+                    await asyncio.sleep(0.3)
             except Exception:
                 pass
             return _fail_result(err)

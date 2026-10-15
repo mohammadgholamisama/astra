@@ -148,6 +148,7 @@ export default function UsersPage() {
   const [dataGb, setDataGb] = useState("50");
   const [days, setDays] = useState("30");
   const [groupIds, setGroupIds] = useState<number[]>([]);
+  const [groupSearch, setGroupSearch] = useState("");
   const [copied, setCopied] = useState("");
   const [confirmUser, setConfirmUser] = useState<User | null>(null);
   const [resetUser, setResetUser] = useState<User | null>(null);
@@ -262,6 +263,7 @@ export default function UsersPage() {
       setDataGb("50");
       setDays("30");
       setGroupIds([]);
+      setGroupSearch("");
       setActionMsg({ type: "ok", text: "کاربر ساخته شد" });
     },
   });
@@ -456,9 +458,29 @@ export default function UsersPage() {
     return m;
   }, [groups]);
 
-  const createGroupHint = useMemo(() => {
-    if (!groupIds.length) return "";
-    const panelMap = new Map<number, number>(); // panel_id -> max coeff
+  const activeGroups = useMemo(
+    () => groups.filter((g) => !g.is_disabled),
+    [groups]
+  );
+
+  const filteredCreateGroups = useMemo(() => {
+    const q = groupSearch.trim().toLowerCase();
+    if (!q) return activeGroups;
+    return activeGroups.filter((g) => {
+      if (g.name.toLowerCase().includes(q)) return true;
+      return (g.panels || []).some(
+        (gp) =>
+          (gp.panel_name || "").toLowerCase().includes(q) ||
+          (gp.panel_type || "").toLowerCase().includes(q)
+      );
+    });
+  }, [activeGroups, groupSearch]);
+
+  const createPanelSummary = useMemo(() => {
+    const panelMap = new Map<
+      number,
+      { name: string; type: string; coeff: number }
+    >();
     for (const gid of groupIds) {
       const g = groupsById.get(gid);
       for (const gp of g?.panels || []) {
@@ -467,18 +489,44 @@ export default function UsersPage() {
         );
         const c = !Number.isNaN(raw) && raw >= 0.01 ? raw : 1;
         const prev = panelMap.get(gp.panel_id);
-        panelMap.set(gp.panel_id, prev == null ? c : Math.max(prev, c));
+        if (!prev || c > prev.coeff) {
+          panelMap.set(gp.panel_id, {
+            name: gp.panel_name || `پنل #${gp.panel_id}`,
+            type: gp.panel_type || "",
+            coeff: c,
+          });
+        }
       }
     }
-    const n = panelMap.size;
-    const coeffs = [...panelMap.values()];
-    const multi = coeffs.some((c) => c !== 1);
-    if (!n) return "گروه‌های انتخاب‌شده پنل فعالی ندارند";
-    if (multi) {
-      return `${toFaDigits(n)} پنل (مرزبان/پاسارگاد/سنایی/ربکا) · مصرف = جمع (خام × ضریب) · با پر شدن سقف همه خاموش می‌شوند`;
-    }
-    return `${toFaDigits(n)} پنل · حجم خرید بین همه مشترک است · با تمام شدن حجم همه خاموش می‌شوند`;
+    return [...panelMap.values()];
   }, [groupIds, groupsById]);
+
+  const createGroupHint = useMemo(() => {
+    const n = createPanelSummary.length;
+    if (!groupIds.length) return "حداقل یک گروه را انتخاب کنید";
+    if (!n) return "گروه‌های انتخاب‌شده پنل فعالی ندارند";
+    const multi = createPanelSummary.some((p) => p.coeff !== 1);
+    if (multi) {
+      return `${toFaDigits(n)} پنل یکتا · مصرف = جمع (خام × ضریب) · با اتمام حجم همه خاموش`;
+    }
+    return `${toFaDigits(n)} پنل یکتا · حجم خرید مشترک بین همه پنل‌ها`;
+  }, [groupIds.length, createPanelSummary]);
+
+  function selectAllFilteredGroups() {
+    const ids = filteredCreateGroups.map((g) => g.id);
+    setGroupIds((cur) => [...new Set([...cur, ...ids])]);
+  }
+
+  function clearCreateGroups() {
+    setGroupIds([]);
+  }
+
+  const panelTypeLabel: Record<string, string> = {
+    marzban: "مرزبان",
+    pasarguard: "پاسارگاد",
+    sanaei: "سنایی",
+    rebecca: "ربکا",
+  };
 
   const stats = useMemo(() => {
     const total = totalUsers;
@@ -1035,7 +1083,7 @@ export default function UsersPage() {
               <div>
                 <h3>ساخت کاربر</h3>
                 <p className="modal-sub">
-                  چند گروه انتخاب کنید؛ کانفیگ روی پنل‌های همهٔ آن‌ها ساخته می‌شود
+                  گروه بزنید تا کانفیگ روی همه پنل‌های همان گروه‌ها ساخته شود
                 </p>
               </div>
               <button
@@ -1048,78 +1096,159 @@ export default function UsersPage() {
               </button>
             </header>
             <form onSubmit={onSubmit} className="user-create-form">
-              <div className="field">
-                <label>یوزرنیم</label>
-                <input
-                  required
-                  pattern="[a-zA-Z0-9_]{3,32}"
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  placeholder="مثلاً user_01"
-                  dir="ltr"
-                  autoFocus
-                />
+              <div className="user-create-grid">
+                <div className="field">
+                  <label>یوزرنیم</label>
+                  <input
+                    required
+                    pattern="[a-zA-Z0-9_]{3,32}"
+                    value={username}
+                    onChange={(e) => setUsername(e.target.value)}
+                    placeholder="user_01"
+                    dir="ltr"
+                    autoFocus
+                  />
+                </div>
+                <div className="field">
+                  <label>نام نمایشی</label>
+                  <input
+                    value={displayName}
+                    onChange={(e) => setDisplayName(e.target.value)}
+                    placeholder="اختیاری"
+                    maxLength={64}
+                  />
+                </div>
               </div>
-              <div className="field">
-                <label>نام کانفیگ‌ها</label>
-                <input
-                  value={displayName}
-                  onChange={(e) => setDisplayName(e.target.value)}
-                  placeholder="مثلاً علی · اختیاری"
-                  maxLength={64}
-                />
-                <p className="field-hint">نامی که در کلاینت‌ها روی کانفیگ‌ها دیده می‌شود</p>
-              </div>
-              <div className="field">
-                <label>
-                  گروه‌ها
-                  {groupIds.length > 0 && (
-                    <span className="badge muted" style={{ marginInlineStart: 8 }}>
-                      {toFaDigits(groupIds.length)} انتخاب‌شده
-                    </span>
-                  )}
-                </label>
-                <div className="check-list user-create-groups">
-                  {groups.length === 0 ? (
-                    <p className="field-hint">ابتدا یک گروه بسازید</p>
+
+              <div className="field user-create-groups-field">
+                <div className="user-create-groups-head">
+                  <label>انتخاب گروه</label>
+                  <div className="user-create-groups-actions">
+                    <button
+                      type="button"
+                      className="btn ghost sm"
+                      onClick={selectAllFilteredGroups}
+                      disabled={!filteredCreateGroups.length}
+                    >
+                      انتخاب همه
+                    </button>
+                    <button
+                      type="button"
+                      className="btn ghost sm"
+                      onClick={clearCreateGroups}
+                      disabled={!groupIds.length}
+                    >
+                      پاک کردن
+                    </button>
+                  </div>
+                </div>
+
+                <div className="user-create-groups-search">
+                  <Search size={16} aria-hidden />
+                  <input
+                    type="search"
+                    value={groupSearch}
+                    onChange={(e) => setGroupSearch(e.target.value)}
+                    placeholder="جستجوی گروه یا پنل…"
+                  />
+                </div>
+
+                {groupIds.length > 0 && (
+                  <div className="user-create-selected">
+                    {groupIds.map((id) => {
+                      const g = groupsById.get(id);
+                      if (!g) return null;
+                      return (
+                        <button
+                          key={id}
+                          type="button"
+                          className="user-create-chip"
+                          onClick={() => toggleCreateGroup(id)}
+                          title="حذف از انتخاب"
+                        >
+                          {g.name}
+                          <X size={14} aria-hidden />
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <div className="user-create-groups" role="group" aria-label="گروه‌ها">
+                  {activeGroups.length === 0 ? (
+                    <p className="field-hint user-create-empty">ابتدا یک گروه بسازید</p>
+                  ) : filteredCreateGroups.length === 0 ? (
+                    <p className="field-hint user-create-empty">نتیجه‌ای پیدا نشد</p>
                   ) : (
-                    groups.map((g) => {
+                    filteredCreateGroups.map((g) => {
                       const on = groupIds.includes(g.id);
-                      const panelN = g.panels?.length || 0;
-                      const coeffs = (g.panels || [])
-                        .map((gp) => {
+                      const types = [
+                        ...new Set(
+                          (g.panels || [])
+                            .map((gp) => gp.panel_type || "")
+                            .filter(Boolean)
+                        ),
+                      ];
+                      const maxCoeff = Math.max(
+                        1,
+                        ...(g.panels || []).map((gp) => {
                           const raw = Number(
                             (gp.config as { coefficient?: number } | undefined)
                               ?.coefficient ?? 1
                           );
                           return !Number.isNaN(raw) && raw >= 0.01 ? raw : 1;
                         })
-                        .filter((c) => c !== 1);
+                      );
                       return (
-                        <label key={g.id} className={`check-item${on ? " on" : ""}`}>
-                          <input
-                            type="checkbox"
-                            checked={on}
-                            onChange={() => toggleCreateGroup(g.id)}
-                          />
-                          <span>
-                            {g.name}{" "}
-                            <span className="badge muted">
-                              {toFaDigits(panelN)} پنل
-                            </span>
-                            {coeffs.length > 0 && (
-                              <span className="badge muted">
-                                ضریب {coeffs.map((c) => toFaDigits(c)).join("، ")}
-                              </span>
-                            )}
+                        <button
+                          key={g.id}
+                          type="button"
+                          className={`user-create-group-card${on ? " on" : ""}`}
+                          onClick={() => toggleCreateGroup(g.id)}
+                          aria-pressed={on}
+                        >
+                          <span className={`user-create-check${on ? " on" : ""}`}>
+                            {on ? <Check size={14} strokeWidth={2.5} /> : null}
                           </span>
-                        </label>
+                          <span className="user-create-group-body">
+                            <span className="user-create-group-name">{g.name}</span>
+                            <span className="user-create-group-meta">
+                              <span>
+                                {toFaDigits(g.panels?.length || 0)} پنل
+                              </span>
+                              {types.map((t) => (
+                                <span key={t} className="user-create-type">
+                                  {panelTypeLabel[t] || t}
+                                </span>
+                              ))}
+                              {maxCoeff !== 1 && (
+                                <span className="user-create-coeff">
+                                  ضریب تا {toFaDigits(maxCoeff)}
+                                </span>
+                              )}
+                            </span>
+                          </span>
+                        </button>
                       );
                     })
                   )}
                 </div>
-                {createGroupHint && <p className="field-hint">{createGroupHint}</p>}
+
+                <div className="user-create-summary">
+                  <p>{createGroupHint}</p>
+                  {createPanelSummary.length > 0 && (
+                    <p className="user-create-summary-panels">
+                      {createPanelSummary
+                        .map(
+                          (p) =>
+                            `${p.name}${p.coeff !== 1 ? ` ×${toFaDigits(p.coeff)}` : ""}`
+                        )
+                        .join(" · ")}
+                    </p>
+                  )}
+                </div>
               </div>
+
               <div className="user-create-grid">
                 <div className="field">
                   <label>حجم (GB)</label>
@@ -1131,11 +1260,9 @@ export default function UsersPage() {
                     value={dataGb}
                     onChange={(e) => setDataGb(e.target.value)}
                     dir="ltr"
-                    placeholder="0.1"
+                    placeholder="50"
                   />
-                  <p className="field-hint">
-                    ۰ = نامحدود · سقف مشترک همه پنل‌ها (با ضریب) · اعشار مجاز
-                  </p>
+                  <p className="field-hint">سقف مشترک همه پنل‌ها · ۰ = نامحدود</p>
                 </div>
                 <div className="field">
                   <label>روز اعتبار</label>
@@ -1161,7 +1288,11 @@ export default function UsersPage() {
                   className="btn"
                   disabled={create.isPending || groupIds.length === 0}
                 >
-                  {create.isPending ? "در حال ساخت…" : "ساخت روی همه پنل‌ها"}
+                  {create.isPending
+                    ? "در حال ساخت…"
+                    : groupIds.length
+                      ? `ساخت روی ${toFaDigits(createPanelSummary.length)} پنل`
+                      : "ساخت کاربر"}
                 </button>
               </footer>
             </form>
