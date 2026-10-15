@@ -147,10 +147,73 @@ async def _lock_for_user(user_id: int) -> asyncio.Lock:
         return lock
 
 
+def merge_group_panel_configs(a: dict, b: dict) -> dict:
+    """Merge two GroupPanel configs for the same remote panel.
+
+    Critical when admin selects e.g. Hajmi4-Direct + Hajmi4-Tunnel:
+    - protocols / inbounds are unioned (not overwritten)
+    - PasarGuard remote_group_ids / group_ids are unioned
+    - coefficient = max
+    """
+    out = {**a, **b}
+
+    # protocols: union preserving order
+    pa = a.get("protocols") if isinstance(a.get("protocols"), list) else []
+    pb = b.get("protocols") if isinstance(b.get("protocols"), list) else []
+    if pa or pb:
+        seen_p: list[str] = []
+        for p in list(pa) + list(pb):
+            s = str(p).lower().strip()
+            if s and s not in seen_p:
+                seen_p.append(s)
+        out["protocols"] = seen_p
+
+    # inbounds: per-protocol tag union
+    ia = a.get("inbounds") if isinstance(a.get("inbounds"), dict) else {}
+    ib = b.get("inbounds") if isinstance(b.get("inbounds"), dict) else {}
+    if ia or ib:
+        merged_ib: dict[str, list[str]] = {}
+        for proto in list(ia.keys()) + list(ib.keys()):
+            key = str(proto).lower().strip()
+            if not key:
+                continue
+            tags: list[str] = []
+            for src in (ia.get(proto), ia.get(key), ib.get(proto), ib.get(key)):
+                if isinstance(src, list):
+                    tags.extend(str(t).strip() for t in src if t and str(t).strip())
+                elif isinstance(src, str) and src.strip():
+                    tags.append(src.strip())
+            uniq: list[str] = []
+            for t in tags:
+                if t not in uniq:
+                    uniq.append(t)
+            if uniq:
+                merged_ib[key] = uniq
+        out["inbounds"] = merged_ib
+
+    # PasarGuard group ids: union
+    for key in ("remote_group_ids", "group_ids"):
+        va = a.get(key) if isinstance(a.get(key), list) else []
+        vb = b.get(key) if isinstance(b.get(key), list) else []
+        if va or vb:
+            ids: list[int] = []
+            for x in list(va) + list(vb):
+                try:
+                    i = int(x)
+                except (TypeError, ValueError):
+                    continue
+                if i not in ids:
+                    ids.append(i)
+            out[key] = ids
+
+    out["coefficient"] = max(coefficient_from_config(a), coefficient_from_config(b))
+    return out
+
+
 async def resolve_panels_for_groups(db: AsyncSession, group_ids: list[int]) -> list[tuple[Panel, dict]]:
     """Return unique (panel, merged_config) for all panels in given groups.
 
-    Same panel in multiple groups → one account; coefficient = max across links.
+    Same panel in multiple groups → one account; configs unioned (protocols/inbounds/groups).
     """
     if not group_ids:
         return []
@@ -170,14 +233,8 @@ async def resolve_panels_for_groups(db: AsyncSession, group_ids: list[int]) -> l
         if panel.id not in seen:
             seen[panel.id] = (panel, cfg)
             continue
-        # Merge: keep existing keys, but coefficient always takes the higher value
         prev_cfg = dict(seen[panel.id][1])
-        merged = {**cfg, **prev_cfg}
-        merged["coefficient"] = max(
-            coefficient_from_config(prev_cfg),
-            coefficient_from_config(cfg),
-        )
-        seen[panel.id] = (panel, merged)
+        seen[panel.id] = (panel, merge_group_panel_configs(prev_cfg, cfg))
     return list(seen.values())
 
 
@@ -240,77 +297,112 @@ async def provision_user_on_panels(
     async def _remote(panel: Panel, payload: UserPayload) -> AdapterResult:
         adapter = get_adapter(panel)
         try:
-            # Fast Marzban create is one POST; keep headroom for slow links
-            return await asyncio.wait_for(adapter.create_user(payload), timeout=45)
+            # Marzban Cloud can be slow on first connect — adapter retries inside
+            return await asyncio.wait_for(adapter.create_user(payload), timeout=60)
         except Exception as e:  # noqa: BLE001
             return _fail_result(_exc_msg(e))
+        finally:
+            try:
+                await adapter.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
     results = await asyncio.gather(*[_remote(panel, payload) for _, panel, payload in jobs])
 
-    # 3) Sequential: persist outcomes
+    # 3) Sequential: persist outcomes (+ recover timeout/exists without needing UI retry)
     accounts: list[PanelAccount] = []
     now = datetime.now(timezone.utc)
     for (account, panel, payload), result in zip(jobs, results):
         cfg = dict(payload.config or {})
         coeff = coefficient_from_config(cfg)
-        if result.success:
+
+        async def _mark_ok(res: AdapterResult) -> None:
             account.status = PanelAccountStatus.active
-            account.remote_username = result.remote_username or user.username
-            account.remote_id = result.remote_id
-            account.uuid = result.uuid or account.uuid
-            account.links = result.links or []
-            account.used_traffic = result.used_traffic or 0
+            account.remote_username = res.remote_username or user.username
+            account.remote_id = res.remote_id or account.remote_id
+            account.uuid = res.uuid or account.uuid
+            account.links = res.links or account.links or []
+            account.used_traffic = int(res.used_traffic or account.used_traffic or 0)
             account.coeff_anchor_raw = 0
             account.coeff_anchor_weighted = 0
             account.applied_coefficient = coeff
             account.error_message = None
             account.last_sync_at = now
             panel.last_ok_at = now
+
+        if result.success:
+            await _mark_ok(result)
         else:
-            # Recover: already-exists / create timed out after remote accepted
             err = (result.error or "").lower()
             exists_hint = any(
-                x in err for x in ("exist", "already", "duplicate", "تکرار", "موجود", "timeout")
+                x in err
+                for x in (
+                    "exist",
+                    "already",
+                    "duplicate",
+                    "تکرار",
+                    "موجود",
+                    "timeout",
+                    "connect",
+                    "network",
+                    "قطع",
+                )
             )
             recovered = False
             if exists_hint or not err:
+                adapter = get_adapter(panel)
                 try:
-                    adapter = get_adapter(panel)
-                    mod = await asyncio.wait_for(adapter.modify_user(payload), timeout=55)
-                    if mod.success:
-                        account.status = PanelAccountStatus.active
-                        account.remote_username = mod.remote_username or user.username
-                        account.remote_id = mod.remote_id or account.remote_id
-                        account.uuid = mod.uuid or account.uuid
-                        account.links = mod.links or account.links or []
-                        account.used_traffic = mod.used_traffic or account.used_traffic or 0
-                        account.error_message = None
-                        account.last_sync_at = now
-                        panel.last_ok_at = now
+                    # 1) Maybe POST succeeded but response timed out
+                    usage = await asyncio.wait_for(
+                        adapter.get_usage(payload.username), timeout=20
+                    )
+                    if usage.success:
+                        # Align limits/status with our payload
+                        mod = await asyncio.wait_for(
+                            adapter.modify_user(payload), timeout=40
+                        )
+                        await _mark_ok(mod if mod.success else usage)
                         recovered = True
                     else:
-                        usage = await asyncio.wait_for(
-                            adapter.get_usage(payload.username), timeout=20
+                        # 2) Not on remote yet — one more create
+                        retry = await asyncio.wait_for(
+                            adapter.create_user(payload), timeout=55
                         )
-                        if usage.success:
-                            account.status = PanelAccountStatus.active
-                            account.remote_username = usage.remote_username or user.username
-                            account.remote_id = usage.remote_id or account.remote_id
-                            account.uuid = usage.uuid or account.uuid
-                            account.links = usage.links or account.links or []
-                            account.used_traffic = usage.used_traffic or 0
-                            account.error_message = None
-                            account.last_sync_at = now
-                            panel.last_ok_at = now
+                        if retry.success:
+                            await _mark_ok(retry)
                             recovered = True
                         else:
-                            account.status = PanelAccountStatus.error
-                            account.error_message = (
-                                mod.error or usage.error or result.error or "ایجاد در پنل ناموفق"
-                            )
+                            err2 = (retry.error or "").lower()
+                            if any(
+                                x in err2
+                                for x in ("exist", "already", "duplicate", "تکرار", "موجود")
+                            ):
+                                mod = await asyncio.wait_for(
+                                    adapter.modify_user(payload), timeout=40
+                                )
+                                if mod.success:
+                                    await _mark_ok(mod)
+                                    recovered = True
+                                else:
+                                    account.status = PanelAccountStatus.error
+                                    account.error_message = (
+                                        mod.error or retry.error or result.error
+                                    )
+                            else:
+                                account.status = PanelAccountStatus.error
+                                account.error_message = (
+                                    retry.error or result.error or "ایجاد در پنل ناموفق"
+                                )
                 except Exception as e:  # noqa: BLE001
                     account.status = PanelAccountStatus.error
-                    account.error_message = f"{result.error or 'create failed'} | recover: {_exc_msg(e)}"
+                    account.error_message = (
+                        f"{result.error or 'create failed'} | recover: {_exc_msg(e)}"
+                    )
+                finally:
+                    try:
+                        await adapter.close()  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
             if not recovered and account.status != PanelAccountStatus.active:
                 account.status = PanelAccountStatus.error
                 account.error_message = result.error or "ایجاد در پنل ناموفق"

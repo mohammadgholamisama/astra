@@ -490,29 +490,65 @@ class MarzbanAdapter(BasePanelAdapter):
         return result
 
     async def create_user(self, payload: UserPayload) -> AdapterResult:
-        """POST /api/user — official Marzban create (no extra /sub round-trips)."""
-        try:
-            # Build body before auth so inbound catalog (if needed) uses its own client cycle
-            body = await self._build_user_body(payload, include_username=True)
-            client, headers = await self._authed()
-            resp = await client.post(
-                "/api/user",
-                headers=headers,
-                json=body,
-                timeout=httpx.Timeout(30.0, connect=15.0),
-            )
-            ok, data = ok_json(resp)
-            if ok and isinstance(data, dict):
-                # Keep subscription_url/links from create response; hydrate later on sub page
-                return self._from_user_response(data, payload.username)
-            return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
-        except Exception as e:
-            msg = str(e).strip() or e.__class__.__name__
-            if isinstance(e, (asyncio.TimeoutError, httpx.TimeoutException)):
-                msg = "Timeout waiting for panel response"
-            if "client has been closed" in msg.lower():
-                msg = "اتصال پنل قطع شد — دوباره تلاش کنید"
-            return AdapterResult(success=False, error=msg)
+        """POST /api/user — official Marzban create (retry on flaky Marzban Cloud)."""
+        body = await self._build_user_body(payload, include_username=True)
+        last_err = "create failed"
+        req_timeout = httpx.Timeout(25.0, connect=10.0)
+
+        for attempt in range(3):
+            try:
+                client, headers = await self._authed()
+                resp = await client.post(
+                    "/api/user",
+                    headers=headers,
+                    json=body,
+                    timeout=req_timeout,
+                )
+                ok, data = ok_json(resp)
+                if ok and isinstance(data, dict):
+                    return self._from_user_response(data, payload.username)
+
+                err = err_msg(data, f"HTTP {resp.status_code}")
+                low = err.lower()
+                # Already exists → fetch and treat as success (idempotent create)
+                if any(x in low for x in ("exist", "already", "duplicate", "تکرار", "موجود")):
+                    existing = await self.get_usage(payload.username, expand_links=False)
+                    if existing.success:
+                        return existing
+                    return AdapterResult(success=False, error=err)
+
+                last_err = err
+                if resp.status_code in (401, 403) and attempt < 2:
+                    self._token = None
+                    _TOKEN_CACHE.pop(self._cache_key(), None)
+                    await self.close()
+                    continue
+                return AdapterResult(success=False, error=err)
+            except Exception as e:
+                last_err = str(e).strip() or e.__class__.__name__
+                if isinstance(e, (asyncio.TimeoutError, httpx.TimeoutException)):
+                    last_err = "Timeout waiting for panel response"
+                if "client has been closed" in last_err.lower():
+                    last_err = "اتصال پنل قطع شد — دوباره تلاش کنید"
+
+                # Response may have been accepted — check if user is already there
+                try:
+                    existing = await asyncio.wait_for(
+                        self.get_usage(payload.username, expand_links=False), timeout=15
+                    )
+                    if existing.success:
+                        return existing
+                except Exception:
+                    pass
+
+                if attempt < 2:
+                    self._token = None
+                    await self.close()
+                    await asyncio.sleep(0.5 + attempt * 0.4)
+                    continue
+                return AdapterResult(success=False, error=last_err)
+
+        return AdapterResult(success=False, error=last_err)
 
     async def modify_user(self, payload: UserPayload) -> AdapterResult:
         """PUT /api/user/{username} — official Marzban modify."""

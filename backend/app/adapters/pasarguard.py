@@ -208,18 +208,62 @@ class PasarGuardAdapter(MarzbanAdapter):
             return AdapterResult(success=False, error=str(e).strip() or e.__class__.__name__)
 
     async def create_user(self, payload: UserPayload) -> AdapterResult:
-        """POST /api/user — PasarGuard docs; no blocking /sub expand."""
-        try:
-            group_ids = await self._resolve_group_ids(payload)
-            body = self._build_pg_body(payload, group_ids)
-            client, headers = await self._authed()
-            resp = await client.post("/api/user", headers=headers, json=body)
-            ok, data = ok_json(resp)
-            if ok and isinstance(data, dict):
-                return self._from_pg_response(data, payload.username)
-            return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
-        except Exception as e:
-            return AdapterResult(success=False, error=str(e).strip() or e.__class__.__name__)
+        """POST /api/user — PasarGuard docs; retry on network blips; idempotent if exists."""
+        import asyncio
+
+        import httpx
+
+        group_ids = await self._resolve_group_ids(payload)
+        body = self._build_pg_body(payload, group_ids)
+        last_err = "create failed"
+        for attempt in range(3):
+            try:
+                client, headers = await self._authed()
+                resp = await client.post(
+                    "/api/user",
+                    headers=headers,
+                    json=body,
+                    timeout=httpx.Timeout(25.0, connect=10.0),
+                )
+                ok, data = ok_json(resp)
+                if ok and isinstance(data, dict):
+                    return self._from_pg_response(data, payload.username)
+                err = err_msg(data, f"HTTP {resp.status_code}")
+                low = err.lower()
+                if any(x in low for x in ("exist", "already", "duplicate", "تکرار", "موجود")):
+                    existing = await self.get_usage(payload.username, expand_links=False)
+                    if existing.success:
+                        return existing
+                    return AdapterResult(success=False, error=err)
+                last_err = err
+                if resp.status_code in (401, 403) and attempt < 2:
+                    self._token = None
+                    from app.adapters.marzban import _TOKEN_CACHE
+
+                    _TOKEN_CACHE.pop(self._cache_key(), None)
+                    await self.close()
+                    continue
+                return AdapterResult(success=False, error=err)
+            except Exception as e:
+                last_err = str(e).strip() or e.__class__.__name__
+                try:
+                    existing = await asyncio.wait_for(
+                        self.get_usage(payload.username, expand_links=False), timeout=15
+                    )
+                    if existing.success:
+                        return existing
+                except Exception:
+                    pass
+                if attempt < 2:
+                    self._token = None
+                    from app.adapters.marzban import _TOKEN_CACHE
+
+                    _TOKEN_CACHE.pop(self._cache_key(), None)
+                    await self.close()
+                    await asyncio.sleep(0.5 + attempt * 0.4)
+                    continue
+                return AdapterResult(success=False, error=last_err)
+        return AdapterResult(success=False, error=last_err)
 
     async def modify_user(self, payload: UserPayload) -> AdapterResult:
         """PUT /api/user/{username} — PasarGuard docs."""
