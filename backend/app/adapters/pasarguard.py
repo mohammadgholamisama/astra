@@ -238,16 +238,46 @@ class PasarGuardAdapter(MarzbanAdapter):
                     return self._from_pg_response(data, payload.username)
                 err = err_msg(data, f"HTTP {resp.status_code}")
                 low = err.lower()
-                if any(x in low for x in ("exist", "already", "duplicate", "تکرار", "موجود")):
+                # "does not exist" / "not found" must NOT match the "already exists" branch
+                not_found = any(
+                    x in low
+                    for x in (
+                        "not found",
+                        "does not exist",
+                        "doesn't exist",
+                        "یافت نشد",
+                        "پیدا نشد",
+                        "وجود ندارد",
+                    )
+                )
+                already = resp.status_code == 409 or (
+                    (not not_found)
+                    and any(
+                        x in low
+                        for x in ("already", "duplicate", "تکرار", "موجود", "already exist")
+                    )
+                ) or ((not not_found) and "exist" in low and "not" not in low)
+                if already:
+                    # 409 on PasarGuard can mean "username reserved" while GET 404
+                    # (other admin / soft-delete). Never fake success — verify or modify.
                     existing = await self.get_usage(payload.username, expand_links=False)
                     if existing.success:
                         return existing
+                    try:
+                        modified = await self.modify_user(payload)
+                        if modified.success:
+                            return modified
+                        mod_err = modified.error or "modify failed"
+                    except Exception as me:  # noqa: BLE001
+                        mod_err = str(me).strip() or me.__class__.__name__
                     return AdapterResult(
-                        success=True,
-                        remote_username=payload.username,
-                        remote_id=payload.username,
-                        links=[],
-                        used_traffic=0,
+                        success=False,
+                        error=(
+                            f"پنل می‌گوید کاربر از قبل هست (HTTP {resp.status_code}: {err}) "
+                            f"ولی خواندن ناموفق بود و به‌روزرسانی هم شکست خورد ({mod_err}). "
+                            f"احتمالاً یوزرنیم برای ادمین دیگر است یا حذف‌نرم شده. "
+                            f"group_ids={group_ids}"
+                        ),
                     )
                 last_err = f"{err} (group_ids={group_ids})"
                 if resp.status_code in (401, 403) and attempt < 2:

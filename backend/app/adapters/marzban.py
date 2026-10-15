@@ -697,20 +697,48 @@ class MarzbanAdapter(BasePanelAdapter):
 
                 err = err_msg(data, f"HTTP {resp.status_code}")
                 low = err.lower()
+                not_found = any(
+                    x in low
+                    for x in (
+                        "not found",
+                        "does not exist",
+                        "doesn't exist",
+                        "یافت نشد",
+                        "پیدا نشد",
+                        "وجود ندارد",
+                    )
+                )
                 # 409 User already exists (official) + forks wording
-                if resp.status_code == 409 or any(
-                    x in low for x in ("exist", "already", "duplicate", "تکرار", "موجود")
-                ):
+                # Never treat "does not exist" / "not found" as already-exists
+                already = resp.status_code == 409 or (
+                    (not not_found)
+                    and any(
+                        x in low
+                        for x in ("already", "duplicate", "تکرار", "موجود", "already exist")
+                    )
+                ) or (
+                    (not not_found) and "exist" in low and "not" not in low
+                )
+                if already:
                     existing = await self._fetch_existing_user(payload.username)
                     if existing:
                         return existing
-                    return AdapterResult(
-                        success=True,
-                        remote_username=payload.username,
-                        remote_id=payload.username,
-                        links=[],
-                        used_traffic=0,
-                    )
+                    # 409 without readable user → try modify; never silent fake-OK
+                    if resp.status_code == 409:
+                        try:
+                            modified = await self.modify_user(payload)
+                            if modified.success:
+                                return modified
+                            mod_err = modified.error or "modify failed"
+                        except Exception as me:  # noqa: BLE001
+                            mod_err = str(me).strip() or me.__class__.__name__
+                        return AdapterResult(
+                            success=False,
+                            error=(
+                                f"User already exists (409) but GET failed; "
+                                f"modify also failed: {mod_err}"
+                            ),
+                        )
 
                 rebuilt = False
                 if resp.status_code in (400, 422):
