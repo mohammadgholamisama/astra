@@ -38,6 +38,29 @@ def test_sum_across_panels_coeff_two():
     assert total == 6 * gb
 
 
+def test_mixed_coeffs_sum_30mb_x3_plus_20mb_x2():
+    mb = 1024**2
+    # 30MB × 3 = 90MB; 20MB × 2 = 40MB → 130MB
+    assert weighted_bytes(30 * mb, 3) == 90 * mb
+    total = sum_weighted(
+        [
+            (30 * mb, 3.0, 0, 0),
+            (20 * mb, 2.0, 0, 0),
+        ]
+    )
+    assert total == 130 * mb
+
+
+def test_coeff_change_recounts_full_raw():
+    """Anchors ignored — changing coeff recounts entire raw at new rate."""
+    mb = 1024**2
+    # Even with stale anchors, 30MB × 3 = 90MB
+    assert (
+        weighted_bytes(30 * mb, 3, anchor_raw=10 * mb, anchor_weighted=10 * mb)
+        == 90 * mb
+    )
+
+
 def test_quota_exhausted_marks_limited():
     gb = 1024**3
     assert is_quota_exhausted(10 * gb, 10 * gb) is True
@@ -68,15 +91,6 @@ def test_remote_limit_full_purchase_ignores_coeff():
 
 def test_remote_limit_unlimited():
     assert remote_data_limit(0, used_weighted_total=0, used_raw_on_panel=0, coefficient=5) == 0
-
-
-def test_coeff_period_keeps_past_at_old_rate():
-    gb = 1024**3
-    # Locked 4GB at coeff 1, then +1GB raw at coeff 2 → 4 + 2 = 6GB
-    assert (
-        weighted_bytes(5 * gb, 2, anchor_raw=4 * gb, anchor_weighted=4 * gb)
-        == 6 * gb
-    )
 
 
 def test_push_only_when_blocked_or_forced():

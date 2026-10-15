@@ -8,11 +8,14 @@ Create / remote caps:
 Usage (what the end-user / admin sees):
     used_astra = Σ over panels  (raw_i × coefficient_i)
 
+Example: panel A raw 30MB × coeff 3 = 90MB; panel B raw 20MB × coeff 2 = 40MB
+→ used_astra = 130MB.
+
 When used_astra >= data_limit → status=limited and ALL remotes are frozen/disabled.
 Remotes may still show leftover raw bytes; Astra is the source of truth.
 
-Coefficient periods (mid-flight change 1→2):
-  past raw stays at the old rate via anchors; only new raw uses the new coefficient.
+Coefficient always applies to the full current raw on that panel (no legacy
+period lock). Changing coeff 1→3 immediately recounts existing raw × 3.
 """
 
 from __future__ import annotations
@@ -35,15 +38,15 @@ def weighted_bytes(
     anchor_raw: int = 0,
     anchor_weighted: int = 0,
 ) -> int:
-    """Astra-facing usage for one panel."""
+    """Astra-facing usage for one panel: raw × current coefficient.
+
+    anchor_* kept for call-site compatibility but ignored — admin expectation is
+    always full raw × live group coefficient.
+    """
+    _ = (anchor_raw, anchor_weighted)
     c = norm_coeff(coeff)
     r = max(0, int(raw or 0))
-    ar = max(0, int(anchor_raw or 0))
-    aw = max(0, int(anchor_weighted or 0))
-    if r < ar:
-        # Remote traffic reset
-        return int(round(r * c))
-    return aw + int(round((r - ar) * c))
+    return int(round(r * c))
 
 
 def sum_weighted(parts: list[tuple[int, float, int, int]]) -> int:

@@ -42,40 +42,27 @@ def _norm_coeff(raw: float | None, default: float = 1.0) -> float:
 
 
 def account_weighted_usage(account: PanelAccount, coeff: float) -> int:
-    """Astra-facing usage for one panel: (anchor + (raw-anchor)×coeff)."""
-    return quota_math.weighted_bytes(
-        int(account.used_traffic or 0),
-        coeff,
-        anchor_raw=int(getattr(account, "coeff_anchor_raw", 0) or 0),
-        anchor_weighted=int(getattr(account, "coeff_anchor_weighted", 0) or 0),
-    )
+    """Astra-facing usage for one panel: raw × live coefficient."""
+    return quota_math.weighted_bytes(int(account.used_traffic or 0), coeff)
 
 
 def apply_coefficient_period(account: PanelAccount, new_coeff: float) -> bool:
-    """Lock current weighted usage when the panel coefficient changes."""
+    """Keep applied_coefficient in sync; always recount full raw × live coeff."""
     new_c = _norm_coeff(new_coeff)
-    raw = max(0, int(account.used_traffic or 0))
-    anchor_raw = max(0, int(getattr(account, "coeff_anchor_raw", 0) or 0))
-    if raw < anchor_raw:
+    # Clear legacy anchors so old period-lock never under-counts
+    dirty = False
+    if int(getattr(account, "coeff_anchor_raw", 0) or 0) or int(
+        getattr(account, "coeff_anchor_weighted", 0) or 0
+    ):
         account.coeff_anchor_raw = 0
         account.coeff_anchor_weighted = 0
-        account.applied_coefficient = new_c
-        return True
+        dirty = True
 
     applied = getattr(account, "applied_coefficient", None)
-    if applied is None:
+    if applied is None or abs(_norm_coeff(applied) - new_c) >= 1e-9:
         account.applied_coefficient = new_c
         return True
-
-    old_c = _norm_coeff(applied)
-    if abs(old_c - new_c) < 1e-9:
-        return False
-
-    locked = account_weighted_usage(account, old_c)
-    account.coeff_anchor_raw = raw
-    account.coeff_anchor_weighted = max(0, locked)
-    account.applied_coefficient = new_c
-    return True
+    return dirty
 
 
 def remote_data_limit_bytes(

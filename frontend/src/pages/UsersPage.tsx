@@ -94,12 +94,9 @@ function coeffsFromGroups(groups: Group[], groupIds: number[]): Map<number, numb
 
 function accountWeighted(a: User["panel_accounts"][number], coefficient: number): number {
   const raw = Number(a.used_traffic) || 0;
-  const anchorRaw = Number(a.coeff_anchor_raw) || 0;
-  const anchorW = Number(a.coeff_anchor_weighted) || 0;
   const coeff = coefficient >= 0.01 ? coefficient : 1;
-  if (raw < anchorRaw) return Math.round(raw * coeff);
-  // Past traffic stays at old rate; only delta uses live coefficient
-  return anchorW + Math.round((raw - anchorRaw) * coeff);
+  // Always raw × live group coefficient (same as backend quota)
+  return Math.round(raw * coeff);
 }
 
 function panelUsageRows(u: User, groups: Group[]): PanelUsageRow[] {
