@@ -183,19 +183,24 @@ def build_config_remark(
     limit: int = 0,
     brand_tag: str | None = None,
 ) -> str:
-    """Real config title: ``#2 [TAG] 3G| mamad``
+    """Real config title:
 
-    brand_tag fills ``[]`` from settings (empty → ``[]``).
+    - no tag:  ``#2. 2.5G | name``
+    - with tag: ``#2. text 2.5G | name``
+
+    brand_tag comes from settings; empty → omitted entirely (no ``[]``).
     Not used for notice / promo / status rows.
     """
     base = " ".join(to_en_digits(name or "").split()).strip() or "config"
     # Keep ASCII-ish name for picky clients (no emoji in real config titles)
     base = re.sub(r"[^\w\s.\-]+", "", base, flags=re.UNICODE).strip() or "config"
-    tag = " ".join(to_en_digits(brand_tag or "").split()).strip()
-    # Allow short unicode brand inside brackets (admin-chosen), strip control chars
+    tag = " ".join((brand_tag or "").split()).strip()
     tag = re.sub(r"[\x00-\x1f\x7f<>\"'`]", "", tag)[:24]
     _badge, remain = remain_badge(used, limit)
-    return f"#{int(config_id)} [{tag}] {remain}| {base}"
+    cid = int(config_id)
+    if tag:
+        return f"#{cid}. {tag} {remain} | {base}"
+    return f"#{cid}. {remain} | {base}"
 
 
 def apply_display_name(

@@ -988,7 +988,7 @@ def collect_links_detailed(user: User, *, include_notices: bool = True) -> list[
       1) status row (✨ user - remain - days ✨) — always, live values
       2) promo row — if enabled in settings
       3) group notices (کانفیگ اضافه) — optional, unchanged text
-      4) real configs — ``#N [brand] 3G| name``
+      4) real configs — ``#N. 2.5G | name`` or ``#N. text 2.5G | name``
 
     Only protocol share links (vless:// …) are returned — never raw /sub/ paths.
     """

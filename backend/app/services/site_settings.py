@@ -230,7 +230,7 @@ def get_public_links() -> dict[str, str]:
 
 
 def normalize_config_brand_tag(raw: str | None) -> str:
-    """Optional short tag shown inside [] on every real config remark."""
+    """Optional short tag inserted in real config remarks (empty = omitted)."""
     tag = _CTRL.sub("", (raw or "").strip())
     tag = _HTML.sub("", tag)
     tag = re.sub(r"\s+", " ", tag).strip()

@@ -296,22 +296,24 @@ export default function SettingsPage() {
               <div>
                 <h2>نام کانفیگ‌های ساب</h2>
                 <p>
-                  فرمت کانفیگ واقعی: <code dir="ltr">#2 [برچسب] 3G| mamad</code> — کانفیگ‌های اضافه
-                  گروه عوض نمی‌شوند
+                  بدون متن: <code dir="ltr">#2. 2.5G | name</code> · با متن:{" "}
+                  <code dir="ltr">#2. text 2.5G | name</code> — کانفیگ‌های اضافه گروه عوض نمی‌شوند
                 </p>
               </div>
             </header>
 
             <div className="field">
-              <label>متن داخل [ ] روی همه کانفیگ‌ها</label>
+              <label>متن روی همه کانفیگ‌ها (اختیاری)</label>
               <input
                 value={configBrandTag}
                 onChange={(e) => setConfigBrandTag(e.target.value)}
-                placeholder="مثلاً VIP یا OK — خالی = []"
+                placeholder="مثلاً VIP — خالی = بدون متن اضافه"
                 maxLength={24}
               />
               <p className="field-hint" dir="ltr">
-                نمونه: #1 [{configBrandTag || ""}] 3G| user
+                {configBrandTag.trim()
+                  ? `#1. ${configBrandTag.trim()} 2.5G | user`
+                  : "#1. 2.5G | user"}
               </p>
             </div>
 
