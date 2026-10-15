@@ -255,16 +255,25 @@ async def get_subscription(
         return await _render_info_page(db, token, user)
 
     # Client feed: hydrate configs; refresh usage when stale (header userinfo).
+    from app.services.site_settings import ensure_loaded
+
+    await ensure_loaded(db)
     user, links = await _ensure_share_links(db, token, user)
     try:
         await asyncio.wait_for(refresh_usage(db, user, force=False), timeout=10.0)
         await db.commit()
         user = await load_user_by_token(db, token) or user
+        # Rebuild so status remark (volume/time) matches live usage
         links = await collect_links(user, include_notices=False) or links
     except Exception as exc:  # noqa: BLE001
         logger.warning("sub feed usage: %s", exc)
         try:
             await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        # Still rebuild status line from DB values
+        try:
+            links = await collect_links(user, include_notices=False) or links
         except Exception:  # noqa: BLE001
             pass
     headers = _sub_headers(user)

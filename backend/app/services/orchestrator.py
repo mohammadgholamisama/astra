@@ -984,14 +984,45 @@ async def collect_links(user: User, *, include_notices: bool = False) -> list[st
 def collect_links_detailed(user: User, *, include_notices: bool = True) -> list[dict]:
     """All unique share links across panels.
 
-    Notices (fake configs) are for the HTML sub page only — omit them from
-    client subscription feeds so V2Ray apps import real configs cleanly.
-    Real config remarks: «اسم 🟢 حجم‌باقی #آیدی» (no panel name).
+    Order (every sub — client feed + HTML):
+      1) status row (✨ user - remain - days ✨) — always, live values
+      2) promo row — if enabled in settings
+      3) group notices (کانفیگ اضافه) — optional, unchanged text
+      4) real configs — ``#N [brand] 3G| name``
 
     Only protocol share links (vless:// …) are returned — never raw /sub/ paths.
     """
     from app.adapters.http_utils import is_share_link
-    from app.services.link_remark import apply_display_name, notice_rows_from_groups
+    from app.services.link_remark import (
+        apply_display_name,
+        build_promo_row,
+        build_status_row,
+        notice_rows_from_groups,
+    )
+    from app.services.site_settings import (
+        get_config_brand_tag,
+        get_promo_config_enabled,
+        get_promo_config_text,
+    )
+
+    used = int(user.used_traffic or 0)
+    limit = int(user.data_limit or 0)
+    show_name = (getattr(user, "display_name", None) or "").strip() or (
+        getattr(user, "username", None) or "user"
+    )
+
+    head: list[dict] = [
+        build_status_row(
+            username=show_name,
+            used=used,
+            limit=limit,
+            expire=getattr(user, "expire", None),
+        )
+    ]
+    if get_promo_config_enabled():
+        promo = build_promo_row(get_promo_config_text())
+        if promo:
+            head.append(promo)
 
     notices = (
         notice_rows_from_groups(list(user.__dict__.get("groups") or []))
@@ -1001,8 +1032,7 @@ def collect_links_detailed(user: User, *, include_notices: bool = True) -> list[
     rows: list[dict] = []
     seen: set[str] = set()
     for account in user.panel_accounts or []:
-        # error accounts often still have working share links (sync flag only) —
-        # skipping them made client feeds return Content-Length: 0 while HTML looked fine after refresh.
+        # error accounts often still have working share links (sync flag only)
         if account.status not in (PanelAccountStatus.active, PanelAccountStatus.error):
             continue
         panel = account.__dict__.get("panel")
@@ -1017,11 +1047,13 @@ def collect_links_detailed(user: User, *, include_notices: bool = True) -> list[
     renamed = apply_display_name(
         rows,
         getattr(user, "display_name", None),
-        used=int(user.used_traffic or 0),
-        limit=int(user.data_limit or 0),
+        used=used,
+        limit=limit,
         username=getattr(user, "username", None),
+        brand_tag=get_config_brand_tag(),
     )
-    return notices + renamed
+    # apply_display_name returns specials+real; we pass only reals so result is reals only
+    return head + notices + renamed
 
 
 async def hydrate_share_links(db: AsyncSession, user: User) -> int:

@@ -1254,6 +1254,18 @@ button, input, select, textarea { font: inherit; }
   gap: 6px;
   margin-top: 8px;
 }
+.settings-check {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.settings-check input {
+  width: 1.05rem;
+  height: 1.05rem;
+  accent-color: var(--accent);
+}
 .settings-foot {
   display: flex;
   justify-content: flex-end;

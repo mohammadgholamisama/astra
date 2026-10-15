@@ -23,6 +23,11 @@ KEY_BRAND_NAME = "brand_name"
 KEY_LINK_CHANNEL = "link_channel"
 KEY_LINK_SUPPORT = "link_support"
 KEY_LINK_APP = "link_app"
+# Text inside [] on real config remarks: ``#2 [TAG] 3G| name``
+KEY_CONFIG_BRAND_TAG = "config_brand_tag"
+# Promotional fake config (2nd line in every sub when enabled)
+KEY_PROMO_CONFIG_ENABLED = "promo_config_enabled"
+KEY_PROMO_CONFIG_TEXT = "promo_config_text"
 
 _ALLOWED_KEYS = frozenset(
     {
@@ -32,6 +37,9 @@ _ALLOWED_KEYS = frozenset(
         KEY_LINK_CHANNEL,
         KEY_LINK_SUPPORT,
         KEY_LINK_APP,
+        KEY_CONFIG_BRAND_TAG,
+        KEY_PROMO_CONFIG_ENABLED,
+        KEY_PROMO_CONFIG_TEXT,
     }
 )
 
@@ -221,6 +229,51 @@ def get_public_links() -> dict[str, str]:
     }
 
 
+def normalize_config_brand_tag(raw: str | None) -> str:
+    """Optional short tag shown inside [] on every real config remark."""
+    tag = _CTRL.sub("", (raw or "").strip())
+    tag = _HTML.sub("", tag)
+    tag = re.sub(r"\s+", " ", tag).strip()
+    if len(tag) > 24:
+        raise ValueError("برچسب کانفیگ حداکثر ۲۴ کاراکتر است")
+    return tag
+
+
+def normalize_promo_text(raw: str | None) -> str:
+    text = _CTRL.sub("", (raw or "").strip())
+    text = _HTML.sub("", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > 200:
+        raise ValueError("متن تبلیغاتی حداکثر ۲۰۰ کاراکتر است")
+    return text
+
+
+def get_config_brand_tag() -> str:
+    with _lock:
+        if _loaded:
+            return (_cache.get(KEY_CONFIG_BRAND_TAG) or "").strip()
+    return ""
+
+
+def get_promo_config_enabled() -> bool:
+    with _lock:
+        if _loaded:
+            return (_cache.get(KEY_PROMO_CONFIG_ENABLED) or "").strip() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+    return False
+
+
+def get_promo_config_text() -> str:
+    with _lock:
+        if _loaded:
+            return (_cache.get(KEY_PROMO_CONFIG_TEXT) or "").strip()
+    return ""
+
+
 def ssl_helper_available() -> bool:
     s = get_settings()
     helper = (getattr(s, "ASTRA_HELPER", None) or "").strip()
@@ -266,6 +319,9 @@ async def read_settings(db: AsyncSession) -> dict:
         "link_channel": get_link_channel(),
         "link_support": get_link_support(),
         "link_app": get_link_app(),
+        "config_brand_tag": get_config_brand_tag(),
+        "promo_config_enabled": get_promo_config_enabled(),
+        "promo_config_text": get_promo_config_text(),
         "ssl_available": ssl_helper_available(),
         "panel_domain": panel_dom,
         "sub_domain": sub_dom,
@@ -276,6 +332,9 @@ async def read_settings(db: AsyncSession) -> dict:
             "link_channel": "",
             "link_support": "",
             "link_app": "",
+            "config_brand_tag": "",
+            "promo_config_enabled": "0",
+            "promo_config_text": "",
         },
     }
 
@@ -306,12 +365,17 @@ async def update_settings(
     link_channel: str | None = None,
     link_support: str | None = None,
     link_app: str | None = None,
+    config_brand_tag: str | None = None,
+    promo_config_enabled: bool | None = None,
+    promo_config_text: str | None = None,
     reset_sub_base_url: bool = False,
     reset_panel_base_url: bool = False,
     reset_brand_name: bool = False,
     clear_link_channel: bool = False,
     clear_link_support: bool = False,
     clear_link_app: bool = False,
+    clear_config_brand_tag: bool = False,
+    clear_promo_config: bool = False,
 ) -> dict:
     if reset_sub_base_url:
         await _delete_key(db, KEY_SUB_BASE_URL)
@@ -348,6 +412,30 @@ async def update_settings(
         await _upsert_key(
             db, KEY_LINK_APP, normalize_optional_link(link_app, label="لینک دانلود برنامه")
         )
+
+    if clear_config_brand_tag:
+        await _delete_key(db, KEY_CONFIG_BRAND_TAG)
+    elif config_brand_tag is not None:
+        await _upsert_key(
+            db, KEY_CONFIG_BRAND_TAG, normalize_config_brand_tag(config_brand_tag)
+        )
+
+    if clear_promo_config:
+        await _delete_key(db, KEY_PROMO_CONFIG_ENABLED)
+        await _delete_key(db, KEY_PROMO_CONFIG_TEXT)
+    else:
+        if promo_config_enabled is not None:
+            await _upsert_key(
+                db,
+                KEY_PROMO_CONFIG_ENABLED,
+                "1" if promo_config_enabled else "0",
+            )
+        if promo_config_text is not None:
+            text = normalize_promo_text(promo_config_text)
+            if text:
+                await _upsert_key(db, KEY_PROMO_CONFIG_TEXT, text)
+            else:
+                await _delete_key(db, KEY_PROMO_CONFIG_TEXT)
 
     await db.commit()
     await refresh_cache(db)

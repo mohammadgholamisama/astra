@@ -85,12 +85,17 @@ async def put_settings_api(
             link_channel=body.link_channel,
             link_support=body.link_support,
             link_app=body.link_app,
+            config_brand_tag=body.config_brand_tag,
+            promo_config_enabled=body.promo_config_enabled,
+            promo_config_text=body.promo_config_text,
             reset_sub_base_url=body.reset_sub_base_url,
             reset_panel_base_url=body.reset_panel_base_url,
             reset_brand_name=body.reset_brand_name,
             clear_link_channel=body.clear_link_channel,
             clear_link_support=body.clear_link_support,
             clear_link_app=body.clear_link_app,
+            clear_config_brand_tag=body.clear_config_brand_tag,
+            clear_promo_config=body.clear_promo_config,
         )
     except ValueError as exc:
         raise HTTPException(

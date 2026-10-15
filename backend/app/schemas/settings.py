@@ -8,6 +8,9 @@ class SiteSettingsOut(BaseModel):
     link_channel: str = ""
     link_support: str = ""
     link_app: str = ""
+    config_brand_tag: str = ""
+    promo_config_enabled: bool = False
+    promo_config_text: str = ""
     ssl_available: bool = False
     panel_domain: str = ""
     sub_domain: str = ""
@@ -21,12 +24,17 @@ class SiteSettingsUpdate(BaseModel):
     link_channel: str | None = Field(default=None, max_length=512)
     link_support: str | None = Field(default=None, max_length=512)
     link_app: str | None = Field(default=None, max_length=512)
+    config_brand_tag: str | None = Field(default=None, max_length=24)
+    promo_config_enabled: bool | None = None
+    promo_config_text: str | None = Field(default=None, max_length=200)
     reset_sub_base_url: bool = False
     reset_panel_base_url: bool = False
     reset_brand_name: bool = False
     clear_link_channel: bool = False
     clear_link_support: bool = False
     clear_link_app: bool = False
+    clear_config_brand_tag: bool = False
+    clear_promo_config: bool = False
 
 
 class SslIssueRequest(BaseModel):

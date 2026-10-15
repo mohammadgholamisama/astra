@@ -10,6 +10,9 @@ type SiteSettings = {
   link_channel: string;
   link_support: string;
   link_app: string;
+  config_brand_tag: string;
+  promo_config_enabled: boolean;
+  promo_config_text: string;
   ssl_available: boolean;
   panel_domain: string;
   sub_domain: string;
@@ -39,6 +42,9 @@ export default function SettingsPage() {
   const [linkChannel, setLinkChannel] = useState("");
   const [linkSupport, setLinkSupport] = useState("");
   const [linkApp, setLinkApp] = useState("");
+  const [configBrandTag, setConfigBrandTag] = useState("");
+  const [promoEnabled, setPromoEnabled] = useState(false);
+  const [promoText, setPromoText] = useState("");
   const [sslPanelDomain, setSslPanelDomain] = useState("");
   const [sslSubDomain, setSslSubDomain] = useState("");
   const [curPass, setCurPass] = useState("");
@@ -60,6 +66,9 @@ export default function SettingsPage() {
     setLinkChannel(data.link_channel || "");
     setLinkSupport(data.link_support || "");
     setLinkApp(data.link_app || "");
+    setConfigBrandTag(data.config_brand_tag || "");
+    setPromoEnabled(!!data.promo_config_enabled);
+    setPromoText(data.promo_config_text || "");
     setSslPanelDomain(data.panel_domain || hostFromUrl(data.panel_base_url) || "");
     setSslSubDomain(data.sub_domain || hostFromUrl(data.sub_base_url) || "");
   }, [data]);
@@ -75,15 +84,22 @@ export default function SettingsPage() {
           link_channel: linkChannel.trim(),
           link_support: linkSupport.trim(),
           link_app: linkApp.trim(),
+          config_brand_tag: configBrandTag.trim(),
+          promo_config_enabled: promoEnabled,
+          promo_config_text: promoText.trim(),
         }),
       }),
     onSuccess: (res) => {
       qc.setQueryData(["site-settings"], res);
       setPanelBase(res.panel_base_url || "");
       setSubBase(res.sub_base_url || "");
+      setBrand(res.brand_name || "");
       setLinkChannel(res.link_channel || "");
       setLinkSupport(res.link_support || "");
       setLinkApp(res.link_app || "");
+      setConfigBrandTag(res.config_brand_tag || "");
+      setPromoEnabled(!!res.promo_config_enabled);
+      setPromoText(res.promo_config_text || "");
       setMsg({ type: "ok", text: "تنظیمات ذخیره شد" });
     },
     onError: (e: Error) => {
@@ -173,7 +189,10 @@ export default function SettingsPage() {
       brand.trim() !== (data.brand_name || "").trim() ||
       linkChannel.trim() !== (data.link_channel || "").trim() ||
       linkSupport.trim() !== (data.link_support || "").trim() ||
-      linkApp.trim() !== (data.link_app || "").trim());
+      linkApp.trim() !== (data.link_app || "").trim() ||
+      configBrandTag.trim() !== (data.config_brand_tag || "").trim() ||
+      promoEnabled !== !!data.promo_config_enabled ||
+      promoText.trim() !== (data.promo_config_text || "").trim());
 
   return (
     <div className="admin-page settings-page">
@@ -268,6 +287,55 @@ export default function SettingsPage() {
                 <RotateCcw size={14} />
                 بازگشت به پیش‌فرض
               </button>
+            </div>
+          </div>
+
+          <div className="settings-card">
+            <header className="settings-card-head">
+              <Settings size={20} />
+              <div>
+                <h2>نام کانفیگ‌های ساب</h2>
+                <p>
+                  فرمت کانفیگ واقعی: <code dir="ltr">#2 [برچسب] 3G| mamad</code> — کانفیگ‌های اضافه
+                  گروه عوض نمی‌شوند
+                </p>
+              </div>
+            </header>
+
+            <div className="field">
+              <label>متن داخل [ ] روی همه کانفیگ‌ها</label>
+              <input
+                value={configBrandTag}
+                onChange={(e) => setConfigBrandTag(e.target.value)}
+                placeholder="مثلاً VIP یا OK — خالی = []"
+                maxLength={24}
+              />
+              <p className="field-hint" dir="ltr">
+                نمونه: #1 [{configBrandTag || ""}] 3G| user
+              </p>
+            </div>
+
+            <div className="field">
+              <label className="settings-check">
+                <input
+                  type="checkbox"
+                  checked={promoEnabled}
+                  onChange={(e) => setPromoEnabled(e.target.checked)}
+                />
+                <span>کانفیگ تبلیغاتی (خط دوم ساب)</span>
+              </label>
+              <p className="field-hint">
+                خط اول همیشه وضعیت است (✨ یوزر - حجم - زمان ✨). اگر این گزینه روشن باشد، متن زیر
+                خط دوم می‌شود — بدون پینگ، فقط نمایش.
+              </p>
+              <textarea
+                value={promoText}
+                onChange={(e) => setPromoText(e.target.value)}
+                placeholder="کانفیگ پلاس | همیشه وصل باش😉"
+                maxLength={200}
+                rows={2}
+                disabled={!promoEnabled}
+              />
             </div>
           </div>
 
