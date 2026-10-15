@@ -92,15 +92,15 @@ class MarzbanAdapter(BasePanelAdapter):
         last_detail = "Login failed"
 
         for form in attempts:
-            for net_try in range(2):
+            for net_try in range(4):
                 try:
                     resp = await self._post_token(client, form)
                     break
                 except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as exc:
                     last_detail = f"شبکه پنل: {exc.__class__.__name__}"
-                    if net_try < 1:
+                    if net_try < 3:
                         await self.close()
-                        await asyncio.sleep(0.6)
+                        await asyncio.sleep(0.25 + net_try * 0.2)
                         client = await self._get_client()
                         continue
                     raise RuntimeError(last_detail) from exc
@@ -493,9 +493,10 @@ class MarzbanAdapter(BasePanelAdapter):
         """POST /api/user — official Marzban create (retry on flaky Marzban Cloud)."""
         body = await self._build_user_body(payload, include_username=True)
         last_err = "create failed"
-        req_timeout = httpx.Timeout(25.0, connect=10.0)
+        # Marzban Cloud often drops first connects; fail-fast + many quick retries
+        req_timeout = httpx.Timeout(20.0, connect=5.0)
 
-        for attempt in range(3):
+        for attempt in range(6):
             try:
                 client, headers = await self._authed()
                 resp = await client.post(
@@ -518,7 +519,7 @@ class MarzbanAdapter(BasePanelAdapter):
                     return AdapterResult(success=False, error=err)
 
                 last_err = err
-                if resp.status_code in (401, 403) and attempt < 2:
+                if resp.status_code in (401, 403) and attempt < 5:
                     self._token = None
                     _TOKEN_CACHE.pop(self._cache_key(), None)
                     await self.close()
@@ -531,20 +532,21 @@ class MarzbanAdapter(BasePanelAdapter):
                 if "client has been closed" in last_err.lower():
                     last_err = "اتصال پنل قطع شد — دوباره تلاش کنید"
 
-                # Response may have been accepted — check if user is already there
+                # Response may have been accepted — quick exists check (short budget)
                 try:
                     existing = await asyncio.wait_for(
-                        self.get_usage(payload.username, expand_links=False), timeout=15
+                        self.get_usage(payload.username, expand_links=False), timeout=8
                     )
                     if existing.success:
                         return existing
                 except Exception:
                     pass
 
-                if attempt < 2:
+                if attempt < 5:
                     self._token = None
+                    _TOKEN_CACHE.pop(self._cache_key(), None)
                     await self.close()
-                    await asyncio.sleep(0.5 + attempt * 0.4)
+                    await asyncio.sleep(0.25 + attempt * 0.2)
                     continue
                 return AdapterResult(success=False, error=last_err)
 
@@ -582,10 +584,10 @@ class MarzbanAdapter(BasePanelAdapter):
             return AdapterResult(success=False, error="username خالی است")
         path = f"/api/user/{quote(uname, safe='')}"
         last_err = "delete failed"
-        for attempt in range(3):
+        t = httpx.Timeout(20.0, connect=5.0)
+        for attempt in range(6):
             try:
                 client, headers = await self._authed()
-                t = httpx.Timeout(30.0, connect=18.0)
                 resp = await client.delete(path, headers=headers, timeout=t)
                 if resp.status_code not in (200, 204, 404):
                     ok, data = ok_json(resp)
@@ -593,7 +595,7 @@ class MarzbanAdapter(BasePanelAdapter):
                     if "not found" in err.lower():
                         return AdapterResult(success=True)
                     last_err = err
-                    if resp.status_code in (401, 403) and attempt < 2:
+                    if resp.status_code in (401, 403) and attempt < 5:
                         self._token = None
                         _TOKEN_CACHE.pop(self._cache_key(), None)
                         await self.close()
@@ -607,24 +609,24 @@ class MarzbanAdapter(BasePanelAdapter):
                     return AdapterResult(success=True)
                 if check.status_code in (200, 201):
                     last_err = "کاربر هنوز روی پنل اصلی وجود دارد"
-                    if attempt < 2:
-                        await asyncio.sleep(0.4)
+                    if attempt < 5:
+                        await asyncio.sleep(0.3)
                         continue
                     return AdapterResult(success=False, error=last_err)
                 # Other codes after DELETE → treat as gone
                 return AdapterResult(success=True)
             except Exception as e:
                 last_err = str(e).strip() or e.__class__.__name__
-                if "client has been closed" in last_err.lower() and attempt < 2:
+                if "client has been closed" in last_err.lower() and attempt < 5:
                     self._token = None
                     await self.close()
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.25)
                     continue
                 if isinstance(e, (asyncio.TimeoutError, httpx.TimeoutException)):
                     last_err = "Timeout waiting for panel response"
-                if attempt < 2:
+                if attempt < 5:
                     await self.close()
-                    await asyncio.sleep(0.4)
+                    await asyncio.sleep(0.25 + attempt * 0.15)
                     continue
                 return AdapterResult(success=False, error=last_err)
         return AdapterResult(success=False, error=last_err)

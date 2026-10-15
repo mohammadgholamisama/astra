@@ -62,8 +62,9 @@ def make_client(
     """
     root = normalize_panel_base_url(base_url).rstrip("/") + "/"
     t = float(timeout if timeout is not None else settings.ADAPTER_TIMEOUT)
-    # Marzban Cloud / distant panels often need >15s TCP connect
-    connect_t = min(30.0, max(20.0, t))
+    # Keep connect short so flaky hosts (Marzban Cloud) fail fast and retry,
+    # instead of burning 30s×N inside a single attempt.
+    connect_t = min(8.0, max(4.0, t * 0.25))
     timeout_cfg = httpx.Timeout(t, connect=connect_t)
     headers = {
         "User-Agent": "AstraPanel/1.1 (httpx)",

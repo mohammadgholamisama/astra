@@ -297,8 +297,8 @@ async def provision_user_on_panels(
     async def _remote(panel: Panel, payload: UserPayload) -> AdapterResult:
         adapter = get_adapter(panel)
         try:
-            # Marzban Cloud can be slow on first connect — adapter retries inside
-            return await asyncio.wait_for(adapter.create_user(payload), timeout=60)
+            # Marzban Cloud is flaky — adapter does short connect + many retries
+            return await asyncio.wait_for(adapter.create_user(payload), timeout=75)
         except Exception as e:  # noqa: BLE001
             return _fail_result(_exc_msg(e))
         finally:
