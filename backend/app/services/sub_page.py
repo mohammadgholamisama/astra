@@ -199,29 +199,49 @@ def render_subscription_page(
 </section>"""
 
     cfg_rows = []
+    real_n = 0
     for i, c in enumerate(configs):
         link = c["link"]
-        is_notice = c.get("kind") == "notice"
-        proto = html.escape("اطلاع" if is_notice else _proto(link))
+        kind = str(c.get("kind") or "").strip().lower()
+        # status / promo / group notices — display-only, no # numbering
+        is_special = kind in ("notice", "status", "promo")
+        if kind == "status":
+            proto_label = "وضعیت"
+        elif kind == "promo":
+            proto_label = "شعار"
+        elif kind == "notice":
+            proto_label = "اطلاع"
+        else:
+            proto_label = _proto(link)
+        proto = html.escape(proto_label)
         remark = html.escape(str(c.get("remark") or "").strip())
         preview = html.escape(
             remark
-            if is_notice and remark
+            if is_special and remark
             else (link if len(link) <= 64 else link[:64] + "…")
         )
-        idx = to_fa_digits(i + 1)
-        title_html = (
-            f'<span class="cfg-name">{remark}</span>' if remark and not is_notice else ""
-        )
-        notice_cls = " notice" if is_notice else ""
+        if is_special:
+            idx_html = ""
+            title_html = ""
+        else:
+            real_n += 1
+            idx_html = f'<span class="idx">#{to_fa_digits(real_n)}</span>'
+            title_html = f'<span class="cfg-name">{remark}</span>' if remark else ""
+        special_cls = " special" if is_special else ""
+        if kind == "notice":
+            special_cls += " notice"
+        elif kind == "status":
+            special_cls += " status"
+        elif kind == "promo":
+            special_cls += " promo"
         cfg_rows.append(
-            f"""<article class="cfg{notice_cls}" data-i="{i}">
+            f"""<article class="cfg{special_cls}" data-i="{i}" dir="ltr">
   <div class="cfg-meta">
-    <span class="proto{" notice" if is_notice else ""}">{proto}</span>
-    <span class="idx">#{idx}</span>
+    <span class="proto{" notice" if is_special else ""}">{proto}</span>
+    {idx_html}
     {title_html}
   </div>
-  <code class="cfg-link{" notice-text" if is_notice else ""}" dir="{"rtl" if is_notice else "ltr"}" title="{html.escape(remark or link)}">{preview}</code>
+  <code class="cfg-link{" notice-text" if is_special else ""}" dir="ltr" title="{html.escape(remark or link)}">{preview}</code>
   <button type="button" class="btn ghost sm" data-copy-one="{i}">کپی</button>
 </article>"""
         )
@@ -377,18 +397,28 @@ input#sub{{
 .cfg{{
   display:grid;grid-template-columns:1fr auto;gap:6px 8px;align-items:center;
   padding:10px;border-radius:10px;border:1px solid var(--line);background:var(--input);
+  direction:ltr;text-align:left;unicode-bidi:isolate;
 }}
-.cfg.notice{{border-color:var(--warn)}}
-.cfg-meta{{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:6px;align-items:center}}
+.cfg.notice,.cfg.status,.cfg.promo{{border-color:var(--warn)}}
+.cfg-meta{{
+  grid-column:1/-1;display:flex;flex-wrap:wrap;gap:6px;align-items:center;
+  justify-content:flex-start;direction:ltr;text-align:left;
+}}
 .proto{{
   font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.03em;
   padding:2px 7px;border-radius:999px;border:1px solid var(--line);color:var(--accent);
 }}
 .proto.notice{{color:var(--warn);text-transform:none}}
-.cfg-name{{font-size:.8rem;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:min(100%,200px)}}
-.idx{{margin-inline-start:auto;font-size:.7rem;color:var(--muted)}}
-.cfg-link{{font-size:.72rem;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}}
-.cfg-link.notice-text{{color:var(--text);font-weight:600;font-size:.84rem;white-space:normal;line-height:1.4}}
+.cfg-name{{
+  font-size:.8rem;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  max-width:min(100%,280px);direction:ltr;text-align:left;unicode-bidi:isolate;
+}}
+.idx{{font-size:.7rem;color:var(--muted);font-variant-numeric:tabular-nums}}
+.cfg-link{{
+  font-size:.72rem;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  min-width:0;direction:ltr;text-align:left;unicode-bidi:isolate;
+}}
+.cfg-link.notice-text{{color:var(--text);font-weight:600;font-size:.84rem;white-space:normal;line-height:1.45}}
 .cfg.more-hidden{{display:none}}
 .empty-cfg{{color:var(--muted);text-align:center;padding:16px 8px;margin:0}}
 #showMore{{width:100%;margin-top:8px}}
