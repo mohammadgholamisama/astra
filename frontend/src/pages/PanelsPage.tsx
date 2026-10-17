@@ -1,6 +1,15 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2, Pencil, Plus, Server, Trash2, Wifi, XCircle } from "lucide-react";
+import {
+  CheckCircle2,
+  Pencil,
+  Plus,
+  Power,
+  Server,
+  Trash2,
+  Wifi,
+  XCircle,
+} from "lucide-react";
 import Select from "../components/Select";
 import { api, Panel, PanelType } from "../lib/api";
 import { toFaDigits } from "../lib/format";
@@ -485,6 +494,40 @@ export default function PanelsPage() {
     },
   });
 
+  const toggleActive = useMutation({
+    mutationFn: ({ id, is_active }: { id: number; is_active: boolean }) =>
+      api<Panel>(`/api/admin/panels/${id}/active`, {
+        method: "PUT",
+        body: JSON.stringify({ is_active }),
+      }),
+    onMutate: async ({ id, is_active }) => {
+      await qc.cancelQueries({ queryKey: ["panels"] });
+      const prev = qc.getQueryData<Panel[]>(["panels"]);
+      if (prev) {
+        qc.setQueryData<Panel[]>(
+          ["panels"],
+          prev.map((p) => (p.id === id ? { ...p, is_active } : p))
+        );
+      }
+      return { prev };
+    },
+    onError: (e: Error, _vars, ctx) => {
+      if (ctx?.prev) qc.setQueryData(["panels"], ctx.prev);
+      setMsg(e.message || "تغییر وضعیت پنل ناموفق بود");
+    },
+    onSuccess: (panel) => {
+      qc.setQueryData<Panel[]>(["panels"], (cur) =>
+        (cur || []).map((p) => (p.id === panel.id ? panel : p))
+      );
+      qc.invalidateQueries({ queryKey: ["groups"] });
+      setMsg(
+        panel.is_active
+          ? `پنل «${panel.name}» روشن شد — در ساب‌ها و گروه‌ها فعال می‌شود و اکانت‌های ناقص ساخته می‌شوند`
+          : `پنل «${panel.name}» خاموش شد — از ساب‌های قدیم و جدید و ساخت روی گروه‌ها خارج شد`
+      );
+    },
+  });
+
   function onSubmit(e: FormEvent) {
     e.preventDefault();
     if (!form.username.trim()) {
@@ -532,7 +575,10 @@ export default function PanelsPage() {
   return (
     <div className="admin-page">
       <h1 className="page-title">پنل‌ها</h1>
-      <p className="page-sub">اتصال به سنایی، پاسارگاد، مرزبان و ربکا</p>
+      <p className="page-sub">
+        اتصال به سنایی، پاسارگاد، مرزبان و ربکا. با دکمه روشن/خاموش، پنل از{" "}
+        <b>همه ساب‌های قدیم و جدید</b> و ساخت روی گروه‌ها خارج یا دوباره فعال می‌شود.
+      </p>
 
       <div className="toolbar">
         <span className="muted">{toFaDigits(data.length)} پنل</span>
@@ -597,11 +643,37 @@ export default function PanelsPage() {
                     <div className="admin-card-tags">
                       <span className="badge muted">{typeLabel}</span>
                       <span className={`badge ${p.is_active ? "ok" : "err"}`}>
-                        {p.is_active ? "فعال" : "غیرفعال"}
+                        {p.is_active ? "روشن" : "خاموش"}
                       </span>
                       <span className={`badge ${credOk ? "ok" : "err"}`}>{credLabel}</span>
                     </div>
                   </div>
+                  <button
+                    type="button"
+                    className={`panel-power-btn${p.is_active ? " on" : ""}`}
+                    disabled={
+                      toggleActive.isPending && toggleActive.variables?.id === p.id
+                    }
+                    title={
+                      p.is_active
+                        ? "خاموش کردن پنل — از ساب و گروه‌ها خارج می‌شود"
+                        : "روشن کردن پنل — به ساب برمی‌گردد و اکانت‌های ناقص ساخته می‌شوند"
+                    }
+                    aria-pressed={p.is_active}
+                    aria-label={p.is_active ? "خاموش کردن پنل" : "روشن کردن پنل"}
+                    onClick={() =>
+                      toggleActive.mutate({ id: p.id, is_active: !p.is_active })
+                    }
+                  >
+                    <Power size={16} />
+                    <span>
+                      {toggleActive.isPending && toggleActive.variables?.id === p.id
+                        ? "…"
+                        : p.is_active
+                          ? "روشن"
+                          : "خاموش"}
+                    </span>
+                  </button>
                 </div>
                 <p className="admin-card-url" dir="ltr" title={p.base_url}>
                   {p.base_url}

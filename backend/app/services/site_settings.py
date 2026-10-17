@@ -25,9 +25,10 @@ KEY_LINK_SUPPORT = "link_support"
 KEY_LINK_APP = "link_app"
 # Text inside [] on real config remarks: ``#2 [TAG] 3G| name``
 KEY_CONFIG_BRAND_TAG = "config_brand_tag"
-# Promotional fake config (2nd line in every sub when enabled)
+# Promotional fake configs (after status row in every sub when enabled; max 2)
 KEY_PROMO_CONFIG_ENABLED = "promo_config_enabled"
 KEY_PROMO_CONFIG_TEXT = "promo_config_text"
+KEY_PROMO_CONFIG_TEXT_2 = "promo_config_text_2"
 
 _ALLOWED_KEYS = frozenset(
     {
@@ -40,6 +41,7 @@ _ALLOWED_KEYS = frozenset(
         KEY_CONFIG_BRAND_TAG,
         KEY_PROMO_CONFIG_ENABLED,
         KEY_PROMO_CONFIG_TEXT,
+        KEY_PROMO_CONFIG_TEXT_2,
     }
 )
 
@@ -274,6 +276,25 @@ def get_promo_config_text() -> str:
     return ""
 
 
+def get_promo_config_text_2() -> str:
+    with _lock:
+        if _loaded:
+            return (_cache.get(KEY_PROMO_CONFIG_TEXT_2) or "").strip()
+    return ""
+
+
+def get_promo_config_texts() -> list[str]:
+    """Non-empty promo remarks in order (max 2) when master switch is on."""
+    if not get_promo_config_enabled():
+        return []
+    out: list[str] = []
+    for raw in (get_promo_config_text(), get_promo_config_text_2()):
+        text = (raw or "").strip()
+        if text:
+            out.append(text)
+    return out
+
+
 def ssl_helper_available() -> bool:
     s = get_settings()
     helper = (getattr(s, "ASTRA_HELPER", None) or "").strip()
@@ -322,6 +343,7 @@ async def read_settings(db: AsyncSession) -> dict:
         "config_brand_tag": get_config_brand_tag(),
         "promo_config_enabled": get_promo_config_enabled(),
         "promo_config_text": get_promo_config_text(),
+        "promo_config_text_2": get_promo_config_text_2(),
         "ssl_available": ssl_helper_available(),
         "panel_domain": panel_dom,
         "sub_domain": sub_dom,
@@ -335,6 +357,7 @@ async def read_settings(db: AsyncSession) -> dict:
             "config_brand_tag": "",
             "promo_config_enabled": "0",
             "promo_config_text": "",
+            "promo_config_text_2": "",
         },
     }
 
@@ -368,6 +391,7 @@ async def update_settings(
     config_brand_tag: str | None = None,
     promo_config_enabled: bool | None = None,
     promo_config_text: str | None = None,
+    promo_config_text_2: str | None = None,
     reset_sub_base_url: bool = False,
     reset_panel_base_url: bool = False,
     reset_brand_name: bool = False,
@@ -423,6 +447,7 @@ async def update_settings(
     if clear_promo_config:
         await _delete_key(db, KEY_PROMO_CONFIG_ENABLED)
         await _delete_key(db, KEY_PROMO_CONFIG_TEXT)
+        await _delete_key(db, KEY_PROMO_CONFIG_TEXT_2)
     else:
         if promo_config_enabled is not None:
             await _upsert_key(
@@ -436,6 +461,12 @@ async def update_settings(
                 await _upsert_key(db, KEY_PROMO_CONFIG_TEXT, text)
             else:
                 await _delete_key(db, KEY_PROMO_CONFIG_TEXT)
+        if promo_config_text_2 is not None:
+            text2 = normalize_promo_text(promo_config_text_2)
+            if text2:
+                await _upsert_key(db, KEY_PROMO_CONFIG_TEXT_2, text2)
+            else:
+                await _delete_key(db, KEY_PROMO_CONFIG_TEXT_2)
 
     await db.commit()
     await refresh_cache(db)

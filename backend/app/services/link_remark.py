@@ -357,6 +357,8 @@ def notice_rows_from_groups(groups: list) -> list[dict]:
     rows: list[dict] = []
     seen: set[str] = set()
     for group in groups or []:
+        if bool(getattr(group, "is_disabled", False)):
+            continue
         for raw in getattr(group, "notices", None) or []:
             text = " ".join(str(raw or "").split()).strip()
             if not text or text in seen:

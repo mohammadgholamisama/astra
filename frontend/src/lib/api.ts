@@ -118,6 +118,7 @@ export interface GroupPanel {
   priority: number;
   panel_name?: string | null;
   panel_type?: string | null;
+  panel_is_active?: boolean;
 }
 
 export interface Group {

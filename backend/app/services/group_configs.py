@@ -244,6 +244,17 @@ async def sync_items_from_sample(db: AsyncSession, group: Group, user: User) -> 
                 item.sort_order = order
             order += 1
 
+    # Drop rows for panels no longer in this group, or links sample no longer has
+    gp_rows = await db.execute(
+        select(GroupPanel.panel_id).where(GroupPanel.group_id == group.id)
+    )
+    linked_panel_ids = {int(pid) for (pid,) in gp_rows.all() if pid is not None}
+    for key, item in list(existing.items()):
+        gone_panel = int(item.panel_id or 0) not in linked_panel_ids
+        gone_link = bool(seen_keys) and key not in seen_keys
+        if gone_panel or gone_link:
+            await db.delete(item)
+
     await db.flush()
     # reload with panels
     result2 = await db.execute(
@@ -389,24 +400,44 @@ async def build_workspace(db: AsyncSession, group: Group) -> GroupConfigWorkspac
     )
 
 
+async def sample_status_for_group(
+    db: AsyncSession, group_id: int
+) -> tuple[bool, str | None]:
+    """Return (alive_on_panels, username) for the group's probe user."""
+    sample = await _get_sample_user(db, group_id)
+    if not sample:
+        return False, None
+    accounts = await _load_panel_accounts(db, sample.id)
+    alive = any(a.status == PanelAccountStatus.active for a in accounts)
+    return alive, sample.username
+
+
 async def _force_reset_sample_remotes(
     db: AsyncSession,
     user: User,
     panels: list,
+    *,
+    include_rebecca: bool = False,
 ) -> None:
-    """Delete sample user on every panel, then wipe local PanelAccount rows."""
+    """Delete sample user on remotes, then wipe local PanelAccount rows.
+
+    Rebecca soft-deletes; on refresh we skip remote delete and upsert instead.
+    Explicit cleanup (حذف نمونه) passes include_rebecca=True.
+    """
     existing = await _load_panel_accounts(db, user.id)
     by_panel = {a.panel_id: a for a in existing}
 
     async def _remote_delete(panel, account: PanelAccount | None) -> None:
-        # Rebecca soft-deletes users; recreating the same name then fails with
-        # "already exists" / "User not found". Sample refresh upserts instead.
-        if getattr(panel, "type", None) == PanelType.rebecca:
+        if not include_rebecca and getattr(panel, "type", None) == PanelType.rebecca:
             return
+        remote_name = (account.remote_username if account else None) or user.username
         try:
             adapter = get_adapter(panel)
             await asyncio.wait_for(
-                adapter.delete_user(user.username, account.remote_id if account else None),
+                adapter.delete_user(
+                    remote_name,
+                    account.remote_id if account else None,
+                ),
                 timeout=25,
             )
         except Exception:  # noqa: BLE001
@@ -531,6 +562,155 @@ async def create_or_refresh_sample(db: AsyncSession, group_id: int) -> GroupConf
 
     await db.commit()
     # New transaction view — expire so workspace does not reuse stale collections
+    db.expire_all()
+    return await get_workspace(db, group_id)
+
+
+async def create_or_refresh_sample_all(db: AsyncSession) -> dict:
+    """
+    Sequentially rebuild probe users for every active sales group.
+    One group at a time to avoid hammering remotes; hide rules stay intact.
+    """
+    from app.services import config_hides as hide_svc
+
+    result = await db.execute(
+        select(Group)
+        .where(Group.is_disabled.is_(False))
+        .order_by(Group.name, Group.id)
+    )
+    groups = list(result.scalars().all())
+    rows: list[dict] = []
+    ok_count = 0
+    fail_count = 0
+
+    for idx, group in enumerate(groups):
+        try:
+            ws = await create_or_refresh_sample(db, group.id)
+            ok_count += 1
+            rows.append(
+                {
+                    "group_id": group.id,
+                    "group_name": group.name,
+                    "ok": True,
+                    "sample_username": ws.sample_username,
+                    "items_count": len(ws.items or []),
+                    "error": None,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            fail_count += 1
+            rows.append(
+                {
+                    "group_id": group.id,
+                    "group_name": group.name,
+                    "ok": False,
+                    "sample_username": None,
+                    "items_count": 0,
+                    "error": str(exc)[:400],
+                }
+            )
+        if idx + 1 < len(groups):
+            await asyncio.sleep(0.35)
+
+    visibility = await hide_svc.build_visibility_all(db)
+    return {
+        "ok_count": ok_count,
+        "fail_count": fail_count,
+        "groups": rows,
+        "visibility": visibility,
+    }
+
+
+async def delete_sample_all(db: AsyncSession) -> dict:
+    """Remove probe users from all active groups; keep hides + discovered items."""
+    from app.services import config_hides as hide_svc
+
+    result = await db.execute(
+        select(Group)
+        .where(Group.is_disabled.is_(False))
+        .order_by(Group.name, Group.id)
+    )
+    groups = list(result.scalars().all())
+    rows: list[dict] = []
+    ok_count = 0
+    fail_count = 0
+
+    for idx, group in enumerate(groups):
+        try:
+            ws = await delete_sample(db, group.id)
+            ok_count += 1
+            rows.append(
+                {
+                    "group_id": group.id,
+                    "group_name": group.name,
+                    "ok": True,
+                    "sample_username": ws.sample_username,
+                    "items_count": len(ws.items or []),
+                    "error": None,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            fail_count += 1
+            rows.append(
+                {
+                    "group_id": group.id,
+                    "group_name": group.name,
+                    "ok": False,
+                    "sample_username": None,
+                    "items_count": 0,
+                    "error": str(exc)[:400],
+                }
+            )
+        if idx + 1 < len(groups):
+            await asyncio.sleep(0.25)
+
+    visibility = await hide_svc.build_visibility_all(db)
+    return {
+        "ok_count": ok_count,
+        "fail_count": fail_count,
+        "groups": rows,
+        "visibility": visibility,
+    }
+
+
+async def delete_sample(db: AsyncSession, group_id: int) -> GroupConfigWorkspaceOut:
+    """
+    Remove the probe/test user from every panel of the group (+ local User).
+
+    Keeps GroupConfigItem rows (discovered endpoints) and all hide rules
+    (host/port/match_host) so visibility settings survive. Next refresh
+    creates a fresh sample again.
+    """
+    group = await _load_group(db, group_id)
+    if not group:
+        raise ValueError("Group not found")
+
+    user = await _get_sample_user(db, group.id)
+    if user is None:
+        return await get_workspace(db, group_id)
+
+    panels = await orchestrator.resolve_panels_for_groups(db, [group.id])
+    if panels:
+        await _force_reset_sample_remotes(
+            db, user, panels, include_rebecca=True
+        )
+
+    # Drop local probe user (accounts already wiped above; cascade safety)
+    await db.execute(delete(UserGroup).where(UserGroup.user_id == user.id))
+    remaining = await _load_panel_accounts(db, user.id)
+    for account in remaining:
+        await db.delete(account)
+    await db.delete(user)
+
+    await db.commit()
     db.expire_all()
     return await get_workspace(db, group_id)
 

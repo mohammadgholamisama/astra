@@ -88,6 +88,7 @@ async def put_settings_api(
             config_brand_tag=body.config_brand_tag,
             promo_config_enabled=body.promo_config_enabled,
             promo_config_text=body.promo_config_text,
+            promo_config_text_2=body.promo_config_text_2,
             reset_sub_base_url=body.reset_sub_base_url,
             reset_panel_base_url=body.reset_panel_base_url,
             reset_brand_name=body.reset_brand_name,

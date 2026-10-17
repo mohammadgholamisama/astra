@@ -40,7 +40,29 @@ _bg_last: dict[int, float] = {}
 _BG_MIN_INTERVAL = 25.0
 
 
+def _account_has_ready_shares(account) -> bool:
+    """True when account can contribute stable share links to the feed."""
+    from app.adapters.http_utils import is_share_link, is_subscription_ref
+    from app.models.user import PanelAccountStatus
+    from app.services.orchestrator import _panel_is_active
+
+    if account.status not in (
+        PanelAccountStatus.active,
+        PanelAccountStatus.error,
+        PanelAccountStatus.pending,
+    ):
+        return True  # not expected in feed — ignore
+    panel = account.__dict__.get("panel") or getattr(account, "panel", None)
+    if panel is not None and not _panel_is_active(panel):
+        return True  # filtered out of feed
+    links = [str(x).strip() for x in (account.links or []) if x and str(x).strip()]
+    if any(is_subscription_ref(x) for x in links):
+        return False  # still need expand
+    return any(is_share_link(x) for x in links)
+
+
 def _user_has_share_links(user) -> bool:
+    """Legacy: any account has at least one share link."""
     from app.adapters.http_utils import is_share_link
 
     for account in user.panel_accounts or []:
@@ -48,6 +70,42 @@ def _user_has_share_links(user) -> bool:
             if is_share_link(str(link or "")):
                 return True
     return False
+
+
+async def _user_sub_links_complete(db: AsyncSession, user) -> bool:
+    """
+    Every panel×group the user should see already has expanded share links.
+
+    Unlike ``_user_has_share_links`` (OR across accounts), this is AND across
+    membership — prevents serving half a multi-panel sub.
+    """
+    from app.services.orchestrator import resolve_group_panel_claims
+
+    claims = await resolve_group_panel_claims(db, user)
+    if not claims:
+        return True
+
+    expected: set[tuple[int, int | None]] = set()
+    for c in claims:
+        expected.add((int(c["panel_id"]), int(c["group_id"])))
+
+    by_key: dict[tuple[int, int], object] = {}
+    legacy_by_panel: dict[int, object] = {}
+    for account in user.panel_accounts or []:
+        gid = getattr(account, "group_id", None)
+        if gid is not None:
+            by_key[(int(account.panel_id), int(gid))] = account
+        else:
+            legacy_by_panel[int(account.panel_id)] = account
+
+    for pid, gid in expected:
+        account = by_key.get((pid, int(gid))) or legacy_by_panel.get(pid)
+        if account is None:
+            # Missing provision — don't block forever; bg maintain will create.
+            continue
+        if not _account_has_ready_shares(account):
+            return False
+    return True
 
 
 async def _bg_sub_maintain(user_id: int) -> None:
@@ -194,8 +252,8 @@ async def _ensure_share_links(
     force: bool = False,
 ):
     """Hydrate missing share links with a hard budget (never block multi-panel users)."""
-    if not force and _user_has_share_links(user):
-        # Already have configs — skip blocking hydrate; bg task fills gaps
+    if not force and await _user_sub_links_complete(db, user):
+        # Every membership account already has expanded shares — serve immediately
         links = await collect_links(user, include_notices=False, db=db)
         return user, links
     try:
@@ -278,25 +336,16 @@ async def _pull_live_usage(db: AsyncSession, user, *, push: bool = False) -> Non
 
 async def _render_info_page(db: AsyncSession, token: str, user) -> HTMLResponse:
     await ensure_loaded(db)
-    # Serve page from cached links/usage; soft-refresh in background.
-    user, _links = await _ensure_share_links(db, token, user, timeout=3.5)
-    _schedule_bg_maintain(int(user.id))
-    try:
-        # Tiny budget only — never wait on all panels for HTML
-        await asyncio.wait_for(
-            refresh_usage(db, user, force=False, quick=True),
-            timeout=2.5,
+    # Same policy as the feed: complete cached links, hydrate gaps, refresh in BG.
+    # Do NOT run request-time refresh_usage here — partial panel responses used to
+    # shrink stored links and make HTML/feed counts diverge.
+    if await _user_sub_links_complete(db, user):
+        user = await load_user_by_token(db, token) or user
+    else:
+        user, _links = await _ensure_share_links(
+            db, token, user, timeout=3.5, force=True
         )
-        await enforce_user_quota(db, user)
-        await db.commit()
-        user = await load_user_by_token(db, token) or user
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("sub page usage: %s", exc)
-        try:
-            await db.rollback()
-        except Exception:  # noqa: BLE001
-            pass
-        user = await load_user_by_token(db, token) or user
+    _schedule_bg_maintain(int(user.id))
 
     configs = await collect_links_detailed(user, include_notices=True, db=db)
     panels_usage = await usage_breakdown_for_user(db, user)
@@ -336,8 +385,8 @@ async def get_subscription(
     - Browser (Mozilla + Accept:text/html) → HTML page
     - Everything else → Base64 feed with Content-Length
 
-    Feed path is cache-first: return stored share links immediately.
-    Hydrate/usage for many panels runs in background (avoids nginx 502).
+    Feed path is cache-first when EVERY membership account has ready share links.
+    Incomplete accounts get a short hydrate, then we serve; BG maintain fills gaps.
     """
     user = await load_user_by_token(db, token)
     if not user:
@@ -350,12 +399,12 @@ async def get_subscription(
 
     await ensure_loaded(db)
 
-    # Fast path: if we already have share links, never wait on remotes.
-    if _user_has_share_links(user):
+    # Complete membership → serve immediately (stable count).
+    # Incomplete → short hydrate so multi-panel users don't get half a feed.
+    if await _user_sub_links_complete(db, user):
         links = await collect_links(user, include_notices=False, db=db)
         _schedule_bg_maintain(int(user.id))
     else:
-        # First-time / empty: short hydrate only, then serve whatever we got
         user, links = await _ensure_share_links(
             db, token, user, timeout=4.0, force=True
         )

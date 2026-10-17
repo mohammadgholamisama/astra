@@ -11,6 +11,7 @@ class SiteSettingsOut(BaseModel):
     config_brand_tag: str = ""
     promo_config_enabled: bool = False
     promo_config_text: str = ""
+    promo_config_text_2: str = ""
     ssl_available: bool = False
     panel_domain: str = ""
     sub_domain: str = ""
@@ -27,6 +28,7 @@ class SiteSettingsUpdate(BaseModel):
     config_brand_tag: str | None = Field(default=None, max_length=24)
     promo_config_enabled: bool | None = None
     promo_config_text: str | None = Field(default=None, max_length=200)
+    promo_config_text_2: str | None = Field(default=None, max_length=200)
     reset_sub_base_url: bool = False
     reset_panel_base_url: bool = False
     reset_brand_name: bool = False

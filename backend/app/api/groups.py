@@ -96,6 +96,7 @@ def _to_out(group: Group) -> GroupOut:
                 priority=link.priority,
                 panel_name=link.panel.name if link.panel else None,
                 panel_type=link.panel.type.value if link.panel else None,
+                panel_is_active=bool(link.panel.is_active) if link.panel else True,
             )
         )
     return GroupOut(

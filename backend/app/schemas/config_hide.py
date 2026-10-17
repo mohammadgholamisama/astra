@@ -20,6 +20,7 @@ class ConfigVisibilityOut(BaseModel):
     group_id: int
     group_name: str
     sample_ready: bool = False
+    sample_username: str | None = None
     items: list[ConfigVisibilityItemOut] = Field(default_factory=list)
     hidden_count: int = 0
     total_count: int = 0
@@ -44,3 +45,21 @@ class ConfigVisibilitySet(BaseModel):
 
 class ConfigVisibilityBulkSet(BaseModel):
     items: list[ConfigVisibilitySet] = Field(default_factory=list, max_length=500)
+
+
+class SampleAllGroupResult(BaseModel):
+    group_id: int
+    group_name: str
+    ok: bool = False
+    sample_username: str | None = None
+    items_count: int = 0
+    error: str | None = None
+
+
+class SampleAllOut(BaseModel):
+    """Result of creating/refreshing probe users on every active group."""
+
+    ok_count: int = 0
+    fail_count: int = 0
+    groups: list[SampleAllGroupResult] = Field(default_factory=list)
+    visibility: ConfigVisibilityAllOut | None = None

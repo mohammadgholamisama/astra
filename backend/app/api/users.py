@@ -246,25 +246,76 @@ async def modify_user(
             ps.update(body.proxy_settings)
         user.proxy_settings = ps
     if body.group_ids is not None:
-        # Edit may only ADD groups — never drop existing ones or rotate sub_token.
-        added = await _add_groups_only(db, user, body.group_ids)
-        # Reload memberships for panel resolve
+        if not body.group_ids:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "GROUP_REQUIRED",
+                    "message": "کاربر باید حداقل یک گروه داشته باشد",
+                },
+            )
+
         ug = await db.execute(
             select(UserGroup.group_id).where(UserGroup.user_id == user.id)
         )
-        all_gids = [row[0] for row in ug.all()]
-        panels = await orchestrator.resolve_panels_for_groups(db, all_gids)
-        # Re-provision full (panel×group) set so shared panels get separate
-        # remote accounts and coefficients stay independent.
-        if panels:
-            await orchestrator.provision_user_on_panels(db, user, panels)
+        old_gids = {int(row[0]) for row in ug.all() if row[0] is not None}
+
+        # Normalize wanted ids (preserve order, drop dupes)
+        wanted: list[int] = []
+        seen: set[int] = set()
+        for raw in body.group_ids:
             try:
-                fresh = await load_user(db, username)
-                if fresh:
-                    await orchestrator.hydrate_share_links(db, fresh)
-            except Exception:  # noqa: BLE001
-                pass
-        _ = added  # used for logging / future hooks
+                gid = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if gid in seen:
+                continue
+            seen.add(gid)
+            wanted.append(gid)
+        wanted_set = set(wanted)
+        removed = sorted(old_gids - wanted_set)
+        added = [g for g in wanted if g not in old_gids]
+
+        # 1) Remove remotes for dropped groups BEFORE rewriting membership
+        if removed:
+            results = await orchestrator.sync_delete_user_group_accounts(
+                db, user, removed
+            )
+            failed = [r for r in results if not r.get("ok")]
+            if failed:
+                await db.commit()  # persist per-panel error_message
+                parts = [
+                    f"{r.get('panel_name') or r.get('panel_id')}: {r.get('error') or 'خطا'}"
+                    for r in failed
+                ]
+                raise HTTPException(
+                    status_code=502,
+                    detail="حذف کانفیگ گروه از پنل اصلی ناموفق بود — عضویت گروه عوض نشد: "
+                    + "؛ ".join(parts),
+                )
+
+        # 2) Replace membership (add + remove + order) — sub_token unchanged
+        await _attach_groups(db, user, wanted)
+
+        # 3) Provision current (panel×group) set — creates missing for added groups
+        panels = await orchestrator.resolve_panels_for_groups(db, wanted)
+        if not panels:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "NO_ACTIVE_PANELS",
+                    "message": "گروه‌های انتخاب‌شده هیچ پنل فعالی ندارند",
+                },
+            )
+        await orchestrator.provision_user_on_panels(db, user, panels)
+        try:
+            fresh = await load_user(db, username)
+            if fresh:
+                await orchestrator.hydrate_share_links(db, fresh)
+                user = fresh
+        except Exception:  # noqa: BLE001
+            pass
+        _ = added  # reserved for future audit hooks
 
     # After admin re-enable, re-apply expire/limit before pushing remotes
     if body.status == UserStatus.active:
@@ -272,6 +323,7 @@ async def modify_user(
 
     # Push full purchased data_limit + status to ALL remotes (coeff is usage-only).
     # Upserts missing remotes (create-if-not-found) without wiping usage math.
+    # Also recalculates weighted usage (skips deleted group accounts).
     await orchestrator.sync_modify_user(db, user)
     await db.commit()
     user = await load_user(db, username)

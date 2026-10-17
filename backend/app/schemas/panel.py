@@ -28,6 +28,12 @@ class PanelUpdate(BaseModel):
     is_active: bool | None = None
 
 
+class PanelActiveSet(BaseModel):
+    """Toggle panel on/off without re-probing credentials."""
+
+    is_active: bool
+
+
 class PanelOut(ORMModel):
     id: int
     name: str

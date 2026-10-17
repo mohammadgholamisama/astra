@@ -10,6 +10,7 @@ import {
   Search,
   Server,
   Sparkles,
+  Trash2,
 } from "lucide-react";
 import { ApiError, Group, api } from "../lib/api";
 import { toFaDigits } from "../lib/format";
@@ -32,6 +33,7 @@ type VisibilityOut = {
   group_id: number;
   group_name: string;
   sample_ready: boolean;
+  sample_username?: string | null;
   items: VisibilityItem[];
   hidden_count: number;
   total_count: number;
@@ -55,6 +57,20 @@ type SampleWorkspace = {
     error_message?: string | null;
   }[];
   items?: unknown[];
+};
+
+type SampleAllOut = {
+  ok_count: number;
+  fail_count: number;
+  groups: {
+    group_id: number;
+    group_name: string;
+    ok: boolean;
+    sample_username?: string | null;
+    items_count: number;
+    error?: string | null;
+  }[];
+  visibility?: VisibilityAllOut | null;
 };
 
 type Scope = "group" | "all";
@@ -143,7 +159,7 @@ export default function ConfigsPage() {
   const visFetching = isAll ? allVis.isFetching : groupVis.isFetching;
   const visError = isAll ? allVis.error : groupVis.error;
 
-  /** Light: only reload DB aggregate (no remote provision storm). */
+  /** Light: only reload DB aggregate (no remote provision). */
   const reloadAll = useMutation({
     mutationFn: () => api<VisibilityAllOut>("/api/admin/config-visibility"),
     onSuccess: (vis) => {
@@ -164,7 +180,72 @@ export default function ConfigsPage() {
     },
   });
 
-  /** Heavy only for ONE selected group — builds sample on that group's panels. */
+  /** Heavy: create/refresh probe on every active group, then refresh all-visibility. */
+  const refreshAllSamples = useMutation({
+    mutationFn: () =>
+      api<SampleAllOut>("/api/admin/configs/sample", { method: "POST" }),
+    onSuccess: (res) => {
+      if (res.visibility) {
+        qc.setQueryData(["config-visibility-all"], res.visibility);
+      } else {
+        qc.invalidateQueries({ queryKey: ["config-visibility-all"] });
+      }
+      qc.invalidateQueries({ queryKey: ["config-visibility"] });
+      const n = res.visibility?.total_count ?? 0;
+      if (res.fail_count > 0) {
+        setMsg({
+          type: "err",
+          text: `ساخت روی ${toFaDigits(res.ok_count)} گروه OK · ${toFaDigits(res.fail_count)} گروه خطا · ${toFaDigits(n)} کانفیگ`,
+        });
+      } else {
+        setMsg({
+          type: "ok",
+          text: `نمونه روی ${toFaDigits(res.ok_count)} گروه ساخته شد · ${toFaDigits(n)} کانفیگ یکتا`,
+        });
+      }
+    },
+    onError: (e) => {
+      setMsg({
+        type: "err",
+        text:
+          e instanceof ApiError || e instanceof Error
+            ? e.message
+            : "خطا در ساخت همه نمونه‌ها",
+      });
+    },
+  });
+
+  /** Remove probe users from every active group; keep hide rules. */
+  const deleteAllSamples = useMutation({
+    mutationFn: () =>
+      api<SampleAllOut>("/api/admin/configs/sample", { method: "DELETE" }),
+    onSuccess: (res) => {
+      if (res.visibility) {
+        qc.setQueryData(["config-visibility-all"], res.visibility);
+      } else {
+        qc.invalidateQueries({ queryKey: ["config-visibility-all"] });
+      }
+      qc.invalidateQueries({ queryKey: ["config-visibility"] });
+      setMsg({
+        type: res.fail_count > 0 ? "err" : "ok",
+        text:
+          res.fail_count > 0
+            ? `حذف از ${toFaDigits(res.ok_count)} گروه OK · ${toFaDigits(res.fail_count)} خطا · مخفی‌ها حفظ شد`
+            : `کاربرهای تستی از ${toFaDigits(res.ok_count)} گروه حذف شدند · مخفی‌ها حفظ شد`,
+      });
+    },
+    onError: (e) => {
+      setMsg({
+        type: "err",
+        text:
+          e instanceof ApiError || e instanceof Error
+            ? e.message
+            : "خطا در حذف نمونه‌ها",
+      });
+    },
+  });
+
+  /** Heavy only for ONE selected group — creates test user on that group's panels. */
   const refreshSample = useMutation({
     mutationFn: async () => {
       if (selectedId == null) throw new Error("گروه انتخاب نشده");
@@ -187,17 +268,17 @@ export default function ConfigsPage() {
       if (n > 0) {
         setMsg({
           type: "ok",
-          text: `نمونه «${ws.sample_username || "…"}» آماده · ${toFaDigits(n)} کانفیگ یکتا`,
+          text: `کاربر تستی «${ws.sample_username || "…"}» روی پنل‌ها ساخته شد · ${toFaDigits(n)} کانفیگ یکتا`,
         });
       } else if (errPanels) {
         setMsg({
           type: "err",
-          text: `نمونه ساخته شد ولی لینکی نیامد · ${toFaDigits(errPanels)} پنل خطا`,
+          text: `نمونه روی پنل ساخته شد ولی لینکی نیامد · ${toFaDigits(errPanels)} پنل خطا`,
         });
       } else {
         setMsg({
           type: "ok",
-          text: "نمونه ساخته شد؛ هنوز کانفیگی از پنل‌ها برنگشته — چند ثانیه بعد دوباره تازه کنید",
+          text: "نمونه روی پنل ساخته شد؛ هنوز کانفیگی برنگشته — چند ثانیه بعد دوباره تازه کنید",
         });
       }
     },
@@ -208,6 +289,38 @@ export default function ConfigsPage() {
           e instanceof ApiError || e instanceof Error
             ? e.message
             : "خطا در تازه‌سازی",
+      });
+    },
+  });
+
+  /** Remove probe users from remotes; keep hide rules + discovered endpoints. */
+  const deleteSample = useMutation({
+    mutationFn: async () => {
+      if (selectedId == null) throw new Error("گروه انتخاب نشده");
+      const ws = await api<SampleWorkspace>(
+        `/api/group/${selectedId}/configs/sample`,
+        { method: "DELETE" }
+      );
+      const vis = await api<VisibilityOut>(
+        `/api/group/${selectedId}/config-visibility`
+      );
+      return { ws, vis };
+    },
+    onSuccess: ({ vis }) => {
+      qc.setQueryData(["config-visibility", selectedId], vis);
+      qc.invalidateQueries({ queryKey: ["config-visibility-all"] });
+      setMsg({
+        type: "ok",
+        text: "کاربرهای تستی از پنل‌ها حذف شدند · تنظیمات مخفی (دامنه/پورت/هاست) حفظ شد",
+      });
+    },
+    onError: (e) => {
+      setMsg({
+        type: "err",
+        text:
+          e instanceof ApiError || e instanceof Error
+            ? e.message
+            : "خطا در حذف نمونه",
       });
     },
   });
@@ -285,8 +398,15 @@ export default function ConfigsPage() {
     });
   }, [visibilityItems, q, filter]);
 
-  const refreshing = refreshSample.isPending || reloadAll.isPending;
+  const refreshing =
+    refreshSample.isPending ||
+    reloadAll.isPending ||
+    deleteSample.isPending ||
+    refreshAllSamples.isPending ||
+    deleteAllSamples.isPending;
   const empty = !visLoading && visibilityItems.length === 0;
+  const canDeleteSample = !isAll && sampleReady && selectedId != null;
+  const canDeleteAllSamples = isAll && sampleReady;
 
   function selectAllPanels() {
     setScope("all");
@@ -308,11 +428,12 @@ export default function ConfigsPage() {
       <header className="configs-hero">
         <div className="configs-hero-text">
           <p className="configs-kicker">سابسکریپشن</p>
-          <h1 className="page-title">مدیریت کانفیگ‌ها</h1>
+          <h1 className="page-title">فیلتر کانفیگ‌ها</h1>
           <p className="page-sub">
-            مخفی‌سازی سراسری است: دامنه+پورت (+هاست هدر در صورت وجود) از{" "}
-            <b>همه ساب‌های قدیم و جدید</b> حذف می‌شود. «همه پنل‌ها» فقط از دیتابیس می‌خواند
-            (بدون فشار روی سرور). تازه‌سازی نمونه فقط برای یک گروه انتخاب‌شده است.
+            یک گروه را انتخاب کنید و             «ساخت مجدد از پنل» (یک گروه یا همه گروه‌ها) کاربر تستی روی پنل می‌سازد
+            و لیست را به‌روز می‌کند. بعد مشخص کنید کدام دامنه/پورت مخفی باشد؛{" "}
+            <b>تنظیمات مخفی حفظ می‌شود</b>. «حذف تستی» فقط نمونه را از پنل
+            برمی‌دارد.
           </p>
         </div>
         <div className="configs-hero-actions">
@@ -323,31 +444,121 @@ export default function ConfigsPage() {
             onClick={selectAllPanels}
           >
             <Server size={16} />
-            همه پنل‌ها
+            <span>همه پنل‌ها</span>
           </button>
-          <button
-            type="button"
-            className="btn configs-refresh-btn"
-            disabled={refreshing || (isAll ? false : selectedId == null)}
-            onClick={() => {
-              setMsg(null);
-              if (isAll) reloadAll.mutate();
-              else refreshSample.mutate();
-            }}
-          >
-            {refreshing ? (
-              <Loader2 size={16} className="configs-spin" />
-            ) : (
-              <RefreshCw size={16} />
-            )}
-            {refreshing
-              ? isAll
-                ? "در حال بارگذاری…"
-                : "در حال ساخت نمونه…"
-              : isAll
-                ? "بارگذاری مجدد لیست"
-                : "تازه‌سازی کانفیگ‌های گروه"}
-          </button>
+          {isAll ? (
+            <>
+              <button
+                type="button"
+                className="btn configs-refresh-btn"
+                disabled={refreshing || !activeGroups.length}
+                onClick={() => {
+                  setMsg(null);
+                  refreshAllSamples.mutate();
+                }}
+              >
+                {refreshAllSamples.isPending ? (
+                  <Loader2 size={16} className="configs-spin" />
+                ) : (
+                  <RefreshCw size={16} />
+                )}
+                <span>
+                  {refreshAllSamples.isPending
+                    ? "در حال ساخت روی همه گروه‌ها…"
+                    : sampleReady
+                      ? "ساخت مجدد همه گروه‌ها از پنل"
+                      : "ساخت نمونه روی همه گروه‌ها"}
+                </span>
+              </button>
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={refreshing}
+                onClick={() => {
+                  setMsg(null);
+                  reloadAll.mutate();
+                }}
+              >
+                {reloadAll.isPending ? (
+                  <Loader2 size={16} className="configs-spin" />
+                ) : (
+                  <RefreshCw size={16} />
+                )}
+                <span>
+                  {reloadAll.isPending ? "در حال بارگذاری…" : "بارگذاری از دیتابیس"}
+                </span>
+              </button>
+              {canDeleteAllSamples ? (
+                <button
+                  type="button"
+                  className="btn danger configs-delete-sample-btn"
+                  disabled={refreshing}
+                  onClick={() => {
+                    setMsg(null);
+                    deleteAllSamples.mutate();
+                  }}
+                >
+                  {deleteAllSamples.isPending ? (
+                    <Loader2 size={16} className="configs-spin" />
+                  ) : (
+                    <Trash2 size={16} />
+                  )}
+                  <span>
+                    {deleteAllSamples.isPending
+                      ? "در حال حذف از همه پنل‌ها…"
+                      : "حذف تستی همه گروه‌ها"}
+                  </span>
+                </button>
+              ) : null}
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                className="btn configs-refresh-btn"
+                disabled={refreshing || selectedId == null}
+                onClick={() => {
+                  setMsg(null);
+                  refreshSample.mutate();
+                }}
+              >
+                {refreshSample.isPending ? (
+                  <Loader2 size={16} className="configs-spin" />
+                ) : (
+                  <RefreshCw size={16} />
+                )}
+                <span>
+                  {refreshSample.isPending
+                    ? "در حال ساخت روی پنل…"
+                    : sampleReady
+                      ? "ساخت مجدد از پنل"
+                      : "ساخت نمونه روی پنل"}
+                </span>
+              </button>
+              {canDeleteSample ? (
+                <button
+                  type="button"
+                  className="btn danger configs-delete-sample-btn"
+                  disabled={refreshing}
+                  onClick={() => {
+                    setMsg(null);
+                    deleteSample.mutate();
+                  }}
+                >
+                  {deleteSample.isPending ? (
+                    <Loader2 size={16} className="configs-spin" />
+                  ) : (
+                    <Trash2 size={16} />
+                  )}
+                  <span>
+                    {deleteSample.isPending
+                      ? "در حال حذف از پنل…"
+                      : "حذف کانفیگ‌های تستی"}
+                  </span>
+                </button>
+              ) : null}
+            </>
+          )}
         </div>
       </header>
 
@@ -380,8 +591,8 @@ export default function ConfigsPage() {
                 onClick={selectAllPanels}
               >
                 <strong>
-                  <Server size={14} style={{ marginInlineEnd: 6, verticalAlign: "-2px" }} />
-                  همه پنل‌ها
+                  <Server size={14} />
+                  <span>همه پنل‌ها</span>
                 </strong>
                 <span>کانفیگ‌های تمام گروه‌ها</span>
               </button>
@@ -437,12 +648,57 @@ export default function ConfigsPage() {
                     <Sparkles size={12} />
                     {isAll
                       ? sampleReady
-                        ? `${toFaDigits(allVis.data?.sample_ready_groups || 0)} گروه با نمونه`
-                        : "نیاز به تازه‌سازی همه"
+                        ? `${toFaDigits(allVis.data?.sample_ready_groups || 0)} گروه با نمونه روی پنل`
+                        : "بدون نمونه فعال روی پنل"
                       : sampleReady
-                        ? "نمونه آماده"
-                        : "نیاز به تازه‌سازی"}
+                        ? groupVis.data?.sample_username
+                          ? `نمونه روی پنل: ${groupVis.data.sample_username}`
+                          : "نمونه روی پنل فعال است"
+                        : "بدون نمونه روی پنل"}
                   </span>
+                  {isAll ? (
+                    <button
+                      type="button"
+                      className="btn sm configs-rebuild-btn"
+                      disabled={refreshing || !activeGroups.length}
+                      onClick={() => {
+                        setMsg(null);
+                        refreshAllSamples.mutate();
+                      }}
+                    >
+                      {refreshAllSamples.isPending ? (
+                        <Loader2 size={14} className="configs-spin" />
+                      ) : (
+                        <RefreshCw size={14} />
+                      )}
+                      <span>
+                        {refreshAllSamples.isPending
+                          ? "در حال ساخت همه…"
+                          : "بروزرسانی همه از پنل"}
+                      </span>
+                    </button>
+                  ) : selectedId != null ? (
+                    <button
+                      type="button"
+                      className="btn sm configs-rebuild-btn"
+                      disabled={refreshing}
+                      onClick={() => {
+                        setMsg(null);
+                        refreshSample.mutate();
+                      }}
+                    >
+                      {refreshSample.isPending ? (
+                        <Loader2 size={14} className="configs-spin" />
+                      ) : (
+                        <RefreshCw size={14} />
+                      )}
+                      <span>
+                        {refreshSample.isPending
+                          ? "در حال ساخت…"
+                          : "بروزرسانی از پنل"}
+                      </span>
+                    </button>
+                  ) : null}
                 </div>
               </div>
 
@@ -488,14 +744,20 @@ export default function ConfigsPage() {
                     <Loader2 size={22} className="configs-spin" />
                     <div>
                       <strong>
-                        {isAll
-                          ? "در حال خواندن لیست از دیتابیس"
-                          : "در حال ساخت نمونه روی پنل‌های این گروه"}
+                        {refreshAllSamples.isPending
+                          ? "در حال ساخت نمونه روی همه گروه‌ها"
+                          : deleteAllSamples.isPending
+                            ? "در حال حذف نمونه‌ها از همه پنل‌ها"
+                            : isAll
+                              ? "در حال خواندن لیست از دیتابیس"
+                              : "در حال ساخت نمونه روی پنل‌های این گروه"}
                       </strong>
                       <span>
-                        {isAll
-                          ? "بدون تماس سنگین با پنل‌های ریموت"
-                          : "فقط همین گروه — لینک‌ها جمع می‌شوند"}
+                        {refreshAllSamples.isPending || deleteAllSamples.isPending
+                          ? "گروه‌ها یکی‌یکی پردازش می‌شوند — چند دقیقه صبر کنید"
+                          : isAll
+                            ? "بدون تماس با پنل‌های ریموت"
+                            : "فقط همین گروه — لینک‌ها جمع می‌شوند"}
                       </span>
                     </div>
                   </div>
@@ -525,27 +787,27 @@ export default function ConfigsPage() {
                     </p>
                     <p className="muted">
                       {isAll
-                        ? "ابتدا برای هر گروه جداگانه «تازه‌سازی کانفیگ‌های گروه» بزنید تا نمونه ساخته شود؛ بعد اینجا همه را یکجا می‌بینید."
-                        : "«تازه‌سازی کانفیگ‌های گروه» یک کاربر نمونه روی پنل‌های همین گروه می‌سازد و لینک‌ها را لیست می‌کند."}
+                        ? "«ساخت نمونه روی همه گروه‌ها» برای هر گروه فعال یک کاربر تستی روی پنل می‌سازد و لیست را اینجا جمع می‌کند."
+                        : "«ساخت نمونه روی پنل» یک کاربر تستی روی پنل‌های همین گروه می‌سازد و همه کانفیگ‌ها را در لیست می‌آورد."}
                     </p>
                     <button
                       type="button"
                       className="btn"
-                      disabled={refreshing || (isAll && selectedId == null)}
+                      disabled={
+                        refreshing || (isAll ? !activeGroups.length : selectedId == null)
+                      }
                       onClick={() => {
-                        if (isAll) {
-                          setScope("group");
-                          setMsg({
-                            type: "ok",
-                            text: "یک گروه انتخاب کنید و تازه‌سازی همان گروه را بزنید",
-                          });
-                          return;
-                        }
-                        refreshSample.mutate();
+                        setMsg(null);
+                        if (isAll) refreshAllSamples.mutate();
+                        else refreshSample.mutate();
                       }}
                     >
                       <RefreshCw size={16} />
-                      {isAll ? "رفتن به انتخاب گروه" : "ساخت نمونه و بارگذاری"}
+                      <span>
+                        {isAll
+                          ? "ساخت نمونه روی همه گروه‌ها"
+                          : "ساخت نمونه روی پنل"}
+                      </span>
                     </button>
                   </div>
                 ) : filtered.length === 0 ? (

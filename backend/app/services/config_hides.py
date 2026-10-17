@@ -274,10 +274,16 @@ async def build_visibility(
         # Recompute hide from live set
         r["hidden"] = (r["host"], int(r["port"]), r.get("match_host") or "") in hidden
 
+    # sample_ready = probe user still exists on remotes (not merely DB items)
+    from app.services.group_configs import sample_status_for_group
+
+    sample_alive, sample_username = await sample_status_for_group(db, group_id)
+
     return {
         "group_id": group.id,
         "group_name": group.name,
-        "sample_ready": bool(items),
+        "sample_ready": sample_alive,
+        "sample_username": sample_username,
         "items": rows,
         "hidden_count": sum(1 for r in rows if r["hidden"]),
         "total_count": len(rows),
@@ -306,6 +312,7 @@ async def build_visibility_all(db: AsyncSession) -> dict[str, Any]:
     # Aggregate by endpoint globally, list which groups/panels carry it
     buckets: dict[tuple[str, int, str], dict[str, Any]] = {}
     sample_ready_groups = 0
+    from app.services.group_configs import sample_status_for_group
 
     for group in groups:
         result = await db.execute(
@@ -314,7 +321,8 @@ async def build_visibility_all(db: AsyncSession) -> dict[str, Any]:
             .options(selectinload(GroupConfigItem.panel))
         )
         items = list(result.scalars().all())
-        if items:
+        alive, _uname = await sample_status_for_group(db, group.id)
+        if alive:
             sample_ready_groups += 1
         for item in items:
             link = (item.sample_link or "").strip()

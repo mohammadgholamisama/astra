@@ -7,6 +7,7 @@ from app.schemas.config_hide import (
     ConfigVisibilityAllOut,
     ConfigVisibilityOut,
     ConfigVisibilitySet,
+    SampleAllOut,
 )
 from app.schemas.group_config import GroupConfigBulkUpdate, GroupConfigWorkspaceOut
 from app.services import config_hides as hide_svc
@@ -50,6 +51,31 @@ async def refresh_group_sample(
         ) from exc
 
 
+@router.delete("/api/group/{group_id}/configs/sample", response_model=GroupConfigWorkspaceOut)
+async def delete_group_sample(
+    group_id: int,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """
+    Delete the probe/test user from remotes. Hide rules (host/port/match_host)
+    and discovered config rows stay so visibility settings remain.
+    """
+    try:
+        return await svc.delete_sample(db, group_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"خطا هنگام حذف نمونه از پنل‌ها: {exc}",
+        ) from exc
+
+
 @router.put("/api/group/{group_id}/configs", response_model=GroupConfigWorkspaceOut)
 async def update_group_configs(
     group_id: int,
@@ -78,6 +104,46 @@ async def get_config_visibility_all(
     """List configs from every panel across all active sales groups (DB only)."""
     data = await hide_svc.build_visibility_all(db)
     return ConfigVisibilityAllOut(**data)
+
+
+@router.post("/api/admin/configs/sample", response_model=SampleAllOut)
+async def refresh_all_samples(
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """Create/refresh probe users on every active group (sequential)."""
+    try:
+        data = await svc.create_or_refresh_sample_all(db)
+        return SampleAllOut(**data)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"خطا هنگام ساخت نمونه روی همه گروه‌ها: {exc}",
+        ) from exc
+
+
+@router.delete("/api/admin/configs/sample", response_model=SampleAllOut)
+async def delete_all_samples(
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """Delete probe users from every active group; hide rules stay."""
+    try:
+        data = await svc.delete_sample_all(db)
+        return SampleAllOut(**data)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"خطا هنگام حذف نمونه‌ها از پنل‌ها: {exc}",
+        ) from exc
 
 
 @router.put(

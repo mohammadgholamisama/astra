@@ -443,12 +443,19 @@ async def resolve_panels_for_groups(
 
     Same panel in multiple groups → multiple targets (separate remote accounts)
     so each group's coefficient applies only to that group's traffic.
+    Skips inactive panels and disabled sales groups.
     """
     if not group_ids:
         return []
+    from app.models.group import Group
+
     result = await db.execute(
         select(GroupPanel)
-        .where(GroupPanel.group_id.in_(group_ids))
+        .join(Group, Group.id == GroupPanel.group_id)
+        .where(
+            GroupPanel.group_id.in_(group_ids),
+            Group.is_disabled.is_(False),
+        )
         .options(selectinload(GroupPanel.panel))
         .order_by(GroupPanel.group_id.asc(), GroupPanel.priority.desc())
     )
@@ -1059,6 +1066,149 @@ async def sync_delete_user(db: AsyncSession, user: User) -> list[dict]:
     return outcomes
 
 
+async def _delete_panel_accounts_remote(
+    db: AsyncSession,
+    user: User,
+    accounts: list[PanelAccount],
+) -> list[dict]:
+    """Delete the given PanelAccount rows on remotes and mark them deleted on success."""
+    if not accounts:
+        return []
+
+    sem = _remote_sem()
+    t0 = time.monotonic()
+
+    async def _remote(account: PanelAccount) -> dict:
+        panel = account.panel
+        name = panel.name if panel else f"#{account.panel_id}"
+        uname = (account.remote_username or user.username or "").strip()
+        base = {
+            "panel_id": account.panel_id,
+            "panel_name": name,
+            "account_id": account.id,
+            "group_id": int(account.group_id) if account.group_id is not None else None,
+        }
+
+        if not panel:
+            return {**base, "ok": False, "error": "پنل پیدا نشد — حذف لغو شد"}
+        if not uname:
+            return {**base, "ok": False, "error": "یوزرنیم ریموت خالی است"}
+
+        # Inactive Astra panels: still try delete so remotes don't keep junk
+        adapter = get_adapter(panel)
+        try:
+            async with sem:
+                res = await asyncio.wait_for(
+                    adapter.delete_user(
+                        uname, account.remote_id or account.remote_username
+                    ),
+                    timeout=14,
+                )
+        except Exception as e:  # noqa: BLE001
+            return {**base, "ok": False, "error": _exc_msg(e)}
+        finally:
+            try:
+                await adapter.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+        if res.success or _is_not_found_err(res.error):
+            return {**base, "ok": True, "error": None}
+        return {
+            **base,
+            "ok": False,
+            "error": res.error or "حذف از پنل ناموفق بود",
+        }
+
+    outcomes = list(await asyncio.gather(*[_remote(a) for a in accounts]))
+
+    by_id = {a.id: a for a in accounts}
+    for row in outcomes:
+        account = by_id.get(row.get("account_id"))
+        if account is None:
+            continue
+        if row.get("ok"):
+            account.status = PanelAccountStatus.deleted
+            account.error_message = None
+            account.links = []
+            account.links_by_group = {}
+        else:
+            account.error_message = row.get("error") or "حذف از پنل ناموفق بود"
+
+    await db.flush()
+    logger.info(
+        "delete-panel-accounts user=%s panels=%s ok=%s total=%.2fs",
+        user.username,
+        len(accounts),
+        sum(1 for r in outcomes if r.get("ok")),
+        time.monotonic() - t0,
+    )
+    return outcomes
+
+
+async def sync_delete_user_group_accounts(
+    db: AsyncSession,
+    user: User,
+    group_ids: list[int],
+) -> list[dict]:
+    """
+    Delete remote accounts that belong to the given Astra groups, then mark
+    those PanelAccount rows deleted.
+
+    Used when an admin removes groups from a user. Caller must only update
+    UserGroup after every outcome is ok=True (same contract as full user delete).
+    """
+    want = {int(g) for g in group_ids if g is not None}
+    if not want:
+        return []
+
+    result = await db.execute(
+        select(PanelAccount)
+        .where(PanelAccount.user_id == user.id)
+        .options(selectinload(PanelAccount.panel))
+    )
+    accounts = [
+        a
+        for a in result.scalars().all()
+        if a.status != PanelAccountStatus.deleted
+        and getattr(a, "group_id", None) is not None
+        and int(a.group_id) in want
+    ]
+    return await _delete_panel_accounts_remote(db, user, accounts)
+
+
+async def sync_delete_user_group_panel_accounts(
+    db: AsyncSession,
+    user: User,
+    group_id: int,
+    panel_ids: list[int],
+) -> list[dict]:
+    """
+    Delete remotes for specific (panel × group) accounts.
+
+    Used when an admin removes panels from a sales group — configs must leave
+    both the subscription feed and the upstream panel, not merely hide in sub.
+    """
+    want_panels = {int(p) for p in panel_ids if p is not None}
+    gid = int(group_id)
+    if not want_panels:
+        return []
+
+    result = await db.execute(
+        select(PanelAccount)
+        .where(PanelAccount.user_id == user.id)
+        .options(selectinload(PanelAccount.panel))
+    )
+    accounts = [
+        a
+        for a in result.scalars().all()
+        if a.status != PanelAccountStatus.deleted
+        and int(a.panel_id) in want_panels
+        and getattr(a, "group_id", None) is not None
+        and int(a.group_id) == gid
+    ]
+    return await _delete_panel_accounts_remote(db, user, accounts)
+
 
 async def retry_failed_accounts(db: AsyncSession, user: User) -> list[PanelAccount]:
     result = await db.execute(
@@ -1332,8 +1482,14 @@ async def ensure_account_links_by_group(
     user: User,
     account: PanelAccount,
     claims: list[dict],
+    *,
+    allow_remote: bool = False,
 ) -> dict[str, list[str]]:
-    """Return astra_group_id → links for this panel account (partitioned)."""
+    """Return astra_group_id → links for this panel account (partitioned).
+
+    On the subscription GET path pass ``allow_remote=False`` so we never hit
+    remotes (stable + fast). BG/provision may pass ``allow_remote=True``.
+    """
     from app.adapters.http_utils import is_share_link
 
     panel_claims = [c for c in claims if int(c.get("panel_id") or 0) == int(account.panel_id)]
@@ -1355,20 +1511,29 @@ async def ensure_account_links_by_group(
         account.links_by_group = local
         return local
 
-    # 2) Cached remote partition if still valid
+    # 2) Cached remote partition — only when it covers EVERY share link
     cached = getattr(account, "links_by_group", None) or {}
     if isinstance(cached, dict) and cached:
         want = {str(c["group_id"]) for c in panel_claims}
-        if want <= set(str(k) for k in cached.keys()):
-            total = sum(len(v or []) for v in cached.values())
-            if total >= max(1, int(len(all_links) * 0.4)):
-                return {str(k): list(v or []) for k, v in cached.items() if str(k) in want}
+        if want <= {str(k) for k in cached.keys()}:
+            total = sum(
+                len(v or []) for k, v in cached.items() if str(k) in want
+            )
+            if total == len(all_links):
+                return {
+                    str(k): list(v or [])
+                    for k, v in cached.items()
+                    if str(k) in want
+                }
 
-    # 3) PasarGuard: partition via remote_group_ids
-    remote = await _partition_pasarguard_by_remote_groups(user, account, panel_claims)
-    if remote:
-        account.links_by_group = remote
-        return remote
+    # 3) PasarGuard remote partition — never on hot sub GET
+    if allow_remote:
+        remote = await _partition_pasarguard_by_remote_groups(
+            user, account, panel_claims
+        )
+        if remote:
+            account.links_by_group = remote
+            return remote
 
     # 4) Last resort — first claim only (avoids wrong tag on every group)
     gid = str(panel_claims[0]["group_id"])
@@ -1380,10 +1545,15 @@ async def ensure_account_links_by_group(
 
 
 async def resolve_group_panel_claims(db: AsyncSession, user: User) -> list[dict]:
-    """User's group→panel claims with config_tag + GroupPanel.config (fresh from DB)."""
+    """User's group→panel claims with config_tag + GroupPanel.config (fresh from DB).
+
+    Excludes inactive panels and disabled sales groups so every sub respects
+    admin filters consistently.
+    """
     from sqlalchemy import select
 
     from app.models.group import Group, GroupPanel, UserGroup
+    from app.models.panel import Panel
 
     ug = await db.execute(select(UserGroup.group_id).where(UserGroup.user_id == user.id))
     gids = [int(r[0]) for r in ug.all() if r[0] is not None]
@@ -1392,17 +1562,24 @@ async def resolve_group_panel_claims(db: AsyncSession, user: User) -> list[dict]
 
     g_rows = await db.execute(
         select(Group.id, Group.config_tag, Group.name)
-        .where(Group.id.in_(gids))
+        .where(Group.id.in_(gids), Group.is_disabled.is_(False))
         .order_by(Group.id.asc())
     )
     meta_by_gid = {
         int(gid): (_normalize_config_tag(tag), str(name or ""))
         for gid, tag, name in g_rows.all()
     }
+    active_gids = list(meta_by_gid.keys())
+    if not active_gids:
+        return []
 
     pl = await db.execute(
         select(GroupPanel.group_id, GroupPanel.panel_id, GroupPanel.config)
-        .where(GroupPanel.group_id.in_(gids))
+        .join(Panel, Panel.id == GroupPanel.panel_id)
+        .where(
+            GroupPanel.group_id.in_(active_gids),
+            Panel.is_active.is_(True),
+        )
         .order_by(GroupPanel.group_id.asc())
     )
     claims: list[dict] = []
@@ -1427,10 +1604,15 @@ def _claims_from_loaded_groups(user: User) -> list[dict]:
     groups = list(getattr(user, "groups", None) or user.__dict__.get("groups") or [])
     claims: list[dict] = []
     for group in sorted(groups, key=lambda g: int(getattr(g, "id", 0) or 0)):
+        if bool(getattr(group, "is_disabled", False)):
+            continue
         tag = _normalize_config_tag(getattr(group, "config_tag", None))
         for gpl in getattr(group, "panel_links", None) or []:
             pid = int(getattr(gpl, "panel_id", 0) or 0)
             if not pid:
+                continue
+            panel = getattr(gpl, "panel", None)
+            if panel is not None and not bool(getattr(panel, "is_active", True)):
                 continue
             cfg = getattr(gpl, "config", None)
             claims.append(
@@ -1443,6 +1625,12 @@ def _claims_from_loaded_groups(user: User) -> list[dict]:
                 }
             )
     return claims
+
+
+def _panel_is_active(panel) -> bool:
+    if panel is None:
+        return False
+    return bool(getattr(panel, "is_active", True))
 
 
 async def resolve_panel_config_tags(db: AsyncSession, user: User) -> dict[int, str]:
@@ -1487,7 +1675,7 @@ async def collect_links_detailed(
 
     Order (every sub — client feed + HTML):
       1) status row (✨ user - remain - days ✨) — always, live values
-      2) promo row — if enabled in settings
+      2) promo rows — up to 2 when enabled in settings
       3) group notices (کانفیگ اضافه) — optional, unchanged text
       4) real configs — ``#N. 2.5G | name`` or ``#N. text 2.5G | name``
 
@@ -1501,10 +1689,7 @@ async def collect_links_detailed(
         build_status_row,
         notice_rows_from_groups,
     )
-    from app.services.site_settings import (
-        get_promo_config_enabled,
-        get_promo_config_text,
-    )
+    from app.services.site_settings import get_promo_config_texts
 
     used = int(user.used_traffic or 0)
     limit = int(user.data_limit or 0)
@@ -1528,8 +1713,8 @@ async def collect_links_detailed(
             expire=getattr(user, "expire", None),
         )
     ]
-    if get_promo_config_enabled():
-        promo = build_promo_row(get_promo_config_text())
+    for promo_text in get_promo_config_texts():
+        promo = build_promo_row(promo_text)
         if promo:
             head.append(promo)
 
@@ -1537,10 +1722,28 @@ async def collect_links_detailed(
     rows: list[dict] = []
     seen: set[str] = set()
 
+    # Only emit configs for live (panel × group) claims — not merely group membership
+    # (a panel removed from a group must leave the sub even before remote delete finishes).
+    claim_keys = {
+        (int(c["panel_id"]), int(c["group_id"]))
+        for c in claims
+        if c.get("panel_id") is not None and c.get("group_id") is not None
+    }
+    claim_panel_ids = {pid for pid, _gid in claim_keys}
+
+    def _account_in_membership(account: PanelAccount) -> bool:
+        gid = getattr(account, "group_id", None)
+        if gid is not None:
+            return (int(account.panel_id), int(gid)) in claim_keys
+        # Legacy merged row: keep only if panel still claimed by a current group
+        return int(account.panel_id) in claim_panel_ids
+
     active_accounts = [
         a
         for a in (user.panel_accounts or [])
         if a.status in (PanelAccountStatus.active, PanelAccountStatus.error)
+        and _panel_is_active(a.__dict__.get("panel") or getattr(a, "panel", None))
+        and _account_in_membership(a)
     ]
     # Per-group accounts already own one group's links; legacy merged rows still partition
     need_partition = [
@@ -1549,7 +1752,12 @@ async def collect_links_detailed(
     partitioned_map: dict[int, dict[str, list[str]]] = {}
     if need_partition:
         partitioned = await asyncio.gather(
-            *[ensure_account_links_by_group(user, a, claims) for a in need_partition],
+            *[
+                ensure_account_links_by_group(
+                    user, a, claims, allow_remote=False
+                )
+                for a in need_partition
+            ],
             return_exceptions=True,
         )
         for account, by_group in zip(need_partition, partitioned):
@@ -1708,7 +1916,7 @@ async def hydrate_share_links(db: AsyncSession, user: User) -> int:
             PanelAccountStatus.pending,
         ):
             return False
-        if not account.panel:
+        if not account.panel or not _panel_is_active(account.panel):
             return False
         links = [str(x).strip() for x in (account.links or []) if x and str(x).strip()]
         # Still hydrate when /sub (or https sub URL) remains — panel may have
@@ -2260,9 +2468,14 @@ async def refresh_usage(
 
         async def _remote(account: PanelAccount) -> tuple[PanelAccount, AdapterResult | None]:
             # Pull usage for active (and error — may still exist on remote)
-            if not account.panel or account.status not in (
-                PanelAccountStatus.active,
-                PanelAccountStatus.error,
+            if (
+                not account.panel
+                or not _panel_is_active(account.panel)
+                or account.status
+                not in (
+                    PanelAccountStatus.active,
+                    PanelAccountStatus.error,
+                )
             ):
                 return account, None
             if not (account.remote_username or account.remote_id or user.username):
@@ -2324,12 +2537,29 @@ async def refresh_usage(
                 ok_n += 1
                 # Trust live panel value (source of truth)
                 account.used_traffic = int(res.used_traffic or 0)
-                # Never replace real share links with raw /sub refs from usage pulls
+                # Never replace real share links with raw /sub refs from usage pulls.
+                # Never shrink a richer stored set with a partial panel response
+                # (that was the main cause of fluctuating sub config counts).
                 new_shares = [
                     str(x) for x in (res.links or []) if x and is_share_link(str(x))
                 ]
                 if new_shares:
-                    account.links = new_shares
+                    old_shares = [
+                        str(x)
+                        for x in (account.links or [])
+                        if x and is_share_link(str(x))
+                    ]
+                    if not old_shares or len(new_shares) >= len(old_shares):
+                        account.links = new_shares
+                        account.links_by_group = None
+                    else:
+                        logger.info(
+                            "refresh_usage keep links user=%s panel=%s old=%s new=%s",
+                            user.username,
+                            account.panel_id,
+                            len(old_shares),
+                            len(new_shares),
+                        )
                 account.last_sync_at = now
                 if account.panel:
                     account.panel.last_ok_at = now
@@ -2437,14 +2667,130 @@ async def recount_group_usage_local(db: AsyncSession, group_id: int) -> int:
 
 
 async def resync_users_for_group(db: AsyncSession, group_id: int) -> int:
-    """After group coefficient / panel config change: reanchor, enforce, push remotes.
+    """After group panel membership / coefficient / config change.
 
-    Ensures remotes are disabled when Astra quota is already exhausted under the
-    new weighted rate. Local recount should already have run on save.
+    For every user (and sample probe) in the sales group:
+
+    1. Delete upstream accounts for panels no longer linked to this group
+       (remove from panel + Astra DB — not only from the sub feed).
+    2. Provision newly added panels and hydrate share links.
+    3. Recount weighted usage and push remotes (caps / disable on quota).
+
+    Local recount should already have run on save for immediate UI feedback.
     """
-    ug = await db.execute(select(UserGroup.user_id).where(UserGroup.group_id == group_id))
+    from app.models.group import Group
+    from app.models.group_config import GroupConfigItem
+    from app.services.group_configs import (
+        _get_sample_user,
+        sample_username_for_group,
+        sync_items_from_sample,
+    )
+    from sqlalchemy import delete
+
+    gid = int(group_id)
+    # Membership = all GroupPanel rows (even inactive panels keep remotes until
+    # the admin actually removes the panel from the group).
+    gp_ids = await db.execute(
+        select(GroupPanel.panel_id).where(GroupPanel.group_id == gid)
+    )
+    desired_panel_ids = {int(pid) for (pid,) in gp_ids.all() if pid is not None}
+    # Provision only active panels (same as create-user / heal).
+    targets = await resolve_panels_for_groups(db, [gid])
+
+    # Drop admin config rows whose panel left this group
+    if desired_panel_ids:
+        await db.execute(
+            delete(GroupConfigItem).where(
+                GroupConfigItem.group_id == gid,
+                GroupConfigItem.panel_id.notin_(desired_panel_ids),
+            )
+        )
+    else:
+        await db.execute(
+            delete(GroupConfigItem).where(GroupConfigItem.group_id == gid)
+        )
+    await db.flush()
+
+    async def _reconcile_user(user: User) -> None:
+        # Reload accounts with panels
+        acc_q = await db.execute(
+            select(PanelAccount)
+            .where(PanelAccount.user_id == user.id)
+            .options(selectinload(PanelAccount.panel))
+        )
+        accounts = list(acc_q.scalars().all())
+        user.panel_accounts = accounts
+
+        stale = [
+            a
+            for a in accounts
+            if a.status != PanelAccountStatus.deleted
+            and getattr(a, "group_id", None) is not None
+            and int(a.group_id) == gid
+            and int(a.panel_id) not in desired_panel_ids
+        ]
+        if stale:
+            await _delete_panel_accounts_remote(db, user, stale)
+
+        # Legacy NULL group_id on a panel no longer linked to any of the
+        # user's groups — delete so remotes don't keep orphan configs.
+        ug_all = await db.execute(
+            select(UserGroup.group_id).where(UserGroup.user_id == user.id)
+        )
+        user_gids = [int(r[0]) for r in ug_all.all() if r[0] is not None]
+        still_claimed: set[int] = set()
+        if user_gids:
+            claim_q = await db.execute(
+                select(GroupPanel.panel_id).where(GroupPanel.group_id.in_(user_gids))
+            )
+            still_claimed = {
+                int(pid) for (pid,) in claim_q.all() if pid is not None
+            }
+        legacy_orphans = [
+            a
+            for a in accounts
+            if a.status != PanelAccountStatus.deleted
+            and getattr(a, "group_id", None) is None
+            and int(a.panel_id) not in still_claimed
+        ]
+        if legacy_orphans:
+            await _delete_panel_accounts_remote(db, user, legacy_orphans)
+
+        if targets:
+            await provision_user_on_panels(db, user, targets)
+            fresh_acc = await db.execute(
+                select(PanelAccount)
+                .where(PanelAccount.user_id == user.id)
+                .options(selectinload(PanelAccount.panel))
+            )
+            user.panel_accounts = list(fresh_acc.scalars().all())
+            try:
+                await hydrate_share_links(db, user)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "group %s hydrate user=%s failed",
+                    gid,
+                    user.username,
+                    exc_info=True,
+                )
+
+    # Sample probe first — keeps Configs page + hide rules panel-aligned
+    sample_name = sample_username_for_group(gid)
+    sample = await _get_sample_user(db, gid)
+    if sample is not None:
+        try:
+            await _reconcile_user(sample)
+            sample = await _get_sample_user(db, gid)
+            group = await db.get(Group, gid)
+            if sample is not None and group is not None:
+                await sync_items_from_sample(db, group, sample)
+        except Exception:  # noqa: BLE001
+            logger.exception("group %s sample reconcile failed", gid)
+
+    ug = await db.execute(select(UserGroup.user_id).where(UserGroup.group_id == gid))
     user_ids = [row[0] for row in ug.all()]
     if not user_ids:
+        await db.flush()
         return 0
 
     result = await db.execute(
@@ -2452,27 +2798,51 @@ async def resync_users_for_group(db: AsyncSession, group_id: int) -> int:
         .where(User.id.in_(user_ids))
         .options(selectinload(User.panel_accounts).selectinload(PanelAccount.panel))
     )
-    users = list(result.scalars().unique().all())
-    # Skip local sample probe users
-    from app.services.group_configs import sample_username_for_group
-
-    sample = sample_username_for_group(group_id)
-    users = [u for u in users if u.username != sample]
+    users = [
+        u
+        for u in result.scalars().unique().all()
+        if u.username != sample_name
+        and not str(u.username or "").startswith(f"ag{gid}s")
+        and "نمونه کانفیگ" not in (u.note or "")
+    ]
     if not users:
+        await db.flush()
         return 0
 
-    # Re-apply coeffs from DB raw first (cheap), then pull remotes + push
-    await recount_group_usage_local(db, group_id)
-    await refresh_users_usage_batch(
-        db, users, force=True, concurrency=8, push_remotes=True
+    ok = 0
+    for user in users:
+        try:
+            await _reconcile_user(user)
+            ok += 1
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "group %s reconcile user=%s failed",
+                gid,
+                getattr(user, "username", "?"),
+            )
+
+    # Re-apply coeffs from DB raw, then pull remotes + push caps
+    await recount_group_usage_local(db, gid)
+    # Reload users after reconcile (accounts may have changed)
+    result2 = await db.execute(
+        select(User)
+        .where(User.id.in_([u.id for u in users]))
+        .options(selectinload(User.panel_accounts).selectinload(PanelAccount.panel))
     )
+    fresh_users = list(result2.scalars().unique().all())
+    if fresh_users:
+        await refresh_users_usage_batch(
+            db, fresh_users, force=True, concurrency=8, push_remotes=True
+        )
     await db.flush()
     logger.info(
-        "group %s coeff/config resync: %s users pushed to remotes",
-        group_id,
+        "group %s panel/coeff resync: reconciled=%s/%s desired_panels=%s",
+        gid,
+        ok,
         len(users),
+        sorted(desired_panel_ids),
     )
-    return len(users)
+    return ok
 
 
 async def sync_subscription_state(
@@ -2523,3 +2893,136 @@ async def sync_subscription_state(
             await sync_modify_user(db, user)
         await db.flush()
         return user
+
+
+async def heal_panel_after_enable(panel_id: int) -> dict:
+    """
+    After an Astra panel is turned back on:
+
+    1. Find every sales group that still links this panel.
+    2. Provision this panel for users (and sample probes) in those groups
+       when the remote account is missing / not active.
+    3. Hydrate share links so old + new subs show configs again.
+
+    Runs in a fresh DB session (background task). Does not wipe hide rules.
+    """
+    from app.core.database import AsyncSessionLocal
+    from app.models.group import Group, GroupPanel, UserGroup
+    from app.services.group_configs import (
+        _get_sample_user,
+        sample_username_for_group,
+        sync_items_from_sample,
+    )
+
+    stats = {"groups": 0, "users": 0, "samples": 0, "errors": 0}
+    try:
+        async with AsyncSessionLocal() as db:
+            panel = await db.get(Panel, panel_id)
+            if not panel or not panel.is_active:
+                return stats
+
+            gp = await db.execute(
+                select(GroupPanel.group_id).where(GroupPanel.panel_id == panel_id)
+            )
+            group_ids = sorted({int(r[0]) for r in gp.all() if r[0] is not None})
+            stats["groups"] = len(group_ids)
+            if not group_ids:
+                return stats
+
+            for gid in group_ids:
+                try:
+                    targets = await resolve_panels_for_groups(db, [gid])
+                    panel_targets = [
+                        t for t in targets if int(t[0].id) == int(panel_id)
+                    ]
+                    if not panel_targets:
+                        continue
+
+                    # Sample probe first — keeps admin config list in sync
+                    sample = await _get_sample_user(db, gid)
+                    if sample is not None:
+                        await provision_user_on_panels(db, sample, panel_targets)
+                        sample = await _get_sample_user(db, gid)
+                        if sample is not None:
+                            group = await db.get(Group, gid)
+                            if group is not None:
+                                await sync_items_from_sample(db, group, sample)
+                        stats["samples"] += 1
+
+                    ug = await db.execute(
+                        select(UserGroup.user_id).where(UserGroup.group_id == gid)
+                    )
+                    user_ids = [int(r[0]) for r in ug.all() if r[0] is not None]
+                    if not user_ids:
+                        await db.commit()
+                        continue
+
+                    sample_name = sample_username_for_group(gid)
+                    result = await db.execute(
+                        select(User)
+                        .where(User.id.in_(user_ids))
+                        .options(
+                            selectinload(User.panel_accounts).selectinload(
+                                PanelAccount.panel
+                            )
+                        )
+                    )
+                    users = [
+                        u
+                        for u in result.scalars().unique().all()
+                        if u.username != sample_name
+                        and not str(u.username or "").startswith(f"ag{gid}s")
+                        and "نمونه کانفیگ" not in (u.note or "")
+                    ]
+
+                    for user in users:
+                        try:
+                            await provision_user_on_panels(db, user, panel_targets)
+                            # Reload accounts onto user for hydrate
+                            acc = await db.execute(
+                                select(PanelAccount)
+                                .where(PanelAccount.user_id == user.id)
+                                .options(selectinload(PanelAccount.panel))
+                            )
+                            user.panel_accounts = list(acc.scalars().all())
+                            await hydrate_share_links(db, user)
+                            stats["users"] += 1
+                        except Exception:  # noqa: BLE001
+                            stats["errors"] += 1
+                            logger.exception(
+                                "heal panel=%s user=%s failed",
+                                panel_id,
+                                getattr(user, "username", "?"),
+                            )
+                            try:
+                                await db.rollback()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            # re-fetch panel for next iterations after rollback
+                            panel = await db.get(Panel, panel_id)
+                            if not panel or not panel.is_active:
+                                return stats
+
+                    await db.commit()
+                except Exception:  # noqa: BLE001
+                    stats["errors"] += 1
+                    logger.exception(
+                        "heal panel=%s group=%s failed", panel_id, gid
+                    )
+                    try:
+                        await db.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            logger.info(
+                "heal panel=%s done groups=%s users=%s samples=%s errors=%s",
+                panel_id,
+                stats["groups"],
+                stats["users"],
+                stats["samples"],
+                stats["errors"],
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("heal panel=%s fatal", panel_id)
+        stats["errors"] += 1
+    return stats

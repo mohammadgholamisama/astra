@@ -19,6 +19,7 @@ from app.schemas.panel import (
     MarzInboundOut,
     MarzInboundPreviewRequest,
     MarzProtocolOut,
+    PanelActiveSet,
     PanelCreate,
     PanelOut,
     PanelUpdate,
@@ -325,12 +326,25 @@ async def update_panel(
     if not panel:
         raise HTTPException(status_code=404, detail="Panel not found")
     data = body.model_dump(exclude_unset=True)
+    only_active = set(data.keys()) == {"is_active"}
+    was_active = bool(panel.is_active)
     for k, v in data.items():
         if k == "base_url" and v:
             v = normalize_panel_base_url(str(v))
         elif k in ("username", "password", "api_token") and isinstance(v, str):
             v = v.strip() or None
         setattr(panel, k, v)
+
+    if only_active:
+        # Toggle on/off must not require a live probe (panel may be temporarily down)
+        await db.commit()
+        await db.refresh(panel)
+        if (not was_active) and bool(panel.is_active):
+            asyncio.create_task(
+                _bg_heal_panel(panel.id),
+                name=f"astra-panel-heal-{panel.id}",
+            )
+        return _to_out(panel)
 
     _validate_credentials(panel.type, panel.username, panel.password, panel.api_token)
     # Re-test with new credentials; reject update if remote rejects us
@@ -339,7 +353,50 @@ async def update_panel(
 
     await db.commit()
     await db.refresh(panel)
+    if (not was_active) and bool(panel.is_active):
+        asyncio.create_task(
+            _bg_heal_panel(panel.id),
+            name=f"astra-panel-heal-{panel.id}",
+        )
     return _to_out(panel)
+
+
+@router.put("/api/panel/{panel_id}/active", response_model=PanelOut)
+@router.put("/api/admin/panels/{panel_id}/active", response_model=PanelOut)
+async def set_panel_active(
+    panel_id: int,
+    body: PanelActiveSet,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """
+    Turn panel on/off without probing remotes.
+
+    Off → excluded from groups provision + all old/new subscriptions immediately.
+    On  → background heal provisions missing accounts on linked groups.
+    """
+    panel = await db.get(Panel, panel_id)
+    if not panel:
+        raise HTTPException(status_code=404, detail="Panel not found")
+    was_active = bool(panel.is_active)
+    panel.is_active = bool(body.is_active)
+    await db.commit()
+    await db.refresh(panel)
+    if (not was_active) and bool(panel.is_active):
+        asyncio.create_task(
+            _bg_heal_panel(panel.id),
+            name=f"astra-panel-heal-{panel.id}",
+        )
+    return _to_out(panel)
+
+
+async def _bg_heal_panel(panel_id: int) -> None:
+    from app.services.orchestrator import heal_panel_after_enable
+
+    try:
+        await heal_panel_after_enable(panel_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("bg heal panel=%s failed", panel_id)
 
 
 @router.delete("/api/panel/{panel_id}")

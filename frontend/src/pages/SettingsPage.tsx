@@ -1,6 +1,16 @@
 import { FormEvent, useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { KeyRound, Link2, Plus, RotateCcw, Save, Settings, ShieldCheck, Trash2 } from "lucide-react";
+import {
+  KeyRound,
+  Link2,
+  Megaphone,
+  Plus,
+  RotateCcw,
+  Save,
+  Settings,
+  ShieldCheck,
+  Trash2,
+} from "lucide-react";
 import { ApiError, ApiKey, api } from "../lib/api";
 import { toFaDigits } from "../lib/format";
 
@@ -13,6 +23,7 @@ type SiteSettings = {
   link_app: string;
   promo_config_enabled: boolean;
   promo_config_text: string;
+  promo_config_text_2: string;
   ssl_available: boolean;
   panel_domain: string;
   sub_domain: string;
@@ -44,6 +55,7 @@ export default function SettingsPage() {
   const [linkApp, setLinkApp] = useState("");
   const [promoEnabled, setPromoEnabled] = useState(false);
   const [promoText, setPromoText] = useState("");
+  const [promoText2, setPromoText2] = useState("");
   const [sslPanelDomain, setSslPanelDomain] = useState("");
   const [sslSubDomain, setSslSubDomain] = useState("");
   const [curPass, setCurPass] = useState("");
@@ -100,6 +112,7 @@ export default function SettingsPage() {
     setLinkApp(data.link_app || "");
     setPromoEnabled(!!data.promo_config_enabled);
     setPromoText(data.promo_config_text || "");
+    setPromoText2(data.promo_config_text_2 || "");
     setSslPanelDomain(data.panel_domain || hostFromUrl(data.panel_base_url) || "");
     setSslSubDomain(data.sub_domain || hostFromUrl(data.sub_base_url) || "");
   }, [data]);
@@ -117,6 +130,7 @@ export default function SettingsPage() {
           link_app: linkApp.trim(),
           promo_config_enabled: promoEnabled,
           promo_config_text: promoText.trim(),
+          promo_config_text_2: promoText2.trim(),
         }),
       }),
     onSuccess: (res) => {
@@ -129,6 +143,7 @@ export default function SettingsPage() {
       setLinkApp(res.link_app || "");
       setPromoEnabled(!!res.promo_config_enabled);
       setPromoText(res.promo_config_text || "");
+      setPromoText2(res.promo_config_text_2 || "");
       setMsg({ type: "ok", text: "تنظیمات ذخیره شد" });
     },
     onError: (e: Error) => {
@@ -220,19 +235,26 @@ export default function SettingsPage() {
       linkSupport.trim() !== (data.link_support || "").trim() ||
       linkApp.trim() !== (data.link_app || "").trim() ||
       promoEnabled !== !!data.promo_config_enabled ||
-      promoText.trim() !== (data.promo_config_text || "").trim());
+      promoText.trim() !== (data.promo_config_text || "").trim() ||
+      promoText2.trim() !== (data.promo_config_text_2 || "").trim());
 
   return (
     <div className="admin-page settings-page">
-      <h1 className="page-title">تنظیمات</h1>
-      <p className="page-sub">دامنه پنل، دامنه ساب، برند، SSL و لینک‌های صفحه اشتراک</p>
+      <header className="settings-page-head">
+        <div>
+          <h1 className="page-title">تنظیمات</h1>
+          <p className="page-sub">
+            دامنه پنل و ساب، برند، تبلیغات، SSL، کلید API و لینک‌های صفحه اشتراک
+          </p>
+        </div>
+      </header>
 
       {isLoading && <p className="muted">در حال بارگذاری…</p>}
       {error && <p className="error">{(error as Error).message}</p>}
 
       {data && (
         <form className="settings-stack" onSubmit={onSubmit}>
-          <div className="settings-card">
+          <div className="settings-card settings-card-wide">
             <header className="settings-card-head">
               <Settings size={20} />
               <div>
@@ -241,60 +263,62 @@ export default function SettingsPage() {
               </div>
             </header>
 
-            <div className="field">
-              <label>دامنه / آدرس پایه پنل</label>
-              <input
-                dir="ltr"
-                value={panelBase}
-                onChange={(e) => setPanelBase(e.target.value)}
-                placeholder="https://panel.example.com"
-                autoComplete="off"
-                spellCheck={false}
-              />
-              <p className="field-hint">
-                آدرس ورود ادمین · پیش‌فرض env:{" "}
-                <code dir="ltr">{data.defaults.panel_base_url || "—"}</code>
-              </p>
-              <button
-                type="button"
-                className="btn ghost sm settings-reset"
-                disabled={resetField.isPending}
-                onClick={() => resetField.mutate("panel")}
-              >
-                <RotateCcw size={14} />
-                بازگشت به پیش‌فرض
-              </button>
+            <div className="settings-fields-grid">
+              <div className="field">
+                <label>دامنه / آدرس پایه پنل</label>
+                <input
+                  dir="ltr"
+                  value={panelBase}
+                  onChange={(e) => setPanelBase(e.target.value)}
+                  placeholder="https://panel.example.com"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <p className="field-hint">
+                  آدرس ورود ادمین · پیش‌فرض env:{" "}
+                  <code dir="ltr">{data.defaults.panel_base_url || "—"}</code>
+                </p>
+                <button
+                  type="button"
+                  className="btn ghost sm settings-reset"
+                  disabled={resetField.isPending}
+                  onClick={() => resetField.mutate("panel")}
+                >
+                  <RotateCcw size={14} />
+                  بازگشت به پیش‌فرض
+                </button>
+              </div>
+
+              <div className="field">
+                <label>دامنه / آدرس پایه ساب</label>
+                <input
+                  dir="ltr"
+                  value={subBase}
+                  onChange={(e) => setSubBase(e.target.value)}
+                  placeholder="https://sub.example.com"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <p className="field-hint">
+                  فقط http/https · بدون مسیر `/sub` · پیش‌فرض env:{" "}
+                  <code dir="ltr">{data.defaults.sub_base_url || "—"}</code>
+                </p>
+                <p className="settings-preview" dir="ltr">
+                  نمونه لینک: {previewSub}
+                </p>
+                <button
+                  type="button"
+                  className="btn ghost sm settings-reset"
+                  disabled={resetField.isPending}
+                  onClick={() => resetField.mutate("sub")}
+                >
+                  <RotateCcw size={14} />
+                  بازگشت به پیش‌فرض
+                </button>
+              </div>
             </div>
 
-            <div className="field">
-              <label>دامنه / آدرس پایه ساب</label>
-              <input
-                dir="ltr"
-                value={subBase}
-                onChange={(e) => setSubBase(e.target.value)}
-                placeholder="https://sub.example.com"
-                autoComplete="off"
-                spellCheck={false}
-              />
-              <p className="field-hint">
-                فقط http/https · بدون مسیر `/sub` · پیش‌فرض env:{" "}
-                <code dir="ltr">{data.defaults.sub_base_url || "—"}</code>
-              </p>
-              <p className="settings-preview" dir="ltr">
-                نمونه لینک: {previewSub}
-              </p>
-              <button
-                type="button"
-                className="btn ghost sm settings-reset"
-                disabled={resetField.isPending}
-                onClick={() => resetField.mutate("sub")}
-              >
-                <RotateCcw size={14} />
-                بازگشت به پیش‌فرض
-              </button>
-            </div>
-
-            <div className="field">
+            <div className="field settings-field-brand">
               <label>نام برند در صفحه ساب</label>
               <input
                 value={brand}
@@ -318,43 +342,90 @@ export default function SettingsPage() {
             </div>
           </div>
 
-          <div className="settings-card">
-            <header className="settings-card-head">
-              <Settings size={20} />
-              <div>
+          <div
+            className={`settings-card settings-card-wide settings-promo${
+              promoEnabled ? " is-on" : ""
+            }`}
+          >
+            <header className="settings-card-head settings-promo-head">
+              <Megaphone size={20} />
+              <div className="settings-promo-head-text">
                 <h2>کانفیگ تبلیغاتی ساب</h2>
                 <p>
-                  خط اول همیشه وضعیت است (✨ یوزر - حجم - زمان ✨). متن اختصاصی هر گروه را از صفحه
-                  گروه‌ها تنظیم کنید.
+                  بعد از خط وضعیت (✨ یوزر - حجم - زمان ✨) تا دو شعار تبلیغاتی در همه ساب‌ها
+                  نشان داده می‌شود — بدون پینگ، فقط نمایش.
                 </p>
               </div>
+              <button
+                type="button"
+                className={`settings-switch${promoEnabled ? " on" : ""}`}
+                role="switch"
+                aria-checked={promoEnabled}
+                aria-label={
+                  promoEnabled
+                    ? "خاموش کردن کانفیگ تبلیغاتی"
+                    : "روشن کردن کانفیگ تبلیغاتی"
+                }
+                onClick={() => setPromoEnabled((v) => !v)}
+              >
+                <span className="settings-switch-track" aria-hidden>
+                  <span className="settings-switch-knob" />
+                </span>
+                <span className="settings-switch-label">
+                  {promoEnabled ? "روشن" : "خاموش"}
+                </span>
+              </button>
             </header>
 
-            <div className="field">
-              <label className="settings-check">
-                <input
-                  type="checkbox"
-                  checked={promoEnabled}
-                  onChange={(e) => setPromoEnabled(e.target.checked)}
-                />
-                <span>کانفیگ تبلیغاتی (خط دوم ساب)</span>
-              </label>
-              <p className="field-hint">
-                اگر روشن باشد، متن زیر خط دوم می‌شود — بدون پینگ، فقط نمایش.
-              </p>
-              <textarea
-                value={promoText}
-                onChange={(e) => setPromoText(e.target.value)}
-                placeholder="کانفیگ پلاس | همیشه وصل باش😉"
-                maxLength={200}
-                rows={2}
-                disabled={!promoEnabled}
-              />
+            <div className={`settings-promo-body${promoEnabled ? "" : " is-disabled"}`}>
+              <div className="settings-promo-slots">
+                <div className="settings-promo-slot">
+                  <div className="settings-promo-slot-head">
+                    <span className="settings-promo-num">۱</span>
+                    <div>
+                      <strong>تبلیغ اول</strong>
+                      <p>خط دوم ساب · اختیاری اگر هر دو خالی باشد چیزی اضافه نمی‌شود</p>
+                    </div>
+                  </div>
+                  <textarea
+                    value={promoText}
+                    onChange={(e) => setPromoText(e.target.value)}
+                    placeholder="کانفیگ پلاس | همیشه وصل باش😉"
+                    maxLength={200}
+                    rows={2}
+                    disabled={!promoEnabled}
+                  />
+                  <span className="settings-promo-count">
+                    {toFaDigits(promoText.length)} / ۲۰۰
+                  </span>
+                </div>
+
+                <div className="settings-promo-slot">
+                  <div className="settings-promo-slot-head">
+                    <span className="settings-promo-num">۲</span>
+                    <div>
+                      <strong>تبلیغ دوم</strong>
+                      <p>خط سوم ساب · اگر خالی باشد فقط تبلیغ اول می‌آید</p>
+                    </div>
+                  </div>
+                  <textarea
+                    value={promoText2}
+                    onChange={(e) => setPromoText2(e.target.value)}
+                    placeholder="کانال ما | @example"
+                    maxLength={200}
+                    rows={2}
+                    disabled={!promoEnabled}
+                  />
+                  <span className="settings-promo-count">
+                    {toFaDigits(promoText2.length)} / ۲۰۰
+                  </span>
+                </div>
+              </div>
             </div>
           </div>
 
           {data.ssl_available && (
-            <div className="settings-card">
+            <div className="settings-card settings-card-wide">
               <header className="settings-card-head">
                 <ShieldCheck size={20} />
                 <div>
@@ -363,58 +434,60 @@ export default function SettingsPage() {
                 </div>
               </header>
 
-              <div className="field">
-                <label>SSL دامنه پنل</label>
-                <input
-                  dir="ltr"
-                  value={sslPanelDomain}
-                  onChange={(e) => setSslPanelDomain(e.target.value)}
-                  placeholder="panel.example.com"
-                  autoComplete="off"
-                  spellCheck={false}
-                />
-                <button
-                  type="button"
-                  className="btn ghost sm settings-reset"
-                  disabled={issueSsl.isPending || !sslPanelDomain.trim()}
-                  onClick={() => {
-                    setMsg(null);
-                    issueSsl.mutate({
-                      target: "panel",
-                      domain: sslPanelDomain.trim(),
-                    });
-                  }}
-                >
-                  <ShieldCheck size={14} />
-                  {issueSsl.isPending ? "در حال صدور…" : "دریافت SSL پنل"}
-                </button>
-              </div>
+              <div className="settings-fields-grid">
+                <div className="field">
+                  <label>SSL دامنه پنل</label>
+                  <input
+                    dir="ltr"
+                    value={sslPanelDomain}
+                    onChange={(e) => setSslPanelDomain(e.target.value)}
+                    placeholder="panel.example.com"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  <button
+                    type="button"
+                    className="btn ghost sm settings-reset"
+                    disabled={issueSsl.isPending || !sslPanelDomain.trim()}
+                    onClick={() => {
+                      setMsg(null);
+                      issueSsl.mutate({
+                        target: "panel",
+                        domain: sslPanelDomain.trim(),
+                      });
+                    }}
+                  >
+                    <ShieldCheck size={14} />
+                    {issueSsl.isPending ? "در حال صدور…" : "دریافت SSL پنل"}
+                  </button>
+                </div>
 
-              <div className="field">
-                <label>SSL دامنه ساب</label>
-                <input
-                  dir="ltr"
-                  value={sslSubDomain}
-                  onChange={(e) => setSslSubDomain(e.target.value)}
-                  placeholder="sub.example.com"
-                  autoComplete="off"
-                  spellCheck={false}
-                />
-                <button
-                  type="button"
-                  className="btn ghost sm settings-reset"
-                  disabled={issueSsl.isPending || !sslSubDomain.trim()}
-                  onClick={() => {
-                    setMsg(null);
-                    issueSsl.mutate({
-                      target: "sub",
-                      domain: sslSubDomain.trim(),
-                    });
-                  }}
-                >
-                  <ShieldCheck size={14} />
-                  {issueSsl.isPending ? "در حال صدور…" : "دریافت SSL ساب"}
-                </button>
+                <div className="field">
+                  <label>SSL دامنه ساب</label>
+                  <input
+                    dir="ltr"
+                    value={sslSubDomain}
+                    onChange={(e) => setSslSubDomain(e.target.value)}
+                    placeholder="sub.example.com"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  <button
+                    type="button"
+                    className="btn ghost sm settings-reset"
+                    disabled={issueSsl.isPending || !sslSubDomain.trim()}
+                    onClick={() => {
+                      setMsg(null);
+                      issueSsl.mutate({
+                        target: "sub",
+                        domain: sslSubDomain.trim(),
+                      });
+                    }}
+                  >
+                    <ShieldCheck size={14} />
+                    {issueSsl.isPending ? "در حال صدور…" : "دریافت SSL ساب"}
+                  </button>
+                </div>
               </div>
               <p className="field-hint">
                 از ترمینال هم می‌توانید با دستور <code dir="ltr">x-astra</code> دامنه و SSL را تنظیم کنید.
@@ -422,7 +495,7 @@ export default function SettingsPage() {
             </div>
           )}
 
-          <div className="settings-card">
+          <div className="settings-card settings-card-wide">
             <header className="settings-card-head">
               <KeyRound size={20} />
               <div>
@@ -515,40 +588,42 @@ export default function SettingsPage() {
               </div>
             </header>
 
-            <div className="field">
-              <label>رمز فعلی</label>
-              <input
-                type="password"
-                value={curPass}
-                onChange={(e) => setCurPass(e.target.value)}
-                autoComplete="current-password"
-                placeholder="رمز فعلی"
-              />
-            </div>
-            <div className="field">
-              <label>رمز جدید</label>
-              <input
-                type="password"
-                value={newPass}
-                onChange={(e) => setNewPass(e.target.value)}
-                autoComplete="new-password"
-                placeholder="حداقل ۸ کاراکتر"
-              />
-            </div>
-            <div className="field">
-              <label>تکرار رمز جدید</label>
-              <input
-                type="password"
-                value={newPass2}
-                onChange={(e) => setNewPass2(e.target.value)}
-                autoComplete="new-password"
-                placeholder="تکرار رمز جدید"
-              />
+            <div className="settings-fields-grid settings-fields-grid-3">
+              <div className="field">
+                <label>رمز فعلی</label>
+                <input
+                  type="password"
+                  value={curPass}
+                  onChange={(e) => setCurPass(e.target.value)}
+                  autoComplete="current-password"
+                  placeholder="رمز فعلی"
+                />
+              </div>
+              <div className="field">
+                <label>رمز جدید</label>
+                <input
+                  type="password"
+                  value={newPass}
+                  onChange={(e) => setNewPass(e.target.value)}
+                  autoComplete="new-password"
+                  placeholder="حداقل ۸ کاراکتر"
+                />
+              </div>
+              <div className="field">
+                <label>تکرار رمز جدید</label>
+                <input
+                  type="password"
+                  value={newPass2}
+                  onChange={(e) => setNewPass2(e.target.value)}
+                  autoComplete="new-password"
+                  placeholder="تکرار رمز جدید"
+                />
+              </div>
             </div>
             {passMsg && <p className={`admin-toast ${passMsg.type}`}>{passMsg.text}</p>}
             <button
               type="button"
-              className="btn"
+              className="btn settings-inline-action"
               disabled={
                 changePass.isPending ||
                 !curPass ||
@@ -578,30 +653,32 @@ export default function SettingsPage() {
               </div>
             </header>
 
-            <div className="field">
-              <label>لینک کانال</label>
-              <input
-                dir="ltr"
-                value={linkChannel}
-                onChange={(e) => setLinkChannel(e.target.value)}
-                placeholder="https://t.me/..."
-                autoComplete="off"
-                spellCheck={false}
-              />
-              <p className="field-hint">دکمه «کانال» در صفحه ساب · خالی = مخفی</p>
-            </div>
+            <div className="settings-fields-grid">
+              <div className="field">
+                <label>لینک کانال</label>
+                <input
+                  dir="ltr"
+                  value={linkChannel}
+                  onChange={(e) => setLinkChannel(e.target.value)}
+                  placeholder="https://t.me/..."
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <p className="field-hint">دکمه «کانال» در صفحه ساب · خالی = مخفی</p>
+              </div>
 
-            <div className="field">
-              <label>لینک پشتیبان</label>
-              <input
-                dir="ltr"
-                value={linkSupport}
-                onChange={(e) => setLinkSupport(e.target.value)}
-                placeholder="https://t.me/..."
-                autoComplete="off"
-                spellCheck={false}
-              />
-              <p className="field-hint">دکمه «پشتیبان» در صفحه ساب · خالی = مخفی</p>
+              <div className="field">
+                <label>لینک پشتیبان</label>
+                <input
+                  dir="ltr"
+                  value={linkSupport}
+                  onChange={(e) => setLinkSupport(e.target.value)}
+                  placeholder="https://t.me/..."
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <p className="field-hint">دکمه «پشتیبان» در صفحه ساب · خالی = مخفی</p>
+              </div>
             </div>
 
             <div className="field">
@@ -618,9 +695,14 @@ export default function SettingsPage() {
             </div>
           </div>
 
-          {msg && <p className={`admin-toast ${msg.type}`}>{msg.text}</p>}
+          {msg && (
+            <p className={`admin-toast settings-toast-span ${msg.type}`}>{msg.text}</p>
+          )}
 
-          <footer className="settings-foot settings-foot-standalone">
+          <footer className="settings-foot settings-foot-bar">
+            <div className="settings-foot-hint">
+              {dirty ? "تغییرات ذخیره‌نشده دارید" : "همه‌چیز ذخیره‌شده است"}
+            </div>
             <button
               type="submit"
               className="btn"

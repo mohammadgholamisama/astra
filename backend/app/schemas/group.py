@@ -43,6 +43,7 @@ class GroupPanelOut(ORMModel):
     priority: int
     panel_name: str | None = None
     panel_type: str | None = None
+    panel_is_active: bool = True
 
 
 class GroupOut(ORMModel):

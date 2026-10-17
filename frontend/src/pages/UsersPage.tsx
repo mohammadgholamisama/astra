@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -294,15 +294,17 @@ export default function UsersPage() {
   const [editDisplayName, setEditDisplayName] = useState("");
   const [editDataGb, setEditDataGb] = useState("50");
   const [editDays, setEditDays] = useState("30");
-  /** Current + newly selected groups (existing ones are locked — add only). */
+  /** Full membership while editing — add/remove freely (min 1 on save). */
   const [editGroupIds, setEditGroupIds] = useState<number[]>([]);
-  const [editLockedGroupIds, setEditLockedGroupIds] = useState<number[]>([]);
+  const [editInitialGroupIds, setEditInitialGroupIds] = useState<number[]>([]);
   const [editGroupSearch, setEditGroupSearch] = useState("");
   const [errorsUser, setErrorsUser] = useState<User | null>(null);
   const [subUser, setSubUser] = useState<User | null>(null);
   const [usageUser, setUsageUser] = useState<User | null>(null);
   const [usageMode, setUsageMode] = useState<UsageMode>("panels");
   const [usageLoading, setUsageLoading] = useState(false);
+  /** Bumps on open/close so a late API reply cannot reopen the usage modal. */
+  const usageFetchId = useRef(0);
   const [qrDataUrl, setQrDataUrl] = useState("");
   const [actionMsg, setActionMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
   const [syncingUsage, setSyncingUsage] = useState(false);
@@ -515,12 +517,14 @@ export default function UsersPage() {
   const saveEdit = useMutation({
     mutationFn: () => {
       if (!editUser) throw new Error("کاربر انتخاب نشده");
+      if (editGroupIds.length === 0) {
+        throw new Error("حداقل یک گروه باید انتخاب شود");
+      }
       const gb = Number(editDataGb);
       const dayN = Number(editDays);
       const expire =
         dayN > 0 ? Math.floor(Date.now() / 1000) + Math.floor(dayN * 86400) : 0;
       const dn = editDisplayName.trim();
-      // Always send full membership (locked + added). Backend only ADDS.
       const body: Record<string, unknown> = {
         display_name: dn || null,
         clear_display_name: !dn,
@@ -534,11 +538,20 @@ export default function UsersPage() {
       });
     },
     onSuccess: () => {
+      const initial = new Set(editInitialGroupIds);
+      const next = new Set(editGroupIds);
+      const added = editGroupIds.filter((id) => !initial.has(id)).length;
+      const removed = editInitialGroupIds.filter((id) => !next.has(id)).length;
+      const parts: string[] = [];
+      if (added) parts.push(`${toFaDigits(added)} گروه اضافه`);
+      if (removed) parts.push(`${toFaDigits(removed)} گروه حذف از پنل و ساب`);
       qc.invalidateQueries({ queryKey: ["users"] });
       setEditUser(null);
       setActionMsg({
         type: "ok",
-        text: "ذخیره شد — گروه جدید ساخته شد، لینک ساب و کانفیگ‌های قبلی ثابت ماند",
+        text: parts.length
+          ? `ذخیره شد · ${parts.join(" · ")}`
+          : "ذخیره شد",
       });
     },
     onError: (e: Error) => setActionMsg({ type: "err", text: e.message }),
@@ -550,17 +563,20 @@ export default function UsersPage() {
     setEditDisplayName(u.display_name || "");
     setEditDataGb(bytesToGbInput(u.data_limit));
     setEditDays(expireToDaysInput(u.expire));
-    const locked = [...(u.group_ids || [])];
-    setEditLockedGroupIds(locked);
-    setEditGroupIds(locked);
+    const ids = [...(u.group_ids || [])];
+    setEditInitialGroupIds(ids);
+    setEditGroupIds(ids);
     setEditGroupSearch("");
   }
 
   function toggleEditGroup(id: number) {
-    if (editLockedGroupIds.includes(id)) return; // add-only
-    setEditGroupIds((cur) =>
-      cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]
-    );
+    setEditGroupIds((cur) => {
+      if (cur.includes(id)) {
+        if (cur.length <= 1) return cur; // keep at least one
+        return cur.filter((x) => x !== id);
+      }
+      return [...cur, id];
+    });
   }
 
   useEffect(() => {
@@ -592,18 +608,26 @@ export default function UsersPage() {
     setTimeout(() => setCopied(""), 1600);
   }
 
+  function closeUsage() {
+    usageFetchId.current += 1;
+    setUsageUser(null);
+    setUsageLoading(false);
+  }
+
   async function openUsage(u: User, mode: UsageMode = "panels") {
+    const fetchId = ++usageFetchId.current;
     setUsageMode(mode);
     setUsageUser(u);
     setUsageLoading(true);
     try {
       const fresh = await api<User>(`/api/user/${encodeURIComponent(u.username)}`);
+      if (usageFetchId.current !== fetchId) return;
       setUsageUser(fresh);
       qc.invalidateQueries({ queryKey: ["users"] });
     } catch {
       /* keep list snapshot */
     } finally {
-      setUsageLoading(false);
+      if (usageFetchId.current === fetchId) setUsageLoading(false);
     }
   }
 
@@ -684,10 +708,15 @@ export default function UsersPage() {
     });
   }, [activeGroups, editGroupSearch]);
 
-  const editAddedCount = useMemo(
-    () => editGroupIds.filter((id) => !editLockedGroupIds.includes(id)).length,
-    [editGroupIds, editLockedGroupIds]
-  );
+  const editAddedCount = useMemo(() => {
+    const initial = new Set(editInitialGroupIds);
+    return editGroupIds.filter((id) => !initial.has(id)).length;
+  }, [editGroupIds, editInitialGroupIds]);
+
+  const editRemovedCount = useMemo(() => {
+    const next = new Set(editGroupIds);
+    return editInitialGroupIds.filter((id) => !next.has(id)).length;
+  }, [editGroupIds, editInitialGroupIds]);
 
   const createPanelSummary = useMemo(() => {
     const panelMap = new Map<
@@ -1661,13 +1690,16 @@ export default function UsersPage() {
 
               <div className="field user-create-groups-field">
                 <div className="user-create-groups-head">
-                  <label>افزودن گروه</label>
+                  <label>گروه‌های کاربر</label>
                 </div>
                 <p className="field-hint">
-                  گروه‌های فعلی قفل‌اند. فقط گروه جدید می‌توانید اضافه کنید — لینک ساب و
-                  کانفیگ‌های قبلی عوض نمی‌شود.
+                  گروه اضافه کنید تا کانفیگ روی پنل ساخته و به ساب بیاید. حذف گروه،
+                  کانفیگ همان گروه را از پنل اصلی و ساب برمی‌دارد. حداقل یک گروه لازم است.
                   {editAddedCount > 0
-                    ? ` · ${toFaDigits(editAddedCount)} گروه جدید انتخاب شد`
+                    ? ` · ${toFaDigits(editAddedCount)} اضافه`
+                    : ""}
+                  {editRemovedCount > 0
+                    ? ` · ${toFaDigits(editRemovedCount)} حذف`
                     : ""}
                 </p>
                 <div className="user-create-groups-search">
@@ -1676,47 +1708,48 @@ export default function UsersPage() {
                     type="search"
                     value={editGroupSearch}
                     onChange={(e) => setEditGroupSearch(e.target.value)}
-                    placeholder="جستجوی گروه برای افزودن…"
+                    placeholder="جستجوی گروه…"
                   />
                 </div>
-                {editLockedGroupIds.length > 0 && (
+                {editGroupIds.length > 0 && (
                   <div className="user-create-selected">
-                    {editLockedGroupIds.map((id) => {
+                    {editGroupIds.map((id) => {
                       const g = groupsById.get(id);
                       if (!g) return null;
+                      const wasInitial = editInitialGroupIds.includes(id);
+                      const onlyOne = editGroupIds.length <= 1;
                       return (
-                        <span key={id} className="user-create-chip locked" title="گروه فعلی">
+                        <button
+                          key={id}
+                          type="button"
+                          className={`user-create-chip${
+                            wasInitial ? "" : " is-new"
+                          }`}
+                          onClick={() => toggleEditGroup(id)}
+                          disabled={onlyOne}
+                          title={
+                            onlyOne
+                              ? "حداقل یک گروه باید بماند"
+                              : wasInitial
+                                ? "حذف گروه — کانفیگ از پنل و ساب حذف می‌شود"
+                                : "برداشتن از انتخاب"
+                          }
+                        >
                           {g.name}
-                        </span>
+                          {!onlyOne ? <X size={14} aria-hidden /> : null}
+                        </button>
                       );
                     })}
-                    {editGroupIds
-                      .filter((id) => !editLockedGroupIds.includes(id))
-                      .map((id) => {
-                        const g = groupsById.get(id);
-                        if (!g) return null;
-                        return (
-                          <button
-                            key={id}
-                            type="button"
-                            className="user-create-chip"
-                            onClick={() => toggleEditGroup(id)}
-                            title="برداشتن از افزوده‌ها"
-                          >
-                            {g.name}
-                            <X size={14} aria-hidden />
-                          </button>
-                        );
-                      })}
                   </div>
                 )}
-                <div className="user-create-groups" role="group" aria-label="افزودن گروه">
+                <div className="user-create-groups" role="group" aria-label="گروه‌های کاربر">
                   {filteredEditGroups.length === 0 ? (
                     <p className="field-hint user-create-empty">نتیجه‌ای پیدا نشد</p>
                   ) : (
                     filteredEditGroups.map((g) => {
-                      const locked = editLockedGroupIds.includes(g.id);
                       const on = editGroupIds.includes(g.id);
+                      const wasInitial = editInitialGroupIds.includes(g.id);
+                      const onlyOne = on && editGroupIds.length <= 1;
                       const types = [
                         ...new Set(
                           (g.panels || [])
@@ -1729,16 +1762,18 @@ export default function UsersPage() {
                           key={g.id}
                           type="button"
                           className={`user-create-group-card${on ? " on" : ""}${
-                            locked ? " locked" : ""
+                            on && !wasInitial ? " is-new" : ""
                           }`}
                           onClick={() => toggleEditGroup(g.id)}
                           aria-pressed={on}
-                          disabled={locked}
+                          disabled={onlyOne}
                           title={
-                            locked
-                              ? "گروه فعلی — قابل حذف نیست"
+                            onlyOne
+                              ? "حداقل یک گروه باید بماند"
                               : on
-                                ? "حذف از افزوده‌ها"
+                                ? wasInitial
+                                  ? "حذف گروه از کاربر"
+                                  : "برداشتن"
                                 : "افزودن گروه"
                           }
                         >
@@ -1748,7 +1783,7 @@ export default function UsersPage() {
                           <span className="user-create-group-body">
                             <span className="user-create-group-name">{g.name}</span>
                             <span className="user-create-group-meta">
-                              {locked ? "فعلی · " : ""}
+                              {on && !wasInitial ? "جدید · " : ""}
                               {types
                                 .map((t) => panelTypeLabel[t] || t)
                                 .join(" · ") || "بدون پنل"}
@@ -1777,7 +1812,10 @@ export default function UsersPage() {
                 >
                   انصراف
                 </button>
-                <button className="btn" disabled={saveEdit.isPending}>
+                <button
+                  className="btn"
+                  disabled={saveEdit.isPending || editGroupIds.length === 0}
+                >
                   {saveEdit.isPending ? "در حال ذخیره…" : "ذخیره تغییرات"}
                 </button>
               </footer>
@@ -1844,7 +1882,7 @@ export default function UsersPage() {
       )}
 
       {usageUser && (
-        <div className="modal-backdrop sheet-backdrop" onClick={() => setUsageUser(null)}>
+        <div className="modal-backdrop sheet-backdrop" onClick={closeUsage}>
           <div
             className="modal modal-lg usage-modal sheet-modal"
             onClick={(e) => e.stopPropagation()}
@@ -1862,7 +1900,7 @@ export default function UsersPage() {
               <button
                 type="button"
                 className="modal-close"
-                onClick={() => setUsageUser(null)}
+                onClick={closeUsage}
                 aria-label="بستن"
               >
                 <X size={18} />
@@ -2019,7 +2057,7 @@ export default function UsersPage() {
             )}
 
             <footer className="modal-foot">
-              <button type="button" className="btn ghost" onClick={() => setUsageUser(null)}>
+              <button type="button" className="btn ghost" onClick={closeUsage}>
                 بستن
               </button>
               <button

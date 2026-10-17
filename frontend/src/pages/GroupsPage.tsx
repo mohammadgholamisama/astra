@@ -439,6 +439,9 @@ export default function GroupsPage() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["groups"] });
       qc.invalidateQueries({ queryKey: ["group-categories"] });
+      // Panel add/remove resyncs remotes + subs in the background
+      qc.invalidateQueries({ queryKey: ["users"] });
+      qc.invalidateQueries({ queryKey: ["configs"] });
       resetModal();
     },
   });
@@ -920,12 +923,32 @@ export default function GroupsPage() {
                   const on = selectedIds.has(p.id);
                   const pick = picks.find((x) => x.panel_id === p.id);
                   const cat = catalogs[p.id];
+                  const panelOff = !p.is_active;
                   return (
-                    <div key={p.id} className={`group-panel-block${on ? " on" : ""}`}>
+                    <div
+                      key={p.id}
+                      className={`group-panel-block${on ? " on" : ""}${
+                        panelOff ? " is-off" : ""
+                      }`}
+                    >
                       <label className="check-item">
-                        <input type="checkbox" checked={on} onChange={() => togglePanel(p)} />
+                        <input
+                          type="checkbox"
+                          checked={on}
+                          disabled={panelOff && !on}
+                          onChange={() => togglePanel(p)}
+                          title={
+                            panelOff && !on
+                              ? "این پنل خاموش است — اول از صفحه پنل‌ها روشن کنید"
+                              : undefined
+                          }
+                        />
                         <span>
-                          {p.name} <span className="badge muted">{p.type}</span>
+                          {p.name}{" "}
+                          <span className="badge muted">{p.type}</span>
+                          {panelOff ? (
+                            <span className="badge err">خاموش</span>
+                          ) : null}
                         </span>
                         {on && pick && (
                           <span className="group-pick-count">
@@ -1263,6 +1286,12 @@ export default function GroupsPage() {
               </div>
 
               {save.isError && <p className="error">{(save.error as Error).message}</p>}
+              {isEdit ? (
+                <p className="muted" style={{ margin: "8px 0 0", fontSize: "0.85rem" }}>
+                  با ذخیره، پنل‌های اضافه‌شده برای همه کاربران این گروه ساخته می‌شوند و
+                  پنل‌های حذف‌شده از ساب و از پنل اصلی هم پاک می‌شوند.
+                </p>
+              ) : null}
 
               <footer className="modal-foot">
                 <button
