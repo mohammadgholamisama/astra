@@ -19,8 +19,10 @@ logger = logging.getLogger(__name__)
 _lock = threading.RLock()
 # Exact: (server_host, port, match_host) → flag when match_host non-empty
 _specific_map: dict[tuple[str, int, str], str] = {}
+_specific_codes: dict[tuple[str, int, str], str] = {}
 # Fallback: (server_host, port) → flag when rule has empty match_host
 _general_map: dict[tuple[str, int], str] = {}
+_general_codes: dict[tuple[str, int], str] = {}
 _loaded = False
 
 _CTRL = re.compile(r"[\x00-\x1f\x7f]")
@@ -254,38 +256,87 @@ def extract_link_match_host(link: str) -> str:
 
 def flag_for_link(link: str) -> str | None:
     """Resolve flag: specific (host+port+match_host) wins over general (host+port)."""
+    info = resolve_location_for_link(link)
+    return info["flag"] if info else None
+
+
+def resolve_location_for_endpoint(
+    host: str, port: int, match_host: str = ""
+) -> dict[str, object] | None:
+    """Same matching rules as sub remarks — exact (host,port,match) then general (host,port).
+
+    ``exact=True`` means a DB rule exists for this fingerprint (safe to clear).
+    ``exact=False`` means the flag is inherited from host:port with empty match_host.
+    """
+    try:
+        h = normalize_host(host)
+        p = int(port)
+        m = normalize_match_host(match_host or "")
+    except (ValueError, TypeError):
+        return None
+    with _lock:
+        if m:
+            flag = _specific_map.get((h, p, m))
+            code = _specific_codes.get((h, p, m))
+            if flag and code:
+                return {
+                    "host": h,
+                    "port": p,
+                    "match_host": m,
+                    "country_code": code,
+                    "flag": flag,
+                    "exact": True,
+                }
+        flag = _general_map.get((h, p))
+        code = _general_codes.get((h, p))
+        if flag and code:
+            return {
+                "host": h,
+                "port": p,
+                "match_host": "",
+                "country_code": code,
+                "flag": flag,
+                # Exact only when this row itself is the general (empty match) rule
+                "exact": not bool(m),
+            }
+    return None
+
+
+def resolve_location_for_link(link: str) -> dict[str, str] | None:
     ep = extract_link_endpoint(link)
     if not ep:
         return None
     server_host, port = ep
-    link_match = extract_link_match_host(link)
-    with _lock:
-        if link_match:
-            specific = _specific_map.get((server_host, port, link_match))
-            if specific:
-                return specific
-        return _general_map.get((server_host, port))
+    link_match = extract_link_match_host(link) or ""
+    return resolve_location_for_endpoint(server_host, port, link_match)
 
 
 def apply_cache(rows: list[ConfigLocation]) -> None:
     specific: dict[tuple[str, int, str], str] = {}
+    specific_codes: dict[tuple[str, int, str], str] = {}
     general: dict[tuple[str, int], str] = {}
+    general_codes: dict[tuple[str, int], str] = {}
     for row in rows:
         try:
             host = normalize_host(row.host)
             port = int(row.port)
             match = normalize_match_host(getattr(row, "match_host", None) or "")
-            flag = flag_from_country_code(row.country_code)
+            code = normalize_country_code(row.country_code)
+            flag = flag_from_country_code(code)
         except (ValueError, TypeError):
             continue
         if match:
             specific[(host, port, match)] = flag
+            specific_codes[(host, port, match)] = code
         else:
             general[(host, port)] = flag
+            general_codes[(host, port)] = code
     with _lock:
-        global _specific_map, _general_map, _loaded
+        global _specific_map, _specific_codes, _general_map, _general_codes, _loaded
         _specific_map = specific
+        _specific_codes = specific_codes
         _general_map = general
+        _general_codes = general_codes
         _loaded = True
 
 
@@ -294,6 +345,74 @@ async def refresh_cache(db: AsyncSession) -> int:
     rows = list(result.scalars().all())
     apply_cache(rows)
     return len(rows)
+
+
+async def upsert_endpoint_location(
+    db: AsyncSession,
+    *,
+    host: str,
+    port: int,
+    match_host: str = "",
+    country_code: str | None,
+) -> dict | None:
+    """Set or clear the location rule for an exact (host, port, match_host) fingerprint.
+
+    ``country_code=None`` deletes that exact rule only (does not touch other SNI variants).
+    Returns the saved row as ``to_out`` dict, or ``None`` when cleared.
+    """
+    h = normalize_host(host)
+    p = int(port)
+    if p < 1 or p > 65535:
+        raise ValueError("پورت نامعتبر است")
+    m = normalize_match_host(match_host or "")
+
+    result = await db.execute(
+        select(ConfigLocation).where(
+            ConfigLocation.host == h,
+            ConfigLocation.port == p,
+            ConfigLocation.match_host == m,
+        )
+    )
+    row = result.scalar_one_or_none()
+
+    if country_code is None or str(country_code).strip() == "":
+        if row is not None:
+            await db.delete(row)
+            await db.commit()
+            await refresh_cache(db)
+        else:
+            await db.commit()
+        return None
+
+    code = normalize_country_code(country_code)
+    flag_from_country_code(code)  # validate
+    if row is None:
+        row = ConfigLocation(host=h, port=p, match_host=m, country_code=code, label=None)
+        db.add(row)
+    else:
+        row.country_code = code
+    await db.commit()
+    await db.refresh(row)
+    await refresh_cache(db)
+    return to_out(row)
+
+
+def attach_location_to_rows(rows: list[dict]) -> None:
+    """Mutate visibility rows with country_code + flag (same resolve rules as sub)."""
+    for r in rows:
+        info = resolve_location_for_endpoint(
+            str(r.get("host") or ""),
+            int(r.get("port") or 0),
+            str(r.get("match_host") or ""),
+        )
+        if info:
+            r["country_code"] = info["country_code"]
+            r["flag"] = info["flag"]
+            r["flag_exact"] = bool(info.get("exact"))
+        else:
+            r["country_code"] = None
+            r["flag"] = None
+            r["flag_exact"] = False
 
 
 def to_out(row: ConfigLocation) -> dict:

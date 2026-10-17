@@ -8,6 +8,7 @@ from app.core.database import get_db
 from app.models.config_location import ConfigLocation
 from app.schemas.config_location import (
     ConfigLocationCreate,
+    ConfigLocationEndpointSet,
     ConfigLocationOut,
     ConfigLocationUpdate,
 )
@@ -19,6 +20,7 @@ from app.services.config_locations import (
     normalize_match_host,
     refresh_cache,
     to_out,
+    upsert_endpoint_location,
 )
 
 router = APIRouter(tags=["Config Locations"])
@@ -118,6 +120,26 @@ async def update_location(
     await db.refresh(row)
     await refresh_cache(db)
     return _as_out(row)
+
+
+@router.put("/api/admin/config-locations/endpoint")
+async def set_endpoint_location(
+    body: ConfigLocationEndpointSet,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """Set or clear flag for exact host:port[+match_host] — used from Configs page."""
+    try:
+        out = await upsert_endpoint_location(
+            db,
+            host=body.host,
+            port=body.port,
+            match_host=body.match_host or "",
+            country_code=body.country_code,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "location": out}
 
 
 @router.delete("/api/admin/config-locations/{location_id}")

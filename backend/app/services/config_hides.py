@@ -274,6 +274,10 @@ async def build_visibility(
         # Recompute hide from live set
         r["hidden"] = (r["host"], int(r["port"]), r.get("match_host") or "") in hidden
 
+    from app.services.config_locations import attach_location_to_rows
+
+    attach_location_to_rows(rows)
+
     # sample_ready = probe user still exists on remotes (not merely DB items)
     from app.services.group_configs import sample_status_for_group
 
@@ -381,6 +385,10 @@ async def build_visibility_all(db: AsyncSession) -> dict[str, Any]:
         names = r.pop("group_names", None) or []
         if names:
             r["group_name"] = " · ".join(names[:4]) + ("…" if len(names) > 4 else "")
+
+    from app.services.config_locations import attach_location_to_rows
+
+    attach_location_to_rows(rows)
 
     return {
         "items": rows,

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Cable,
@@ -11,6 +11,7 @@ import {
   Server,
   Sparkles,
   Trash2,
+  X,
 } from "lucide-react";
 import { ApiError, Group, api } from "../lib/api";
 import { toFaDigits } from "../lib/format";
@@ -27,7 +28,51 @@ type VisibilityItem = {
   orphan: boolean;
   group_id?: number | null;
   group_name?: string | null;
+  country_code?: string | null;
+  flag?: string | null;
+  flag_exact?: boolean;
 };
+
+const COUNTRIES: { code: string; name: string }[] = [
+  { code: "DE", name: "آلمان" },
+  { code: "TR", name: "ترکیه" },
+  { code: "NL", name: "هلند" },
+  { code: "US", name: "آمریکا" },
+  { code: "GB", name: "انگلیس" },
+  { code: "FR", name: "فرانسه" },
+  { code: "AE", name: "امارات" },
+  { code: "FI", name: "فنلاند" },
+  { code: "SE", name: "سوئد" },
+  { code: "NO", name: "نروژ" },
+  { code: "PL", name: "لهستان" },
+  { code: "AT", name: "اتریش" },
+  { code: "CH", name: "سوئیس" },
+  { code: "IT", name: "ایتالیا" },
+  { code: "ES", name: "اسپانیا" },
+  { code: "CA", name: "کانادا" },
+  { code: "JP", name: "ژاپن" },
+  { code: "SG", name: "سنگاپور" },
+  { code: "HK", name: "هنگ‌کنگ" },
+  { code: "KR", name: "کره جنوبی" },
+  { code: "IN", name: "هند" },
+  { code: "RU", name: "روسیه" },
+  { code: "UA", name: "اوکراین" },
+  { code: "CZ", name: "چک" },
+  { code: "RO", name: "رومانی" },
+  { code: "BG", name: "بلغارستان" },
+  { code: "IR", name: "ایران" },
+  { code: "IQ", name: "عراق" },
+  { code: "AM", name: "ارمنستان" },
+  { code: "GE", name: "گرجستان" },
+  { code: "CY", name: "قبرس" },
+  { code: "AU", name: "استرالیا" },
+];
+
+function flagEmoji(code: string): string {
+  const c = (code || "").trim().toUpperCase();
+  if (c.length !== 2) return "";
+  return String.fromCodePoint(...[...c].map((ch) => 0x1f1e6 + ch.charCodeAt(0) - 65));
+}
 
 type VisibilityOut = {
   group_id: number;
@@ -107,6 +152,8 @@ export default function ConfigsPage() {
   const [filter, setFilter] = useState<"all" | "visible" | "hidden">("all");
   const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
   const [pendingKey, setPendingKey] = useState<string | null>(null);
+  const [flagRow, setFlagRow] = useState<VisibilityItem | null>(null);
+  const flagPopRef = useRef<HTMLDivElement | null>(null);
   const { data: groups = [], isLoading: groupsLoading } = useQuery({
     queryKey: ["groups"],
     queryFn: () => api<Group[]>("/api/groups"),
@@ -377,6 +424,90 @@ export default function ConfigsPage() {
     onSettled: () => setPendingKey(null),
   });
 
+  const setFlag = useMutation({
+    mutationFn: async (args: {
+      row: VisibilityItem;
+      country_code: string | null;
+    }) => {
+      const { row, country_code } = args;
+      setPendingKey(rowKey(row, scope));
+      await api("/api/admin/config-locations/endpoint", {
+        method: "PUT",
+        body: JSON.stringify({
+          host: row.host,
+          port: row.port,
+          match_host: (row.match_host || "").trim(),
+          country_code,
+        }),
+      });
+      // Refresh current visibility so flag fields stay exact
+      if (isAll) {
+        return {
+          mode: "all" as const,
+          vis: await api<VisibilityAllOut>("/api/admin/config-visibility"),
+          row,
+          country_code,
+        };
+      }
+      if (selectedId == null) throw new Error("گروه انتخاب نشده");
+      return {
+        mode: "group" as const,
+        vis: await api<VisibilityOut>(
+          `/api/group/${selectedId}/config-visibility`
+        ),
+        row,
+        country_code,
+      };
+    },
+    onSuccess: (res) => {
+      if (res.mode === "all") {
+        qc.setQueryData(["config-visibility-all"], res.vis);
+        qc.invalidateQueries({ queryKey: ["config-visibility"] });
+      } else {
+        qc.setQueryData(["config-visibility", selectedId], res.vis);
+        qc.invalidateQueries({ queryKey: ["config-visibility-all"] });
+      }
+      setFlagRow(null);
+      const ep = endpointLabel(res.row);
+      const name =
+        COUNTRIES.find((c) => c.code === (res.country_code || ""))?.name ||
+        res.country_code;
+      setMsg({
+        type: "ok",
+        text: res.country_code
+          ? `پرچم ${name} برای ${ep} روی همه ساب‌ها ست شد`
+          : `پرچم ${ep} برداشته شد`,
+      });
+    },
+    onError: (e) => {
+      setMsg({
+        type: "err",
+        text:
+          e instanceof ApiError || e instanceof Error
+            ? e.message
+            : "خطا در تنظیم پرچم",
+      });
+    },
+    onSettled: () => setPendingKey(null),
+  });
+
+  useEffect(() => {
+    if (!flagRow) return;
+    function onDoc(e: MouseEvent) {
+      const el = flagPopRef.current;
+      if (el && !el.contains(e.target as Node)) setFlagRow(null);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setFlagRow(null);
+    }
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [flagRow]);
+
   const filtered = useMemo(() => {
     const needle = q.trim().toLowerCase();
     return visibilityItems.filter((row) => {
@@ -430,10 +561,9 @@ export default function ConfigsPage() {
           <p className="configs-kicker">سابسکریپشن</p>
           <h1 className="page-title">فیلتر کانفیگ‌ها</h1>
           <p className="page-sub">
-            یک گروه را انتخاب کنید و             «ساخت مجدد از پنل» (یک گروه یا همه گروه‌ها) کاربر تستی روی پنل می‌سازد
-            و لیست را به‌روز می‌کند. بعد مشخص کنید کدام دامنه/پورت مخفی باشد؛{" "}
-            <b>تنظیمات مخفی حفظ می‌شود</b>. «حذف تستی» فقط نمونه را از پنل
-            برمی‌دارد.
+            کانفیگ‌ها را از پنل بسازید، مخفی/نمایش کنید، و با دکمه پرچم برای همان
+            دامنه/پورت/هاست روی همه ساب‌ها پرچم بگذارید. مخفی‌ها و پرچم‌ها با حذف
+            نمونه پاک نمی‌شوند.
           </p>
         </div>
         <div className="configs-hero-actions">
@@ -818,8 +948,12 @@ export default function ConfigsPage() {
                   <div className="configs-list" role="list">
                     {filtered.map((row) => {
                       const key = rowKey(row, scope);
-                      const busy = pendingKey === key && toggle.isPending;
+                      const hideBusy = pendingKey === key && toggle.isPending;
+                      const flagBusy = pendingKey === key && setFlag.isPending;
+                      const busy = hideBusy || flagBusy;
                       const shown = !row.hidden;
+                      const flagOpen =
+                        flagRow != null && rowKey(flagRow, scope) === key;
                       return (
                         <article
                           key={key}
@@ -872,8 +1006,91 @@ export default function ConfigsPage() {
                               )}
                             </div>
                           </div>
+                          <div className="configs-flag-wrap" ref={flagOpen ? flagPopRef : undefined}>
+                            <button
+                              type="button"
+                              className={`configs-flag-btn${row.flag ? " has-flag" : ""}${
+                                flagOpen ? " open" : ""
+                              }`}
+                              disabled={busy || refreshing}
+                              onClick={() =>
+                                setFlagRow(flagOpen ? null : row)
+                              }
+                              title="پرچم این دامنه/پورت/هاست در همه ساب‌ها"
+                              aria-label="انتخاب پرچم"
+                              aria-expanded={flagOpen}
+                            >
+                              <span aria-hidden>{row.flag || "🏳️"}</span>
+                            </button>
+                            {flagOpen ? (
+                              <div className="configs-flag-pop" role="dialog" aria-label="انتخاب کشور">
+                                <div className="configs-flag-pop-head">
+                                  <span>پرچم برای ساب</span>
+                                  <button
+                                    type="button"
+                                    className="modal-close"
+                                    onClick={() => setFlagRow(null)}
+                                    aria-label="بستن"
+                                  >
+                                    <X size={16} />
+                                  </button>
+                                </div>
+                                <p className="configs-flag-ep" dir="ltr">
+                                  {endpointLabel(row)}
+                                </p>
+                                <div className="configs-flag-grid">
+                                  {COUNTRIES.map((c) => {
+                                    const active =
+                                      (row.country_code || "").toUpperCase() ===
+                                      c.code;
+                                    return (
+                                      <button
+                                        key={c.code}
+                                        type="button"
+                                        className={`configs-flag-opt${
+                                          active ? " active" : ""
+                                        }`}
+                                        disabled={setFlag.isPending}
+                                        onClick={() =>
+                                          setFlag.mutate({
+                                            row,
+                                            country_code: c.code,
+                                          })
+                                        }
+                                        title={c.name}
+                                      >
+                                        <span aria-hidden>{flagEmoji(c.code)}</span>
+                                        <small>{c.name}</small>
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                                {row.flag_exact ? (
+                                  <button
+                                    type="button"
+                                    className="btn ghost sm configs-flag-clear"
+                                    disabled={setFlag.isPending}
+                                    onClick={() =>
+                                      setFlag.mutate({
+                                        row,
+                                        country_code: null,
+                                      })
+                                    }
+                                  >
+                                    برداشتن پرچم این دامنه/پورت/هاست
+                                  </button>
+                                ) : row.flag ? (
+                                  <p className="configs-flag-inherited muted">
+                                    پرچم از قانون کلی دامنه:پورت می‌آید — برای
+                                    همین هاست یک پرچم جدا انتخاب کنید یا از ردیف
+                                    بدون هاست بردارید.
+                                  </p>
+                                ) : null}
+                              </div>
+                            ) : null}
+                          </div>
                           <label
-                            className={`configs-switch${busy ? " busy" : ""}`}
+                            className={`configs-switch${hideBusy ? " busy" : ""}`}
                             title={
                               shown
                                 ? "الان در ساب هست — برای مخفی کردن بزنید"

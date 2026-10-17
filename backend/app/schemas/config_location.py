@@ -20,6 +20,16 @@ class ConfigLocationUpdate(BaseModel):
     label: str | None = Field(default=None, max_length=64)
 
 
+class ConfigLocationEndpointSet(BaseModel):
+    """Upsert/clear flag for an exact config fingerprint from the Configs page."""
+
+    host: str = Field(min_length=1, max_length=253)
+    port: int = Field(ge=1, le=65535)
+    match_host: str = Field(default="", max_length=253)
+    # null / omit clear → remove this exact rule
+    country_code: str | None = Field(default=None, max_length=2)
+
+
 class ConfigLocationOut(BaseModel):
     id: int
     host: str

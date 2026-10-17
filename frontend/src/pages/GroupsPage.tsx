@@ -1288,8 +1288,9 @@ export default function GroupsPage() {
               {save.isError && <p className="error">{(save.error as Error).message}</p>}
               {isEdit ? (
                 <p className="muted" style={{ margin: "8px 0 0", fontSize: "0.85rem" }}>
-                  با ذخیره، پنل‌های اضافه‌شده برای همه کاربران این گروه ساخته می‌شوند و
-                  پنل‌های حذف‌شده از ساب و از پنل اصلی هم پاک می‌شوند.
+                  با ذخیره، پنل جدید برای همه کاربران این گروه روی پنل اصلی ساخته می‌شود.
+                  پنل برداشته‌شده از ساب‌های قدیم و جدید و از خود پنل اصلی (همه انواع پنل)
+                  حذف می‌شود.
                 </p>
               ) : null}
 

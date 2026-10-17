@@ -14,6 +14,11 @@ class ConfigVisibilityItemOut(BaseModel):
     # Present in «all panels» aggregate view
     group_id: int | None = None
     group_name: str | None = None
+    # Global flag for this host:port[+match] (same key as sub remarks)
+    country_code: str | None = None
+    flag: str | None = None
+    # True = DB rule is for this exact fingerprint (clear is safe)
+    flag_exact: bool = False
 
 
 class ConfigVisibilityOut(BaseModel):

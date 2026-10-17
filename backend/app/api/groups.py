@@ -61,16 +61,25 @@ def _panel_config_fingerprint(panels: list[Any]) -> tuple[tuple[int, str], ...]:
     return tuple(sorted(items, key=lambda x: (x[0], x[1])))
 
 
-async def _bg_resync_group_users(group_id: int) -> None:
-    """Push new caps/coeffs without blocking the group-save HTTP response."""
+async def _bg_resync_group_users(
+    group_id: int, removed_panel_ids: list[int] | None = None
+) -> None:
+    """Push new caps/coeffs + remote delete for removed panels (non-blocking)."""
     from app.core.database import AsyncSessionLocal
     from app.services.orchestrator import resync_users_for_group
 
     try:
         async with AsyncSessionLocal() as db:
-            n = await resync_users_for_group(db, group_id)
+            n = await resync_users_for_group(
+                db, group_id, removed_panel_ids=removed_panel_ids or []
+            )
             await db.commit()
-            logger.info("bg group %s resync ok users=%s", group_id, n)
+            logger.info(
+                "bg group %s resync ok users=%s removed_panels=%s",
+                group_id,
+                n,
+                removed_panel_ids or [],
+            )
     except Exception:  # noqa: BLE001
         logger.exception("bg group %s resync failed", group_id)
 
@@ -383,15 +392,24 @@ async def update_group(
     elif body.category_id is not None:
         group.category_id = await _ensure_category(db, body.category_id)
     need_resync = False
+    removed_panel_ids: list[int] = []
     if body.panels is not None:
-        old_fp = _panel_config_fingerprint(list(group.panel_links or []))
+        old_links = list(group.panel_links or [])
+        old_fp = _panel_config_fingerprint(old_links)
         new_fp = _panel_config_fingerprint(body.panels)
+        old_pids = {int(link.panel_id) for link in old_links if link.panel_id is not None}
+        new_pids = {int(getattr(p, "panel_id")) for p in body.panels}
+        removed_panel_ids = sorted(old_pids - new_pids)
         await _set_panels(db, group, body.panels)
         # Only remote-push when panel set / coefficient / inbounds / etc. actually changed
         need_resync = old_fp != new_fp
+        # Removing a panel must always deprovision remotes even if fingerprint
+        # somehow matched (shouldn't) — belt and suspenders.
+        if removed_panel_ids:
+            need_resync = True
     if need_resync:
         # Apply raw×coeff to Astra used_traffic immediately (no remote I/O).
-        # Bg task still refreshes remotes / disables when quota exhausted.
+        # Bg task still deletes remotes for removed panels + refreshes caps.
         from app.services.orchestrator import recount_group_usage_local
 
         await recount_group_usage_local(db, group_id)
@@ -399,7 +417,7 @@ async def update_group(
     if need_resync:
         # Never block PUT /api/group — large groups time out proxies (502/504).
         asyncio.create_task(
-            _bg_resync_group_users(group_id),
+            _bg_resync_group_users(group_id, removed_panel_ids),
             name=f"astra-group-resync-{group_id}",
         )
     group = await _load_group(db, group_id)

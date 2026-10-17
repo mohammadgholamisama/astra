@@ -1452,10 +1452,6 @@ export default function UsersPage() {
                     </button>
                   </div>
                 </div>
-                <p className="field-hint" style={{ marginTop: 0 }}>
-                  ترتیب انتخاب = ترتیب کانفیگ‌های همان گروه در ساب
-                </p>
-
                 <div className="user-create-groups-search">
                   <Search size={16} aria-hidden />
                   <input
@@ -1467,8 +1463,8 @@ export default function UsersPage() {
                 </div>
 
                 {groupIds.length > 0 && (
-                  <div className="user-create-selected" aria-label="ترتیب گروه‌ها در ساب">
-                    {groupIds.map((id, i) => {
+                  <div className="user-create-selected" aria-label="گروه‌های انتخاب‌شده">
+                    {groupIds.map((id) => {
                       const g = groupsById.get(id);
                       if (!g) return null;
                       return (
@@ -1477,9 +1473,8 @@ export default function UsersPage() {
                           type="button"
                           className="user-create-chip"
                           onClick={() => toggleCreateGroup(id)}
-                          title={`ترتیب ${i + 1} در ساب — کلیک برای حذف`}
+                          title="کلیک برای حذف"
                         >
-                          <span className="user-create-chip-ord">{toFaDigits(i + 1)}</span>
                           {g.name}
                           <X size={14} aria-hidden />
                         </button>

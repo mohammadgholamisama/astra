@@ -1070,8 +1070,15 @@ async def _delete_panel_accounts_remote(
     db: AsyncSession,
     user: User,
     accounts: list[PanelAccount],
+    *,
+    clear_links_always: bool = True,
 ) -> list[dict]:
-    """Delete the given PanelAccount rows on remotes and mark them deleted on success."""
+    """Delete the given PanelAccount rows on remotes (all panel types) and mark deleted.
+
+    Retries once per account. Treats not-found as success. When
+    ``clear_links_always`` is True, share links are wiped even if remote delete
+    fails so old/new subs cannot keep emitting those configs.
+    """
     if not accounts:
         return []
 
@@ -1095,30 +1102,34 @@ async def _delete_panel_accounts_remote(
             return {**base, "ok": False, "error": "یوزرنیم ریموت خالی است"}
 
         # Inactive Astra panels: still try delete so remotes don't keep junk
-        adapter = get_adapter(panel)
-        try:
-            async with sem:
-                res = await asyncio.wait_for(
-                    adapter.delete_user(
-                        uname, account.remote_id or account.remote_username
-                    ),
-                    timeout=14,
-                )
-        except Exception as e:  # noqa: BLE001
-            return {**base, "ok": False, "error": _exc_msg(e)}
-        finally:
+        last_err = "حذف از پنل ناموفق بود"
+        for attempt in range(2):
+            adapter = get_adapter(panel)
             try:
-                await adapter.close()  # type: ignore[attr-defined]
-            except Exception:
-                pass
+                async with sem:
+                    res = await asyncio.wait_for(
+                        adapter.delete_user(
+                            uname, account.remote_id or account.remote_username
+                        ),
+                        timeout=16,
+                    )
+            except Exception as e:  # noqa: BLE001
+                last_err = _exc_msg(e)
+                res = None
+            finally:
+                try:
+                    await adapter.close()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
 
-        if res.success or _is_not_found_err(res.error):
-            return {**base, "ok": True, "error": None}
-        return {
-            **base,
-            "ok": False,
-            "error": res.error or "حذف از پنل ناموفق بود",
-        }
+            if res is not None and (res.success or _is_not_found_err(res.error)):
+                return {**base, "ok": True, "error": None}
+            if res is not None:
+                last_err = res.error or last_err
+            if attempt == 0:
+                await asyncio.sleep(0.35)
+
+        return {**base, "ok": False, "error": last_err}
 
     outcomes = list(await asyncio.gather(*[_remote(a) for a in accounts]))
 
@@ -1127,6 +1138,9 @@ async def _delete_panel_accounts_remote(
         account = by_id.get(row.get("account_id"))
         if account is None:
             continue
+        if clear_links_always:
+            account.links = []
+            account.links_by_group = {}
         if row.get("ok"):
             account.status = PanelAccountStatus.deleted
             account.error_message = None
@@ -1144,6 +1158,68 @@ async def _delete_panel_accounts_remote(
         time.monotonic() - t0,
     )
     return outcomes
+
+
+async def deprovision_all_accounts_on_panel(db: AsyncSession, panel_id: int) -> dict:
+    """Delete every remote account on this panel, then mark local rows deleted.
+
+    Used before removing a panel from Astra so remotes are not left with live configs.
+    """
+    pid = int(panel_id)
+    result = await db.execute(
+        select(PanelAccount)
+        .where(
+            PanelAccount.panel_id == pid,
+            PanelAccount.status != PanelAccountStatus.deleted,
+        )
+        .options(
+            selectinload(PanelAccount.panel),
+            selectinload(PanelAccount.user),
+        )
+    )
+    accounts = list(result.scalars().unique().all())
+    if not accounts:
+        return {"accounts": 0, "ok": 0, "fail": 0}
+
+    by_user: dict[int, list[PanelAccount]] = {}
+    users: dict[int, User] = {}
+    for a in accounts:
+        uid = int(a.user_id)
+        by_user.setdefault(uid, []).append(a)
+        if a.user is not None:
+            users[uid] = a.user
+
+    ok = 0
+    fail = 0
+    for uid, accs in by_user.items():
+        user = users.get(uid)
+        if user is None:
+            user = await db.get(User, uid)
+        if user is None:
+            for a in accs:
+                a.links = []
+                a.links_by_group = {}
+                a.status = PanelAccountStatus.deleted
+            fail += len(accs)
+            continue
+        outcomes = await _delete_panel_accounts_remote(db, user, accs)
+        ok += sum(1 for r in outcomes if r.get("ok"))
+        fail += sum(1 for r in outcomes if not r.get("ok"))
+        # Force local gone even if remote failed — panel row is about to be deleted
+        for a in accs:
+            a.status = PanelAccountStatus.deleted
+            a.links = []
+            a.links_by_group = {}
+
+    await db.flush()
+    logger.info(
+        "deprovision-panel panel=%s accounts=%s ok=%s fail=%s",
+        pid,
+        len(accounts),
+        ok,
+        fail,
+    )
+    return {"accounts": len(accounts), "ok": ok, "fail": fail}
 
 
 async def sync_delete_user_group_accounts(
@@ -1856,30 +1932,13 @@ async def collect_links_detailed(
         except Exception:  # noqa: BLE001
             pass
 
-    # Subscription order = user's group selection order (UserGroup.sort_order)
-    ordered_gids: list[int] = []
-    if db is not None:
-        try:
-            from app.models.group import UserGroup
+    # Global admin order by host:port[+SNI]; unlisted configs stay at the end.
+    # Users missing a panel simply won't have that link — nothing is injected.
+    from app.services.config_orders import link_order_index
 
-            ug_rows = await db.execute(
-                select(UserGroup.group_id)
-                .where(UserGroup.user_id == user.id)
-                .order_by(UserGroup.sort_order.asc(), UserGroup.id.asc())
-            )
-            ordered_gids = [int(r[0]) for r in ug_rows.all() if r[0] is not None]
-        except Exception:  # noqa: BLE001
-            ordered_gids = []
-    if not ordered_gids:
-        ordered_gids = [
-            int(g.id)
-            for g in groups
-            if getattr(g, "id", None) is not None
-        ]
-    order_idx = {gid: i for i, gid in enumerate(ordered_gids)}
     rows.sort(
         key=lambda row: (
-            order_idx.get(int(row.get("group_id") or -1), 10**6),
+            link_order_index(str(row.get("link") or "")),
             int(row.get("panel_id") or 0),
             str(row.get("link") or ""),
         )
@@ -2334,9 +2393,16 @@ async def refresh_users_usage_batch(
         async with sem:
             try:
                 await refresh_usage(db, u, force=force, quick=quick)
+                # used_traffic is already Σ(raw × coeff) from refresh_usage
                 changed = await enforce_user_quota(db, u)
-                if quick and not changed:
-                    # List sync: skip remote modify (slow) unless status flipped
+                blocked = u.status in (
+                    UserStatus.limited,
+                    UserStatus.expired,
+                    UserStatus.disabled,
+                )
+                # Quick path: still push when quota just flipped OR user is blocked
+                # so every panel stays frozen after volume (with coeff) is exhausted.
+                if quick and not changed and not blocked:
                     return
                 result = await db.execute(
                     select(PanelAccount).where(PanelAccount.user_id == u.id)
@@ -2348,7 +2414,7 @@ async def refresh_users_usage_batch(
                     u,
                     accounts,
                     status_changed=changed,
-                    force=bool(push_remotes) and not quick,
+                    force=bool(push_remotes) or blocked,
                     shrink_shared_caps=multi,
                 ):
                     await sync_modify_user(db, u)
@@ -2666,7 +2732,12 @@ async def recount_group_usage_local(db: AsyncSession, group_id: int) -> int:
     return len(users)
 
 
-async def resync_users_for_group(db: AsyncSession, group_id: int) -> int:
+async def resync_users_for_group(
+    db: AsyncSession,
+    group_id: int,
+    *,
+    removed_panel_ids: list[int] | None = None,
+) -> int:
     """After group panel membership / coefficient / config change.
 
     For every user (and sample probe) in the sales group:
@@ -2688,6 +2759,7 @@ async def resync_users_for_group(db: AsyncSession, group_id: int) -> int:
     from sqlalchemy import delete
 
     gid = int(group_id)
+    removed_hint = {int(p) for p in (removed_panel_ids or []) if p is not None}
     # Membership = all GroupPanel rows (even inactive panels keep remotes until
     # the admin actually removes the panel from the group).
     gp_ids = await db.execute(
@@ -2721,19 +2793,6 @@ async def resync_users_for_group(db: AsyncSession, group_id: int) -> int:
         accounts = list(acc_q.scalars().all())
         user.panel_accounts = accounts
 
-        stale = [
-            a
-            for a in accounts
-            if a.status != PanelAccountStatus.deleted
-            and getattr(a, "group_id", None) is not None
-            and int(a.group_id) == gid
-            and int(a.panel_id) not in desired_panel_ids
-        ]
-        if stale:
-            await _delete_panel_accounts_remote(db, user, stale)
-
-        # Legacy NULL group_id on a panel no longer linked to any of the
-        # user's groups — delete so remotes don't keep orphan configs.
         ug_all = await db.execute(
             select(UserGroup.group_id).where(UserGroup.user_id == user.id)
         )
@@ -2746,15 +2805,40 @@ async def resync_users_for_group(db: AsyncSession, group_id: int) -> int:
             still_claimed = {
                 int(pid) for (pid,) in claim_q.all() if pid is not None
             }
-        legacy_orphans = [
-            a
-            for a in accounts
-            if a.status != PanelAccountStatus.deleted
-            and getattr(a, "group_id", None) is None
-            and int(a.panel_id) not in still_claimed
-        ]
-        if legacy_orphans:
-            await _delete_panel_accounts_remote(db, user, legacy_orphans)
+
+        # Stale for THIS group: tagged with gid and panel left the group
+        stale: list[PanelAccount] = []
+        seen_acc: set[int] = set()
+        for a in accounts:
+            if a.status == PanelAccountStatus.deleted:
+                continue
+            aid = int(a.id)
+            pid = int(a.panel_id)
+            agid = getattr(a, "group_id", None)
+            # Per-group remote for this sales group, panel unlinked
+            if agid is not None and int(agid) == gid and pid not in desired_panel_ids:
+                stale.append(a)
+                seen_acc.add(aid)
+                continue
+            # Explicitly removed panel ids (hint from group save)
+            if pid in removed_hint and pid not in still_claimed and aid not in seen_acc:
+                stale.append(a)
+                seen_acc.add(aid)
+                continue
+            # Legacy NULL group_id orphan
+            if agid is None and pid not in still_claimed and aid not in seen_acc:
+                stale.append(a)
+                seen_acc.add(aid)
+
+        if stale:
+            await _delete_panel_accounts_remote(db, user, stale, clear_links_always=True)
+            # Force deleted when panel is no longer claimed by any of user's groups
+            for a in stale:
+                if int(a.panel_id) not in still_claimed:
+                    a.status = PanelAccountStatus.deleted
+                    a.links = []
+                    a.links_by_group = {}
+            await db.flush()
 
         if targets:
             await provision_user_on_panels(db, user, targets)

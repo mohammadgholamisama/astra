@@ -8,8 +8,8 @@ import GroupsPage from "./pages/GroupsPage";
 import UsersPage from "./pages/UsersPage";
 import BackupPage from "./pages/BackupPage";
 import SettingsPage from "./pages/SettingsPage";
-import LocationsPage from "./pages/LocationsPage";
 import ConfigsPage from "./pages/ConfigsPage";
+import ConfigOrderPage from "./pages/ConfigOrderPage";
 
 function Private({ children }: { children: React.ReactNode }) {
   const token = useAuth((s) => s.token);
@@ -33,8 +33,8 @@ export default function App() {
         <Route path="panels" element={<PanelsPage />} />
         <Route path="groups" element={<GroupsPage />} />
         <Route path="users" element={<UsersPage />} />
-        <Route path="locations" element={<LocationsPage />} />
         <Route path="configs" element={<ConfigsPage />} />
+        <Route path="config-order" element={<ConfigOrderPage />} />
         <Route path="backup" element={<BackupPage />} />
         <Route path="settings" element={<SettingsPage />} />
       </Route>

@@ -17,6 +17,7 @@ from app.api import (
     auth,
     backup,
     config_locations,
+    config_orders,
     group_configs,
     groups,
     panels,
@@ -27,6 +28,7 @@ from app.api import (
     users,
 )
 # ensure new models are registered for schema sync
+from app.models import config_link_order as _config_link_order_model  # noqa: F401
 from app.models import config_location as _config_location_model  # noqa: F401
 from app.models import group_config as _group_config_model  # noqa: F401
 from app.models import group_config_hide as _group_config_hide_model  # noqa: F401
@@ -38,6 +40,7 @@ from app.core.schema_sync import ensure_schema
 from app.seed import seed_admin
 from app.services.config_hides import refresh_cache as refresh_config_hides
 from app.services.config_locations import refresh_cache as refresh_config_locations
+from app.services.config_orders import refresh_cache as refresh_config_orders
 from app.services.site_settings import refresh_cache as refresh_site_settings
 
 settings = get_settings()
@@ -46,7 +49,11 @@ logger = logging.getLogger("astra")
 
 
 async def _usage_sync_loop() -> None:
-    """Keep Astra used_traffic fresh so the admin list is not stuck at 0."""
+    """Every ~1 minute: pull raw usage × coeff, and disable remotes when quota ends.
+
+    When Astra weighted used_traffic hits data_limit, status → limited and
+    sync_modify freezes configs on every panel (Marzban/PasarGuard/Sanaei/Rebecca).
+    """
     from app.services.orchestrator import refresh_users_usage_batch
 
     await asyncio.sleep(8)
@@ -55,10 +62,21 @@ async def _usage_sync_loop() -> None:
             async with AsyncSessionLocal() as db:
                 result = await db.execute(
                     select(User)
-                    .where(User.status.in_((UserStatus.active, UserStatus.on_hold, UserStatus.limited)))
-                    .options(selectinload(User.panel_accounts).selectinload(PanelAccount.panel))
+                    .where(
+                        User.status.in_(
+                            (
+                                UserStatus.active,
+                                UserStatus.on_hold,
+                                UserStatus.limited,
+                                UserStatus.expired,
+                            )
+                        )
+                    )
+                    .options(
+                        selectinload(User.panel_accounts).selectinload(PanelAccount.panel)
+                    )
                     .order_by(User.id.desc())
-                    .limit(200)
+                    .limit(2000)
                 )
                 users = list(result.scalars().unique().all())
                 if users:
@@ -66,8 +84,9 @@ async def _usage_sync_loop() -> None:
                         db,
                         users,
                         force=True,
-                        concurrency=12,
-                        push_remotes=False,
+                        concurrency=16,
+                        # Must push disables when weighted quota is exhausted
+                        push_remotes=True,
                         quick=True,
                     )
                     await db.commit()
@@ -76,7 +95,7 @@ async def _usage_sync_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("usage sync loop failed")
-        await asyncio.sleep(30)
+        await asyncio.sleep(60)
 
 
 def _resolve_frontend_dist() -> Path | None:
@@ -109,6 +128,7 @@ async def lifespan(_app: FastAPI):
         await refresh_site_settings(db)
         await refresh_config_locations(db)
         await refresh_config_hides(db)
+        await refresh_config_orders(db)
     usage_task = asyncio.create_task(_usage_sync_loop(), name="astra-usage-sync")
     try:
         yield
@@ -179,6 +199,7 @@ app.include_router(templates.router)
 app.include_router(api_keys.router)
 app.include_router(settings_api.router)
 app.include_router(config_locations.router)
+app.include_router(config_orders.router)
 app.include_router(backup.router)
 app.include_router(subscription.router)
 app.include_router(system.router)

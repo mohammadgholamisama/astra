@@ -406,12 +406,26 @@ async def delete_panel(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
+    """Remove panel from Astra AFTER deleting its configs on the remote panel.
+
+    Every PanelAccount on this panel is deleted upstream (Marzban / PasarGuard /
+    Sanaei / Rebecca) so old and new subs lose those configs and remotes stay clean.
+    """
+    from app.services.orchestrator import deprovision_all_accounts_on_panel
+
     panel = await db.get(Panel, panel_id)
     if not panel:
         raise HTTPException(status_code=404, detail="Panel not found")
+
+    stats = await deprovision_all_accounts_on_panel(db, panel_id)
     await db.delete(panel)
     await db.commit()
-    return {"detail": "Panel deleted"}
+    return {
+        "detail": "Panel deleted",
+        "remote_deleted": stats.get("ok", 0),
+        "remote_failed": stats.get("fail", 0),
+        "accounts": stats.get("accounts", 0),
+    }
 
 
 @router.post("/api/panel/{panel_id}/test")
