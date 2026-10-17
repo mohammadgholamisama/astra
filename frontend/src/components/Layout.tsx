@@ -12,6 +12,7 @@ import {
   Users,
   Layers,
   X,
+  type LucideIcon,
 } from "lucide-react";
 import ThemeToggle from "./ThemeToggle";
 import { useAuth } from "../store/auth";
@@ -24,7 +25,20 @@ function docsHref(): string {
   return "/docs";
 }
 
-const navSections = [
+type NavItem = {
+  to: string;
+  label: string;
+  icon: LucideIcon;
+  end?: boolean;
+};
+
+type NavSection = {
+  id: string;
+  title: string;
+  links: NavItem[];
+};
+
+const navSections: NavSection[] = [
   {
     id: "main",
     title: "مدیریت",
@@ -45,9 +59,9 @@ const navSections = [
       { to: "/settings", label: "تنظیمات", icon: Settings },
     ],
   },
-] as const;
+];
 
-const allLinks = navSections.flatMap((s) => s.links);
+const allLinks: NavItem[] = navSections.flatMap((s) => s.links);
 
 export default function Layout() {
   const logout = useAuth((s) => s.logout);
@@ -147,7 +161,7 @@ export default function Layout() {
                     <NavLink
                       key={l.to}
                       to={l.to}
-                      end={"end" in l ? l.end : undefined}
+                      end={l.end}
                       className={({ isActive }) =>
                         `nav-link${isActive ? " active" : ""}`
                       }
