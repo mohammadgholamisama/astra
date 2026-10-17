@@ -182,25 +182,32 @@ def build_config_remark(
     used: int = 0,
     limit: int = 0,
     brand_tag: str | None = None,
+    location_flag: str | None = None,
 ) -> str:
     """Real config title:
 
     - no tag:  ``#2. 2.5G | name``
     - with tag: ``#2. text 2.5G | name``
+    - with flag: ``#2. 2.5G | name 🇩🇪`` (after username)
 
-    brand_tag comes from settings; empty → omitted entirely (no ``[]``).
+    brand_tag comes from group/settings; location_flag from host:port map.
     Not used for notice / promo / status rows.
     """
     base = " ".join(to_en_digits(name or "").split()).strip() or "config"
-    # Keep ASCII-ish name for picky clients (no emoji in real config titles)
+    # Keep ASCII-ish username; flag is appended separately after the name
     base = re.sub(r"[^\w\s.\-]+", "", base, flags=re.UNICODE).strip() or "config"
     tag = " ".join((brand_tag or "").split()).strip()
     tag = re.sub(r"[\x00-\x1f\x7f<>\"'`]", "", tag)[:24]
+    # Country flag from host:port map (regional-indicator pair, e.g. 🇩🇪)
+    flag = re.sub(r"[\x00-\x1f\x7f]", "", str(location_flag or "")).strip()
+    if flag and not all(0x1F1E6 <= ord(ch) <= 0x1F1FF for ch in flag):
+        flag = "".join(ch for ch in flag if 0x1F1E6 <= ord(ch) <= 0x1F1FF)
     _badge, remain = remain_badge(used, limit)
     cid = int(config_id)
+    name_part = f"{base} {flag}".strip() if flag else base
     if tag:
-        return f"#{cid}. {tag} {remain} | {base}"
-    return f"#{cid}. {remain} | {base}"
+        return f"#{cid}. {tag} {remain} | {name_part}"
+    return f"#{cid}. {remain} | {name_part}"
 
 
 def apply_display_name(
@@ -211,14 +218,22 @@ def apply_display_name(
     limit: int = 0,
     username: str | None = None,
     brand_tag: str | None = None,
+    brand_tags_by_panel: dict[int, str] | None = None,
 ) -> list[dict]:
-    """Rename + sanitize REAL configs only — notices / status / promo stay untouched."""
+    """Rename + sanitize REAL configs only — notices / status / promo stay untouched.
+
+    Tag priority per row:
+      1) ``row["config_tag"]`` (per-group match from collect_links)
+      2) ``brand_tags_by_panel[panel_id]`` (legacy fallback)
+      3) global ``brand_tag``
+    """
     if not links:
         return links
 
     preferred = (display_name or "").strip() or (username or "").strip()
     real = [r for r in links if r.get("kind") not in ("notice", "status", "promo")]
     special = [r for r in links if r.get("kind") in ("notice", "status", "promo")]
+    panel_tags = brand_tags_by_panel or {}
     out: list[dict] = []
     for i, row in enumerate(real):
         link = sanitize_share_link(row.get("link") or "")
@@ -226,12 +241,31 @@ def apply_display_name(
         if " · " in original and preferred:
             original = ""
         name = preferred or original or "config"
+        pid = row.get("panel_id")
+        try:
+            pid_i = int(pid) if pid is not None else 0
+        except (TypeError, ValueError):
+            pid_i = 0
+        if "config_tag" in row:
+            tag = row.get("config_tag") or None
+        else:
+            tag = panel_tags.get(pid_i) if pid_i else None
+        if tag is None:
+            tag = brand_tag
+        location_flag = None
+        try:
+            from app.services.config_locations import flag_for_link
+
+            location_flag = flag_for_link(link)
+        except Exception:  # noqa: BLE001
+            location_flag = None
         remark = build_config_remark(
             name=name,
             config_id=i + 1,
             used=used,
             limit=limit,
-            brand_tag=brand_tag,
+            brand_tag=tag,
+            location_flag=location_flag,
         )
         new_link = rewrite_link_remark(link, remark)
         out.append({**row, "link": new_link, "remark": remark, "config_id": i + 1})

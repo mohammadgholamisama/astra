@@ -2,32 +2,53 @@
 Shared Astra traffic quota across remote panels.
 
 Create / remote caps:
-    Every panel gets the FULL purchased data_limit (e.g. 4GB → 4GB on all).
+    Every remote account gets the FULL purchased data_limit (e.g. 4GB → 4GB on all).
     Coefficient does NOT shrink the remote create/modify data_limit.
 
 Usage (what the end-user / admin sees):
-    used_astra = Σ over panels  (raw_i × coefficient_i)
+    used_astra = Σ over accounts  (raw_i × coefficient_of_that_account's_group)
 
-Example: panel A raw 30MB × coeff 3 = 90MB; panel B raw 20MB × coeff 2 = 40MB
-→ used_astra = 130MB.
+Each sales group that includes a panel gets its own remote account on that panel
+when needed, so coefficients never steal traffic from another group:
+
+    Group1: 10MB raw × 2 = 20MB
+    Group2: 20MB raw × 3 = 60MB
+    Group3: 10MB raw × 4 = 40MB
+    Group4: 45MB raw × 1 = 45MB
+    → used_astra = 165MB
 
 When used_astra >= data_limit → status=limited and ALL remotes are frozen/disabled.
 Remotes may still show leftover raw bytes; Astra is the source of truth.
 
-Coefficient always applies to the full current raw on that panel (no legacy
+Coefficient always applies to the full current raw on that account (no legacy
 period lock). Changing coeff 1→3 immediately recounts existing raw × 3.
 """
 
 from __future__ import annotations
 
 
-def norm_coeff(raw: float | None, default: float = 1.0) -> float:
+_DIGIT_TRANS = str.maketrans(
+    "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+    "01234567890123456789",
+)
+
+
+def norm_coeff(raw: float | str | None, default: float = 1.0) -> float:
+    """Normalize Astra usage coefficient (e.g. 1.33 → raw×1.33 on Astra).
+
+    Accepts int/float/str; comma decimals (1,33) and Persian/Arabic digits.
+    """
+    if isinstance(raw, str):
+        s = raw.strip().translate(_DIGIT_TRANS).replace(",", ".")
+        raw = s if s else default
     try:
         c = float(raw if raw is not None else default)
     except (TypeError, ValueError):
-        c = default
+        c = float(default)
     if c < 0.01:
         c = 0.01
+    if c > 1000.0:
+        c = 1000.0
     return c
 
 
@@ -38,7 +59,7 @@ def weighted_bytes(
     anchor_raw: int = 0,
     anchor_weighted: int = 0,
 ) -> int:
-    """Astra-facing usage for one panel: raw × current coefficient.
+    """Astra-facing usage for one account: raw × current coefficient.
 
     anchor_* kept for call-site compatibility but ignored — admin expectation is
     always full raw × live group coefficient.

@@ -413,7 +413,10 @@ async def _force_reset_sample_remotes(
             pass
 
     await asyncio.gather(
-        *[_remote_delete(panel, by_panel.get(panel.id)) for panel, _cfg in panels]
+        *[
+            _remote_delete(panel, by_panel.get(panel.id))
+            for panel, *_rest in panels
+        ]
     )
 
     for account in existing:
@@ -466,13 +469,19 @@ async def create_or_refresh_sample(db: AsyncSession, group_id: int) -> GroupConf
         raise ValueError("ساخت کاربر نمونه ناموفق بود")
 
     # If Rebecca burned the sample username via soft-delete, rotate and retry once
-    rebecca_panels = [(p, c) for p, c in panels if getattr(p, "type", None) == PanelType.rebecca]
+    # panels are (panel, config, group_id) triples from resolve_panels_for_groups
+    rebecca_panels = [
+        (p, c, g)
+        for p, c, g in panels
+        if getattr(p, "type", None) == PanelType.rebecca
+    ]
     if rebecca_panels:
         accounts = await _load_panel_accounts(db, user.id)
+        rebecca_ids = {p.id for p, _c, _g in rebecca_panels}
         trapped = [
             a
             for a in accounts
-            if a.panel_id in {p.id for p, _ in rebecca_panels}
+            if a.panel_id in rebecca_ids
             and a.status != PanelAccountStatus.active
             and (
                 "soft-delete" in (a.error_message or "").lower()
@@ -488,7 +497,7 @@ async def create_or_refresh_sample(db: AsyncSession, group_id: int) -> GroupConf
             await db.flush()
             # wipe local rebecca accounts then reprovision only those panels
             for a in accounts:
-                if a.panel_id in {p.id for p, _ in rebecca_panels}:
+                if a.panel_id in rebecca_ids:
                     await db.delete(a)
             await db.flush()
             await orchestrator.provision_user_on_panels(db, user, rebecca_panels)

@@ -212,12 +212,12 @@ async def expand_subscription_links(
         "Accept": "text/plain, */*",
         **(headers or {}),
     }
-    # Short per-sub timeout — sub page must stay snappy with many panels
-    sub_timeout = httpx.Timeout(5.0, connect=3.0)
+    # Fail-fast per-sub — many panels in parallel must not stall the feed
+    sub_timeout = httpx.Timeout(3.0, connect=1.8)
 
     async def _fetch_absolute(url: str) -> list[str]:
         # Fail fast on dead CDN hosts so we can fall back to panel /sub
-        abs_timeout = httpx.Timeout(4.0, connect=2.5)
+        abs_timeout = httpx.Timeout(2.8, connect=1.6)
         try:
             async with httpx.AsyncClient(
                 timeout=abs_timeout,

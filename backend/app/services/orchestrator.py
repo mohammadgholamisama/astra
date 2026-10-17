@@ -103,6 +103,14 @@ def make_remote_username_alias(
     return sanitize_remote_username(candidate)[:32]
 
 
+def make_group_remote_username(astra_username: str, group_id: int) -> str:
+    """Remote name when several Astra groups share one panel: ``{base}_g{group_id}``."""
+    base = sanitize_remote_username(astra_username)
+    suffix = f"_g{int(group_id)}"
+    keep = max(3, 32 - len(suffix))
+    return sanitize_remote_username(f"{base[:keep]}{suffix}")[:32]
+
+
 def _astra_note(user: User, remote_username: str) -> str:
     """Tag remote note so panel admins see Astra ownership."""
     base = (user.note or "").strip()
@@ -369,12 +377,9 @@ async def _lock_for_user(user_id: int) -> asyncio.Lock:
 
 
 def merge_group_panel_configs(a: dict, b: dict) -> dict:
-    """Merge two GroupPanel configs for the same remote panel.
+    """Merge two GroupPanel configs (legacy helper for scripts / probes).
 
-    Critical when admin selects e.g. Hajmi4-Direct + Hajmi4-Tunnel:
-    - protocols / inbounds are unioned (not overwritten)
-    - PasarGuard remote_group_ids / group_ids are unioned
-    - coefficient = max
+    Prefer per-group PanelAccounts — coefficients must stay independent.
     """
     out = {**a, **b}
 
@@ -431,10 +436,13 @@ def merge_group_panel_configs(a: dict, b: dict) -> dict:
     return out
 
 
-async def resolve_panels_for_groups(db: AsyncSession, group_ids: list[int]) -> list[tuple[Panel, dict]]:
-    """Return unique (panel, merged_config) for all panels in given groups.
+async def resolve_panels_for_groups(
+    db: AsyncSession, group_ids: list[int]
+) -> list[tuple[Panel, dict, int]]:
+    """Return one (panel, config, group_id) per GroupPanel link.
 
-    Same panel in multiple groups → one account; configs unioned (protocols/inbounds/groups).
+    Same panel in multiple groups → multiple targets (separate remote accounts)
+    so each group's coefficient applies only to that group's traffic.
     """
     if not group_ids:
         return []
@@ -442,21 +450,37 @@ async def resolve_panels_for_groups(db: AsyncSession, group_ids: list[int]) -> l
         select(GroupPanel)
         .where(GroupPanel.group_id.in_(group_ids))
         .options(selectinload(GroupPanel.panel))
-        .order_by(GroupPanel.priority.desc())
+        .order_by(GroupPanel.group_id.asc(), GroupPanel.priority.desc())
     )
     links = result.scalars().all()
-    seen: dict[int, tuple[Panel, dict]] = {}
+    out: list[tuple[Panel, dict, int]] = []
+    seen_keys: set[tuple[int, int]] = set()
     for link in links:
         panel = link.panel
         if not panel or not panel.is_active:
             continue
-        cfg = dict(link.config or {})
-        if panel.id not in seen:
-            seen[panel.id] = (panel, cfg)
+        gid = int(link.group_id)
+        key = (int(panel.id), gid)
+        if key in seen_keys:
             continue
-        prev_cfg = dict(seen[panel.id][1])
-        seen[panel.id] = (panel, merge_group_panel_configs(prev_cfg, cfg))
-    return list(seen.values())
+        seen_keys.add(key)
+        out.append((panel, dict(link.config or {}), gid))
+    return out
+
+
+def _normalize_panel_targets(
+    panels: list[tuple[Panel, dict] | tuple[Panel, dict, int]],
+) -> list[tuple[Panel, dict, int]]:
+    """Accept legacy (panel, cfg) or new (panel, cfg, group_id) tuples."""
+    out: list[tuple[Panel, dict, int]] = []
+    for item in panels:
+        if len(item) >= 3:
+            panel, cfg, gid = item[0], item[1], int(item[2])
+        else:
+            panel, cfg = item[0], item[1]
+            gid = 0
+        out.append((panel, dict(cfg or {}), gid))
+    return out
 
 
 def _exc_msg(exc: BaseException) -> str:
@@ -484,52 +508,102 @@ def _fail_result(error: str) -> AdapterResult:
 async def provision_user_on_panels(
     db: AsyncSession,
     user: User,
-    panels: list[tuple[Panel, dict]],
+    panels: list[tuple[Panel, dict] | tuple[Panel, dict, int]],
 ) -> list[PanelAccount]:
-    """Create on all remotes in parallel (capped concurrency).
+    """Create one remote account per (panel × group) in parallel.
 
-    Wall time ~ ceil(N / PANEL_REMOTE_CONCURRENCY) * slowest panel.
+    When several Astra groups share a panel, each group gets its own remote
+    user (``username_g{id}``) so raw usage × that group's coefficient is exact.
     """
-    if not panels:
+    targets = _normalize_panel_targets(panels)
+    if not targets:
         return []
 
     t_prov = time.monotonic()
-    panel_ids = [p.id for p, _ in panels]
+    panel_ids = list({p.id for p, _, _ in targets})
     existing_rows = await db.execute(
         select(PanelAccount).where(
             PanelAccount.user_id == user.id,
             PanelAccount.panel_id.in_(panel_ids),
         )
     )
-    by_panel = {a.panel_id: a for a in existing_rows.scalars().all()}
+    existing = list(existing_rows.scalars().all())
+    by_key: dict[tuple[int, int], PanelAccount] = {}
+    legacy_by_panel: dict[int, PanelAccount] = {}
+    for a in existing:
+        gid = getattr(a, "group_id", None)
+        if gid is None:
+            # Only keep first legacy row per panel
+            legacy_by_panel.setdefault(int(a.panel_id), a)
+        else:
+            by_key[(int(a.panel_id), int(gid))] = a
 
-    jobs: list[tuple[PanelAccount, Panel, UserPayload]] = []
+    panel_counts: dict[int, int] = {}
+    for p, _, gid in targets:
+        if gid:
+            panel_counts[p.id] = panel_counts.get(p.id, 0) + 1
+
+    # Assign legacy merged accounts to the lowest group_id on that panel
+    claimed_legacy: set[int] = set()
+    for panel, _cfg, group_id in sorted(targets, key=lambda t: (t[0].id, t[2])):
+        if not group_id:
+            continue
+        key = (panel.id, group_id)
+        if key in by_key:
+            continue
+        leg = legacy_by_panel.get(panel.id)
+        if leg is not None and leg.id not in claimed_legacy:
+            leg.group_id = group_id
+            by_key[key] = leg
+            claimed_legacy.add(leg.id)
+
+    jobs: list[tuple[PanelAccount, Panel, UserPayload, int]] = []
     created_any = False
-    for panel, config in panels:
-        account = by_panel.get(panel.id)
+    for panel, config, group_id in targets:
+        gid = int(group_id or 0)
+        key = (panel.id, gid) if gid else (panel.id, 0)
+        account = by_key.get(key) if gid else None
+        if account is None and not gid:
+            account = legacy_by_panel.get(panel.id)
         if account is None:
             account = PanelAccount(
-                user_id=user.id, panel_id=panel.id, status=PanelAccountStatus.pending
+                user_id=user.id,
+                panel_id=panel.id,
+                group_id=gid or None,
+                status=PanelAccountStatus.pending,
             )
             db.add(account)
-            by_panel[panel.id] = account
+            if gid:
+                by_key[key] = account
             created_any = True
-        # Prefer stored alias if this panel already collided before
-        preferred = (account.remote_username or user.username or "").strip()
+        else:
+            account.group_id = gid or account.group_id
+
+        shared = panel_counts.get(panel.id, 0) > 1 and gid > 0
+        existing_name = (account.remote_username or "").strip()
+        if existing_name:
+            preferred = existing_name
+        elif shared:
+            preferred = make_group_remote_username(user.username, gid)
+        else:
+            preferred = (user.username or "").strip()
+
         payload = build_user_payload(
             user,
             uuid=account.uuid,
             panel_config=config,
             remote_username=preferred,
         )
-        jobs.append((account, panel, payload))
+        jobs.append((account, panel, payload, gid))
 
     if created_any:
         await db.flush()
 
     sem = _remote_sem()
 
-    async def _remote(panel: Panel, payload: UserPayload) -> AdapterResult:
+    async def _remote(
+        panel: Panel, payload: UserPayload, *, prefer_modify: bool
+    ) -> AdapterResult:
         adapter = get_adapter(panel)
         t0 = time.monotonic()
         create_timeout = 30.0
@@ -538,6 +612,19 @@ async def provision_user_on_panels(
             create_timeout = 35.0
         try:
             async with sem:
+                if prefer_modify:
+                    try:
+                        mod = await asyncio.wait_for(
+                            adapter.modify_user(payload), timeout=create_timeout
+                        )
+                        if mod.success:
+                            return mod
+                        # Missing on remote → fall through to create
+                        if not _is_not_found_err(mod.error):
+                            # Still try create/upsert path for forks that reject modify
+                            pass
+                    except Exception:  # noqa: BLE001
+                        pass
                 return await create_user_with_collision_alias(
                     adapter,
                     payload,
@@ -560,22 +647,36 @@ async def provision_user_on_panels(
                 pass
 
     results = await asyncio.gather(
-        *[_remote(panel, payload) for _, panel, payload in jobs]
+        *[
+            _remote(
+                panel,
+                payload,
+                prefer_modify=bool((account.remote_username or "").strip())
+                and account.status
+                in (
+                    PanelAccountStatus.active,
+                    PanelAccountStatus.error,
+                ),
+            )
+            for account, panel, payload, _ in jobs
+        ]
     )
 
     accounts: list[PanelAccount] = []
     now = datetime.now(timezone.utc)
-    for (account, panel, payload), result in zip(jobs, results):
+    for (account, panel, payload, gid), result in zip(jobs, results):
         coeff = coefficient_from_config(payload.config or {})
+        if gid:
+            account.group_id = gid
         if result.success:
             account.status = PanelAccountStatus.active
-            # Persist the name actually used on remote (may be alias)
             account.remote_username = (
                 result.remote_username or payload.username or user.username
             )
             account.remote_id = result.remote_id or account.remote_id
             account.uuid = result.uuid or account.uuid
             account.links = result.links or account.links or []
+            account.links_by_group = None
             account.used_traffic = int(result.used_traffic or 0)
             account.coeff_anchor_raw = 0
             account.coeff_anchor_weighted = 0
@@ -594,7 +695,6 @@ async def provision_user_on_panels(
         accounts.append(account)
 
     await db.flush()
-    # Expand /sub refs now so first /sub page has ALL panel configs (esp. PasarGuard)
     try:
         reloaded = await db.execute(
             select(User)
@@ -608,7 +708,7 @@ async def provision_user_on_panels(
         logger.warning("provision hydrate user=%s: %s", user.username, _exc_msg(exc))
 
     logger.info(
-        "provision done user=%s panels=%s ok=%s total=%.2fs",
+        "provision done user=%s targets=%s ok=%s total=%.2fs",
         user.username,
         len(jobs),
         sum(1 for a in accounts if a.status == PanelAccountStatus.active),
@@ -707,13 +807,15 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
 
     ug = await db.execute(select(UserGroup.group_id).where(UserGroup.user_id == user.id))
     group_ids = [row[0] for row in ug.all()]
-    panel_cfg: dict[int, dict] = {}
+    claim_cfg: dict[tuple[int, int], dict] = {}
+    panel_ids_in_groups: set[int] = set()
     if group_ids:
-        for panel, cfg in await resolve_panels_for_groups(db, group_ids):
-            panel_cfg[panel.id] = cfg
+        for panel, cfg, gid in await resolve_panels_for_groups(db, group_ids):
+            claim_cfg[(int(panel.id), int(gid))] = dict(cfg or {})
+            panel_ids_in_groups.add(int(panel.id))
 
-    coeffs = await panel_coefficients_for_user(db, user)
-    weighted = await _weighted_total(accounts, coeffs)
+    account_coeffs = await account_coefficients_for_user(db, user, accounts)
+    weighted = await _weighted_total(accounts, account_coeffs)
     user.used_traffic = weighted
 
     blocked = user.status in (
@@ -729,20 +831,33 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
             continue
         if account.status == PanelAccountStatus.deleted:
             continue
+        gid = int(getattr(account, "group_id", 0) or 0)
+        claim_key = (int(account.panel_id), gid) if gid else None
+        in_groups = (
+            (claim_key in claim_cfg)
+            if claim_key
+            else (int(account.panel_id) in panel_ids_in_groups)
+        )
         # Skip orphan panel rows (no longer in user's groups) unless freezing all
-        if panel.id not in panel_cfg and not blocked:
-            # Drop noisy false errors from leftover accounts of removed groups
+        if not in_groups and not blocked:
             if account.status == PanelAccountStatus.error and not (account.links or []):
                 account.status = PanelAccountStatus.deleted
                 account.error_message = None
             continue
         # Still push disable/limits to error accounts — they often exist on remote
-        merged = dict(panel_cfg.get(panel.id) or {})
+        if claim_key and claim_key in claim_cfg:
+            cfg = dict(claim_cfg[claim_key])
+        else:
+            # Legacy NULL group_id: pick any claim config for this panel
+            cfg = next(
+                (dict(c) for (pid, _g), c in claim_cfg.items() if pid == account.panel_id),
+                {},
+            )
         rem_name = (account.remote_username or user.username or "").strip()
         payload = build_user_payload(
             user,
             uuid=account.uuid,
-            panel_config=merged,
+            panel_config=cfg,
             used_weighted_total=weighted,
             used_raw_on_panel=int(account.used_traffic or 0),
             remote_username=rem_name,
@@ -852,8 +967,8 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
                 )
     await db.flush()
     # Recompute weighted usage after any raw changes (existing panels unchanged)
-    coeffs = await panel_coefficients_for_user(db, user)
-    user.used_traffic = await _weighted_total(accounts, coeffs)
+    account_coeffs = await account_coefficients_for_user(db, user, accounts)
+    user.used_traffic = await _weighted_total(accounts, account_coeffs)
     await db.flush()
 
 
@@ -960,28 +1075,414 @@ async def retry_failed_accounts(db: AsyncSession, user: User) -> list[PanelAccou
 
     ug = await db.execute(select(UserGroup.group_id).where(UserGroup.user_id == user.id))
     group_ids = [row[0] for row in ug.all()]
-    cfg_by_panel: dict[int, dict] = {}
+    claim_cfg: dict[tuple[int, int], dict] = {}
     if group_ids:
-        for panel, cfg in await resolve_panels_for_groups(db, group_ids):
-            cfg_by_panel[panel.id] = cfg
+        for panel, cfg, gid in await resolve_panels_for_groups(db, group_ids):
+            claim_cfg[(int(panel.id), int(gid))] = dict(cfg or {})
 
-    panels = [
-        (a.panel, dict(cfg_by_panel.get(a.panel_id) or {}))
-        for a in failed
-        if a.panel
-    ]
+    panels: list[tuple[Panel, dict, int]] = []
+    for a in failed:
+        if not a.panel:
+            continue
+        gid = int(getattr(a, "group_id", 0) or 0)
+        cfg = claim_cfg.get((int(a.panel_id), gid)) or next(
+            (c for (pid, _g), c in claim_cfg.items() if pid == a.panel_id),
+            {},
+        )
+        panels.append((a.panel, dict(cfg), gid))
     return await provision_user_on_panels(db, user, panels)
 
 
-async def collect_links(user: User, *, include_notices: bool = False) -> list[str]:
-    return [
-        row["link"]
-        for row in collect_links_detailed(user, include_notices=include_notices)
-        if row.get("link")
-    ]
+def _normalize_config_tag(raw: object) -> str:
+    return " ".join(str(raw or "").split()).strip()[:24]
 
 
-def collect_links_detailed(user: User, *, include_notices: bool = True) -> list[dict]:
+def _link_protocol(link: str) -> str:
+    """Normalize share-link scheme to a protocol key (vless / shadowsocks / …)."""
+    raw = (link or "").strip().lower()
+    if not raw:
+        return ""
+    if raw.startswith("ss://"):
+        return "shadowsocks"
+    if "://" not in raw:
+        return ""
+    scheme = raw.split("://", 1)[0].strip()
+    if scheme in ("ss", "shadowsocks"):
+        return "shadowsocks"
+    if scheme in ("hy2", "hysteria2"):
+        return "hysteria2"
+    return scheme
+
+
+def _group_config_protocols(config: dict | None) -> set[str]:
+    """Protocols this group expects on its panel (from GroupPanel.config)."""
+    cfg = config or {}
+    out: set[str] = set()
+    for p in cfg.get("protocols") or []:
+        key = str(p or "").strip().lower()
+        if not key:
+            continue
+        if key in ("ss", "shadowsocks"):
+            out.add("shadowsocks")
+        elif key in ("hy2", "hysteria2"):
+            out.add("hysteria2")
+        else:
+            out.add(key)
+    inbounds = cfg.get("inbounds")
+    if isinstance(inbounds, dict):
+        for k in inbounds.keys():
+            key = str(k or "").strip().lower()
+            if not key:
+                continue
+            if key in ("ss", "shadowsocks"):
+                out.add("shadowsocks")
+            elif key in ("hy2", "hysteria2"):
+                out.add("hysteria2")
+            else:
+                out.add(key)
+    return out
+
+
+def _link_fit_group_config(link: str, config: dict | None) -> str:
+    """How well a share link matches a group's panel config.
+
+    Returns:
+      - ``specific``: group filters by protocol and this link matches
+      - ``broad``: group has no protocol filter (PasarGuard/Sanaei) — claims all on panel
+      - ``no``: group filters by protocol and this link does not match
+    """
+    protos = _group_config_protocols(config)
+    if not protos:
+        return "broad"
+    lp = _link_protocol(link)
+    if not lp or lp in ("http", "https"):
+        # Not yet expanded /sub or unknown — don't force a protocol group
+        return "broad"
+    return "specific" if lp in protos else "no"
+
+
+def _remote_group_ids(config: dict | None) -> list[int]:
+    cfg = config or {}
+    raw = cfg.get("remote_group_ids") or cfg.get("group_ids") or []
+    out: list[int] = []
+    for x in raw:
+        try:
+            out.append(int(x))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _partition_links_by_protocol(
+    all_links: list[str],
+    claims: list[dict],
+) -> dict[str, list[str]] | None:
+    """Split links by Marzban-style protocol filters.
+
+    Returns None when any claim has no protocol filter (needs remote partition)
+    while multiple claims share the panel — caller must use remote_group split.
+    """
+    from app.adapters.http_utils import is_share_link
+
+    if not claims:
+        return {}
+    specific = [c for c in claims if _group_config_protocols(c.get("config"))]
+    broad = [c for c in claims if not _group_config_protocols(c.get("config"))]
+    # Ambiguous PasarGuard/Sanaei multi-group share → cannot protocol-split
+    if len(broad) > 1:
+        return None
+    if not specific and len(claims) == 1:
+        gid = str(claims[0]["group_id"])
+        return {gid: [l for l in all_links if is_share_link(l)]}
+
+    out: dict[str, list[str]] = {str(c["group_id"]): [] for c in claims}
+    assigned: set[str] = set()
+    for link in all_links:
+        if not is_share_link(link) or link in assigned:
+            continue
+        hit = False
+        for c in specific:
+            if _link_fit_group_config(link, c.get("config")) == "specific":
+                out[str(c["group_id"])].append(link)
+                assigned.add(link)
+                hit = True
+                break
+        if hit:
+            continue
+        # leftovers → single broad claim, else first specific
+        if broad:
+            out[str(broad[0]["group_id"])].append(link)
+            assigned.add(link)
+        elif specific:
+            out[str(specific[0]["group_id"])].append(link)
+            assigned.add(link)
+    return out
+
+
+_partition_locks: dict[str, asyncio.Lock] = {}
+
+
+async def _partition_pasarguard_by_remote_groups(
+    user: User,
+    account: PanelAccount,
+    claims: list[dict],
+) -> dict[str, list[str]] | None:
+    """Fetch link sets per remote_group_ids by briefly switching PG group membership.
+
+    Restores original group_ids afterwards. Locked per remote user.
+    """
+    from app.adapters.base import UserPayload
+    from app.adapters.http_utils import expand_subscription_links, is_share_link, make_client
+
+    panel = account.__dict__.get("panel")
+    if panel is None:
+        return None
+    ptype = getattr(panel, "type", None)
+    ptype_s = ptype.value if hasattr(ptype, "value") else str(ptype or "")
+    if ptype_s != "pasarguard":
+        return None
+
+    # frozenset(remote_gids) → [astra group_ids]
+    buckets: dict[frozenset[int], list[int]] = {}
+    for c in claims:
+        rids = frozenset(_remote_group_ids(c.get("config")))
+        if not rids:
+            return None
+        buckets.setdefault(rids, []).append(int(c["group_id"]))
+    if len(buckets) <= 1:
+        return None
+
+    uname = (account.remote_username or user.username or "").strip()
+    if not uname:
+        return None
+
+    lock_key = f"{panel.id}:{uname}"
+    lock = _partition_locks.setdefault(lock_key, asyncio.Lock())
+    adapter = get_adapter(panel)
+
+    async with lock:
+        try:
+            cur = await adapter.get_usage(uname, expand_links=False)
+            if not cur or not cur.success:
+                return None
+            raw = cur.raw if isinstance(cur.raw, dict) else {}
+            original_gids = [int(x) for x in (raw.get("group_ids") or []) if x is not None]
+            if not original_gids:
+                original_gids = sorted({i for s in buckets for i in s})
+
+            base_payload = UserPayload(
+                username=uname,
+                data_limit=int(user.data_limit or 0),
+                expire=int(user.expire or 0) or None,
+                status=user.status.value if hasattr(user.status, "value") else str(user.status),
+                note=getattr(user, "note", None),
+                config={},
+            )
+            out: dict[str, list[str]] = {}
+            client = make_client(
+                panel.base_url,
+                bool((panel.meta or {}).get("verify_ssl", False)),
+                timeout=8.0,
+                xhr=False,
+            )
+            try:
+                for rids, gids in buckets.items():
+                    base_payload.config = {"remote_group_ids": list(rids), "group_ids": list(rids)}
+                    mod = await adapter.modify_user(base_payload)
+                    if not mod.success:
+                        logger.warning(
+                            "tag-partition modify failed user=%s gids=%s: %s",
+                            uname,
+                            list(rids),
+                            mod.error,
+                        )
+                        continue
+                    res = await adapter.get_usage(uname, expand_links=False)
+                    raw_links = [str(x).strip() for x in (res.links or []) if x]
+                    shares = [x for x in raw_links if is_share_link(x)]
+                    if not shares and raw_links:
+                        try:
+                            shares = await asyncio.wait_for(
+                                expand_subscription_links(client, raw_links), timeout=10
+                            )
+                        except Exception:  # noqa: BLE001
+                            shares = []
+                    shares = [x for x in (shares or []) if is_share_link(x)]
+                    for gid in gids:
+                        out[str(gid)] = list(shares)
+            finally:
+                await client.aclose()
+                # Always restore full membership
+                base_payload.config = {
+                    "remote_group_ids": original_gids,
+                    "group_ids": original_gids,
+                }
+                try:
+                    await adapter.modify_user(base_payload)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("tag-partition restore failed user=%s: %s", uname, exc)
+
+            return out if out else None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("tag-partition error user=%s: %s", uname, exc)
+            return None
+
+
+async def ensure_account_links_by_group(
+    user: User,
+    account: PanelAccount,
+    claims: list[dict],
+) -> dict[str, list[str]]:
+    """Return astra_group_id → links for this panel account (partitioned)."""
+    from app.adapters.http_utils import is_share_link
+
+    panel_claims = [c for c in claims if int(c.get("panel_id") or 0) == int(account.panel_id)]
+    all_links = [str(x).strip() for x in (account.links or []) if x and is_share_link(str(x))]
+    if not panel_claims:
+        return {}
+    if not all_links:
+        return {str(c["group_id"]): [] for c in panel_claims}
+
+    if len(panel_claims) == 1:
+        gid = str(panel_claims[0]["group_id"])
+        mapping = {gid: list(all_links)}
+        account.links_by_group = mapping
+        return mapping
+
+    # 1) Protocol split (Marzban Direct=vless / Tunnel=ss)
+    local = _partition_links_by_protocol(all_links, panel_claims)
+    if local is not None:
+        account.links_by_group = local
+        return local
+
+    # 2) Cached remote partition if still valid
+    cached = getattr(account, "links_by_group", None) or {}
+    if isinstance(cached, dict) and cached:
+        want = {str(c["group_id"]) for c in panel_claims}
+        if want <= set(str(k) for k in cached.keys()):
+            total = sum(len(v or []) for v in cached.values())
+            if total >= max(1, int(len(all_links) * 0.4)):
+                return {str(k): list(v or []) for k, v in cached.items() if str(k) in want}
+
+    # 3) PasarGuard: partition via remote_group_ids
+    remote = await _partition_pasarguard_by_remote_groups(user, account, panel_claims)
+    if remote:
+        account.links_by_group = remote
+        return remote
+
+    # 4) Last resort — first claim only (avoids wrong tag on every group)
+    gid = str(panel_claims[0]["group_id"])
+    mapping = {gid: list(all_links)}
+    for c in panel_claims[1:]:
+        mapping.setdefault(str(c["group_id"]), [])
+    account.links_by_group = mapping
+    return mapping
+
+
+async def resolve_group_panel_claims(db: AsyncSession, user: User) -> list[dict]:
+    """User's group→panel claims with config_tag + GroupPanel.config (fresh from DB)."""
+    from sqlalchemy import select
+
+    from app.models.group import Group, GroupPanel, UserGroup
+
+    ug = await db.execute(select(UserGroup.group_id).where(UserGroup.user_id == user.id))
+    gids = [int(r[0]) for r in ug.all() if r[0] is not None]
+    if not gids:
+        return []
+
+    g_rows = await db.execute(
+        select(Group.id, Group.config_tag, Group.name)
+        .where(Group.id.in_(gids))
+        .order_by(Group.id.asc())
+    )
+    meta_by_gid = {
+        int(gid): (_normalize_config_tag(tag), str(name or ""))
+        for gid, tag, name in g_rows.all()
+    }
+
+    pl = await db.execute(
+        select(GroupPanel.group_id, GroupPanel.panel_id, GroupPanel.config)
+        .where(GroupPanel.group_id.in_(gids))
+        .order_by(GroupPanel.group_id.asc())
+    )
+    claims: list[dict] = []
+    for gid, pid, cfg in pl.all():
+        pid_i = int(pid or 0)
+        if not pid_i:
+            continue
+        tag, name = meta_by_gid.get(int(gid), ("", ""))
+        claims.append(
+            {
+                "group_id": int(gid),
+                "panel_id": pid_i,
+                "tag": tag,
+                "name": name,
+                "config": cfg if isinstance(cfg, dict) else {},
+            }
+        )
+    return claims
+
+
+def _claims_from_loaded_groups(user: User) -> list[dict]:
+    groups = list(getattr(user, "groups", None) or user.__dict__.get("groups") or [])
+    claims: list[dict] = []
+    for group in sorted(groups, key=lambda g: int(getattr(g, "id", 0) or 0)):
+        tag = _normalize_config_tag(getattr(group, "config_tag", None))
+        for gpl in getattr(group, "panel_links", None) or []:
+            pid = int(getattr(gpl, "panel_id", 0) or 0)
+            if not pid:
+                continue
+            cfg = getattr(gpl, "config", None)
+            claims.append(
+                {
+                    "group_id": int(getattr(group, "id", 0) or 0),
+                    "panel_id": pid,
+                    "tag": tag,
+                    "name": str(getattr(group, "name", "") or ""),
+                    "config": cfg if isinstance(cfg, dict) else {},
+                }
+            )
+    return claims
+
+
+async def resolve_panel_config_tags(db: AsyncSession, user: User) -> dict[int, str]:
+    """Legacy panel_id → tag map (first non-empty). Prefer per-link claims instead."""
+    claims = await resolve_group_panel_claims(db, user)
+    out: dict[int, str] = {}
+    for claim in claims:
+        pid = int(claim["panel_id"])
+        tag = _normalize_config_tag(claim.get("tag"))
+        if pid and tag and pid not in out:
+            out[pid] = tag
+    return out
+
+
+def _config_hidden(link: str) -> bool:
+    """Skip share links whose host:port[+header] is globally hidden from all subs."""
+    try:
+        from app.services.config_hides import is_hidden
+
+        return bool(is_hidden(link))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def collect_links(
+    user: User,
+    *,
+    include_notices: bool = False,
+    db: AsyncSession | None = None,
+) -> list[str]:
+    rows = await collect_links_detailed(user, include_notices=include_notices, db=db)
+    return [row["link"] for row in rows if row.get("link")]
+
+
+async def collect_links_detailed(
+    user: User,
+    *,
+    include_notices: bool = True,
+    db: AsyncSession | None = None,
+) -> list[dict]:
     """All unique share links across panels.
 
     Order (every sub — client feed + HTML):
@@ -990,7 +1491,8 @@ def collect_links_detailed(user: User, *, include_notices: bool = True) -> list[
       3) group notices (کانفیگ اضافه) — optional, unchanged text
       4) real configs — ``#N. 2.5G | name`` or ``#N. text 2.5G | name``
 
-    Only protocol share links (vless:// …) are returned — never raw /sub/ paths.
+    Each real config gets the ``config_tag`` of the Astra group that owns it:
+    protocol split for Marzban, remote_group_ids partition for PasarGuard.
     """
     from app.adapters.http_utils import is_share_link
     from app.services.link_remark import (
@@ -1000,7 +1502,6 @@ def collect_links_detailed(user: User, *, include_notices: bool = True) -> list[
         notice_rows_from_groups,
     )
     from app.services.site_settings import (
-        get_config_brand_tag,
         get_promo_config_enabled,
         get_promo_config_text,
     )
@@ -1010,6 +1511,14 @@ def collect_links_detailed(user: User, *, include_notices: bool = True) -> list[
     show_name = (getattr(user, "display_name", None) or "").strip() or (
         getattr(user, "username", None) or "user"
     )
+    groups = list(getattr(user, "groups", None) or user.__dict__.get("groups") or [])
+
+    if db is not None:
+        claims = await resolve_group_panel_claims(db, user)
+    else:
+        claims = _claims_from_loaded_groups(user)
+
+    tag_by_gid = {str(c["group_id"]): _normalize_config_tag(c.get("tag")) for c in claims}
 
     head: list[dict] = [
         build_status_row(
@@ -1024,35 +1533,157 @@ def collect_links_detailed(user: User, *, include_notices: bool = True) -> list[
         if promo:
             head.append(promo)
 
-    notices = (
-        notice_rows_from_groups(list(user.__dict__.get("groups") or []))
-        if include_notices
-        else []
-    )
+    notices = notice_rows_from_groups(groups) if include_notices else []
     rows: list[dict] = []
     seen: set[str] = set()
-    for account in user.panel_accounts or []:
-        # error accounts often still have working share links (sync flag only)
-        if account.status not in (PanelAccountStatus.active, PanelAccountStatus.error):
-            continue
+
+    active_accounts = [
+        a
+        for a in (user.panel_accounts or [])
+        if a.status in (PanelAccountStatus.active, PanelAccountStatus.error)
+    ]
+    # Per-group accounts already own one group's links; legacy merged rows still partition
+    need_partition = [
+        a for a in active_accounts if not getattr(a, "group_id", None)
+    ]
+    partitioned_map: dict[int, dict[str, list[str]]] = {}
+    if need_partition:
+        partitioned = await asyncio.gather(
+            *[ensure_account_links_by_group(user, a, claims) for a in need_partition],
+            return_exceptions=True,
+        )
+        for account, by_group in zip(need_partition, partitioned):
+            if isinstance(by_group, Exception) or not isinstance(by_group, dict):
+                logger.warning(
+                    "links_by_group failed panel=%s: %s", account.panel_id, by_group
+                )
+                partitioned_map[account.id] = {}
+            else:
+                partitioned_map[account.id] = by_group
+
+    for account in active_accounts:
         panel = account.__dict__.get("panel")
         panel_name = getattr(panel, "name", None) if panel is not None else None
         label = panel_name or f"پنل #{account.panel_id}"
-        for link in account.links or []:
-            text = (link or "").strip()
-            if not text or text in seen or not is_share_link(text):
-                continue
-            seen.add(text)
-            rows.append({"link": text, "panel": label, "panel_id": account.panel_id})
+        pid = int(account.panel_id)
+        acct_gid = getattr(account, "group_id", None)
+
+        if acct_gid is not None:
+            # Dedicated per-group remote account — all its links belong to that group
+            gid_s = str(int(acct_gid))
+            tag = tag_by_gid.get(gid_s, "")
+            for link in account.links or []:
+                text = (link or "").strip()
+                if not text or text in seen or not is_share_link(text):
+                    continue
+                if _config_hidden(text):
+                    continue
+                seen.add(text)
+                rows.append(
+                    {
+                        "link": text,
+                        "panel": label,
+                        "panel_id": pid,
+                        "config_tag": tag,
+                        "group_id": int(acct_gid),
+                    }
+                )
+            continue
+
+        panel_claims = [c for c in claims if int(c.get("panel_id") or 0) == pid]
+        by_group = partitioned_map.get(account.id) or {}
+
+        if not panel_claims:
+            for link in account.links or []:
+                text = (link or "").strip()
+                if not text or text in seen or not is_share_link(text):
+                    continue
+                if _config_hidden(text):
+                    continue
+                seen.add(text)
+                rows.append(
+                    {"link": text, "panel": label, "panel_id": pid, "config_tag": ""}
+                )
+            continue
+
+        if not by_group:
+            local = _partition_links_by_protocol(
+                [str(x).strip() for x in (account.links or []) if x],
+                panel_claims,
+            )
+            if local:
+                by_group = local
+            else:
+                by_group = {
+                    str(panel_claims[0]["group_id"]): [
+                        str(x).strip()
+                        for x in (account.links or [])
+                        if x and is_share_link(str(x))
+                    ]
+                }
+
+        for gid in sorted(by_group.keys(), key=lambda x: int(x) if str(x).isdigit() else 0):
+            tag = tag_by_gid.get(str(gid), "")
+            gid_i = int(gid) if str(gid).isdigit() else 0
+            for link in by_group.get(gid) or []:
+                text = (link or "").strip()
+                if not text or text in seen or not is_share_link(text):
+                    continue
+                if _config_hidden(text):
+                    continue
+                seen.add(text)
+                rows.append(
+                    {
+                        "link": text,
+                        "panel": label,
+                        "panel_id": pid,
+                        "config_tag": tag,
+                        "group_id": gid_i,
+                    }
+                )
+
+    if db is not None:
+        try:
+            await db.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Subscription order = user's group selection order (UserGroup.sort_order)
+    ordered_gids: list[int] = []
+    if db is not None:
+        try:
+            from app.models.group import UserGroup
+
+            ug_rows = await db.execute(
+                select(UserGroup.group_id)
+                .where(UserGroup.user_id == user.id)
+                .order_by(UserGroup.sort_order.asc(), UserGroup.id.asc())
+            )
+            ordered_gids = [int(r[0]) for r in ug_rows.all() if r[0] is not None]
+        except Exception:  # noqa: BLE001
+            ordered_gids = []
+    if not ordered_gids:
+        ordered_gids = [
+            int(g.id)
+            for g in groups
+            if getattr(g, "id", None) is not None
+        ]
+    order_idx = {gid: i for i, gid in enumerate(ordered_gids)}
+    rows.sort(
+        key=lambda row: (
+            order_idx.get(int(row.get("group_id") or -1), 10**6),
+            int(row.get("panel_id") or 0),
+            str(row.get("link") or ""),
+        )
+    )
+
     renamed = apply_display_name(
         rows,
         getattr(user, "display_name", None),
         used=used,
         limit=limit,
         username=getattr(user, "username", None),
-        brand_tag=get_config_brand_tag(),
     )
-    # apply_display_name returns specials+real; we pass only reals so result is reals only
     return head + notices + renamed
 
 
@@ -1107,13 +1738,13 @@ async def hydrate_share_links(db: AsyncSession, user: User) -> int:
         client = make_client(
             panel.base_url,
             bool((panel.meta or {}).get("verify_ssl", False)),
-            timeout=8.0,
+            timeout=4.0,
             xhr=False,
         )
         before_shares = sum(1 for x in stored if is_share_link(x))
         try:
             expanded = await asyncio.wait_for(
-                expand_subscription_links(client, stored), timeout=10
+                expand_subscription_links(client, stored), timeout=4.5
             )
         except Exception:
             expanded = []
@@ -1126,6 +1757,7 @@ async def hydrate_share_links(db: AsyncSession, user: User) -> int:
         if len(shares) < before_shares:
             return False
         account.links = shares
+        account.links_by_group = None  # rebuild on next sub (per-group tags)
         account.status = PanelAccountStatus.active
         account.error_message = None
         account.last_sync_at = now
@@ -1141,7 +1773,7 @@ async def hydrate_share_links(db: AsyncSession, user: User) -> int:
                 coro = adapter.get_usage(uname, rid, expand_links=False)  # type: ignore[call-arg]
             except TypeError:
                 coro = adapter.get_usage(uname, rid)
-            res = await asyncio.wait_for(coro, timeout=7)
+            res = await asyncio.wait_for(coro, timeout=3.5)
             if not res or not res.success:
                 return False
 
@@ -1151,12 +1783,12 @@ async def hydrate_share_links(db: AsyncSession, user: User) -> int:
                 client2 = make_client(
                     panel.base_url,
                     bool((panel.meta or {}).get("verify_ssl", False)),
-                    timeout=6.0,
+                    timeout=3.5,
                     xhr=False,
                 )
                 try:
                     shares = await asyncio.wait_for(
-                        expand_subscription_links(client2, raw_links), timeout=6
+                        expand_subscription_links(client2, raw_links), timeout=3.5
                     )
                 except Exception:
                     shares = []
@@ -1165,9 +1797,11 @@ async def hydrate_share_links(db: AsyncSession, user: User) -> int:
 
             if shares:
                 account.links = shares
+                account.links_by_group = None
             elif raw_links:
                 # Keep /sub refs for a later expand pass
                 account.links = raw_links
+                account.links_by_group = None
             else:
                 return False
 
@@ -1228,11 +1862,11 @@ async def hydrate_share_links(db: AsyncSession, user: User) -> int:
             if x and str(x).strip()
         )
     ]
-    updated += await _run_wave([_expand_stored(a) for a in need_expand], timeout=12.0)
+    updated += await _run_wave([_expand_stored(a) for a in need_expand], timeout=5.0)
 
     # Wave 2: remaining accounts still missing share links
     remaining = [a for a in targets if _needs_hydrate(a)]
-    updated += await _run_wave([_fetch_remote(a) for a in remaining], timeout=12.0)
+    updated += await _run_wave([_fetch_remote(a) for a in remaining], timeout=5.0)
 
     if updated:
         await db.flush()
@@ -1248,11 +1882,11 @@ async def hydrate_share_links(db: AsyncSession, user: User) -> int:
 
 async def usage_breakdown_for_user(db: AsyncSession, user: User) -> list[dict]:
     """Per-panel raw usage with live coefficient → weighted (admin / internal)."""
-    coeffs = await panel_coefficients_for_user(db, user)
     accounts = list(user.panel_accounts or [])
-    _sync_account_coeff_periods(accounts, coeffs)
+    account_coeffs = await account_coefficients_for_user(db, user, accounts)
+    _sync_account_coeff_periods(accounts, account_coeffs)
     user_limit = int(user.data_limit or 0)
-    weighted_total = await _weighted_total(accounts, coeffs)
+    weighted_total = await _weighted_total(accounts, account_coeffs)
     rows: list[dict] = []
     for account in accounts:
         if account.status not in (
@@ -1264,7 +1898,7 @@ async def usage_breakdown_for_user(db: AsyncSession, user: User) -> list[dict]:
         name = getattr(panel, "name", None) if panel is not None else None
         label = name or f"پنل #{account.panel_id}"
         raw = int(account.used_traffic or 0)
-        coeff = _norm_coeff(coeffs.get(account.panel_id, 1.0))
+        coeff = _norm_coeff(account_coeffs.get(account.id, 1.0))
         weighted = account_weighted_usage(account, coeff)
         remote_limit = remote_data_limit_bytes(
             user_limit,
@@ -1277,6 +1911,7 @@ async def usage_breakdown_for_user(db: AsyncSession, user: User) -> list[dict]:
             {
                 "panel": label,
                 "panel_id": account.panel_id,
+                "group_id": int(getattr(account, "group_id", 0) or 0) or None,
                 "raw": raw,
                 "coefficient": coeff,
                 "weighted": weighted,
@@ -1289,7 +1924,10 @@ async def usage_breakdown_for_user(db: AsyncSession, user: User) -> list[dict]:
 
 
 async def panel_coefficients_for_user(db: AsyncSession, user: User) -> dict[int, float]:
-    """Map panel_id -> coefficient from the user's groups (GroupPanel.config)."""
+    """Legacy map panel_id → max coefficient (UI fallback only).
+
+    Prefer ``account_coefficients_for_user`` — max was the shared-panel bug.
+    """
     ug = await db.execute(select(UserGroup.group_id).where(UserGroup.user_id == user.id))
     group_ids = [row[0] for row in ug.all()]
     if not group_ids:
@@ -1297,17 +1935,56 @@ async def panel_coefficients_for_user(db: AsyncSession, user: User) -> dict[int,
     result = await db.execute(select(GroupPanel).where(GroupPanel.group_id.in_(group_ids)))
     coeffs: dict[int, float] = {}
     for link in result.scalars().all():
-        raw = (link.config or {}).get("coefficient", 1)
-        try:
-            c = float(raw if raw is not None else 1)
-        except (TypeError, ValueError):
-            c = 1.0
-        if c < 0.01:
-            c = 0.01
-        # Multiple groups sharing a panel → take the higher coefficient
+        c = coefficient_from_config(link.config if isinstance(link.config, dict) else {})
         prev = coeffs.get(link.panel_id)
         coeffs[link.panel_id] = max(prev, c) if prev is not None else c
     return coeffs
+
+
+async def claim_coefficients_for_user(
+    db: AsyncSession, user: User
+) -> dict[tuple[int, int], float]:
+    """Map (panel_id, group_id) → coefficient from GroupPanel.config."""
+    ug = await db.execute(select(UserGroup.group_id).where(UserGroup.user_id == user.id))
+    group_ids = [row[0] for row in ug.all()]
+    if not group_ids:
+        return {}
+    result = await db.execute(select(GroupPanel).where(GroupPanel.group_id.in_(group_ids)))
+    out: dict[tuple[int, int], float] = {}
+    for link in result.scalars().all():
+        out[(int(link.panel_id), int(link.group_id))] = coefficient_from_config(
+            link.config if isinstance(link.config, dict) else {}
+        )
+    return out
+
+
+async def account_coefficients_for_user(
+    db: AsyncSession,
+    user: User,
+    accounts: list[PanelAccount] | None = None,
+) -> dict[int, float]:
+    """Map PanelAccount.id → that account's group×panel coefficient.
+
+    Formula: used_astra = Σ account.raw × account_coefficients[account.id]
+    """
+    claims = await claim_coefficients_for_user(db, user)
+    panel_max = await panel_coefficients_for_user(db, user)
+    if accounts is None:
+        result = await db.execute(
+            select(PanelAccount).where(PanelAccount.user_id == user.id)
+        )
+        accounts = list(result.scalars().all())
+    out: dict[int, float] = {}
+    for account in accounts:
+        gid = getattr(account, "group_id", None)
+        if gid is not None:
+            out[account.id] = _norm_coeff(
+                claims.get((int(account.panel_id), int(gid)), 1.0)
+            )
+        else:
+            # Legacy merged row: fall back to panel max until split on next provision
+            out[account.id] = _norm_coeff(panel_max.get(int(account.panel_id), 1.0))
+    return out
 
 
 async def device_limit_for_user(db: AsyncSession, user: User) -> int:
@@ -1331,7 +2008,7 @@ async def device_limit_for_user(db: AsyncSession, user: User) -> int:
 
 
 def _sync_account_coeff_periods(
-    accounts: list[PanelAccount], coeffs: dict[int, float]
+    accounts: list[PanelAccount], account_coeffs: dict[int, float]
 ) -> bool:
     """Apply current group coefficients to account periods. True if any changed."""
     changed = False
@@ -1342,16 +2019,17 @@ def _sync_account_coeff_periods(
             PanelAccountStatus.pending,
         ):
             continue
-        coeff = _norm_coeff(coeffs.get(account.panel_id, 1.0))
+        coeff = _norm_coeff(account_coeffs.get(account.id, 1.0))
         if apply_coefficient_period(account, coeff):
             changed = True
     return changed
 
 
 async def _weighted_total(
-    accounts: list[PanelAccount], coeffs: dict[int, float]
+    accounts: list[PanelAccount], account_coeffs: dict[int, float]
 ) -> int:
-    _sync_account_coeff_periods(accounts, coeffs)
+    """Σ (raw_i × coeff_of_account_i's group)."""
+    _sync_account_coeff_periods(accounts, account_coeffs)
     total = 0
     for account in accounts:
         if account.status not in (
@@ -1359,7 +2037,7 @@ async def _weighted_total(
             PanelAccountStatus.error,
         ):
             continue
-        coeff = _norm_coeff(coeffs.get(account.panel_id, 1.0))
+        coeff = _norm_coeff(account_coeffs.get(account.id, 1.0))
         total += account_weighted_usage(account, coeff)
     return total
 
@@ -1416,13 +2094,13 @@ async def should_push_remotes(
         )
         accounts = list(result.scalars().all())
     active = _active_accounts(accounts)
-    coeffs = await panel_coefficients_for_user(db, user)
+    account_coeffs = await account_coefficients_for_user(db, user, accounts)
     return quota_math.needs_remote_cap_sync(
         status_changed=status_changed,
         blocked=blocked,
         force=force,
         active_panel_count=len(active),
-        coefficients=[coeffs.get(a.panel_id, 1.0) for a in active],
+        coefficients=[account_coeffs.get(a.id, 1.0) for a in active],
         shrink_shared_caps=shrink_shared_caps,
     )
 
@@ -1494,20 +2172,91 @@ async def refresh_usage(
         .options(selectinload(PanelAccount.panel))
     )
     accounts = list(result.scalars().all())
-    coeffs = await panel_coefficients_for_user(db, user)
+
+    # Split legacy merged panel accounts into per-group remotes when needed
+    # so coefficients stay exact on shared panels.
+    # NEVER on quick/sub path — provision of 20+ panels blocks the event loop
+    # and causes nginx 502 on subscription feeds.
+    if not quick:
+        try:
+            ug = await db.execute(
+                select(UserGroup.group_id).where(UserGroup.user_id == user.id)
+            )
+            gids = [row[0] for row in ug.all()]
+            targets = await resolve_panels_for_groups(db, gids) if gids else []
+            have = {
+                (int(a.panel_id), int(a.group_id))
+                for a in accounts
+                if getattr(a, "group_id", None) is not None
+            }
+            legacy_panels = {
+                int(a.panel_id)
+                for a in accounts
+                if getattr(a, "group_id", None) is None
+                and a.status
+                in (
+                    PanelAccountStatus.active,
+                    PanelAccountStatus.error,
+                    PanelAccountStatus.pending,
+                )
+            }
+            missing = False
+            for panel, _cfg, gid in targets:
+                key = (int(panel.id), int(gid))
+                if key in have:
+                    continue
+                # Legacy row can cover one group on first provision; still need split
+                # when this panel has 2+ group targets.
+                n_on_panel = sum(1 for p, _, _g in targets if p.id == panel.id)
+                if n_on_panel > 1 or int(panel.id) not in legacy_panels:
+                    missing = True
+                    break
+            if missing and targets:
+                await provision_user_on_panels(db, user, targets)
+                result = await db.execute(
+                    select(PanelAccount)
+                    .where(PanelAccount.user_id == user.id)
+                    .options(selectinload(PanelAccount.panel))
+                )
+                accounts = list(result.scalars().all())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "per-group split user=%s: %s",
+                getattr(user, "username", "?"),
+                _exc_msg(exc),
+            )
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            # Reload accounts after rollback so the rest of refresh can continue
+            try:
+                result = await db.execute(
+                    select(PanelAccount)
+                    .where(PanelAccount.user_id == user.id)
+                    .options(selectinload(PanelAccount.panel))
+                )
+                accounts = list(result.scalars().all())
+            except Exception:  # noqa: BLE001
+                pass
+
+    account_coeffs = await account_coefficients_for_user(db, user, accounts)
 
     need_remote = force or _accounts_need_remote_refresh(accounts, interval)
     if need_remote:
-        # quick: fail-fast for admin list; full: longer for sub page / open-user
+        # quick: fail-fast (sub bg / admin list); full: longer for forced sync
         if quick:
-            per_try = 4.5
+            per_try = 2.8
             tries = 1
+            overall_budget = 5.0
         elif force:
-            per_try = 18.0
+            per_try = 12.0
             tries = 2
+            overall_budget = 22.0
         else:
-            per_try = 8.0
-            tries = 2
+            per_try = 5.0
+            tries = 1
+            overall_budget = 10.0
 
         async def _remote(account: PanelAccount) -> tuple[PanelAccount, AdapterResult | None]:
             # Pull usage for active (and error — may still exist on remote)
@@ -1548,10 +2297,22 @@ async def refresh_usage(
                         except Exception:  # noqa: BLE001
                             pass
                 if attempt + 1 < tries:
-                    await asyncio.sleep(0.15)
+                    await asyncio.sleep(0.1)
             return account, last
 
-        outcomes = await asyncio.gather(*[_remote(a) for a in accounts])
+        # Hard overall budget — many panels must not block for minutes
+        tasks = [asyncio.create_task(_remote(a)) for a in accounts]
+        done, pending = await asyncio.wait(tasks, timeout=overall_budget)
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        outcomes: list[tuple[PanelAccount, AdapterResult | None]] = []
+        for t in done:
+            try:
+                outcomes.append(t.result())
+            except Exception:  # noqa: BLE001
+                pass
         now = datetime.now(timezone.utc)
         from app.adapters.http_utils import is_share_link
 
@@ -1584,14 +2345,19 @@ async def refresh_usage(
                 )
 
         logger.info(
-            "refresh_usage user=%s panels=%s ok=%s force=%s",
+            "refresh_usage user=%s panels=%s ok=%s force=%s quick=%s budget=%s pending=%s",
             user.username,
             len(accounts),
             ok_n,
             force,
+            quick,
+            overall_budget,
+            len(pending),
         )
 
-    total = await _weighted_total(accounts, coeffs)
+    # Refresh coeffs in case new accounts appeared (should not, but cheap)
+    account_coeffs = await account_coefficients_for_user(db, user, accounts)
+    total = await _weighted_total(accounts, account_coeffs)
     user.used_traffic = total
     await db.flush()
     return total
@@ -1639,11 +2405,42 @@ async def enforce_user_quota(db: AsyncSession, user: User) -> bool:
     return True
 
 
+async def recount_group_usage_local(db: AsyncSession, group_id: int) -> int:
+    """Apply live GroupPanel coefficients to Astra used_traffic (no remote I/O).
+
+    Formula: used_astra = Σ (panel_account.raw × coeff of that account's group×panel).
+    Example: 1 GB raw with coeff 1.33 → 1.33 GB on Astra.
+    Call synchronously after group coefficient save so admin UI updates immediately.
+    """
+    ug = await db.execute(select(UserGroup.user_id).where(UserGroup.group_id == group_id))
+    user_ids = [row[0] for row in ug.all()]
+    if not user_ids:
+        return 0
+
+    from app.services.group_configs import sample_username_for_group
+
+    sample = sample_username_for_group(group_id)
+    result = await db.execute(
+        select(User)
+        .where(User.id.in_(user_ids))
+        .options(selectinload(User.panel_accounts))
+    )
+    users = [u for u in result.scalars().unique().all() if u.username != sample]
+    for user in users:
+        accounts = list(user.panel_accounts or [])
+        account_coeffs = await account_coefficients_for_user(db, user, accounts)
+        user.used_traffic = await _weighted_total(accounts, account_coeffs)
+        await enforce_user_quota(db, user)
+    await db.flush()
+    logger.info("group %s local coeff recount users=%s", group_id, len(users))
+    return len(users)
+
+
 async def resync_users_for_group(db: AsyncSession, group_id: int) -> int:
     """After group coefficient / panel config change: reanchor, enforce, push remotes.
 
-    Ensures remotes get the new (usually lower) data_limit and are disabled when
-    Astra quota is already exhausted under the new rate.
+    Ensures remotes are disabled when Astra quota is already exhausted under the
+    new weighted rate. Local recount should already have run on save.
     """
     ug = await db.execute(select(UserGroup.user_id).where(UserGroup.group_id == group_id))
     user_ids = [row[0] for row in ug.all()]
@@ -1664,6 +2461,8 @@ async def resync_users_for_group(db: AsyncSession, group_id: int) -> int:
     if not users:
         return 0
 
+    # Re-apply coeffs from DB raw first (cheap), then pull remotes + push
+    await recount_group_usage_local(db, group_id)
     await refresh_users_usage_batch(
         db, users, force=True, concurrency=8, push_remotes=True
     )

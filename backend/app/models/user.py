@@ -62,17 +62,30 @@ class User(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    groups = relationship("Group", secondary="user_groups", back_populates="users")
+    groups = relationship(
+        "Group",
+        secondary="user_groups",
+        back_populates="users",
+        order_by="UserGroup.sort_order, UserGroup.id",
+    )
     panel_accounts = relationship("PanelAccount", back_populates="user", cascade="all, delete-orphan")
 
 
 class PanelAccount(Base):
     __tablename__ = "panel_accounts"
-    __table_args__ = (UniqueConstraint("user_id", "panel_id", name="uq_user_panel"),)
+    # One remote user per (Astra user × panel × sales group) so coefficients
+    # and tags stay accurate when several groups share the same panel.
+    __table_args__ = (
+        UniqueConstraint("user_id", "panel_id", "group_id", name="uq_user_panel_group"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     panel_id: Mapped[int] = mapped_column(ForeignKey("panels.id", ondelete="CASCADE"), index=True)
+    # Astra sales group this remote account belongs to (required for multi-group panels).
+    group_id: Mapped[int | None] = mapped_column(
+        ForeignKey("groups.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     remote_username: Mapped[str | None] = mapped_column(String(128), nullable=True)
     remote_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     uuid: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -81,6 +94,9 @@ class PanelAccount(Base):
         default=PanelAccountStatus.pending,
     )
     links: Mapped[list] = mapped_column(JSONType, default=list)
+    # Optional: astra group_id (str) → share links belonging to that group on this panel.
+    # Used when several groups share one panel (PasarGuard remote_group_ids / Marzban protocols).
+    links_by_group: Mapped[dict | None] = mapped_column(JSONType, nullable=True, default=dict)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     used_traffic: Mapped[int] = mapped_column(BigInteger, default=0)
     # Coefficient periods: past usage stays at old rate; only delta uses current coeff.

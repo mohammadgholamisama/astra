@@ -16,6 +16,7 @@ from app.api import (
     api_keys,
     auth,
     backup,
+    config_locations,
     group_configs,
     groups,
     panels,
@@ -26,13 +27,17 @@ from app.api import (
     users,
 )
 # ensure new models are registered for schema sync
+from app.models import config_location as _config_location_model  # noqa: F401
 from app.models import group_config as _group_config_model  # noqa: F401
+from app.models import group_config_hide as _group_config_hide_model  # noqa: F401
 from app.models import site_setting as _site_setting_model  # noqa: F401
 from app.models.user import PanelAccount, User, UserStatus
 from app.core.config import get_settings
 from app.core.database import AsyncSessionLocal
 from app.core.schema_sync import ensure_schema
 from app.seed import seed_admin
+from app.services.config_hides import refresh_cache as refresh_config_hides
+from app.services.config_locations import refresh_cache as refresh_config_locations
 from app.services.site_settings import refresh_cache as refresh_site_settings
 
 settings = get_settings()
@@ -102,6 +107,8 @@ async def lifespan(_app: FastAPI):
     await seed_admin()
     async with AsyncSessionLocal() as db:
         await refresh_site_settings(db)
+        await refresh_config_locations(db)
+        await refresh_config_hides(db)
     usage_task = asyncio.create_task(_usage_sync_loop(), name="astra-usage-sync")
     try:
         yield
@@ -171,6 +178,7 @@ app.include_router(panels.router)
 app.include_router(templates.router)
 app.include_router(api_keys.router)
 app.include_router(settings_api.router)
+app.include_router(config_locations.router)
 app.include_router(backup.router)
 app.include_router(subscription.router)
 app.include_router(system.router)

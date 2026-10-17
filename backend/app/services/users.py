@@ -13,13 +13,16 @@ def subscription_url(user: User) -> str:
 
 
 async def load_user(db: AsyncSession, username: str) -> User | None:
+    from app.models.group import Group, GroupPanel
     from app.models.user import PanelAccount
 
     result = await db.execute(
         select(User)
         .where(User.username == username)
         .options(
-            selectinload(User.groups),
+            selectinload(User.groups).selectinload(Group.panel_links).selectinload(
+                GroupPanel.panel
+            ),
             selectinload(User.panel_accounts).selectinload(PanelAccount.panel),
         )
     )
@@ -27,13 +30,16 @@ async def load_user(db: AsyncSession, username: str) -> User | None:
 
 
 async def load_user_by_token(db: AsyncSession, token: str) -> User | None:
+    from app.models.group import Group, GroupPanel
     from app.models.user import PanelAccount
 
     result = await db.execute(
         select(User)
         .where(User.sub_token == token)
         .options(
-            selectinload(User.groups),
+            selectinload(User.groups).selectinload(Group.panel_links).selectinload(
+                GroupPanel.panel
+            ),
             selectinload(User.panel_accounts).selectinload(PanelAccount.panel),
         )
     )
@@ -75,6 +81,9 @@ def to_user_response(user: User, *, include_links: bool = True) -> UserResponse:
             PanelAccountOut(
                 id=a.id,
                 panel_id=a.panel_id,
+                group_id=(
+                    int(a.group_id) if getattr(a, "group_id", None) is not None else None
+                ),
                 panel_name=getattr(panel, "name", None) if panel is not None else None,
                 panel_type=panel_type,
                 panel_base_url=str(panel_base).rstrip("/") if panel_base else None,
@@ -112,6 +121,7 @@ def to_user_response(user: User, *, include_links: bool = True) -> UserResponse:
         links=links,
         subscription_url=subscription_url(user),
         proxies=proxies,
-        group_ids=[g.id for g in groups],
+        # Preserve membership order (selection order → subscription order)
+        group_ids=[int(g.id) for g in groups],
         panel_accounts=panel_accounts,
     )

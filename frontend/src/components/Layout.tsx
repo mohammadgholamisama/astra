@@ -2,10 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import {
   BookOpen,
+  Cable,
   DatabaseBackup,
-  KeyRound,
   LayoutDashboard,
   LogOut,
+  MapPin,
   Server,
   Settings,
   Users,
@@ -27,7 +28,8 @@ const links = [
   { to: "/panels", label: "پنل‌ها", icon: Server },
   { to: "/groups", label: "گروه‌ها", icon: Layers },
   { to: "/users", label: "کاربران", icon: Users },
-  { to: "/api-keys", label: "کلید API", icon: KeyRound },
+  { to: "/locations", label: "لوکیشن", icon: MapPin },
+  { to: "/configs", label: "کانفیگ‌ها", icon: Cable },
   { to: "/backup", label: "بک‌آپ", icon: DatabaseBackup },
   { to: "/settings", label: "تنظیمات", icon: Settings },
 ];

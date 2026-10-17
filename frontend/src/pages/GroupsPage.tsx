@@ -1,8 +1,19 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Layers, Megaphone, Pencil, Plus, Trash2, X } from "lucide-react";
-import { api, Group, Panel, PanelType } from "../lib/api";
+import {
+  ArrowRightLeft,
+  FolderPlus,
+  Layers,
+  Pencil,
+  Plus,
+  Trash2,
+  X,
+} from "lucide-react";
+import { api, Group, GroupCategory, Panel, PanelType } from "../lib/api";
 import { toFaDigits } from "../lib/format";
+
+/** Active tab: null = default «همه گروه‌ها» (uncategorized) */
+type CatTab = null | number;
 
 type InboundInfo = {
   id: number;
@@ -75,6 +86,28 @@ function emptyPick(panelId: number): PanelPick {
   };
 }
 
+/** Parse Astra usage coefficient; accepts 1.33 / 1,33 / فارسی digits. */
+function parseCoeff(raw: unknown, fallback = 1): number {
+  if (typeof raw === "number") {
+    return !Number.isNaN(raw) && raw >= 0.01 ? raw : fallback;
+  }
+  let s = String(raw ?? "").trim();
+  s = s
+    .replace(/[۰-۹]/g, (d) => "۰۱۲۳۴۵۶۷۸۹".indexOf(d).toString())
+    .replace(/[٠-٩]/g, (d) => "٠١٢٣٤٥٦٧٨٩".indexOf(d).toString())
+    .replace(/,/g, ".");
+  if (!s || s === ".") return fallback;
+  const n = Number(s);
+  if (Number.isNaN(n) || n < 0.01) return fallback;
+  return Math.min(1000, n);
+}
+
+function formatCoeffInput(c: number): string {
+  if (!Number.isFinite(c)) return "1";
+  if (c === Math.floor(c)) return String(c);
+  return String(Math.round(c * 10000) / 10000);
+}
+
 function allMarzInbounds(catalog: MarzProtocolInfo[]): Record<string, string[]> {
   const out: Record<string, string[]> = {};
   for (const p of catalog) {
@@ -116,8 +149,7 @@ function pickToConfig(pick: PanelPick, type: PanelType): Record<string, unknown>
   if (pick.limit_ip > 0) {
     cfg.limit_ip = pick.limit_ip;
   }
-  const coeff = Number(pick.coefficient);
-  cfg.coefficient = !Number.isNaN(coeff) && coeff >= 0.01 ? coeff : 1;
+  cfg.coefficient = parseCoeff(pick.coefficient, 1);
   return cfg;
 }
 
@@ -161,8 +193,7 @@ function configToPick(
 
   const lip = Number(cfg.limit_ip);
   pick.limit_ip = !Number.isNaN(lip) && lip > 0 ? lip : 0;
-  const coeff = Number(cfg.coefficient);
-  pick.coefficient = !Number.isNaN(coeff) && coeff >= 0.01 ? coeff : 1;
+  pick.coefficient = parseCoeff(cfg.coefficient, 1);
   return pick;
 }
 
@@ -189,13 +220,18 @@ export default function GroupsPage() {
   const qc = useQueryClient();
   const [open, setOpen] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
+  const [activeTab, setActiveTab] = useState<CatTab>(null);
+  const [moveGroup, setMoveGroup] = useState<Group | null>(null);
+  const [catModal, setCatModal] = useState<"create" | { edit: GroupCategory } | null>(null);
+  const [catName, setCatName] = useState("");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
-  const [notices, setNotices] = useState<string[]>([]);
-  const [noticeDraft, setNoticeDraft] = useState("");
+  const [configTag, setConfigTag] = useState("");
   const [picks, setPicks] = useState<PanelPick[]>([]);
   const [catalogs, setCatalogs] = useState<Record<number, PanelCatalog>>({});
   const [confirmGroup, setConfirmGroup] = useState<Group | null>(null);
+  /** Draft text while typing coefficient (keeps "1." / "1,33" mid-edit). */
+  const [coeffDrafts, setCoeffDrafts] = useState<Record<number, string>>({});
   const loadingRef = useRef<Set<number>>(new Set());
   const attemptedRef = useRef<Set<number>>(new Set());
   const seededRef = useRef<Set<number>>(new Set());
@@ -205,6 +241,10 @@ export default function GroupsPage() {
     queryKey: ["groups"],
     queryFn: () => api<Group[]>("/api/groups"),
   });
+  const { data: categories = [] } = useQuery({
+    queryKey: ["group-categories"],
+    queryFn: () => api<GroupCategory[]>("/api/group-categories"),
+  });
   const { data: panels = [] } = useQuery({
     queryKey: ["panels"],
     queryFn: () => api<Panel[]>("/api/admin/panels"),
@@ -212,6 +252,21 @@ export default function GroupsPage() {
 
   const panelMap = useMemo(() => Object.fromEntries(panels.map((p) => [p.id, p])), [panels]);
   const selectedIds = useMemo(() => new Set(picks.map((p) => p.panel_id)), [picks]);
+
+  const uncategorizedCount = useMemo(
+    () => groups.filter((g) => g.category_id == null).length,
+    [groups],
+  );
+  const visibleGroups = useMemo(() => {
+    if (activeTab == null) return groups.filter((g) => g.category_id == null);
+    return groups.filter((g) => g.category_id === activeTab);
+  }, [groups, activeTab]);
+
+  // If active category was deleted, fall back to default tab
+  useEffect(() => {
+    if (activeTab == null) return;
+    if (!categories.some((c) => c.id === activeTab)) setActiveTab(null);
+  }, [categories, activeTab]);
 
   const loadCatalog = useCallback(async (panel: Panel, force = false) => {
     if (loadingRef.current.has(panel.id)) return;
@@ -347,18 +402,25 @@ export default function GroupsPage() {
 
   const save = useMutation({
     mutationFn: () => {
-      const bodyPanels = picks.map((pick, i) => {
+      // Finalize any mid-edit coefficient drafts (e.g. "1,33") before payload
+      const finalized = picks.map((pick) => {
+        const draft = coeffDrafts[pick.panel_id];
+        if (draft === undefined) return pick;
+        return { ...pick, coefficient: parseCoeff(draft, pick.coefficient) };
+      });
+      const bodyPanels = finalized.map((pick, i) => {
         const panel = panelMap[pick.panel_id];
         return {
           panel_id: pick.panel_id,
           config: panel ? pickToConfig(pick, panel.type) : {},
-          priority: picks.length - i,
+          priority: finalized.length - i,
         };
       });
-      const payload = {
+      const payload: Record<string, unknown> = {
         name,
         description: description || null,
-        notices: notices.map((t) => t.trim()).filter(Boolean).slice(0, 10),
+        config_tag: configTag.trim(),
+        notices: [] as string[],
         panels: bodyPanels,
       };
       if (editingId != null) {
@@ -367,6 +429,8 @@ export default function GroupsPage() {
           body: JSON.stringify(payload),
         });
       }
+      // New groups land in the active tab (null = «همه گروه‌ها»)
+      if (activeTab != null) payload.category_id = activeTab;
       return api<Group>("/api/group", {
         method: "POST",
         body: JSON.stringify(payload),
@@ -374,6 +438,7 @@ export default function GroupsPage() {
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["groups"] });
+      qc.invalidateQueries({ queryKey: ["group-categories"] });
       resetModal();
     },
   });
@@ -382,7 +447,57 @@ export default function GroupsPage() {
     mutationFn: (id: number) => api(`/api/group/${id}`, { method: "DELETE" }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["groups"] });
+      qc.invalidateQueries({ queryKey: ["group-categories"] });
       setConfirmGroup(null);
+    },
+  });
+
+  const moveMut = useMutation({
+    mutationFn: ({ id, category_id }: { id: number; category_id: number | null }) =>
+      api<Group>(`/api/group/${id}/move`, {
+        method: "PUT",
+        body: JSON.stringify({ category_id }),
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["groups"] });
+      qc.invalidateQueries({ queryKey: ["group-categories"] });
+      setMoveGroup(null);
+    },
+  });
+
+  const saveCategory = useMutation({
+    mutationFn: async () => {
+      const n = catName.trim();
+      if (!n) throw new Error("نام دسته را وارد کنید");
+      if (catModal === "create") {
+        return api<GroupCategory>("/api/group-categories", {
+          method: "POST",
+          body: JSON.stringify({ name: n }),
+        });
+      }
+      if (catModal && typeof catModal === "object" && "edit" in catModal) {
+        return api<GroupCategory>(`/api/group-categories/${catModal.edit.id}`, {
+          method: "PUT",
+          body: JSON.stringify({ name: n }),
+        });
+      }
+      throw new Error("invalid");
+    },
+    onSuccess: (cat) => {
+      qc.invalidateQueries({ queryKey: ["group-categories"] });
+      setCatModal(null);
+      setCatName("");
+      if (catModal === "create") setActiveTab(cat.id);
+    },
+  });
+
+  const deleteCategory = useMutation({
+    mutationFn: (id: number) => api(`/api/group-categories/${id}`, { method: "DELETE" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["group-categories"] });
+      qc.invalidateQueries({ queryKey: ["groups"] });
+      setActiveTab(null);
+      setCatModal(null);
     },
   });
 
@@ -519,10 +634,10 @@ export default function GroupsPage() {
     setEditingId(null);
     setName("");
     setDescription("");
-    setNotices([]);
-    setNoticeDraft("");
+    setConfigTag("");
     setPicks([]);
     setCatalogs({});
+    setCoeffDrafts({});
     seededRef.current = new Set();
     attemptedRef.current = new Set();
     loadingRef.current = new Set();
@@ -537,8 +652,7 @@ export default function GroupsPage() {
     setEditingId(group.id);
     setName(group.name);
     setDescription(group.description || "");
-    setNotices([...(group.notices || [])].filter(Boolean).slice(0, 10));
-    setNoticeDraft("");
+    setConfigTag((group.config_tag || "").trim());
     setCatalogs({});
     attemptedRef.current = new Set();
     loadingRef.current = new Set();
@@ -553,23 +667,8 @@ export default function GroupsPage() {
     }
     seededRef.current = seeded;
     setPicks(nextPicks);
+    setCoeffDrafts({});
     setOpen(true);
-  }
-
-  function addNotice() {
-    const text = noticeDraft.trim();
-    if (!text) return;
-    if (notices.includes(text)) {
-      setNoticeDraft("");
-      return;
-    }
-    if (notices.length >= 10) return;
-    setNotices((prev) => [...prev, text.slice(0, 200)]);
-    setNoticeDraft("");
-  }
-
-  function removeNotice(idx: number) {
-    setNotices((prev) => prev.filter((_, i) => i !== idx));
   }
 
   function selectionSummary(panel: Panel, pick: PanelPick, cat?: PanelCatalog) {
@@ -588,21 +687,82 @@ export default function GroupsPage() {
     return "";
   }
 
+  const activeCat = activeTab != null ? categories.find((c) => c.id === activeTab) : null;
+
   return (
     <div className="admin-page">
       <h1 className="page-title">گروه‌ها</h1>
       <p className="page-sub">
-        کاربر روی همه پنل‌های گروه ساخته می‌شود. مصرف Astra = جمع (مصرف خام هر پنل × ضریب همان پنل).
-        ضریب ۲ یعنی مصرف دوبرابر حساب می‌شود. با چند پنل، مصرف همه با هم جمع می‌شود. وقتی به سقف خرید
-        برسد، در Astra «اتمام حجم» می‌شود و کانفیگ روی پنل اصلی هم خاموش می‌شود — حتی اگر آنجا حجم مانده باشد.
+        گروه‌ها را در دسته‌ها (مثل مستقیم، تانل، گیمینگ) مرتب کنید. گروه جدید پیش‌فرض در «همه گروه‌ها»
+        می‌آید مگر روی تب دسته دیگری باشید. مصرف Astra = جمع (مصرف خام × ضریب هر گروه).
       </p>
 
       <div className="toolbar">
-        <span className="muted">{toFaDigits(groups.length)} گروه</span>
+        <span className="muted">
+          {toFaDigits(visibleGroups.length)} گروه
+          {activeCat ? ` در «${activeCat.name}»` : " بدون دسته"}
+          <span className="groups-total-hint"> · کل {toFaDigits(groups.length)}</span>
+        </span>
         <button className="btn toolbar-primary" onClick={openCreate}>
           <Plus size={16} />
           گروه جدید
         </button>
+      </div>
+
+      <div className="groups-cat-bar" role="tablist" aria-label="دسته‌بندی گروه‌ها">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab == null}
+          className={`groups-cat-tab${activeTab == null ? " active" : ""}`}
+          onClick={() => setActiveTab(null)}
+        >
+          همه گروه‌ها
+          <span className="groups-cat-count">{toFaDigits(uncategorizedCount)}</span>
+        </button>
+        {categories.map((c) => (
+          <button
+            key={c.id}
+            type="button"
+            role="tab"
+            aria-selected={activeTab === c.id}
+            className={`groups-cat-tab${activeTab === c.id ? " active" : ""}`}
+            onClick={() => setActiveTab(c.id)}
+            onDoubleClick={() => {
+              setCatName(c.name);
+              setCatModal({ edit: c });
+            }}
+            title="دبل‌کلیک برای ویرایش نام"
+          >
+            {c.name}
+            <span className="groups-cat-count">{toFaDigits(c.groups_count)}</span>
+          </button>
+        ))}
+        <button
+          type="button"
+          className="groups-cat-add"
+          onClick={() => {
+            setCatName("");
+            setCatModal("create");
+          }}
+          title="دسته جدید"
+        >
+          <FolderPlus size={16} />
+          <span>دسته جدید</span>
+        </button>
+        {activeCat && (
+          <button
+            type="button"
+            className="groups-cat-manage"
+            onClick={() => {
+              setCatName(activeCat.name);
+              setCatModal({ edit: activeCat });
+            }}
+          >
+            <Pencil size={14} />
+            ویرایش دسته
+          </button>
+        )}
       </div>
 
       {isLoading ? (
@@ -618,49 +778,68 @@ export default function GroupsPage() {
             ساخت اولین گروه
           </button>
         </div>
+      ) : visibleGroups.length === 0 ? (
+        <div className="admin-empty groups-empty-tab">
+          <Layers size={32} strokeWidth={1.4} />
+          <p>
+            {activeTab == null
+              ? "گروه بدون دسته‌ای نیست — از دکمه جابه‌جایی گروه را به اینجا برگردانید"
+              : `در «${activeCat?.name || "این دسته"}» گروهی نیست`}
+          </p>
+          <button className="btn" onClick={openCreate}>
+            ساخت گروه در این تب
+          </button>
+        </div>
       ) : (
-        <div className="admin-grid">
-          {groups.map((g) => (
-            <article key={g.id} className={`admin-card ${g.is_disabled ? "is-off" : ""}`}>
-              <div className="admin-card-top">
-                <div className="admin-card-id">
+        <div className="groups-list">
+          {visibleGroups.map((g) => (
+            <article key={g.id} className={`groups-row${g.is_disabled ? " is-off" : ""}`}>
+              <div className="groups-row-main">
+                <div className="groups-row-title">
                   <b>{g.name}</b>
-                  {g.description && <p className="admin-card-desc">{g.description}</p>}
-                  <div className="admin-card-tags">
-                    <span className={`badge ${g.is_disabled ? "err" : "ok"}`}>
-                      {g.is_disabled ? "غیرفعال" : "فعال"}
+                  {g.description ? <span className="groups-row-desc">{g.description}</span> : null}
+                </div>
+                <div className="groups-row-meta">
+                  <span className={`badge ${g.is_disabled ? "err" : "ok"}`}>
+                    {g.is_disabled ? "غیرفعال" : "فعال"}
+                  </span>
+                  <span className="badge muted">{toFaDigits((g.panels || []).length)} پنل</span>
+                  {(g.config_tag || "").trim() ? (
+                    <span className="badge muted" dir="ltr">
+                      {(g.config_tag || "").trim()}
                     </span>
-                    <span className="badge muted">
-                      {toFaDigits((g.panels || []).length)} پنل
-                    </span>
-                    {(g.notices || []).length > 0 && (
-                      <span className="badge warn">
-                        <Megaphone size={11} style={{ marginInlineEnd: 4, verticalAlign: "-1px" }} />
-                        {toFaDigits((g.notices || []).length)} اطلاع
+                  ) : null}
+                </div>
+                <div className="groups-row-chips">
+                  {(g.panels || []).map((p) => {
+                    const coeff = parseCoeff(
+                      (p.config as { coefficient?: number } | undefined)?.coefficient,
+                      1
+                    );
+                    return (
+                      <span key={p.panel_id} className="badge muted">
+                        {p.panel_name || panelMap[p.panel_id]?.name || `#${p.panel_id}`}
+                        {coeff !== 1 ? ` · ×${formatCoeffInput(coeff)}` : ""}
                       </span>
-                    )}
-                  </div>
+                    );
+                  })}
+                  {(g.panels || []).length === 0 && (
+                    <span className="muted" style={{ fontSize: "0.82rem" }}>
+                      بدون پنل
+                    </span>
+                  )}
                 </div>
               </div>
-              <div className="admin-card-chips">
-                {(g.panels || []).map((p) => {
-                  const coeff = Number(
-                    (p.config as { coefficient?: number } | undefined)?.coefficient ?? 1
-                  );
-                  return (
-                    <span key={p.panel_id} className="badge muted">
-                      {p.panel_name || panelMap[p.panel_id]?.name || `#${p.panel_id}`}
-                      {coeff !== 1 ? ` · ×${coeff}` : ""}
-                    </span>
-                  );
-                })}
-                {(g.panels || []).length === 0 && (
-                  <span className="muted" style={{ fontSize: "0.82rem" }}>
-                    بدون پنل
-                  </span>
-                )}
-              </div>
-              <div className="admin-card-actions">
+              <div className="groups-row-actions">
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  onClick={() => setMoveGroup(g)}
+                  title="جابه‌جایی به دسته دیگر"
+                >
+                  <ArrowRightLeft size={14} />
+                  جابه‌جایی
+                </button>
                 <button type="button" className="btn ghost sm" onClick={() => openEdit(g)}>
                   <Pencil size={14} />
                   ویرایش
@@ -713,55 +892,24 @@ export default function GroupsPage() {
                 <input value={description} onChange={(e) => setDescription(e.target.value)} />
               </div>
 
-              <div className="field group-notices-field">
-                <label>کانفیگ اطلاع‌رسانی (اختیاری)</label>
-                <p className="field-hint">
-                  متن‌هایی که به‌صورت کانفیگ اول در ساب و لینک‌ها به کاربر نشان داده می‌شوند — اگر
-                  لازم نیست خالی بگذارید
+              <div className="field">
+                <label>متن روی کانفیگ‌های این گروه در ساب (اختیاری)</label>
+                <input
+                  value={configTag}
+                  onChange={(e) => setConfigTag(e.target.value)}
+                  placeholder="مثلاً VIP — خالی = بدون متن اضافه"
+                  maxLength={24}
+                />
+                <p className="field-hint" dir="ltr">
+                  {configTag.trim()
+                    ? `#1. ${configTag.trim()} 2.5G | user`
+                    : "#1. 2.5G | user"}
                 </p>
-                {notices.length > 0 && (
-                  <ul className="group-notices-list">
-                    {notices.map((n, i) => (
-                      <li key={`${i}-${n.slice(0, 24)}`}>
-                        <span className="group-notice-idx">{toFaDigits(i + 1)}</span>
-                        <span className="group-notice-text">{n}</span>
-                        <button
-                          type="button"
-                          className="btn ghost sm icon-only"
-                          onClick={() => removeNotice(i)}
-                          aria-label="حذف اطلاع"
-                          title="حذف"
-                        >
-                          <X size={14} />
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                <div className="group-notice-add">
-                  <input
-                    value={noticeDraft}
-                    onChange={(e) => setNoticeDraft(e.target.value)}
-                    placeholder="مثلاً: قبل اتصال آپدیت بزنید"
-                    maxLength={200}
-                    disabled={notices.length >= 10}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        addNotice();
-                      }
-                    }}
-                  />
-                  <button
-                    type="button"
-                    className="btn ghost sm"
-                    onClick={addNotice}
-                    disabled={!noticeDraft.trim() || notices.length >= 10}
-                  >
-                    <Plus size={14} />
-                    افزودن
-                  </button>
-                </div>
+                <p className="field-hint">
+                  فقط روی کانفیگ‌های پنل‌های همین گروه اعمال می‌شود — از لحظه ذخیره روی همه
+                  ساب‌های قبلی کاربران این گروه هم می‌آید (کلاینت ممکن است تا یک ساعت بعد
+                  تازه‌سازی کند).
+                </p>
               </div>
 
               <label className="muted" style={{ fontSize: "0.86rem", display: "block", marginBottom: 8 }}>
@@ -1051,22 +1199,40 @@ export default function GroupsPage() {
                             <div className="field" style={{ marginBottom: 0 }}>
                               <label>ضریب ساب Astra</label>
                               <input
-                                type="number"
-                                min={0.01}
-                                step="any"
+                                type="text"
                                 inputMode="decimal"
                                 dir="ltr"
                                 placeholder="1"
-                                value={pick.coefficient}
+                                autoComplete="off"
+                                value={
+                                  coeffDrafts[p.id] !== undefined
+                                    ? coeffDrafts[p.id]
+                                    : formatCoeffInput(pick.coefficient)
+                                }
                                 onChange={(e) => {
-                                  const n = Number(e.target.value);
-                                  updatePick(p.id, {
-                                    coefficient: !Number.isNaN(n) && n >= 0.01 ? n : 1,
+                                  const v = e.target.value;
+                                  setCoeffDrafts((prev) => ({ ...prev, [p.id]: v }));
+                                  const n = parseCoeff(v, NaN);
+                                  if (!Number.isNaN(n)) {
+                                    updatePick(p.id, { coefficient: n });
+                                  }
+                                }}
+                                onBlur={() => {
+                                  const draft = coeffDrafts[p.id];
+                                  const n = parseCoeff(
+                                    draft !== undefined ? draft : pick.coefficient,
+                                    1
+                                  );
+                                  updatePick(p.id, { coefficient: n });
+                                  setCoeffDrafts((prev) => {
+                                    const next = { ...prev };
+                                    delete next[p.id];
+                                    return next;
                                   });
                                 }}
                               />
                               <p className="field-hint" style={{ marginBottom: 0 }}>
-                                ۱ = عادی · ۲ = هر بایت خام ×۲ در Astra. سقف خرید بین همه پنل‌های گروه مشترک است.
+                                ۱ = همان حجم دانلود · ۱.۳۳ = مصرف Astra برابر خام × ۱.۳۳ (بیشتر از دانلود).
                               </p>
                             </div>
                             <div className="field" style={{ marginBottom: 0 }}>
@@ -1165,6 +1331,164 @@ export default function GroupsPage() {
                 {remove.isPending ? "در حال حذف…" : "بله، حذف از سایت"}
               </button>
             </footer>
+          </div>
+        </div>
+      )}
+
+      {moveGroup && (
+        <div
+          className="modal-backdrop"
+          onClick={() => !moveMut.isPending && setMoveGroup(null)}
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <header className="modal-head">
+              <div>
+                <h3>جابه‌جایی گروه</h3>
+                <p className="modal-sub">
+                  «{moveGroup.name}» را به کدام دسته ببرید؟
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setMoveGroup(null)}
+                aria-label="بستن"
+              >
+                ×
+              </button>
+            </header>
+            <div className="groups-move-list">
+              <button
+                type="button"
+                className={`groups-move-opt${moveGroup.category_id == null ? " current" : ""}`}
+                disabled={moveMut.isPending || moveGroup.category_id == null}
+                onClick={() => moveMut.mutate({ id: moveGroup.id, category_id: null })}
+              >
+                <span>همه گروه‌ها</span>
+                <span className="muted">بدون دسته</span>
+              </button>
+              {categories.map((c) => (
+                <button
+                  key={c.id}
+                  type="button"
+                  className={`groups-move-opt${moveGroup.category_id === c.id ? " current" : ""}`}
+                  disabled={moveMut.isPending || moveGroup.category_id === c.id}
+                  onClick={() => moveMut.mutate({ id: moveGroup.id, category_id: c.id })}
+                >
+                  <span>{c.name}</span>
+                  <span className="muted">{toFaDigits(c.groups_count)} گروه</span>
+                </button>
+              ))}
+              {categories.length === 0 && (
+                <p className="muted" style={{ margin: "8px 0 0", fontSize: "0.86rem" }}>
+                  هنوز دسته‌ای نساخته‌اید — اول «دسته جدید» را بزنید.
+                </p>
+              )}
+            </div>
+            {moveMut.isError && (
+              <p className="error">{(moveMut.error as Error).message}</p>
+            )}
+            <footer className="modal-foot">
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={moveMut.isPending}
+                onClick={() => setMoveGroup(null)}
+              >
+                بستن
+              </button>
+            </footer>
+          </div>
+        </div>
+      )}
+
+      {catModal && (
+        <div
+          className="modal-backdrop"
+          onClick={() => !saveCategory.isPending && !deleteCategory.isPending && setCatModal(null)}
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <header className="modal-head">
+              <div>
+                <h3>{catModal === "create" ? "دسته جدید" : "ویرایش دسته"}</h3>
+                <p className="modal-sub">
+                  {catModal === "create"
+                    ? "مثلاً مستقیم، تانل، گیمینگ"
+                    : "تغییر نام یا حذف دسته — گروه‌هایش به «همه گروه‌ها» برمی‌گردند"}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setCatModal(null)}
+                aria-label="بستن"
+              >
+                ×
+              </button>
+            </header>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                saveCategory.mutate();
+              }}
+            >
+              <div className="field">
+                <label>نام دسته</label>
+                <input
+                  required
+                  maxLength={48}
+                  value={catName}
+                  onChange={(e) => setCatName(e.target.value)}
+                  placeholder="مثلاً گیمینگ"
+                  autoFocus
+                />
+              </div>
+              {saveCategory.isError && (
+                <p className="error">{(saveCategory.error as Error).message}</p>
+              )}
+              {deleteCategory.isError && (
+                <p className="error">{(deleteCategory.error as Error).message}</p>
+              )}
+              <footer className="modal-foot">
+                {catModal !== "create" && typeof catModal === "object" && (
+                  <button
+                    type="button"
+                    className="btn danger"
+                    disabled={saveCategory.isPending || deleteCategory.isPending}
+                    onClick={() => {
+                      if (
+                        window.confirm(
+                          `فقط دسته «${catModal.edit.name}» حذف شود؟\nگروه‌های داخلش پاک نمی‌شوند و همه به تب «همه گروه‌ها» منتقل می‌شوند.`,
+                        )
+                      ) {
+                        deleteCategory.mutate(catModal.edit.id);
+                      }
+                    }}
+                  >
+                    {deleteCategory.isPending ? "…" : "حذف دسته"}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="btn ghost"
+                  disabled={saveCategory.isPending || deleteCategory.isPending}
+                  onClick={() => setCatModal(null)}
+                >
+                  انصراف
+                </button>
+                <button
+                  type="submit"
+                  className="btn"
+                  disabled={saveCategory.isPending || !catName.trim()}
+                >
+                  {saveCategory.isPending
+                    ? "…"
+                    : catModal === "create"
+                      ? "ساخت"
+                      : "ذخیره"}
+                </button>
+              </footer>
+            </form>
           </div>
         </div>
       )}

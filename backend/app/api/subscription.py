@@ -2,13 +2,16 @@ import asyncio
 import base64
 import logging
 import re
+import time
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
-from app.core.database import get_db
-from app.models.user import UserStatus
+from app.core.database import AsyncSessionLocal, get_db
+from app.models.user import PanelAccount, User, UserStatus
 from app.services.orchestrator import (
     collect_links,
     collect_links_detailed,
@@ -31,6 +34,71 @@ from app.services.users import load_user_by_token, subscription_url
 
 router = APIRouter(tags=["Subscription"])
 logger = logging.getLogger("astra.sub")
+
+# Debounce background maintain so many clients don't stampede one user
+_bg_last: dict[int, float] = {}
+_BG_MIN_INTERVAL = 25.0
+
+
+def _user_has_share_links(user) -> bool:
+    from app.adapters.http_utils import is_share_link
+
+    for account in user.panel_accounts or []:
+        for link in account.links or []:
+            if is_share_link(str(link or "")):
+                return True
+    return False
+
+
+async def _bg_sub_maintain(user_id: int) -> None:
+    """Fill missing share links + soft usage refresh — never on the HTTP path."""
+    now = time.monotonic()
+    last = _bg_last.get(user_id, 0.0)
+    if now - last < _BG_MIN_INTERVAL:
+        return
+    _bg_last[user_id] = now
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(User)
+                .where(User.id == user_id)
+                .options(
+                    selectinload(User.panel_accounts).selectinload(PanelAccount.panel),
+                    selectinload(User.groups),
+                )
+            )
+            user = result.scalar_one_or_none()
+            if not user:
+                return
+            try:
+                await asyncio.wait_for(hydrate_share_links(db, user), timeout=6.0)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("bg hydrate user_id=%s: %s", user_id, exc)
+            try:
+                # quick=True → no provision, hard overall budget on panel pulls
+                await asyncio.wait_for(
+                    refresh_usage(db, user, force=False, quick=True),
+                    timeout=5.5,
+                )
+                await enforce_user_quota(db, user)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("bg usage user_id=%s: %s", user_id, exc)
+            try:
+                await db.commit()
+            except Exception:  # noqa: BLE001
+                await db.rollback()
+    except Exception:  # noqa: BLE001
+        logger.exception("bg sub maintain user_id=%s failed", user_id)
+
+
+def _schedule_bg_maintain(user_id: int) -> None:
+    try:
+        asyncio.create_task(
+            _bg_sub_maintain(user_id),
+            name=f"astra-sub-bg-{user_id}",
+        )
+    except RuntimeError:
+        pass
 
 
 def _header_base64(text: str) -> str:
@@ -57,7 +125,8 @@ def _sub_headers(user) -> dict[str, str]:
     sub = subscription_url(user)
     headers = {
         "profile-title": _header_base64(f"{brand}-{title_name}"),
-        "profile-update-interval": "12",
+        # 1h so remark/tag changes (group config_tag) reach clients quickly
+        "profile-update-interval": "1",
         "subscription-userinfo": f"upload={upload}; download={download}; total={total}; expire={expire}",
         # filename ASCII only; some clients mishandle attachment — keep for PG parity
         "content-disposition": f'attachment; filename="{file_base}"',
@@ -116,10 +185,20 @@ def _feed_response(body: bytes, headers: dict[str, str]) -> Response:
     )
 
 
-async def _ensure_share_links(db: AsyncSession, token: str, user, *, timeout: float = 14.0):
-    """Ensure share links from ALL panels are in the feed (parallel hydrate)."""
+async def _ensure_share_links(
+    db: AsyncSession,
+    token: str,
+    user,
+    *,
+    timeout: float = 4.0,
+    force: bool = False,
+):
+    """Hydrate missing share links with a hard budget (never block multi-panel users)."""
+    if not force and _user_has_share_links(user):
+        # Already have configs — skip blocking hydrate; bg task fills gaps
+        links = await collect_links(user, include_notices=False, db=db)
+        return user, links
     try:
-        # hydrate waves need headroom for PasarGuard/Marzban /sub expand
         n = await asyncio.wait_for(hydrate_share_links(db, user), timeout=timeout)
         if n:
             await db.commit()
@@ -132,7 +211,7 @@ async def _ensure_share_links(db: AsyncSession, token: str, user, *, timeout: fl
         except Exception:  # noqa: BLE001
             pass
         user = await load_user_by_token(db, token) or user
-    links = await collect_links(user, include_notices=False)
+    links = await collect_links(user, include_notices=False, db=db)
     if not links:
         logger.warning(
             "sub feed empty user=%s status=%s accounts=%s",
@@ -199,17 +278,27 @@ async def _pull_live_usage(db: AsyncSession, user, *, push: bool = False) -> Non
 
 async def _render_info_page(db: AsyncSession, token: str, user) -> HTMLResponse:
     await ensure_loaded(db)
-    # 1) Share links from every panel  2) Live raw usage × coefficients
-    # Sequential on one DB session (SQLAlchemy async is not concurrency-safe).
-    user, _links = await _ensure_share_links(db, token, user, timeout=12.0)
+    # Serve page from cached links/usage; soft-refresh in background.
+    user, _links = await _ensure_share_links(db, token, user, timeout=3.5)
+    _schedule_bg_maintain(int(user.id))
     try:
-        await asyncio.wait_for(_pull_live_usage(db, user, push=False), timeout=30.0)
+        # Tiny budget only — never wait on all panels for HTML
+        await asyncio.wait_for(
+            refresh_usage(db, user, force=False, quick=True),
+            timeout=2.5,
+        )
+        await enforce_user_quota(db, user)
+        await db.commit()
         user = await load_user_by_token(db, token) or user
     except Exception as exc:  # noqa: BLE001
         logger.warning("sub page usage: %s", exc)
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
         user = await load_user_by_token(db, token) or user
 
-    configs = collect_links_detailed(user, include_notices=True)
+    configs = await collect_links_detailed(user, include_notices=True, db=db)
     panels_usage = await usage_breakdown_for_user(db, user)
     device_limit = await device_limit_for_user(db, user)
     status = user.status.value if hasattr(user.status, "value") else str(user.status)
@@ -246,6 +335,9 @@ async def get_subscription(
     One URL, two responses (like PasarGuard):
     - Browser (Mozilla + Accept:text/html) → HTML page
     - Everything else → Base64 feed with Content-Length
+
+    Feed path is cache-first: return stored share links immediately.
+    Hydrate/usage for many panels runs in background (avoids nginx 502).
     """
     user = await load_user_by_token(db, token)
     if not user:
@@ -254,28 +346,21 @@ async def get_subscription(
     if _wants_html_page(request):
         return await _render_info_page(db, token, user)
 
-    # Client feed: hydrate configs; refresh usage when stale (header userinfo).
     from app.services.site_settings import ensure_loaded
 
     await ensure_loaded(db)
-    user, links = await _ensure_share_links(db, token, user)
-    try:
-        await asyncio.wait_for(refresh_usage(db, user, force=False), timeout=10.0)
-        await db.commit()
-        user = await load_user_by_token(db, token) or user
-        # Rebuild so status remark (volume/time) matches live usage
-        links = await collect_links(user, include_notices=False) or links
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("sub feed usage: %s", exc)
-        try:
-            await db.rollback()
-        except Exception:  # noqa: BLE001
-            pass
-        # Still rebuild status line from DB values
-        try:
-            links = await collect_links(user, include_notices=False) or links
-        except Exception:  # noqa: BLE001
-            pass
+
+    # Fast path: if we already have share links, never wait on remotes.
+    if _user_has_share_links(user):
+        links = await collect_links(user, include_notices=False, db=db)
+        _schedule_bg_maintain(int(user.id))
+    else:
+        # First-time / empty: short hydrate only, then serve whatever we got
+        user, links = await _ensure_share_links(
+            db, token, user, timeout=4.0, force=True
+        )
+        _schedule_bg_maintain(int(user.id))
+
     headers = _sub_headers(user)
 
     if user.status not in (UserStatus.active, UserStatus.on_hold):

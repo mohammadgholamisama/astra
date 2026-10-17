@@ -125,15 +125,29 @@ export interface Group {
   name: string;
   description: string | null;
   is_disabled: boolean;
+  /** Optional text in real config remarks for this group's panels: `#1. TAG 2.5G | name` */
+  config_tag?: string;
   /** Optional info messages prepended as first configs in subscription */
   notices?: string[];
+  /** null = default bucket «همه گروه‌ها» */
+  category_id?: number | null;
   panels: GroupPanel[];
+  created_at: string;
+}
+
+export interface GroupCategory {
+  id: number;
+  name: string;
+  sort_order: number;
+  groups_count: number;
   created_at: string;
 }
 
 export interface PanelAccount {
   id: number;
   panel_id: number;
+  /** Astra sales group this remote account belongs to (per-group coeffs). */
+  group_id?: number | null;
   panel_name?: string | null;
   panel_type?: string | null;
   panel_base_url?: string | null;

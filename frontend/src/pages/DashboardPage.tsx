@@ -249,10 +249,15 @@ export default function DashboardPage() {
                 <Layers size={15} />
                 گروه
               </Link>
-              <Link to="/api-keys" className="board-chip">
+              <a
+                href="/docs"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="board-chip"
+              >
                 <KeyRound size={15} />
-                API
-              </Link>
+                مستندات API
+              </a>
             </div>
           </section>
         </>

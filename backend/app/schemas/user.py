@@ -37,6 +37,7 @@ class UserModify(BaseModel):
 class PanelAccountOut(ORMModel):
     id: int
     panel_id: int
+    group_id: int | None = None
     panel_name: str | None = None
     panel_type: str | None = None
     panel_base_url: str | None = None

@@ -1,7 +1,8 @@
 import { FormEvent, useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { KeyRound, Link2, RotateCcw, Save, Settings, ShieldCheck } from "lucide-react";
-import { ApiError, api } from "../lib/api";
+import { KeyRound, Link2, Plus, RotateCcw, Save, Settings, ShieldCheck, Trash2 } from "lucide-react";
+import { ApiError, ApiKey, api } from "../lib/api";
+import { toFaDigits } from "../lib/format";
 
 type SiteSettings = {
   sub_base_url: string;
@@ -10,7 +11,6 @@ type SiteSettings = {
   link_channel: string;
   link_support: string;
   link_app: string;
-  config_brand_tag: string;
   promo_config_enabled: boolean;
   promo_config_text: string;
   ssl_available: boolean;
@@ -42,7 +42,6 @@ export default function SettingsPage() {
   const [linkChannel, setLinkChannel] = useState("");
   const [linkSupport, setLinkSupport] = useState("");
   const [linkApp, setLinkApp] = useState("");
-  const [configBrandTag, setConfigBrandTag] = useState("");
   const [promoEnabled, setPromoEnabled] = useState(false);
   const [promoText, setPromoText] = useState("");
   const [sslPanelDomain, setSslPanelDomain] = useState("");
@@ -52,10 +51,43 @@ export default function SettingsPage() {
   const [newPass2, setNewPass2] = useState("");
   const [passMsg, setPassMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
   const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+  const [keyOpen, setKeyOpen] = useState(false);
+  const [keyName, setKeyName] = useState("");
+  const [keyNote, setKeyNote] = useState("");
+  const [createdKey, setCreatedKey] = useState<string | null>(null);
+  const [confirmKey, setConfirmKey] = useState<ApiKey | null>(null);
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["site-settings"],
     queryFn: () => api<SiteSettings>("/api/admin/settings"),
+  });
+
+  const { data: apiKeys = [], isLoading: keysLoading } = useQuery({
+    queryKey: ["api-keys"],
+    queryFn: () => api<ApiKey[]>("/api/admin/api-keys"),
+  });
+
+  const createKey = useMutation({
+    mutationFn: () =>
+      api<ApiKey>("/api/admin/api-keys", {
+        method: "POST",
+        body: JSON.stringify({ name: keyName, note: keyNote || null }),
+      }),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["api-keys"] });
+      setCreatedKey(res.key || null);
+      setKeyName("");
+      setKeyNote("");
+      setKeyOpen(false);
+    },
+  });
+
+  const removeKey = useMutation({
+    mutationFn: (id: number) => api(`/api/admin/api-keys/${id}`, { method: "DELETE" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["api-keys"] });
+      setConfirmKey(null);
+    },
   });
 
   useEffect(() => {
@@ -66,7 +98,6 @@ export default function SettingsPage() {
     setLinkChannel(data.link_channel || "");
     setLinkSupport(data.link_support || "");
     setLinkApp(data.link_app || "");
-    setConfigBrandTag(data.config_brand_tag || "");
     setPromoEnabled(!!data.promo_config_enabled);
     setPromoText(data.promo_config_text || "");
     setSslPanelDomain(data.panel_domain || hostFromUrl(data.panel_base_url) || "");
@@ -84,7 +115,6 @@ export default function SettingsPage() {
           link_channel: linkChannel.trim(),
           link_support: linkSupport.trim(),
           link_app: linkApp.trim(),
-          config_brand_tag: configBrandTag.trim(),
           promo_config_enabled: promoEnabled,
           promo_config_text: promoText.trim(),
         }),
@@ -97,7 +127,6 @@ export default function SettingsPage() {
       setLinkChannel(res.link_channel || "");
       setLinkSupport(res.link_support || "");
       setLinkApp(res.link_app || "");
-      setConfigBrandTag(res.config_brand_tag || "");
       setPromoEnabled(!!res.promo_config_enabled);
       setPromoText(res.promo_config_text || "");
       setMsg({ type: "ok", text: "تنظیمات ذخیره شد" });
@@ -190,7 +219,6 @@ export default function SettingsPage() {
       linkChannel.trim() !== (data.link_channel || "").trim() ||
       linkSupport.trim() !== (data.link_support || "").trim() ||
       linkApp.trim() !== (data.link_app || "").trim() ||
-      configBrandTag.trim() !== (data.config_brand_tag || "").trim() ||
       promoEnabled !== !!data.promo_config_enabled ||
       promoText.trim() !== (data.promo_config_text || "").trim());
 
@@ -294,28 +322,13 @@ export default function SettingsPage() {
             <header className="settings-card-head">
               <Settings size={20} />
               <div>
-                <h2>نام کانفیگ‌های ساب</h2>
+                <h2>کانفیگ تبلیغاتی ساب</h2>
                 <p>
-                  بدون متن: <code dir="ltr">#2. 2.5G | name</code> · با متن:{" "}
-                  <code dir="ltr">#2. text 2.5G | name</code> — کانفیگ‌های اضافه گروه عوض نمی‌شوند
+                  خط اول همیشه وضعیت است (✨ یوزر - حجم - زمان ✨). متن اختصاصی هر گروه را از صفحه
+                  گروه‌ها تنظیم کنید.
                 </p>
               </div>
             </header>
-
-            <div className="field">
-              <label>متن روی همه کانفیگ‌ها (اختیاری)</label>
-              <input
-                value={configBrandTag}
-                onChange={(e) => setConfigBrandTag(e.target.value)}
-                placeholder="مثلاً VIP — خالی = بدون متن اضافه"
-                maxLength={24}
-              />
-              <p className="field-hint" dir="ltr">
-                {configBrandTag.trim()
-                  ? `#1. ${configBrandTag.trim()} 2.5G | user`
-                  : "#1. 2.5G | user"}
-              </p>
-            </div>
 
             <div className="field">
               <label className="settings-check">
@@ -327,8 +340,7 @@ export default function SettingsPage() {
                 <span>کانفیگ تبلیغاتی (خط دوم ساب)</span>
               </label>
               <p className="field-hint">
-                خط اول همیشه وضعیت است (✨ یوزر - حجم - زمان ✨). اگر این گزینه روشن باشد، متن زیر
-                خط دوم می‌شود — بدون پینگ، فقط نمایش.
+                اگر روشن باشد، متن زیر خط دوم می‌شود — بدون پینگ، فقط نمایش.
               </p>
               <textarea
                 value={promoText}
@@ -414,6 +426,90 @@ export default function SettingsPage() {
             <header className="settings-card-head">
               <KeyRound size={20} />
               <div>
+                <h2>کلیدهای API</h2>
+                <p>
+                  برای ربات تلگرام / اسکریپت — هدر{" "}
+                  <code dir="ltr">X-Api-Key</code> · لیست کامل endpointها از منو: مستندات API
+                </p>
+              </div>
+            </header>
+
+            {createdKey && (
+              <div className="admin-toast ok admin-key-reveal">
+                <div>
+                  <strong>کلید یک‌بار نمایش داده می‌شود — همین الان کپی کنید</strong>
+                  <code dir="ltr" className="admin-key-value">
+                    {createdKey}
+                  </code>
+                </div>
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  onClick={() => {
+                    void navigator.clipboard.writeText(createdKey);
+                  }}
+                >
+                  کپی
+                </button>
+              </div>
+            )}
+
+            <div className="toolbar" style={{ margin: "0 0 12px" }}>
+              <span className="muted">{toFaDigits(apiKeys.length)} کلید</span>
+              <button
+                type="button"
+                className="btn toolbar-primary"
+                onClick={() => setKeyOpen(true)}
+              >
+                <Plus size={16} />
+                ساخت کلید
+              </button>
+            </div>
+
+            {keysLoading ? (
+              <p className="muted">در حال بارگذاری…</p>
+            ) : apiKeys.length === 0 ? (
+              <p className="muted" style={{ margin: 0 }}>
+                هنوز کلیدی ساخته نشده
+              </p>
+            ) : (
+              <div className="groups-list">
+                {apiKeys.map((k) => (
+                  <article key={k.id} className="groups-row">
+                    <div className="groups-row-main">
+                      <div className="groups-row-title">
+                        <b>{k.name}</b>
+                        {k.note ? <span className="groups-row-desc">{k.note}</span> : null}
+                      </div>
+                      <div className="groups-row-meta">
+                        <span className="badge muted" dir="ltr">
+                          {k.key_prefix}…
+                        </span>
+                        <span className={`badge ${k.is_active ? "ok" : "err"}`}>
+                          {k.is_active ? "فعال" : "غیرفعال"}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="groups-row-actions">
+                      <button
+                        type="button"
+                        className="btn danger sm"
+                        onClick={() => setConfirmKey(k)}
+                      >
+                        <Trash2 size={14} />
+                        حذف
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="settings-card">
+            <header className="settings-card-head">
+              <ShieldCheck size={20} />
+              <div>
                 <h2>رمز ورود به پنل</h2>
                 <p>تغییر رمز ادمین فعلی · حداقل ۸ کاراکتر</p>
               </div>
@@ -468,7 +564,7 @@ export default function SettingsPage() {
                 changePass.mutate();
               }}
             >
-              <KeyRound size={16} />
+              <ShieldCheck size={16} />
               {changePass.isPending ? "در حال تغییر…" : "تغییر رمز عبور"}
             </button>
           </div>
@@ -541,6 +637,112 @@ export default function SettingsPage() {
             </button>
           </footer>
         </form>
+      )}
+
+      {keyOpen && (
+        <div
+          className="modal-backdrop"
+          onClick={() => !createKey.isPending && setKeyOpen(false)}
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <header className="modal-head">
+              <div>
+                <h3>ساخت کلید API</h3>
+                <p className="modal-sub">کلید فقط یک‌بار بعد از ساخت نشان داده می‌شود</p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setKeyOpen(false)}
+                aria-label="بستن"
+              >
+                ×
+              </button>
+            </header>
+            <form
+              onSubmit={(e: FormEvent) => {
+                e.preventDefault();
+                createKey.mutate();
+              }}
+            >
+              <div className="field">
+                <label>نام</label>
+                <input
+                  required
+                  minLength={2}
+                  value={keyName}
+                  onChange={(e) => setKeyName(e.target.value)}
+                  placeholder="مثلاً ربات تلگرام"
+                />
+              </div>
+              <div className="field">
+                <label>یادداشت (اختیاری)</label>
+                <input value={keyNote} onChange={(e) => setKeyNote(e.target.value)} />
+              </div>
+              {createKey.isError && (
+                <p className="error">{(createKey.error as Error).message}</p>
+              )}
+              <footer className="modal-foot">
+                <button
+                  type="button"
+                  className="btn ghost"
+                  disabled={createKey.isPending}
+                  onClick={() => setKeyOpen(false)}
+                >
+                  انصراف
+                </button>
+                <button className="btn" disabled={createKey.isPending || keyName.trim().length < 2}>
+                  {createKey.isPending ? "…" : "ساخت"}
+                </button>
+              </footer>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {confirmKey && (
+        <div
+          className="modal-backdrop"
+          onClick={() => !removeKey.isPending && setConfirmKey(null)}
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <header className="modal-head">
+              <div>
+                <h3>حذف کلید</h3>
+                <p className="modal-sub">«{confirmKey.name}» دیگر کار نمی‌کند</p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setConfirmKey(null)}
+                aria-label="بستن"
+              >
+                ×
+              </button>
+            </header>
+            {removeKey.isError && (
+              <p className="error">{(removeKey.error as Error).message}</p>
+            )}
+            <footer className="modal-foot">
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={removeKey.isPending}
+                onClick={() => setConfirmKey(null)}
+              >
+                انصراف
+              </button>
+              <button
+                type="button"
+                className="btn danger"
+                disabled={removeKey.isPending}
+                onClick={() => removeKey.mutate(confirmKey.id)}
+              >
+                {removeKey.isPending ? "…" : "حذف"}
+              </button>
+            </footer>
+          </div>
+        </div>
       )}
     </div>
   );

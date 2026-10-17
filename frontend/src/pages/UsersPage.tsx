@@ -54,6 +54,20 @@ function userHasErrors(u: User) {
   return (u.panel_accounts || []).some((a) => a.status === "error");
 }
 
+/** Distinct remote panels (not per-group account rows). */
+function uniquePanelStats(u: User): { ok: number; total: number; errorPanels: number } {
+  const accounts = u.panel_accounts || [];
+  const all = new Set<number>();
+  const active = new Set<number>();
+  const errored = new Set<number>();
+  for (const a of accounts) {
+    all.add(a.panel_id);
+    if (a.status === "active") active.add(a.panel_id);
+    if (a.status === "error") errored.add(a.panel_id);
+  }
+  return { ok: active.size, total: all.size, errorPanels: errored.size };
+}
+
 function formatPanelErrorDetail(
   a: User["panel_accounts"][number],
   astraUsername?: string
@@ -106,49 +120,92 @@ type PanelUsageRow = {
   configs: number;
 };
 
-function coeffsFromGroups(groups: Group[], groupIds: number[]): Map<number, number> {
+type GroupUsageRow = {
+  groupId: number;
+  name: string;
+  raw: number;
+  weighted: number;
+  panels: number;
+  configs: number;
+  /** Distinct coefficients used by this group's panels */
+  coefficients: number[];
+};
+
+type UsageMode = "panels" | "groups";
+
+const CARD_GROUP_SHOW = 1;
+
+function readCoeff(raw: unknown): number {
+  if (typeof raw === "string") {
+    const s = raw
+      .trim()
+      .replace(/[۰-۹]/g, (d) => "۰۱۲۳۴۵۶۷۸۹".indexOf(d).toString())
+      .replace(/[٠-٩]/g, (d) => "٠١٢٣٤٥٦٧٨٩".indexOf(d).toString())
+      .replace(/,/g, ".");
+    const n = Number(s);
+    return !Number.isNaN(n) && n >= 0.01 ? n : 1;
+  }
+  const n = Number(raw ?? 1);
+  return !Number.isNaN(n) && n >= 0.01 ? n : 1;
+}
+
+function claimCoeff(groups: Group[], groupId: number, panelId: number): number {
+  const g = groups.find((x) => x.id === groupId);
+  const gp = (g?.panels || []).find((p) => p.panel_id === panelId);
+  return readCoeff((gp?.config as { coefficient?: number } | undefined)?.coefficient);
+}
+
+/** Coefficient for one PanelAccount: its group×panel config (not max across groups). */
+function accountCoeff(a: User["panel_accounts"][number], groups: Group[], groupIds: number[]): number {
+  if (a.group_id != null) {
+    return claimCoeff(groups, a.group_id, a.panel_id);
+  }
+  // Legacy merged account: max across user's groups on this panel
   const want = new Set(groupIds || []);
-  const map = new Map<number, number>();
+  let best = 1;
   for (const g of groups) {
     if (want.size && !want.has(g.id)) continue;
-    for (const gp of g.panels || []) {
-      const raw = Number((gp.config as { coefficient?: number } | undefined)?.coefficient ?? 1);
-      const c = !Number.isNaN(raw) && raw >= 0.01 ? raw : 1;
-      const prev = map.get(gp.panel_id);
-      map.set(gp.panel_id, prev == null ? c : Math.max(prev, c));
-    }
+    const gp = (g.panels || []).find((p) => p.panel_id === a.panel_id);
+    if (!gp) continue;
+    const c = readCoeff((gp.config as { coefficient?: number } | undefined)?.coefficient);
+    if (c > best) best = c;
   }
-  return map;
+  return best;
 }
 
 function accountWeighted(a: User["panel_accounts"][number], coefficient: number): number {
   const raw = Number(a.used_traffic) || 0;
   const coeff = coefficient >= 0.01 ? coefficient : 1;
-  // Always raw × live group coefficient (same as backend quota)
   return Math.round(raw * coeff);
 }
 
+function formatCoeff(c: number): string {
+  return c === Math.floor(c) ? String(c) : c.toFixed(2).replace(/\.?0+$/, "");
+}
+
 function panelUsageRows(u: User, groups: Group[]): PanelUsageRow[] {
-  const coeffs = coeffsFromGroups(groups, u.group_ids || []);
   const astraLimit = Number(u.data_limit) || 0;
   const usedWeighted = Number(u.used_traffic) || 0;
   const rows: PanelUsageRow[] = [];
+  const gids = u.group_ids || [];
 
   for (const a of u.panel_accounts || []) {
     if (a.status !== "active" && a.status !== "error") continue;
     const raw = Number(a.used_traffic) || 0;
-    const coefficient = coeffs.get(a.panel_id) ?? 1;
+    const coefficient = accountCoeff(a, groups, gids);
     const weighted = accountWeighted(a, coefficient);
-    // Remotes get the full purchased quota; coefficient only weights Astra usage.
-    // When Astra quota is exhausted, freeze at current raw on that panel.
     let remoteLimit = 0;
     if (astraLimit > 0) {
       const exhausted = usedWeighted >= astraLimit;
       remoteLimit = exhausted ? Math.max(1, raw || 1) : astraLimit;
     }
+    const gName =
+      a.group_id != null ? groups.find((g) => g.id === a.group_id)?.name : null;
     rows.push({
       panelId: a.panel_id,
-      name: a.panel_name || `پنل #${a.panel_id}`,
+      name: gName
+        ? `${a.panel_name || `پنل #${a.panel_id}`} · ${gName}`
+        : a.panel_name || `پنل #${a.panel_id}`,
       raw,
       coefficient,
       weighted,
@@ -157,6 +214,63 @@ function panelUsageRows(u: User, groups: Group[]): PanelUsageRow[] {
     });
   }
   rows.sort((a, b) => b.weighted - a.weighted);
+  return rows;
+}
+
+/** Per-group: Σ (raw × coeff) only for accounts that belong to that group. */
+function groupUsageRows(u: User, groups: Group[]): GroupUsageRow[] {
+  const want = new Set(u.group_ids || []);
+  const accounts = (u.panel_accounts || []).filter(
+    (a) => a.status === "active" || a.status === "error",
+  );
+  const rows: GroupUsageRow[] = [];
+  for (const g of groups) {
+    if (want.size && !want.has(g.id)) continue;
+    let rawSum = 0;
+    let weighted = 0;
+    let panels = 0;
+    let configs = 0;
+    const coeffSet = new Set<number>();
+    const mine = accounts.filter((a) => a.group_id === g.id);
+    if (mine.length) {
+      for (const a of mine) {
+        const c = claimCoeff(groups, g.id, a.panel_id);
+        const raw = Number(a.used_traffic) || 0;
+        rawSum += raw;
+        weighted += Math.round(raw * c);
+        panels += 1;
+        configs += (a.links || []).filter(Boolean).length;
+        coeffSet.add(c);
+      }
+    } else {
+      // Legacy: no group_id on accounts — attribute each panel once with this group's coeff
+      const seenPanel = new Set<number>();
+      for (const gp of g.panels || []) {
+        const a = accounts.find(
+          (x) => x.panel_id === gp.panel_id && (x.group_id == null || x.group_id === g.id),
+        );
+        if (!a || seenPanel.has(a.panel_id)) continue;
+        seenPanel.add(a.panel_id);
+        const c = claimCoeff(groups, g.id, gp.panel_id);
+        const raw = Number(a.used_traffic) || 0;
+        rawSum += raw;
+        weighted += Math.round(raw * c);
+        panels += 1;
+        configs += (a.links || []).filter(Boolean).length;
+        coeffSet.add(c);
+      }
+    }
+    rows.push({
+      groupId: g.id,
+      name: g.name,
+      raw: rawSum,
+      weighted,
+      panels,
+      configs,
+      coefficients: [...coeffSet].sort((a, b) => a - b),
+    });
+  }
+  rows.sort((a, b) => b.weighted - a.weighted || a.name.localeCompare(b.name, "fa"));
   return rows;
 }
 
@@ -187,6 +301,7 @@ export default function UsersPage() {
   const [errorsUser, setErrorsUser] = useState<User | null>(null);
   const [subUser, setSubUser] = useState<User | null>(null);
   const [usageUser, setUsageUser] = useState<User | null>(null);
+  const [usageMode, setUsageMode] = useState<UsageMode>("panels");
   const [usageLoading, setUsageLoading] = useState(false);
   const [qrDataUrl, setQrDataUrl] = useState("");
   const [actionMsg, setActionMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
@@ -477,7 +592,8 @@ export default function UsersPage() {
     setTimeout(() => setCopied(""), 1600);
   }
 
-  async function openUsage(u: User) {
+  async function openUsage(u: User, mode: UsageMode = "panels") {
+    setUsageMode(mode);
     setUsageUser(u);
     setUsageLoading(true);
     try {
@@ -495,13 +611,25 @@ export default function UsersPage() {
     () => (usageUser ? panelUsageRows(usageUser, groups) : []),
     [usageUser, groups]
   );
+  const groupUsage = useMemo(
+    () => (usageUser ? groupUsageRows(usageUser, groups) : []),
+    [usageUser, groups]
+  );
   const usageTotalWeighted = useMemo(
     () => usageRows.reduce((s, r) => s + r.weighted, 0),
     [usageRows]
   );
+  const groupUsageTotal = useMemo(
+    () => groupUsage.reduce((s, r) => s + r.weighted, 0),
+    [groupUsage]
+  );
   const usageMaxWeighted = useMemo(
     () => Math.max(1, ...usageRows.map((r) => r.weighted), 1),
     [usageRows]
+  );
+  const groupUsageMax = useMemo(
+    () => Math.max(1, ...groupUsage.map((r) => r.weighted), 1),
+    [groupUsage]
   );
 
   function onSubmit(e: FormEvent) {
@@ -694,35 +822,62 @@ export default function UsersPage() {
         </div>
       </header>
 
-      <section className="users-stats" aria-label="آمار کاربران">
-        <article className="users-stat">
-          <strong>{toFaDigits(stats.total)}</strong>
-          <span>کل</span>
-        </article>
-        <article className="users-stat ok">
-          <strong>{toFaDigits(stats.active)}</strong>
-          <span>فعال</span>
-        </article>
-        <article className={`users-stat ${stats.withError ? "danger" : ""}`}>
-          <strong>{toFaDigits(stats.withError)}</strong>
-          <span>خطا</span>
-        </article>
-        <article className={`users-stat ${stats.expiringSoon ? "warn" : ""}`}>
-          <strong>{toFaDigits(stats.expiringSoon)}</strong>
-          <span>انقضا ۷روز</span>
-        </article>
-        <article className="users-stat wide">
-          <strong>{formatTraffic(stats.usedSum, { empty: "۰" })}</strong>
-          <span>مصرف صفحه</span>
-        </article>
+      <section className="users-board" aria-label="آمار کاربران">
+        <div className="users-stats">
+          <article className="users-stat">
+            <span className="users-stat-ico" aria-hidden>
+              <Users size={15} />
+            </span>
+            <div className="users-stat-body">
+              <strong>{toFaDigits(stats.total)}</strong>
+              <span>کل</span>
+            </div>
+          </article>
+          <article className="users-stat ok">
+            <span className="users-stat-ico" aria-hidden>
+              <Wifi size={15} />
+            </span>
+            <div className="users-stat-body">
+              <strong>{toFaDigits(stats.active)}</strong>
+              <span>فعال</span>
+            </div>
+          </article>
+          <article className={`users-stat ${stats.withError ? "danger" : ""}`}>
+            <span className="users-stat-ico" aria-hidden>
+              <AlertTriangle size={15} />
+            </span>
+            <div className="users-stat-body">
+              <strong>{toFaDigits(stats.withError)}</strong>
+              <span>خطا</span>
+            </div>
+          </article>
+          <article className={`users-stat ${stats.expiringSoon ? "warn" : ""}`}>
+            <span className="users-stat-ico" aria-hidden>
+              <Clock size={15} />
+            </span>
+            <div className="users-stat-body">
+              <strong>{toFaDigits(stats.expiringSoon)}</strong>
+              <span>انقضا ۷روز</span>
+            </div>
+          </article>
+          <article className="users-stat wide">
+            <span className="users-stat-ico" aria-hidden>
+              <BarChart3 size={15} />
+            </span>
+            <div className="users-stat-body">
+              <strong>{formatTraffic(stats.usedSum, { empty: "۰" })}</strong>
+              <span>مصرف صفحه</span>
+            </div>
+          </article>
+        </div>
       </section>
 
       <div className="users-toolbar">
         <div className="users-toolbar-main">
           <div className="users-search">
-            <Search size={15} />
+            <Search size={16} strokeWidth={2} />
             <input
-              placeholder="جستجو…"
+              placeholder="جستجوی یوزرنیم…"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               dir="ltr"
@@ -762,7 +917,7 @@ export default function UsersPage() {
               className={`users-filter ${filter === f.key ? "active" : ""}`}
               onClick={() => setFilter(f.key)}
             >
-              {f.label}
+              <span>{f.label}</span>
               <em>{toFaDigits(f.count)}</em>
             </button>
           ))}
@@ -776,7 +931,7 @@ export default function UsersPage() {
                 setFilterGroupId("");
               }}
             >
-              پاک
+              پاک کردن
               <X size={12} />
             </button>
           )}
@@ -817,20 +972,22 @@ export default function UsersPage() {
         <div className="users-list" role="list">
           {filtered.map((u) => {
             const errors = (u.panel_accounts || []).filter((a) => a.status === "error");
-            const ok = (u.panel_accounts || []).filter((a) => a.status === "active").length;
-            const panels = (u.panel_accounts || []).length;
+            const { ok, total: panels, errorPanels } = uniquePanelStats(u);
             const pct = usagePercent(u.used_traffic, u.data_limit);
             const remain = remainingBytes(u.used_traffic, u.data_limit);
             const exp = formatExpire(u.expire);
             const st = statusLabel(u);
-            const groupNames = (u.group_ids || [])
-              .map((id) => groupsById.get(id)?.name)
-              .filter(Boolean)
-              .join("، ");
+            const userGroupList = (u.group_ids || [])
+              .map((id) => groupsById.get(id))
+              .filter((g): g is Group => !!g);
+            const groupTitle = userGroupList.map((g) => g.name).join("، ");
+            const shownGroups = userGroupList.slice(0, CARD_GROUP_SHOW);
+            const hiddenGroupCount = Math.max(0, userGroupList.length - CARD_GROUP_SHOW);
             const barTone =
               pct == null ? "muted" : pct >= 90 ? "danger" : pct >= 70 ? "warn" : "ok";
             const isOff = u.status === "disabled";
             const menuOpen = menuUser?.username === u.username;
+            const initial = (u.username || "?").trim().charAt(0).toUpperCase() || "?";
             return (
               <article
                 key={u.username}
@@ -838,22 +995,39 @@ export default function UsersPage() {
                 className={`user-card${errors.length ? " has-err" : ""}${isOff ? " is-off" : ""}${menuOpen ? " menu-open" : ""}`}
               >
                 <div className="user-card-top">
+                  <div className={`user-card-avatar ${st.tone}`} aria-hidden>
+                    {initial}
+                  </div>
                   <div className="user-card-who">
                     <div className="user-card-name">
                       <b dir="ltr">{u.username}</b>
                       <span className={`badge ${st.tone}`}>{st.text}</span>
                     </div>
-                    <div className="user-card-meta">
-                      {u.display_name ? (
-                        <span className="user-card-display">{u.display_name}</span>
-                      ) : null}
-                      {groupNames ? (
-                        <span className="user-group-chip" title={groupNames}>
-                          <Layers size={11} />
-                          {groupNames}
-                        </span>
+                    {u.display_name ? (
+                      <div className="user-card-display">{u.display_name}</div>
+                    ) : null}
+                    <div className="user-card-groups" title={groupTitle || undefined}>
+                      {userGroupList.length === 0 ? (
+                        <span className="user-group-empty">بدون گروه</span>
+                      ) : userGroupList.length === 1 ? (
+                        <span className="user-group-pill">{userGroupList[0].name}</span>
                       ) : (
-                        <span className="muted">بدون گروه</span>
+                        <>
+                          <span className="user-group-count">
+                            <Layers size={11} />
+                            {toFaDigits(userGroupList.length)} گروه
+                          </span>
+                          {shownGroups.map((g) => (
+                            <span key={g.id} className="user-group-pill soft">
+                              {g.name}
+                            </span>
+                          ))}
+                          {hiddenGroupCount > 1 ? (
+                            <span className="user-group-more">
+                              +{toFaDigits(hiddenGroupCount)}
+                            </span>
+                          ) : null}
+                        </>
                       )}
                     </div>
                   </div>
@@ -873,7 +1047,8 @@ export default function UsersPage() {
 
                 <div className={`user-card-usage ${barTone}`}>
                   <div className="user-card-usage-line">
-                    <span>
+                    <span className="user-card-usage-label">مصرف</span>
+                    <span className="user-card-usage-vals">
                       {formatTraffic(u.used_traffic, { empty: "۰" })}
                       <em> / {formatDataLimit(u.data_limit)}</em>
                     </span>
@@ -901,14 +1076,14 @@ export default function UsersPage() {
                       ? `باقی ${formatTraffic(remain, { empty: "۰" })}`
                       : "حجم نامحدود"}
                   </span>
-                  {errors.length > 0 && (
+                  {errorPanels > 0 && (
                     <button
                       type="button"
                       className="user-card-chip err"
                       onClick={() => setErrorsUser(u)}
                     >
                       <AlertTriangle size={12} />
-                      {toFaDigits(errors.length)} خطا
+                      {toFaDigits(errorPanels)} خطا
                     </button>
                   )}
                 </div>
@@ -960,14 +1135,13 @@ export default function UsersPage() {
         const st = statusLabel(u);
         const isOff = u.status === "disabled";
         const errors = (u.panel_accounts || []).filter((a) => a.status === "error");
-        const ok = (u.panel_accounts || []).filter((a) => a.status === "active").length;
-        const panels = (u.panel_accounts || []).length;
+        const { ok, total: panels } = uniquePanelStats(u);
         const remain = remainingBytes(u.used_traffic, u.data_limit);
         const exp = formatExpire(u.expire);
-        const groupNames = (u.group_ids || [])
-          .map((id) => groupsById.get(id)?.name)
-          .filter(Boolean)
-          .join("، ");
+        const menuGroups = (u.group_ids || [])
+          .map((id) => groupsById.get(id))
+          .filter((g): g is Group => !!g);
+        const initial = (u.username || "?").trim().charAt(0).toUpperCase() || "?";
         return (
           <div
             className="modal-backdrop user-actions-backdrop"
@@ -982,6 +1156,9 @@ export default function UsersPage() {
             >
               <div className="user-actions-handle" aria-hidden />
               <header className="user-actions-head">
+                <div className={`user-actions-avatar ${st.tone}`} aria-hidden>
+                  {initial}
+                </div>
                 <div className="user-actions-who">
                   <div className="user-actions-name">
                     <b id="user-actions-title" dir="ltr">
@@ -993,12 +1170,12 @@ export default function UsersPage() {
                     <p className="user-actions-display">{u.display_name}</p>
                   ) : null}
                   <div className="user-actions-meta">
-                    {groupNames ? (
-                      <span>
-                        <Layers size={12} />
-                        {groupNames}
-                      </span>
-                    ) : null}
+                    <span>
+                      <Layers size={12} />
+                      {menuGroups.length
+                        ? `${toFaDigits(menuGroups.length)} گروه`
+                        : "بدون گروه"}
+                    </span>
                     <span>
                       <Wifi size={12} />
                       {toFaDigits(ok)}/{toFaDigits(panels)} پنل
@@ -1014,6 +1191,15 @@ export default function UsersPage() {
                       {exp.label}
                     </span>
                   </div>
+                  {menuGroups.length > 0 ? (
+                    <div className="user-actions-groups" title="گروه‌های کاربر">
+                      {menuGroups.map((g) => (
+                        <span key={g.id} className="user-actions-group-pill">
+                          {g.name}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
                 <button
                   type="button"
@@ -1063,7 +1249,7 @@ export default function UsersPage() {
                   role="menuitem"
                   onClick={() => {
                     setMenuUser(null);
-                    void openUsage(u);
+                    void openUsage(u, "panels");
                   }}
                 >
                   <span className="user-actions-ico">
@@ -1072,6 +1258,22 @@ export default function UsersPage() {
                   <span className="user-actions-label">
                     <strong>مصرف پنل‌ها</strong>
                     <small>جزئیات حجم با ضریب</small>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setMenuUser(null);
+                    void openUsage(u, "groups");
+                  }}
+                >
+                  <span className="user-actions-ico">
+                    <Layers size={18} />
+                  </span>
+                  <span className="user-actions-label">
+                    <strong>مصرف گروه‌ها</strong>
+                    <small>جمع حجم هر گروه با ضریب</small>
                   </span>
                 </button>
                 <button
@@ -1221,6 +1423,9 @@ export default function UsersPage() {
                     </button>
                   </div>
                 </div>
+                <p className="field-hint" style={{ marginTop: 0 }}>
+                  ترتیب انتخاب = ترتیب کانفیگ‌های همان گروه در ساب
+                </p>
 
                 <div className="user-create-groups-search">
                   <Search size={16} aria-hidden />
@@ -1233,8 +1438,8 @@ export default function UsersPage() {
                 </div>
 
                 {groupIds.length > 0 && (
-                  <div className="user-create-selected">
-                    {groupIds.map((id) => {
+                  <div className="user-create-selected" aria-label="ترتیب گروه‌ها در ساب">
+                    {groupIds.map((id, i) => {
                       const g = groupsById.get(id);
                       if (!g) return null;
                       return (
@@ -1243,8 +1448,9 @@ export default function UsersPage() {
                           type="button"
                           className="user-create-chip"
                           onClick={() => toggleCreateGroup(id)}
-                          title="حذف از انتخاب"
+                          title={`ترتیب ${i + 1} در ساب — کلیک برای حذف`}
                         >
+                          <span className="user-create-chip-ord">{toFaDigits(i + 1)}</span>
                           {g.name}
                           <X size={14} aria-hidden />
                         </button>
@@ -1261,6 +1467,7 @@ export default function UsersPage() {
                   ) : (
                     filteredCreateGroups.map((g) => {
                       const on = groupIds.includes(g.id);
+                      const ord = on ? groupIds.indexOf(g.id) + 1 : 0;
                       const types = [
                         ...new Set(
                           (g.panels || [])
@@ -1287,7 +1494,7 @@ export default function UsersPage() {
                           aria-pressed={on}
                         >
                           <span className={`user-create-check${on ? " on" : ""}`}>
-                            {on ? <Check size={14} strokeWidth={2.5} /> : null}
+                            {on ? toFaDigits(ord) : null}
                           </span>
                           <span className="user-create-group-body">
                             <span className="user-create-group-name">{g.name}</span>
@@ -1645,7 +1852,7 @@ export default function UsersPage() {
             <div className="user-actions-handle mobile-only" aria-hidden />
             <header className="modal-head">
               <div>
-                <h3>مصرف پنل‌ها</h3>
+                <h3>{usageMode === "groups" ? "مصرف گروه‌ها" : "مصرف پنل‌ها"}</h3>
                 <p className="modal-sub">
                   <strong dir="ltr">{usageUser.username}</strong>
                   {usageUser.display_name ? ` · ${usageUser.display_name}` : ""}
@@ -1662,60 +1869,153 @@ export default function UsersPage() {
               </button>
             </header>
 
-            <p className="usage-modal-hint">
-              مصرف کل = جمع (خام هر پنل × ضریب). با رسیدن به سقف خرید، وضعیت «اتمام حجم» می‌شود و کانفیگ
-              روی پنل اصلی هم خاموش می‌شود — حتی اگر آنجا حجم مانده باشد.
-            </p>
-
-            <div className="usage-modal-total">
-              <span>مصرف کل (با ضریب)</span>
-              <strong>
-                {formatTraffic(usageUser.used_traffic || usageTotalWeighted, { empty: "۰" })}
-                <small> / {formatDataLimit(usageUser.data_limit)}</small>
-              </strong>
+            <div className="usage-mode-tabs" role="tablist" aria-label="نوع مصرف">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={usageMode === "panels"}
+                className={usageMode === "panels" ? "active" : ""}
+                onClick={() => setUsageMode("panels")}
+              >
+                پنل‌ها
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={usageMode === "groups"}
+                className={usageMode === "groups" ? "active" : ""}
+                onClick={() => setUsageMode("groups")}
+              >
+                گروه‌ها
+              </button>
             </div>
 
-            {usageRows.length === 0 ? (
-              <p className="muted" style={{ textAlign: "center", padding: "20px 0" }}>
-                پنل فعالی برای این کاربر نیست
-              </p>
+            {usageMode === "panels" ? (
+              <>
+                <p className="usage-modal-hint">
+                  مصرف کل = جمع (خام هر پنل × ضریب نهایی). با رسیدن به سقف خرید، وضعیت «اتمام حجم»
+                  می‌شود و کانفیگ روی پنل اصلی هم خاموش می‌شود — حتی اگر آنجا حجم مانده باشد.
+                </p>
+
+                <div className="usage-modal-total">
+                  <span>مصرف کل (با ضریب)</span>
+                  <strong>
+                    {formatTraffic(usageUser.used_traffic || usageTotalWeighted, {
+                      empty: "۰",
+                    })}
+                    <small> / {formatDataLimit(usageUser.data_limit)}</small>
+                  </strong>
+                </div>
+
+                {usageRows.length === 0 ? (
+                  <p className="muted" style={{ textAlign: "center", padding: "20px 0" }}>
+                    پنل فعالی برای این کاربر نیست
+                  </p>
+                ) : (
+                  <div className="usage-panel-list">
+                    {usageRows.map((row) => {
+                      const width = Math.min(100, (row.weighted / usageMaxWeighted) * 100);
+                      const share =
+                        usageTotalWeighted > 0
+                          ? Math.round((row.weighted / usageTotalWeighted) * 100)
+                          : 0;
+                      return (
+                        <div key={row.panelId} className="usage-panel-row">
+                          <div className="usage-panel-head">
+                            <strong>{row.name}</strong>
+                            <span>{formatTraffic(row.weighted, { empty: "۰" })}</span>
+                          </div>
+                          <div className="usage-panel-bar" aria-hidden>
+                            <i style={{ width: `${width}%` }} />
+                          </div>
+                          <div className="usage-panel-meta">
+                            <span>خام: {formatTraffic(row.raw, { empty: "۰" })}</span>
+                            <span>ضریب ×{toFaDigits(formatCoeff(row.coefficient))}</span>
+                            <span>
+                              روی پنل:{" "}
+                              {row.remoteLimit > 0
+                                ? formatTraffic(row.remoteLimit, { empty: "۰" })
+                                : "نامحدود"}
+                            </span>
+                            <span>{toFaDigits(row.configs)} کانفیگ</span>
+                            <span>{toFaDigits(share)}٪ از کل</span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </>
             ) : (
-              <div className="usage-panel-list">
-                {usageRows.map((row) => {
-                  const width = Math.min(100, (row.weighted / usageMaxWeighted) * 100);
-                  const share =
-                    usageTotalWeighted > 0
-                      ? Math.round((row.weighted / usageTotalWeighted) * 100)
-                      : 0;
-                  const coeffLabel =
-                    row.coefficient === Math.floor(row.coefficient)
-                      ? String(row.coefficient)
-                      : row.coefficient.toFixed(2).replace(/\.?0+$/, "");
-                  return (
-                    <div key={row.panelId} className="usage-panel-row">
-                      <div className="usage-panel-head">
-                        <strong>{row.name}</strong>
-                        <span>{formatTraffic(row.weighted, { empty: "۰" })}</span>
-                      </div>
-                      <div className="usage-panel-bar" aria-hidden>
-                        <i style={{ width: `${width}%` }} />
-                      </div>
-                      <div className="usage-panel-meta">
-                        <span>خام: {formatTraffic(row.raw, { empty: "۰" })}</span>
-                        <span>ضریب ×{toFaDigits(coeffLabel)}</span>
-                        <span>
-                          روی پنل:{" "}
-                          {row.remoteLimit > 0
-                            ? formatTraffic(row.remoteLimit, { empty: "۰" })
-                            : "نامحدود"}
-                        </span>
-                        <span>{toFaDigits(row.configs)} کانفیگ</span>
-                        <span>{toFaDigits(share)}٪ از کل</span>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
+              <>
+                <p className="usage-modal-hint">
+                  مصرف هر گروه = جمع (خام پنل‌های همان گروه × ضریب همان گروه). مصرف کل Astra هر پنل را
+                  یک‌بار با ضریب نهایی حساب می‌کند؛ اگر پنلی در چند گروه باشد، در هر گروه جدا دیده
+                  می‌شود.
+                </p>
+
+                <div className="usage-modal-total">
+                  <span>مصرف کل Astra</span>
+                  <strong>
+                    {formatTraffic(usageUser.used_traffic || usageTotalWeighted, {
+                      empty: "۰",
+                    })}
+                    <small> / {formatDataLimit(usageUser.data_limit)}</small>
+                  </strong>
+                </div>
+
+                {groupUsage.length === 0 ? (
+                  <p className="muted" style={{ textAlign: "center", padding: "20px 0" }}>
+                    گروهی برای این کاربر نیست
+                  </p>
+                ) : (
+                  <div className="usage-panel-list">
+                    {groupUsage.map((row) => {
+                      const width = Math.min(100, (row.weighted / groupUsageMax) * 100);
+                      const shareOfAstra =
+                        (Number(usageUser.used_traffic) || usageTotalWeighted) > 0
+                          ? Math.min(
+                              100,
+                              Math.round(
+                                (row.weighted /
+                                  (Number(usageUser.used_traffic) || usageTotalWeighted)) *
+                                  100
+                              )
+                            )
+                          : 0;
+                      const shareOfGroups =
+                        groupUsageTotal > 0
+                          ? Math.round((row.weighted / groupUsageTotal) * 100)
+                          : 0;
+                      const coeffLabel =
+                        row.coefficients.length === 0
+                          ? "۱"
+                          : row.coefficients.length === 1
+                            ? formatCoeff(row.coefficients[0])
+                            : row.coefficients.map(formatCoeff).join(" / ");
+                      return (
+                        <div key={row.groupId} className="usage-panel-row">
+                          <div className="usage-panel-head">
+                            <strong>{row.name}</strong>
+                            <span>{formatTraffic(row.weighted, { empty: "۰" })}</span>
+                          </div>
+                          <div className="usage-panel-bar" aria-hidden>
+                            <i style={{ width: `${width}%` }} />
+                          </div>
+                          <div className="usage-panel-meta">
+                            <span>خام: {formatTraffic(row.raw, { empty: "۰" })}</span>
+                            <span>ضریب ×{toFaDigits(coeffLabel)}</span>
+                            <span>{toFaDigits(row.panels)} پنل</span>
+                            <span>{toFaDigits(row.configs)} کانفیگ</span>
+                            <span>{toFaDigits(shareOfGroups)}٪ از گروه‌ها</span>
+                            <span>{toFaDigits(shareOfAstra)}٪ نسبت به کل</span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </>
             )}
 
             <footer className="modal-foot">
@@ -1726,7 +2026,7 @@ export default function UsersPage() {
                 type="button"
                 className="btn"
                 disabled={usageLoading}
-                onClick={() => void openUsage(usageUser)}
+                onClick={() => void openUsage(usageUser, usageMode)}
               >
                 {usageLoading ? "…" : "تازه‌سازی مصرف"}
               </button>

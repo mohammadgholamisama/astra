@@ -32,26 +32,49 @@ def _username_exists_error(username: str) -> HTTPException:
 
 
 async def _attach_groups(db: AsyncSession, user: User, group_ids: list[int]) -> None:
-    """Replace user↔groups via UserGroup rows — never assign user.groups (async lazy-load 500)."""
-    result = await db.execute(select(Group.id).where(Group.id.in_(group_ids)))
+    """Replace user↔groups in the given order (order = subscription config order)."""
+    # Preserve selection order; drop dupes while keeping first occurrence
+    ordered: list[int] = []
+    seen: set[int] = set()
+    for raw in group_ids:
+        try:
+            gid = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if gid in seen:
+            continue
+        seen.add(gid)
+        ordered.append(gid)
+    result = await db.execute(select(Group.id).where(Group.id.in_(ordered or [-1])))
     found = {row[0] for row in result.all()}
-    if found != set(group_ids):
+    if found != set(ordered):
         raise HTTPException(
             status_code=400,
             detail={"code": "GROUP_NOT_FOUND", "message": "یک یا چند گروه پیدا نشد"},
         )
     await db.execute(delete(UserGroup).where(UserGroup.user_id == user.id))
-    for gid in group_ids:
-        db.add(UserGroup(user_id=user.id, group_id=gid))
+    for i, gid in enumerate(ordered):
+        db.add(UserGroup(user_id=user.id, group_id=gid, sort_order=i))
     await db.flush()
 
 
 async def _add_groups_only(db: AsyncSession, user: User, group_ids: list[int]) -> list[int]:
     """Append groups to the user — never remove existing memberships.
 
+    New groups are appended after existing ones (keeps prior subscription order).
     Returns newly added group ids (empty if nothing new).
     """
-    wanted = [int(g) for g in group_ids if g is not None]
+    wanted: list[int] = []
+    seen: set[int] = set()
+    for raw in group_ids:
+        try:
+            gid = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if gid in seen:
+            continue
+        seen.add(gid)
+        wanted.append(gid)
     if not wanted:
         return []
     result = await db.execute(select(Group.id).where(Group.id.in_(wanted)))
@@ -62,12 +85,20 @@ async def _add_groups_only(db: AsyncSession, user: User, group_ids: list[int]) -
             detail={"code": "GROUP_NOT_FOUND", "message": "یک یا چند گروه پیدا نشد"},
         )
     existing = await db.execute(
-        select(UserGroup.group_id).where(UserGroup.user_id == user.id)
+        select(UserGroup)
+        .where(UserGroup.user_id == user.id)
+        .order_by(UserGroup.sort_order.asc(), UserGroup.id.asc())
     )
-    have = {row[0] for row in existing.all()}
-    added = [gid for gid in wanted if gid not in have]
-    for gid in added:
-        db.add(UserGroup(user_id=user.id, group_id=gid))
+    rows = list(existing.scalars().all())
+    have = {int(r.group_id) for r in rows}
+    next_ord = (max((int(r.sort_order or 0) for r in rows), default=-1) + 1) if rows else 0
+    added: list[int] = []
+    for gid in wanted:
+        if gid in have:
+            continue
+        db.add(UserGroup(user_id=user.id, group_id=gid, sort_order=next_ord))
+        next_ord += 1
+        added.append(gid)
     if added:
         await db.flush()
     return added
@@ -223,33 +254,17 @@ async def modify_user(
         )
         all_gids = [row[0] for row in ug.all()]
         panels = await orchestrator.resolve_panels_for_groups(db, all_gids)
-        # Fresh load of accounts (avoid stale relationship after prior ops)
-        acc_rows = await db.execute(
-            select(PanelAccount).where(PanelAccount.user_id == user.id)
-        )
-        by_panel = {a.panel_id: a for a in acc_rows.scalars().all()}
-        # Create on brand-new panels AND retry error/pending rows for group panels
-        # so added-group configs actually land on remotes and /sub.
-        need_provision: list[tuple] = []
-        for panel, cfg in panels:
-            acc = by_panel.get(panel.id)
-            if acc is None or acc.status in (
-                PanelAccountStatus.error,
-                PanelAccountStatus.pending,
-            ):
-                need_provision.append((panel, cfg))
-        if need_provision:
-            await orchestrator.provision_user_on_panels(db, user, need_provision)
-            # Expand share links for new panels without touching existing raw usage
+        # Re-provision full (panel×group) set so shared panels get separate
+        # remote accounts and coefficients stay independent.
+        if panels:
+            await orchestrator.provision_user_on_panels(db, user, panels)
             try:
                 fresh = await load_user(db, username)
                 if fresh:
                     await orchestrator.hydrate_share_links(db, fresh)
             except Exception:  # noqa: BLE001
                 pass
-        elif added:
-            # Same panels already active: sync_modify below pushes merged inbounds
-            pass
+        _ = added  # used for logging / future hooks
 
     # After admin re-enable, re-apply expire/limit before pushing remotes
     if body.status == UserStatus.active:

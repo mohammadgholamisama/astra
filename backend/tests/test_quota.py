@@ -14,6 +14,33 @@ def test_weighted_simple_coeff_two():
     assert weighted_bytes(500 * 1024**2, 2) == 1000 * 1024**2
 
 
+def test_weighted_coeff_1_33():
+    """1.33 means Astra usage = raw × 1.33 (more than downloaded)."""
+    from app.services.quota import norm_coeff
+
+    gb = 1024**3
+    assert abs(norm_coeff(1.33) - 1.33) < 1e-9
+    assert abs(norm_coeff("1.33") - 1.33) < 1e-9
+    assert abs(norm_coeff("1,33") - 1.33) < 1e-9
+    assert weighted_bytes(gb, 1.33) == int(round(gb * 1.33))
+    assert weighted_bytes(1000, 1.0) == 1000
+    assert weighted_bytes(1000, 1.33) == 1330
+
+
+def test_multi_group_coeffs_sum_exact():
+    """10×2 + 20×3 + 10×4 + 45×1 = 165 MB (shared-panel style)."""
+    mb = 1024**2
+    total = sum_weighted(
+        [
+            (10 * mb, 2, 0, 0),
+            (20 * mb, 3, 0, 0),
+            (10 * mb, 4, 0, 0),
+            (45 * mb, 1, 0, 0),
+        ]
+    )
+    assert total == 165 * mb
+
+
 def test_sum_across_panels_coeff_one():
     # Even with coeff=1, panels SUM (not max)
     gb = 1024**3
