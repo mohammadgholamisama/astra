@@ -49,7 +49,7 @@ logger = logging.getLogger("astra")
 
 
 async def _usage_sync_loop() -> None:
-    """Every ~1 minute: pull raw usage × coeff, and disable remotes when quota ends.
+    """Every ~30s: pull raw usage × coeff, and disable remotes when quota ends.
 
     When Astra weighted used_traffic hits data_limit, status → limited and
     sync_modify freezes configs on every panel (Marzban/PasarGuard/Sanaei/Rebecca).
@@ -95,7 +95,7 @@ async def _usage_sync_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("usage sync loop failed")
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)
 
 
 def _resolve_frontend_dist() -> Path | None:
