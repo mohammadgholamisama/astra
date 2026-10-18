@@ -8,7 +8,6 @@ import GroupsPage from "./pages/GroupsPage";
 import UsersPage from "./pages/UsersPage";
 import BackupPage from "./pages/BackupPage";
 import SettingsPage from "./pages/SettingsPage";
-import ConfigsPage from "./pages/ConfigsPage";
 import ConfigOrderPage from "./pages/ConfigOrderPage";
 
 function Private({ children }: { children: React.ReactNode }) {
@@ -33,7 +32,7 @@ export default function App() {
         <Route path="panels" element={<PanelsPage />} />
         <Route path="groups" element={<GroupsPage />} />
         <Route path="users" element={<UsersPage />} />
-        <Route path="configs" element={<ConfigsPage />} />
+        <Route path="configs" element={<Navigate to="/config-order" replace />} />
         <Route path="config-order" element={<ConfigOrderPage />} />
         <Route path="backup" element={<BackupPage />} />
         <Route path="settings" element={<SettingsPage />} />

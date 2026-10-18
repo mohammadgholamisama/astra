@@ -19,6 +19,10 @@ class ConfigOrderItemOut(BaseModel):
     protocol: str | None = None
     panel_names: list[str] = Field(default_factory=list)
     group_names: list[str] = Field(default_factory=list)
+    hidden: bool = False
+    country_code: str | None = None
+    flag: str | None = None
+    flag_exact: bool = False
 
 
 class ConfigOrderWorkspaceOut(BaseModel):

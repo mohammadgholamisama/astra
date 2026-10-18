@@ -146,16 +146,17 @@ async def delete_all_samples(
         ) from exc
 
 
-@router.put(
-    "/api/admin/config-visibility",
-    response_model=ConfigVisibilityAllOut,
-)
+@router.put("/api/admin/config-visibility")
 async def set_config_visibility_global(
     body: ConfigVisibilitySet,
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
-    """Globally hide/show host:port[+match_host] from ALL subscription feeds."""
+    """Globally hide/show host:port[+match_host] from ALL subscription feeds.
+
+    Returns a lightweight ack — Config Order page only needs success + hidden flag.
+    Avoid rebuilding the full visibility list (slow / lock-prone under load).
+    """
     try:
         await hide_svc.set_hidden(
             db,
@@ -165,10 +166,24 @@ async def set_config_visibility_global(
             hidden=body.hidden,
             match_host=body.match_host or "",
         )
-        data = await hide_svc.build_visibility_all(db)
-        return ConfigVisibilityAllOut(**data)
+        return {
+            "ok": True,
+            "host": body.host,
+            "port": int(body.port),
+            "match_host": body.match_host or "",
+            "hidden": bool(body.hidden),
+        }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"خطا در تغییر نمایش کانفیگ: {exc}",
+        ) from exc
 
 
 @router.get(

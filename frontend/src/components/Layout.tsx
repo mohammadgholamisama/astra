@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import {
   BookOpen,
-  Cable,
   DatabaseBackup,
   LayoutDashboard,
   ListOrdered,
@@ -53,7 +52,6 @@ const navSections: NavSection[] = [
     id: "tools",
     title: "ابزارها",
     links: [
-      { to: "/configs", label: "فیلتر کانفیگ‌ها", icon: Cable },
       { to: "/config-order", label: "ترتیب کانفیگ‌ها", icon: ListOrdered },
       { to: "/backup", label: "بک‌آپ", icon: DatabaseBackup },
       { to: "/settings", label: "تنظیمات", icon: Settings },

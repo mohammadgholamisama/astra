@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.adapters.factory import get_adapter
+from app.adapters.http_utils import is_share_link, is_subscription_ref
 from app.models.group import Group, GroupPanel, UserGroup
 from app.models.panel import PanelType
 from app.models.group_config import GroupConfigItem
@@ -31,6 +32,44 @@ def sample_username_for_group(group_id: int) -> str:
     # Marzban username: 3–32 chars, a-z / 0-9 / underscore only
     name = f"astra_g{group_id}_sample"
     return name[:32].lower()
+
+
+def _share_links_of(account: PanelAccount) -> list[str]:
+    """Real share configs only — http(s)/sub refs do not count."""
+    out: list[str] = []
+    for raw in account.links or []:
+        if not raw or not isinstance(raw, str):
+            continue
+        text = raw.strip()
+        if text and is_share_link(text):
+            out.append(text)
+    return out
+
+
+def _account_is_active(account: PanelAccount) -> bool:
+    val = getattr(account.status, "value", account.status)
+    return val == PanelAccountStatus.active.value or val == "active"
+
+
+async def _hydrate_sample_share_links(db: AsyncSession, user: User) -> int:
+    """Expand /sub refs into vless/vmess/… share links on the sample user."""
+    # Ensure relationship is loaded for hydrate_share_links
+    reloaded = await db.execute(
+        select(User)
+        .where(User.id == user.id)
+        .options(selectinload(User.panel_accounts).selectinload(PanelAccount.panel))
+        .execution_options(populate_existing=True)
+    )
+    fresh = reloaded.scalar_one_or_none() or user
+    try:
+        return int(
+            await asyncio.wait_for(
+                orchestrator.hydrate_share_links(db, fresh),
+                timeout=18.0,
+            )
+        )
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def _parse_link_meta(link: str) -> tuple[str, str, str]:
@@ -125,6 +164,7 @@ async def _get_sample_user(db: AsyncSession, group_id: int) -> User | None:
         select(User)
         .where(User.username == uname)
         .options(selectinload(User.panel_accounts).selectinload(PanelAccount.panel))
+        .execution_options(populate_existing=True)
     )
     user = result.scalar_one_or_none()
     if user:
@@ -141,6 +181,7 @@ async def _get_sample_user(db: AsyncSession, group_id: int) -> User | None:
             ),
         )
         .options(selectinload(User.panel_accounts).selectinload(PanelAccount.panel))
+        .execution_options(populate_existing=True)
         .order_by(User.id.desc())
         .limit(1)
     )
@@ -153,6 +194,7 @@ async def _load_panel_accounts(db: AsyncSession, user_id: int) -> list[PanelAcco
         select(PanelAccount)
         .where(PanelAccount.user_id == user_id)
         .options(selectinload(PanelAccount.panel))
+        .execution_options(populate_existing=True)
         .order_by(PanelAccount.panel_id)
     )
     return list(result.scalars().all())
@@ -188,7 +230,7 @@ async def _ensure_sample_user(db: AsyncSession, group: Group) -> User:
 
 
 async def sync_items_from_sample(db: AsyncSession, group: Group, user: User) -> list[GroupConfigItem]:
-    """Upsert GroupConfigItem rows from sample user's active panel links."""
+    """Upsert GroupConfigItem rows from sample user's active share links only."""
     result = await db.execute(
         select(GroupConfigItem).where(GroupConfigItem.group_id == group.id)
     )
@@ -196,27 +238,11 @@ async def sync_items_from_sample(db: AsyncSession, group: Group, user: User) -> 
     seen_keys: set[str] = set()
     order = 0
 
-    share_prefixes = ("vless://", "vmess://", "trojan://", "ss://", "shadowsocks://", "tuic://", "hysteria://", "hy2://")
-
     accounts = await _load_panel_accounts(db, user.id)
     for account in accounts:
-        if account.status != PanelAccountStatus.active:
+        if not _account_is_active(account):
             continue
-        for link in account.links or []:
-            if not link or not isinstance(link, str):
-                continue
-            raw = link.strip()
-            if not raw:
-                continue
-            lower = raw.lower()
-            # Keep protocol share links; skip plain http(s) subscription URLs
-            is_share = lower.startswith(share_prefixes)
-            is_http_sub = lower.startswith(("http://", "https://"))
-            if is_http_sub and not is_share:
-                continue
-            if not is_share and not is_http_sub:
-                # some panels return bare links without scheme — keep them
-                pass
+        for raw in _share_links_of(account):
             key = make_config_key(account.panel_id, raw)
             seen_keys.add(key)
             protocol, label, _host = _parse_link_meta(raw)
@@ -244,7 +270,8 @@ async def sync_items_from_sample(db: AsyncSession, group: Group, user: User) -> 
                 item.sort_order = order
             order += 1
 
-    # Drop rows for panels no longer in this group, or links sample no longer has
+    # Drop rows for panels no longer in this group, or links sample no longer has.
+    # If no share links were found, keep previous rows (avoid empty wipe on hydrate lag).
     gp_rows = await db.execute(
         select(GroupPanel.panel_id).where(GroupPanel.group_id == group.id)
     )
@@ -256,7 +283,6 @@ async def sync_items_from_sample(db: AsyncSession, group: Group, user: User) -> 
             await db.delete(item)
 
     await db.flush()
-    # reload with panels
     result2 = await db.execute(
         select(GroupConfigItem)
         .where(GroupConfigItem.group_id == group.id)
@@ -372,13 +398,14 @@ async def build_workspace(db: AsyncSession, group: Group) -> GroupConfigWorkspac
     if sample:
         accounts = await _load_panel_accounts(db, sample.id)
         for a in accounts:
+            share_n = len(_share_links_of(a))
             accounts_out.append(
                 GroupConfigSampleAccountOut(
                     panel_id=a.panel_id,
                     panel_name=a.panel.name if a.panel else None,
                     panel_type=a.panel.type.value if a.panel else None,
                     status=a.status.value if hasattr(a.status, "value") else str(a.status),
-                    links_count=len(a.links or []),
+                    links_count=share_n,
                     error_message=a.error_message,
                 )
             )
@@ -394,7 +421,10 @@ async def build_workspace(db: AsyncSession, group: Group) -> GroupConfigWorkspac
         group_id=group.id,
         group_name=group.name,
         sample_username=sample.username if sample else None,
-        sample_ready=bool(any(a.status == PanelAccountStatus.active for a in accounts)),
+        sample_ready=bool(
+            any(_account_is_active(a) and _share_links_of(a) for a in accounts)
+            or items
+        ),
         accounts=accounts_out,
         items=items,
     )
@@ -482,16 +512,34 @@ async def create_or_refresh_sample(db: AsyncSession, group_id: int) -> GroupConf
             item.coefficient or 1
         )
 
-    # Force recreate on remotes so «تازه‌سازی» always rebuilds
-    await _force_reset_sample_remotes(db, user, panels)
-    # Give remotes a moment after delete (avoids "user exists" / empty first response)
+    # Force recreate on remotes (incl. Rebecca) so «تازه‌سازی» always rebuilds
+    await _force_reset_sample_remotes(db, user, panels, include_rebecca=True)
     await asyncio.sleep(0.6)
 
     user = await _get_sample_user(db, group.id)
     if not user:
         raise ValueError("کاربر نمونه پیدا نشد")
-    # Drop stale relationship cache before provision/sync
-    await db.refresh(user)
+
+    # Rebecca soft-deletes usernames — seed a fresh remote name before create
+    import secrets
+
+    rebecca_panels = [
+        (p, c, g)
+        for p, c, g in panels
+        if getattr(p, "type", None) == PanelType.rebecca
+    ]
+    if rebecca_panels:
+        for panel, _cfg, gid in rebecca_panels:
+            db.add(
+                PanelAccount(
+                    user_id=user.id,
+                    panel_id=panel.id,
+                    group_id=int(gid) if gid else None,
+                    status=PanelAccountStatus.pending,
+                    remote_username=f"ag{group.id}s{secrets.token_hex(3)}"[:32],
+                )
+            )
+        await db.flush()
 
     await orchestrator.provision_user_on_panels(db, user, panels)
 
@@ -499,61 +547,66 @@ async def create_or_refresh_sample(db: AsyncSession, group_id: int) -> GroupConf
     if not user:
         raise ValueError("ساخت کاربر نمونه ناموفق بود")
 
-    # If Rebecca burned the sample username via soft-delete, rotate and retry once
-    # panels are (panel, config, group_id) triples from resolve_panels_for_groups
-    rebecca_panels = [
-        (p, c, g)
-        for p, c, g in panels
-        if getattr(p, "type", None) == PanelType.rebecca
-    ]
+    # Rebecca still trapped → rotate remote name once and reprovision those panels
     if rebecca_panels:
         accounts = await _load_panel_accounts(db, user.id)
-        rebecca_ids = {p.id for p, _c, _g in rebecca_panels}
-        trapped = [
-            a
-            for a in accounts
-            if a.panel_id in rebecca_ids
-            and a.status != PanelAccountStatus.active
-            and (
-                "soft-delete" in (a.error_message or "").lower()
-                or "user not found" in (a.error_message or "").lower()
-                or "already exists" in (a.error_message or "").lower()
+        by_panel = {int(a.panel_id): a for a in accounts}
+        trapped_targets: list = []
+        for panel, cfg, gid in rebecca_panels:
+            acc = by_panel.get(int(panel.id))
+            err = (acc.error_message or "").lower() if acc else ""
+            bad = (
+                acc is None
+                or not _account_is_active(acc)
+                or "soft-delete" in err
+                or "already exists" in err
             )
-        ]
-        if trapped:
-            import secrets
-
-            new_name = f"ag{group.id}s{secrets.token_hex(3)}"[:32]
-            user.username = new_name
+            if not bad:
+                continue
+            if acc is not None:
+                acc.remote_username = f"ag{group.id}s{secrets.token_hex(3)}"[:32]
+                acc.status = PanelAccountStatus.pending
+                acc.error_message = None
+            else:
+                db.add(
+                    PanelAccount(
+                        user_id=user.id,
+                        panel_id=panel.id,
+                        group_id=int(gid) if gid else None,
+                        status=PanelAccountStatus.pending,
+                        remote_username=f"ag{group.id}s{secrets.token_hex(3)}"[:32],
+                    )
+                )
+            trapped_targets.append((panel, cfg, gid))
+        if trapped_targets:
             await db.flush()
-            # wipe local rebecca accounts then reprovision only those panels
-            for a in accounts:
-                if a.panel_id in rebecca_ids:
-                    await db.delete(a)
-            await db.flush()
-            await orchestrator.provision_user_on_panels(db, user, rebecca_panels)
+            await orchestrator.provision_user_on_panels(db, user, trapped_targets)
             user = await _get_sample_user(db, group.id)
             if not user:
                 raise ValueError("ساخت کاربر نمونه ناموفق بود")
 
-    # Pull links: create response is sometimes empty until a follow-up GET
-    for attempt in range(3):
+    # Expand /sub → real share links. Do NOT treat subscription URLs as success.
+    share_total = 0
+    for attempt in range(4):
+        await _hydrate_sample_share_links(db, user)
+        user = await _get_sample_user(db, group.id) or user
         accounts = await _load_panel_accounts(db, user.id)
-        active = [a for a in accounts if a.status == PanelAccountStatus.active]
-        with_links = [a for a in active if a.links]
-        if active and (with_links or attempt == 2):
+        active = [a for a in accounts if _account_is_active(a)]
+        share_total = sum(len(_share_links_of(a)) for a in active)
+        still_need = any(
+            (not _share_links_of(a))
+            and (
+                not (a.links or [])
+                or any(is_subscription_ref(str(x)) for x in (a.links or []) if x)
+            )
+            for a in active
+        )
+        if active and share_total > 0 and not still_need:
             break
-        try:
-            await orchestrator.refresh_usage(db, user)
-        except Exception:  # noqa: BLE001
-            pass
-        if attempt < 2:
-            await asyncio.sleep(0.5)
+        if attempt < 3:
+            await asyncio.sleep(0.45 + 0.25 * attempt)
 
-    # Fresh item list from all share links
-    await db.execute(delete(GroupConfigItem).where(GroupConfigItem.group_id == group.id))
-    await db.flush()
-
+    # Upsert items from share links — never wipe-all first (empty hydrate must not erase coeffs)
     items = await sync_items_from_sample(db, group, user)
     for item in items:
         key = (item.panel_id, item.protocol or "", item.label or "")
@@ -561,8 +614,8 @@ async def create_or_refresh_sample(db: AsyncSession, group_id: int) -> GroupConf
             item.coefficient = saved_coeff[key]
 
     await db.commit()
-    # New transaction view — expire so workspace does not reuse stale collections
-    db.expire_all()
+    # Do NOT expire_all() — parent loops (sample_all) still hold Group instances;
+    # lazy refresh after expire causes MissingGreenlet under AsyncSession.
     return await get_workspace(db, group_id)
 
 
@@ -578,19 +631,24 @@ async def create_or_refresh_sample_all(db: AsyncSession) -> dict:
         .where(Group.is_disabled.is_(False))
         .order_by(Group.name, Group.id)
     )
-    groups = list(result.scalars().all())
+    # Snapshot ids/names before any commit — objects may expire mid-loop
+    group_meta = [
+        (int(g.id), str(g.name or ""))
+        for g in result.scalars().all()
+        if g.id is not None
+    ]
     rows: list[dict] = []
     ok_count = 0
     fail_count = 0
 
-    for idx, group in enumerate(groups):
+    for idx, (gid, gname) in enumerate(group_meta):
         try:
-            ws = await create_or_refresh_sample(db, group.id)
+            ws = await create_or_refresh_sample(db, gid)
             ok_count += 1
             rows.append(
                 {
-                    "group_id": group.id,
-                    "group_name": group.name,
+                    "group_id": gid,
+                    "group_name": gname,
                     "ok": True,
                     "sample_username": ws.sample_username,
                     "items_count": len(ws.items or []),
@@ -605,15 +663,15 @@ async def create_or_refresh_sample_all(db: AsyncSession) -> dict:
             fail_count += 1
             rows.append(
                 {
-                    "group_id": group.id,
-                    "group_name": group.name,
+                    "group_id": gid,
+                    "group_name": gname,
                     "ok": False,
                     "sample_username": None,
                     "items_count": 0,
                     "error": str(exc)[:400],
                 }
             )
-        if idx + 1 < len(groups):
+        if idx + 1 < len(group_meta):
             await asyncio.sleep(0.35)
 
     visibility = await hide_svc.build_visibility_all(db)
@@ -634,19 +692,23 @@ async def delete_sample_all(db: AsyncSession) -> dict:
         .where(Group.is_disabled.is_(False))
         .order_by(Group.name, Group.id)
     )
-    groups = list(result.scalars().all())
+    group_meta = [
+        (int(g.id), str(g.name or ""))
+        for g in result.scalars().all()
+        if g.id is not None
+    ]
     rows: list[dict] = []
     ok_count = 0
     fail_count = 0
 
-    for idx, group in enumerate(groups):
+    for idx, (gid, gname) in enumerate(group_meta):
         try:
-            ws = await delete_sample(db, group.id)
+            ws = await delete_sample(db, gid)
             ok_count += 1
             rows.append(
                 {
-                    "group_id": group.id,
-                    "group_name": group.name,
+                    "group_id": gid,
+                    "group_name": gname,
                     "ok": True,
                     "sample_username": ws.sample_username,
                     "items_count": len(ws.items or []),
@@ -661,15 +723,15 @@ async def delete_sample_all(db: AsyncSession) -> dict:
             fail_count += 1
             rows.append(
                 {
-                    "group_id": group.id,
-                    "group_name": group.name,
+                    "group_id": gid,
+                    "group_name": gname,
                     "ok": False,
                     "sample_username": None,
                     "items_count": 0,
                     "error": str(exc)[:400],
                 }
             )
-        if idx + 1 < len(groups):
+        if idx + 1 < len(group_meta):
             await asyncio.sleep(0.25)
 
     visibility = await hide_svc.build_visibility_all(db)
@@ -711,7 +773,7 @@ async def delete_sample(db: AsyncSession, group_id: int) -> GroupConfigWorkspace
     await db.delete(user)
 
     await db.commit()
-    db.expire_all()
+    # Avoid expire_all() — shared AsyncSession + parent loops (see sample_all).
     return await get_workspace(db, group_id)
 
 

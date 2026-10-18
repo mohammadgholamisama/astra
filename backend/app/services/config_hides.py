@@ -18,6 +18,7 @@ from app.services.config_locations import (
     extract_link_match_host,
     normalize_host,
     normalize_match_host,
+    try_normalize_endpoint,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,10 @@ def is_hidden(link: str, group_id: int | None = None) -> bool:
         return False
     host, port = ep
     match = extract_link_match_host(link) or ""
+    norm = try_normalize_endpoint(host, port, match)
+    if not norm:
+        return False
+    host, port, match = norm
     with _lock:
         return (host, port, match) in _hidden
 
@@ -121,12 +126,18 @@ async def set_hidden(
         for extra in rows[1:]:
             await db.delete(extra)
         if row is None:
-            # group_id optional audit pointer
-            gid = None
+            # group_id is audit-only; some DBs still have NOT NULL — always resolve a safe id
+            gid: int | None = None
             if group_id is not None:
                 g = await db.get(Group, int(group_id))
                 if g:
                     gid = int(g.id)
+            if gid is None:
+                any_g = (
+                    await db.execute(select(Group).order_by(Group.id.asc()).limit(1))
+                ).scalar_one_or_none()
+                if any_g is not None:
+                    gid = int(any_g.id)
             row = GroupConfigHide(
                 group_id=gid,
                 host=host_n,
@@ -282,6 +293,7 @@ async def build_visibility(
     from app.services.group_configs import sample_status_for_group
 
     sample_alive, sample_username = await sample_status_for_group(db, group_id)
+    sample_rows = [r for r in rows if not r.get("orphan")]
 
     return {
         "group_id": group.id,
@@ -289,8 +301,8 @@ async def build_visibility(
         "sample_ready": sample_alive,
         "sample_username": sample_username,
         "items": rows,
-        "hidden_count": sum(1 for r in rows if r["hidden"]),
-        "total_count": len(rows),
+        "hidden_count": sum(1 for r in sample_rows if r["hidden"]),
+        "total_count": len(sample_rows),
     }
 
 

@@ -82,6 +82,50 @@ async def create_location(
     return _as_out(row)
 
 
+@router.put("/api/admin/config-locations/endpoint")
+async def set_endpoint_location(
+    body: ConfigLocationEndpointSet,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """Set or clear flag for exact host:port[+match_host].
+
+    Must be registered BEFORE ``/{location_id}`` so ``endpoint`` is not parsed as an int.
+    """
+    try:
+        out = await upsert_endpoint_location(
+            db,
+            host=body.host,
+            port=int(body.port),
+            match_host=body.match_host or "",
+            country_code=body.country_code,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="برای این دامنه، پورت و هاست هدر قبلاً لوکیشن ثبت شده",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"خطا در تنظیم پرچم: {exc}",
+        ) from exc
+    # Serialize datetimes so JSON never fails on plain dict responses
+    if out and isinstance(out, dict):
+        for key in ("created_at", "updated_at"):
+            val = out.get(key)
+            if hasattr(val, "isoformat"):
+                out[key] = val.isoformat()
+    return {"ok": True, "location": out}
+
+
 @router.put("/api/admin/config-locations/{location_id}", response_model=ConfigLocationOut)
 async def update_location(
     location_id: int,
@@ -120,26 +164,6 @@ async def update_location(
     await db.refresh(row)
     await refresh_cache(db)
     return _as_out(row)
-
-
-@router.put("/api/admin/config-locations/endpoint")
-async def set_endpoint_location(
-    body: ConfigLocationEndpointSet,
-    db: AsyncSession = Depends(get_db),
-    _admin=Depends(get_current_admin),
-):
-    """Set or clear flag for exact host:port[+match_host] — used from Configs page."""
-    try:
-        out = await upsert_endpoint_location(
-            db,
-            host=body.host,
-            port=body.port,
-            match_host=body.match_host or "",
-            country_code=body.country_code,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"ok": True, "location": out}
 
 
 @router.delete("/api/admin/config-locations/{location_id}")

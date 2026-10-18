@@ -2,6 +2,7 @@ import { FormEvent, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { MapPin, Pencil, Plus, Trash2, X } from "lucide-react";
 import { ApiError, api } from "../lib/api";
+import { countriesForPicker, countryName as countryLabel } from "../lib/countries";
 
 export type ConfigLocation = {
   id: number;
@@ -12,60 +13,6 @@ export type ConfigLocation = {
   country_code: string;
   flag: string;
 };
-
-const COUNTRIES: { code: string; name: string }[] = [
-  { code: "DE", name: "آلمان" },
-  { code: "TR", name: "ترکیه" },
-  { code: "NL", name: "هلند" },
-  { code: "US", name: "آمریکا" },
-  { code: "GB", name: "انگلیس" },
-  { code: "FR", name: "فرانسه" },
-  { code: "AE", name: "امارات" },
-  { code: "FI", name: "فنلاند" },
-  { code: "SE", name: "سوئد" },
-  { code: "NO", name: "نروژ" },
-  { code: "PL", name: "لهستان" },
-  { code: "AT", name: "اتریش" },
-  { code: "CH", name: "سوئیس" },
-  { code: "IT", name: "ایتالیا" },
-  { code: "ES", name: "اسپانیا" },
-  { code: "CA", name: "کانادا" },
-  { code: "JP", name: "ژاپن" },
-  { code: "SG", name: "سنگاپور" },
-  { code: "HK", name: "هنگ‌کنگ" },
-  { code: "KR", name: "کره جنوبی" },
-  { code: "IN", name: "هند" },
-  { code: "RU", name: "روسیه" },
-  { code: "UA", name: "اوکراین" },
-  { code: "CZ", name: "چک" },
-  { code: "RO", name: "رومانی" },
-  { code: "BG", name: "بلغارستان" },
-  { code: "MD", name: "مولداوی" },
-  { code: "LV", name: "لتونی" },
-  { code: "LT", name: "لیتوانی" },
-  { code: "EE", name: "استونی" },
-  { code: "PT", name: "پرتغال" },
-  { code: "BE", name: "بلژیک" },
-  { code: "DK", name: "دانمارک" },
-  { code: "IE", name: "ایرلند" },
-  { code: "AU", name: "استرالیا" },
-  { code: "BR", name: "برزیل" },
-  { code: "IR", name: "ایران" },
-  { code: "IQ", name: "عراق" },
-  { code: "AM", name: "ارمنستان" },
-  { code: "AZ", name: "آذربایجان" },
-  { code: "GE", name: "گرجستان" },
-  { code: "KZ", name: "قزاقستان" },
-  { code: "CY", name: "قبرس" },
-  { code: "GR", name: "یونان" },
-  { code: "IL", name: "اسرائیل" },
-  { code: "SA", name: "عربستان" },
-  { code: "EG", name: "مصر" },
-  { code: "ZA", name: "آفریقای جنوبی" },
-  { code: "MX", name: "مکزیک" },
-  { code: "AR", name: "آرژانتین" },
-  { code: "CL", name: "شیلی" },
-];
 
 function flagEmoji(code: string): string {
   const c = (code || "").trim().toUpperCase();
@@ -96,10 +43,11 @@ export default function LocationsPage() {
   });
 
   const previewFlag = useMemo(() => flagEmoji(form.country_code), [form.country_code]);
-  const countryName = useMemo(() => {
-    const hit = COUNTRIES.find((c) => c.code === form.country_code.toUpperCase());
-    return hit?.name || form.country_code;
-  }, [form.country_code]);
+  const countryName = useMemo(
+    () => countryLabel(form.country_code),
+    [form.country_code]
+  );
+  const countryOptions = useMemo(() => countriesForPicker(), []);
 
   function openCreate() {
     setEditing(null);
@@ -221,7 +169,7 @@ export default function LocationsPage() {
         <div className="locations-list" role="list">
           {locations.map((row) => {
             const cname =
-              COUNTRIES.find((c) => c.code === row.country_code)?.name || row.country_code;
+              countryLabel(row.country_code);
             return (
               <article key={row.id} className="locations-row" role="listitem">
                 <div className="locations-flag" aria-hidden>
@@ -353,7 +301,7 @@ export default function LocationsPage() {
                   value={form.country_code}
                   onChange={(e) => setForm((f) => ({ ...f, country_code: e.target.value }))}
                 >
-                  {COUNTRIES.map((c) => (
+                  {countryOptions.map((c) => (
                     <option key={c.code} value={c.code}>
                       {flagEmoji(c.code)} {c.name}
                     </option>

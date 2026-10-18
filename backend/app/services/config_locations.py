@@ -26,9 +26,6 @@ _general_codes: dict[tuple[str, int], str] = {}
 _loaded = False
 
 _CTRL = re.compile(r"[\x00-\x1f\x7f]")
-_HOST_LABEL = re.compile(
-    r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
-)
 _IPV4 = re.compile(
     r"^(?:\d{1,3}\.){3}\d{1,3}$"
 )
@@ -49,28 +46,46 @@ def normalize_country_code(raw: str) -> str:
     return c
 
 
+# Fingerprint hosts may include underscores / long reality tokens from real share links
+_FP_HOST_CHARS = re.compile(r"^[a-z0-9_.*-]+$")
+
+
 def normalize_host(raw: str) -> str:
-    """Normalize hostname as it appears in share links (may be a single label)."""
+    """Normalize share-link authority for order / hide / flag fingerprints.
+
+    Must accept every host ``extract_link_endpoint`` can return — strict DNS
+    label rules would reject real configs (IPv6, underscores, odd SNI) and
+    break save/reorder on the Config Order page.
+    """
     host = _CTRL.sub("", (raw or "").strip())
     host = host.strip("[]").rstrip(".").lower()
     if not host or len(host) > 253:
         raise ValueError("دامنه نامعتبر است")
-    if any(ch.isspace() for ch in host) or "/" in host or ":" in host:
-        raise ValueError("دامنه نباید فاصله، / یا پورت داشته باشد")
+    if any(ch.isspace() for ch in host) or "/" in host:
+        raise ValueError("دامنه نباید فاصله یا / داشته باشد")
+    # Mistaken ``host:port`` (single colon + numeric) — not IPv6
+    if host.count(":") == 1:
+        _left, right = host.rsplit(":", 1)
+        if right.isdigit():
+            raise ValueError("دامنه نباید پورت داشته باشد")
     if _IPV4.match(host):
         parts = host.split(".")
         if any(not p.isdigit() or int(p) > 255 for p in parts):
             raise ValueError("آدرس IP نامعتبر است")
         return host
-    # IPv6 compressed forms
-    if host.count(":") >= 2:
+    # IPv6 — hex + colons, optional zone id
+    if ":" in host:
+        bare = host.split("%", 1)[0]
+        if bare.count(":") >= 2 and all(c in "0123456789abcdef:" for c in bare):
+            return bare
+        raise ValueError("آدرس IPv6 نامعتبر است")
+    # Hostname / single-label / CDN / reality id — keep as fingerprint key
+    if _FP_HOST_CHARS.fullmatch(host):
         return host
-    # Allow single-label hosts (e.g. ``real``) — matches literal link authority
-    labels = host.split(".")
-    for label in labels:
-        if not label or not _HOST_LABEL.match(label):
-            raise ValueError("دامنه نامعتبر است")
-    return host
+    # Last resort: printable ASCII used in odd share links
+    if all(33 <= ord(c) <= 126 for c in host) and "@" not in host and "?" not in host:
+        return host
+    raise ValueError("دامنه نامعتبر است")
 
 
 def normalize_match_host(raw: str | None) -> str:
@@ -78,7 +93,35 @@ def normalize_match_host(raw: str | None) -> str:
     text = _CTRL.sub("", str(raw or "")).strip()
     if not text:
         return ""
-    return normalize_host(text)
+    try:
+        return normalize_host(text)
+    except ValueError:
+        # Exotic SNI tokens (long reality ids, etc.) — keep as lowercase fingerprint
+        host = text.strip("[]").rstrip(".").lower()
+        if (
+            not host
+            or len(host) > 253
+            or any(ch.isspace() for ch in host)
+            or "/" in host
+            or "@" in host
+        ):
+            raise ValueError("هاست هدر نامعتبر است") from None
+        return host
+
+
+def try_normalize_endpoint(
+    host: str, port: int, match_host: str = ""
+) -> tuple[str, int, str] | None:
+    """Return normalized (host, port, match) or None if fingerprint is unusable."""
+    try:
+        h = normalize_host(host)
+        p = int(port)
+        m = normalize_match_host(match_host or "")
+    except (ValueError, TypeError):
+        return None
+    if p < 1 or p > 65535:
+        return None
+    return h, p, m
 
 
 def normalize_label(raw: str | None) -> str | None:
@@ -240,17 +283,17 @@ def extract_link_match_host(link: str) -> str:
             return ""
         if not isinstance(data, dict):
             return ""
-        # Prefer explicit header host / sni over server address
-        for key in ("host", "sni", "peer"):
+        # Prefer explicit header host / sni / authority over server address
+        for key in ("host", "sni", "peer", "authority"):
             val = str(data.get(key) or "").strip().strip("[]").rstrip(".").lower()
             if val:
                 return val
         return ""
 
-    # URI query: host → sni → peer (order matches common vless/trojan/hy2)
+    # URI query: host → sni → peer → authority (grpc / reality)
     if "?" in rest:
         _path, _, query = rest.partition("?")
-        return _first_query_host(query, "host", "sni", "peer")
+        return _first_query_host(query, "host", "sni", "peer", "authority")
     return ""
 
 

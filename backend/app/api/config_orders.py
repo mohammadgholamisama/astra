@@ -37,11 +37,27 @@ async def refresh_config_order_samples(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
-    """Create/refresh sample probe users on every group so endpoints appear for ordering."""
-    stats = await order_svc.create_or_refresh_samples(db)
-    workspace = await order_svc.list_workspace(db)
-    return {
-        "ok": True,
-        "sample": stats,
-        "workspace": workspace.model_dump(),
-    }
+    """Wipe previous order probe on remotes, recreate on every active panel."""
+    try:
+        stats = await order_svc.create_or_refresh_samples(db)
+        workspace = await order_svc.list_workspace(db)
+        return {
+            "ok": True,
+            "sample": stats,
+            "workspace": workspace.model_dump(),
+        }
+    except ValueError as exc:
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"خطا هنگام ساخت نمونه روی همه پنل‌ها: {exc}",
+        ) from exc

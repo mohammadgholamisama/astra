@@ -30,8 +30,15 @@ def test_normalize_host():
     assert normalize_host("1.2.3.4") == "1.2.3.4"
     assert normalize_host("real") == "real"
     assert normalize_host("REAL") == "real"
+    assert normalize_host("2606:4700:4700::1001") == "2606:4700:4700::1001"
+    assert normalize_host("[2a01:4f8:1c16:bad::1]") == "2a01:4f8:1c16:bad::1"
+    assert normalize_host("cdn_edge.example.com") == "cdn_edge.example.com"
+    assert normalize_host("astra_order_sample") == "astra_order_sample"
     assert normalize_match_host("") == ""
     assert normalize_match_host("  Turkiye.Varzeshfotsal.IR ") == "turkiye.varzeshfotsal.ir"
+    assert normalize_match_host(
+        "7c7tc7ytcc7tc77tc9y8yctrefuggooh8f7d6e5a"
+    ) == "7c7tc7ytcc7tc77tc9y8yctrefuggooh8f7d6e5a"
 
 
 def test_extract_ss_sip002():

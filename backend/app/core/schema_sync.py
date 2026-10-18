@@ -505,6 +505,77 @@ def _migrate_group_config_hide_match_host(connection: Connection) -> list[str]:
     return changed
 
 
+def _migrate_group_config_hide_nullable_group_id(connection: Connection) -> list[str]:
+    """Ensure group_config_hides.group_id is nullable (global hide is not group-scoped)."""
+    inspector = inspect(connection)
+    if "group_config_hides" not in set(inspector.get_table_names()):
+        return []
+    cols = {c["name"]: c for c in inspector.get_columns("group_config_hides")}
+    gid = cols.get("group_id")
+    if not gid or gid.get("nullable", True):
+        return []
+    dialect = connection.dialect.name
+    changed: list[str] = []
+    try:
+        if dialect == "sqlite":
+            connection.execute(text("PRAGMA foreign_keys=OFF"))
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE group_config_hides__nullgid (
+                        id INTEGER NOT NULL PRIMARY KEY,
+                        group_id INTEGER,
+                        host VARCHAR(253) NOT NULL,
+                        port INTEGER NOT NULL,
+                        match_host VARCHAR(253) NOT NULL DEFAULT '',
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY(group_id) REFERENCES groups (id) ON DELETE SET NULL
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO group_config_hides__nullgid
+                        (id, group_id, host, port, match_host, created_at)
+                    SELECT id, group_id, host, port,
+                           COALESCE(match_host, ''), created_at
+                    FROM group_config_hides
+                    """
+                )
+            )
+            connection.execute(text("DROP TABLE group_config_hides"))
+            connection.execute(
+                text(
+                    "ALTER TABLE group_config_hides__nullgid "
+                    "RENAME TO group_config_hides"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    '"uq_config_hide_host_port_match" '
+                    'ON "group_config_hides" ("host", "port", "match_host")'
+                )
+            )
+            connection.execute(text("PRAGMA foreign_keys=ON"))
+            changed.append("group_config_hides.group_id.nullable")
+            logger.info("Migrated group_config_hides.group_id to nullable")
+        else:
+            connection.execute(
+                text(
+                    'ALTER TABLE "group_config_hides" '
+                    "ALTER COLUMN group_id DROP NOT NULL"
+                )
+            )
+            changed.append("group_config_hides.group_id.nullable")
+            logger.info("Dropped NOT NULL on group_config_hides.group_id")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not make group_config_hides.group_id nullable: %s", exc)
+    return changed
+
+
 def sync_schema_sync(connection: Connection) -> dict[str, Any]:
     import app.models  # noqa: F401
 
@@ -514,11 +585,12 @@ def sync_schema_sync(connection: Connection) -> dict[str, Any]:
     mig = _migrate_panel_account_group_unique(connection)
     mig2 = _migrate_config_location_match_host(connection)
     mig3 = _migrate_group_config_hide_match_host(connection)
+    mig4 = _migrate_group_config_hide_nullable_group_id(connection)
     added_idx = _add_missing_indexes(connection)
     return {
         "added_columns": added_cols,
         "added_indexes": added_idx,
-        "migrations": mig + mig2 + mig3,
+        "migrations": mig + mig2 + mig3 + mig4,
     }
 
 
