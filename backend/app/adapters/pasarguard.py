@@ -222,8 +222,9 @@ class PasarGuardAdapter(MarzbanAdapter):
             )
         body = self._build_pg_body(payload, group_ids)
         last_err = "create failed"
-        req_timeout = httpx.Timeout(22.0, connect=8.0)
-        for attempt in range(3):
+        # Keep under orchestrator create_timeout (~20s): 2 tries, short connect
+        req_timeout = httpx.Timeout(16.0, connect=5.0)
+        for attempt in range(2):
             try:
                 client, headers = await self._authed()
                 resp = await client.post(
@@ -280,35 +281,35 @@ class PasarGuardAdapter(MarzbanAdapter):
                         ),
                     )
                 last_err = f"{err} (group_ids={group_ids})"
-                if resp.status_code in (401, 403) and attempt < 2:
+                if resp.status_code in (401, 403) and attempt < 1:
                     self._token = None
                     from app.adapters.marzban import _TOKEN_CACHE
 
                     _TOKEN_CACHE.pop(self._cache_key(), None)
                     await self.close()
                     continue
-                if attempt < 2 and resp.status_code >= 500:
+                if attempt < 1 and resp.status_code >= 500:
                     await self.close()
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.25)
                     continue
                 return AdapterResult(success=False, error=last_err)
             except Exception as e:
                 last_err = str(e).strip() or e.__class__.__name__
                 try:
                     existing = await asyncio.wait_for(
-                        self.get_usage(payload.username, expand_links=False), timeout=6
+                        self.get_usage(payload.username, expand_links=False), timeout=4
                     )
                     if existing.success:
                         return existing
                 except Exception:
                     pass
-                if attempt < 2:
+                if attempt < 1:
                     self._token = None
                     from app.adapters.marzban import _TOKEN_CACHE
 
                     _TOKEN_CACHE.pop(self._cache_key(), None)
                     await self.close()
-                    await asyncio.sleep(0.25 + attempt * 0.2)
+                    await asyncio.sleep(0.2)
                     continue
                 return AdapterResult(
                     success=False,

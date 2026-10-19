@@ -13,6 +13,7 @@ import {
   ListOrdered,
   X,
 } from "lucide-react";
+import { ToastStack, useToastStack } from "../components/ToastStack";
 import { ApiError, api } from "../lib/api";
 import { countriesForPicker, countryName } from "../lib/countries";
 import { toFaDigits } from "../lib/format";
@@ -96,11 +97,9 @@ function patchItem(
 
 export default function ConfigOrderPage() {
   const qc = useQueryClient();
+  const { toasts, push: pushToast, dismiss: dismissToast } = useToastStack();
   const [items, setItems] = useState<OrderItem[]>([]);
   const [dirty, setDirty] = useState(false);
-  const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(
-    null
-  );
   const [q, setQ] = useState("");
   const [filter, setFilter] = useState<"all" | "visible" | "hidden">("all");
   const [flagRow, setFlagRow] = useState<OrderItem | null>(null);
@@ -160,17 +159,14 @@ export default function ConfigOrderPage() {
       setItems(ws.items || []);
       setDirty(false);
       qc.setQueryData(["config-order"], ws);
-      setMsg({
-        type: "ok",
-        text: "ترتیب ذخیره شد و روی همه ساب‌ها اعمال شد",
-      });
+      pushToast("ok", "ترتیب ذخیره شد و روی همه ساب‌ها اعمال شد");
     },
     onError: (e) => {
       setDirty(true);
-      setMsg({
-        type: "err",
-        text: e instanceof ApiError ? e.message : "ذخیره ترتیب ناموفق بود",
-      });
+      pushToast(
+        "err",
+        e instanceof ApiError ? e.message : "ذخیره ترتیب ناموفق بود"
+      );
     },
   });
 
@@ -183,6 +179,8 @@ export default function ConfigOrderPage() {
           ok_count?: number;
           fail_count?: number;
           panels_count?: number;
+          targets_count?: number;
+          groups_count?: number;
           links_count?: number;
         };
       }>("/api/admin/config-order/sample", {
@@ -200,21 +198,25 @@ export default function ConfigOrderPage() {
       const s = res.sample;
       const okN = s?.ok_count ?? 0;
       const failN = s?.fail_count ?? 0;
-      const linkN = s?.links_count ?? ws?.total_sample_links ?? 0;
+      const linkN =
+        s?.links_count ?? ws?.total_sample_links ?? ws?.items?.length ?? 0;
+      const gN = s?.groups_count;
       const base =
         failN > 0
-          ? `تست قبلی حذف شد؛ ${toFaDigits(okN)} پنل موفق، ${toFaDigits(failN)} ناموفق — ${toFaDigits(linkN)} کانفیگ تازه`
-          : `تست قبلی حذف و از نو ساخته شد — ${toFaDigits(okN)} پنل، ${toFaDigits(linkN)} کانفیگ تازه`;
-      setMsg({
-        type: failN > 0 && okN === 0 ? "err" : "ok",
-        text: `${base} — لیست به‌روز شد`,
-      });
+          ? `تست قبلی حذف شد؛ ${toFaDigits(okN)} پنل موفق، ${toFaDigits(failN)} ناموفق — ${toFaDigits(linkN)} کانفیگ یکتا`
+          : `مثل یوزر همه‌گروه ساخته شد — ${toFaDigits(okN)} پنل${
+              gN != null ? `، ${toFaDigits(gN)} گروه` : ""
+            }، ${toFaDigits(linkN)} کانفیگ یکتا`;
+      pushToast(
+        failN > 0 && okN === 0 ? "err" : "ok",
+        `${base} — لیست به‌روز شد`
+      );
     },
     onError: (e) => {
-      setMsg({
-        type: "err",
-        text: e instanceof ApiError ? e.message : "ساخت نمونه ناموفق بود",
-      });
+      pushToast(
+        "err",
+        e instanceof ApiError ? e.message : "ساخت نمونه ناموفق بود"
+      );
     },
   });
 
@@ -242,18 +244,18 @@ export default function ConfigOrderPage() {
           : old
       );
       const ep = endpointLabel(row);
-      setMsg({
-        type: "ok",
-        text: hidden
+      pushToast(
+        "ok",
+        hidden
           ? `${ep} از همه ساب‌ها مخفی شد`
-          : `${ep} دوباره در همه ساب‌ها نمایش داده می‌شود`,
-      });
+          : `${ep} دوباره در همه ساب‌ها نمایش داده می‌شود`
+      );
     },
     onError: (e) => {
-      setMsg({
-        type: "err",
-        text: e instanceof ApiError ? e.message : "خطا در تغییر نمایش",
-      });
+      pushToast(
+        "err",
+        e instanceof ApiError ? e.message : "خطا در تغییر نمایش"
+      );
     },
     onSettled: () => setPendingKey(null),
   });
@@ -305,18 +307,18 @@ export default function ConfigOrderPage() {
       setFlagRow(null);
       const ep = endpointLabel(row);
       const name = countryName(country_code) || country_code;
-      setMsg({
-        type: "ok",
-        text: country_code
+      pushToast(
+        "ok",
+        country_code
           ? `پرچم ${name} برای ${ep} روی همه ساب‌ها ست شد`
-          : `پرچم ${ep} برداشته شد`,
-      });
+          : `پرچم ${ep} برداشته شد`
+      );
     },
     onError: (e) => {
-      setMsg({
-        type: "err",
-        text: e instanceof ApiError ? e.message : "خطا در تنظیم پرچم",
-      });
+      pushToast(
+        "err",
+        e instanceof ApiError ? e.message : "خطا در تنظیم پرچم"
+      );
     },
     onSettled: () => setPendingKey(null),
   });
@@ -331,7 +333,6 @@ export default function ConfigOrderPage() {
     const ordered = next.map((it, i) => ({ ...it, sort_order: i }));
     setItems(ordered);
     setDirty(true);
-    setMsg(null);
     if (persist) {
       save.mutate(ordered);
     }
@@ -353,6 +354,56 @@ export default function ConfigOrderPage() {
     const targetPos = pos + direction;
     if (targetPos < 0 || targetPos >= positions.length) return;
     move(absIndex, positions[targetPos]);
+  }
+
+  /**
+   * Jump by subscription #N (visible-only numbering on the page).
+   * Item becomes that #; the previous #N and everything after shift down one.
+   * Hidden rows between slots stay put relative to the list.
+   */
+  function moveToSubNumber(fromAbs: number, targetSub: number) {
+    if (!Number.isFinite(targetSub) || targetSub < 1) return;
+    const row = items[fromAbs];
+    if (!row || row.hidden) return;
+
+    const visibleAbs: number[] = [];
+    items.forEach((it, i) => {
+      if (!it.hidden) visibleAbs.push(i);
+    });
+    const fromPos = visibleAbs.indexOf(fromAbs);
+    if (fromPos < 0) return;
+
+    const toPos = Math.max(
+      0,
+      Math.min(visibleAbs.length - 1, Math.floor(targetSub) - 1)
+    );
+    if (fromPos === toPos) return;
+
+    const next = [...items];
+    const [moved] = next.splice(fromAbs, 1);
+
+    // Insert so `moved` becomes the toPos-th visible item among `next`
+    let seen = 0;
+    let insertAt = next.length;
+    for (let i = 0; i <= next.length; i++) {
+      if (seen === toPos) {
+        insertAt = i;
+        break;
+      }
+      if (i < next.length && !next[i].hidden) seen += 1;
+    }
+    next.splice(insertAt, 0, moved);
+    applyOrder(next);
+  }
+
+  function parseJumpNumber(raw: string): number | null {
+    const digits = String(raw || "")
+      .trim()
+      .replace(/[۰-۹]/g, (d) => String("۰۱۲۳۴۵۶۷۸۹".indexOf(d)))
+      .replace(/[^\d]/g, "");
+    if (!digits) return null;
+    const n = Number.parseInt(digits, 10);
+    return Number.isFinite(n) && n >= 1 ? n : null;
   }
 
   function onDragStart(index: number) {
@@ -381,14 +432,32 @@ export default function ConfigOrderPage() {
     [items]
   );
 
+  /** Same #N as subscription page (visible configs only, global order). */
+  const subNumByKey = useMemo(() => {
+    const map = new Map<string, number>();
+    let n = 0;
+    for (const it of items) {
+      if (it.hidden) continue;
+      n += 1;
+      map.set(itemKey(it), n);
+    }
+    return map;
+  }, [items]);
+
   const filtered = useMemo(() => {
-    const needle = q.trim().toLowerCase();
+    const needleRaw = q.trim();
+    const needle = needleRaw.toLowerCase();
+    const needleDigits = needleRaw
+      .replace(/[۰-۹]/g, (d) => String("۰۱۲۳۴۵۶۷۸۹".indexOf(d)))
+      .replace(/^#/, "")
+      .trim();
     return items
       .map((it, index) => ({ it, index }))
       .filter(({ it }) => {
         if (filter === "visible" && it.hidden) return false;
         if (filter === "hidden" && !it.hidden) return false;
         if (!needle) return true;
+        const subN = subNumByKey.get(itemKey(it));
         const hay = [
           it.host,
           String(it.port),
@@ -397,24 +466,34 @@ export default function ConfigOrderPage() {
           it.protocol || "",
           ...(it.panel_names || []),
           ...(it.group_names || []),
+          subN != null ? String(subN) : "",
+          subN != null ? `#${subN}` : "",
+          subN != null ? toFaDigits(subN) : "",
+          subN != null ? `#${toFaDigits(subN)}` : "",
         ]
           .join(" ")
           .toLowerCase();
-        return hay.includes(needle);
+        if (hay.includes(needle)) return true;
+        if (needleDigits && /^\d+$/.test(needleDigits) && subN != null) {
+          return String(subN) === needleDigits;
+        }
+        return false;
       });
-  }, [items, q, filter]);
+  }, [items, q, filter, subNumByKey]);
 
   return (
     <div className="admin-page config-order-page">
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
+
       <header className="config-order-hero">
         <div>
           <p className="configs-kicker">سابسکریپشن</p>
           <h1 className="page-title">ترتیب کانفیگ‌ها</h1>
           <p className="page-sub">
-            هر ردیف با <strong>دامنه</strong>، <strong>پورت</strong> و در صورت وجود{" "}
-            <strong>هاست (SNI)</strong> مشخص می‌شود. با ساخت مجدد، نمونه‌های تست قبلی
-            از همه پنل‌ها حذف و لیست تازه جایگزین می‌شود. پرچم و خاموش/روشن روی همه
-            ساب‌ها اعمال می‌شود.
+            شمارهٔ <strong>#</strong> همان شمارهٔ صفحهٔ ساب است (فقط کانفیگ‌های
+            نمایش‌داده‌شده). هر ردیف با <strong>دامنه</strong>، <strong>پورت</strong> و در
+            صورت وجود <strong>هاست (SNI)</strong> مشخص می‌شود. پرچم و خاموش/روشن روی
+            همه ساب‌ها اعمال می‌شود.
           </p>
         </div>
         <div className="config-order-hero-actions">
@@ -422,10 +501,7 @@ export default function ConfigOrderPage() {
             type="button"
             className="btn"
             disabled={busy}
-            onClick={() => {
-              setMsg(null);
-              buildSamples.mutate();
-            }}
+            onClick={() => buildSamples.mutate()}
           >
             {buildSamples.isPending ? (
               <Loader2 size={16} className="configs-spin" />
@@ -444,10 +520,7 @@ export default function ConfigOrderPage() {
             type="button"
             className="btn ghost"
             disabled={busy || !dirty || !items.length}
-            onClick={() => {
-              setMsg(null);
-              save.mutate(items);
-            }}
+            onClick={() => save.mutate(items)}
           >
             {save.isPending ? (
               <Loader2 size={16} className="configs-spin" />
@@ -458,12 +531,6 @@ export default function ConfigOrderPage() {
           </button>
         </div>
       </header>
-
-      {msg && (
-        <p className={`config-order-toast ${msg.type}`} role="status">
-          {msg.text}
-        </p>
-      )}
 
       <div className="config-order-meta">
         <span>
@@ -492,7 +559,7 @@ export default function ConfigOrderPage() {
               type="search"
               value={q}
               onChange={(e) => setQ(e.target.value)}
-              placeholder="جستجوی دامنه، پورت، پنل…"
+              placeholder="جستجو: #۲۵، دامنه، پورت، پنل…"
             />
           </label>
           <div className="configs-filters" role="group" aria-label="فیلتر نمایش">
@@ -541,6 +608,8 @@ export default function ConfigOrderPage() {
               flagRow != null && itemKey(flagRow) === key;
             const hideBusy = pendingKey === key;
             const shown = !it.hidden;
+            const subN = subNumByKey.get(key);
+            const canJump = !busy && !it.hidden && subN != null;
             return (
               <li
                 key={key}
@@ -561,8 +630,19 @@ export default function ConfigOrderPage() {
                 <span className="config-order-grip" aria-hidden>
                   <GripVertical size={16} />
                 </span>
-                <span className="config-order-num">
-                  {toFaDigits(index + 1)}
+                <span
+                  className={`config-order-num${
+                    it.hidden ? " is-hidden-num" : ""
+                  }`}
+                  title={
+                    it.hidden
+                      ? "مخفی از ساب — شماره‌ای در ساب ندارد"
+                      : `شماره در ساب: #${toFaDigits(subN ?? 0)}`
+                  }
+                >
+                  {it.hidden
+                    ? "—"
+                    : `#${toFaDigits(subN ?? 0)}`}
                 </span>
                 <div className="config-order-body">
                   <div className="config-order-title">
@@ -785,6 +865,33 @@ export default function ConfigOrderPage() {
                     >
                       <ArrowUp size={15} />
                     </button>
+                    <input
+                      className="config-order-jump"
+                      type="text"
+                      inputMode="numeric"
+                      enterKeyHint="done"
+                      disabled={!canJump}
+                      placeholder={subN != null ? toFaDigits(subN) : "—"}
+                      aria-label="برو به شماره ساب"
+                      title={
+                        canJump
+                          ? "شماره مقصد را بنویس و Enter بزن — جای همان # می‌رود و بقیه یکی پایین می‌آیند"
+                          : "برای کانفیگ مخفی جابه‌جایی با شماره ممکن نیست"
+                      }
+                      onClick={(e) => e.stopPropagation()}
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onFocus={(e) => e.currentTarget.select()}
+                      onKeyDown={(e) => {
+                        if (e.key !== "Enter") return;
+                        e.preventDefault();
+                        e.stopPropagation();
+                        const n = parseJumpNumber(e.currentTarget.value);
+                        if (n == null) return;
+                        moveToSubNumber(index, n);
+                        e.currentTarget.value = "";
+                        e.currentTarget.blur();
+                      }}
+                    />
                     <button
                       type="button"
                       className="btn ghost sm icon"
@@ -809,10 +916,7 @@ export default function ConfigOrderPage() {
             type="button"
             className="btn"
             disabled={busy || !dirty}
-            onClick={() => {
-              setMsg(null);
-              save.mutate(items);
-            }}
+            onClick={() => save.mutate(items)}
           >
             {save.isPending ? (
               <Loader2 size={16} className="configs-spin" />

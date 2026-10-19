@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     ADAPTER_TIMEOUT: float = 35.0
     # Max concurrent HTTP ops to remotes (create/delete/modify). Caps FD/TLS storm
     # when a user spans many panels; wall time still ≈ ceil(N/limit)×slowest.
-    PANEL_REMOTE_CONCURRENCY: int = 20
+    PANEL_REMOTE_CONCURRENCY: int = 32
     # Min seconds between remote usage polls per user (sub page / clients)
     # Client sub feed throttle; HTML/admin use force=True for live pulls
     # Sub clients / admin list force=True anyway; this only gates soft refreshes

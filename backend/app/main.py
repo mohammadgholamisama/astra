@@ -48,11 +48,35 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("astra")
 
 
+async def _heal_failed_panels_loop() -> None:
+    """Periodically recreate users on panels that were unreachable at create time.
+
+    When a dead panel comes back, error/pending accounts become active and
+    their share links show up on the subscription automatically.
+    """
+    from app.services.orchestrator import heal_failed_panel_accounts_batch
+
+    await asyncio.sleep(20)
+    while True:
+        try:
+            n = await heal_failed_panel_accounts_batch(limit_users=30)
+            if n:
+                logger.info("heal loop: recovered panels for %s users", n)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("heal failed panels loop failed")
+        await asyncio.sleep(45)
+
+
 async def _usage_sync_loop() -> None:
     """Every ~30s: pull raw usage × coeff, and disable remotes when quota ends.
 
     When Astra weighted used_traffic hits data_limit, status → limited and
     sync_modify freezes configs on every panel (Marzban/PasarGuard/Sanaei/Rebecca).
+
+    SQLite: never hold one write transaction across hundreds of users + HTTP.
+    Each user gets its own short session so POST /api/user is not locked out.
     """
     from app.services.orchestrator import refresh_users_usage_batch
 
@@ -61,7 +85,7 @@ async def _usage_sync_loop() -> None:
         try:
             async with AsyncSessionLocal() as db:
                 result = await db.execute(
-                    select(User)
+                    select(User.id)
                     .where(
                         User.status.in_(
                             (
@@ -72,25 +96,50 @@ async def _usage_sync_loop() -> None:
                             )
                         )
                     )
-                    .options(
-                        selectinload(User.panel_accounts).selectinload(PanelAccount.panel)
-                    )
                     .order_by(User.id.desc())
                     .limit(2000)
                 )
-                users = list(result.scalars().unique().all())
-                if users:
-                    await refresh_users_usage_batch(
-                        db,
-                        users,
-                        force=True,
-                        concurrency=16,
-                        # Must push disables when weighted quota is exhausted
-                        push_remotes=True,
-                        quick=True,
-                    )
-                    await db.commit()
-                    logger.info("usage sync loop: refreshed %s users", len(users))
+                user_ids = [int(r[0]) for r in result.all()]
+
+            if user_ids:
+                # Small chunks + low concurrency keep WAL writers brief on SQLite.
+                chunk_size = 12
+                done = 0
+                for i in range(0, len(user_ids), chunk_size):
+                    chunk = user_ids[i : i + chunk_size]
+                    try:
+                        async with AsyncSessionLocal() as db:
+                            result = await db.execute(
+                                select(User)
+                                .where(User.id.in_(chunk))
+                                .options(
+                                    selectinload(User.panel_accounts).selectinload(
+                                        PanelAccount.panel
+                                    )
+                                )
+                            )
+                            users = list(result.scalars().unique().all())
+                            if users:
+                                await refresh_users_usage_batch(
+                                    db,
+                                    users,
+                                    force=True,
+                                    # SQLite: one writer at a time — avoids "database is locked"
+                                    # on POST /api/user while sync_modify holds a transaction.
+                                    concurrency=1,
+                                    push_remotes=True,
+                                    quick=True,
+                                    isolated=True,
+                                )
+                            await db.commit()
+                            done += len(users)
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "usage sync chunk failed ids=%s", chunk[:5]
+                        )
+                    # Yield so create/update requests can acquire the write lock
+                    await asyncio.sleep(0.05)
+                logger.info("usage sync loop: refreshed %s users", done)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
@@ -130,14 +179,19 @@ async def lifespan(_app: FastAPI):
         await refresh_config_hides(db)
         await refresh_config_orders(db)
     usage_task = asyncio.create_task(_usage_sync_loop(), name="astra-usage-sync")
+    heal_task = asyncio.create_task(
+        _heal_failed_panels_loop(), name="astra-heal-panels"
+    )
     try:
         yield
     finally:
         usage_task.cancel()
-        try:
-            await usage_task
-        except asyncio.CancelledError:
-            pass
+        heal_task.cancel()
+        for task in (usage_task, heal_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(

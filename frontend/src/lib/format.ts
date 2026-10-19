@@ -1,8 +1,16 @@
-/** Persian byte formatting for traffic display. */
-export function formatTraffic(bytes: number, opts?: { empty?: string }): string {
+/** Byte formatting for traffic display. */
+export function formatTraffic(
+  bytes: number,
+  opts?: { empty?: string; unit?: "fa" | "en"; digits?: "fa" | "en" }
+): string {
   const n = Number(bytes) || 0;
-  if (n <= 0) return opts?.empty ?? "۰";
-  const units = ["بایت", "کیلوبایت", "مگابایت", "گیگابایت", "ترابایت"];
+  if (n <= 0) return opts?.empty ?? (opts?.unit === "en" ? "0" : "۰");
+  const unitStyle = opts?.unit ?? "fa";
+  const digitStyle = opts?.digits ?? (unitStyle === "en" ? "en" : "fa");
+  const units =
+    unitStyle === "en"
+      ? ["B", "KB", "MB", "GB", "TB"]
+      : ["بایت", "کیلوبایت", "مگابایت", "گیگابایت", "ترابایت"];
   let x = n;
   let i = 0;
   while (x >= 1024 && i < units.length - 1) {
@@ -10,7 +18,8 @@ export function formatTraffic(bytes: number, opts?: { empty?: string }): string 
     i += 1;
   }
   const num = x >= 100 ? x.toFixed(0) : x >= 10 ? x.toFixed(1) : x.toFixed(2);
-  return `${toFaDigits(num)} ${units[i]}`;
+  const shown = digitStyle === "en" ? num : toFaDigits(num);
+  return `${shown} ${units[i]}`;
 }
 
 /** Data limit: 0 / null → نامحدود */

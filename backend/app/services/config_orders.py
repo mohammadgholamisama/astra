@@ -15,7 +15,7 @@ from sqlalchemy.orm import selectinload
 from app.adapters.factory import get_adapter
 from app.adapters.http_utils import is_share_link, is_subscription_ref
 from app.models.config_link_order import ConfigLinkOrder
-from app.models.group import Group, GroupPanel
+from app.models.group import Group, UserGroup
 from app.models.panel import Panel, PanelType
 from app.models.user import PanelAccount, PanelAccountStatus, User, UserStatus
 from app.schemas.config_order import (
@@ -61,7 +61,11 @@ def apply_cache(rows: list[ConfigLinkOrder]) -> None:
             continue
         if port < 1 or port > 65535:
             continue
-        next_map[_fp_key(host, port, match)] = i
+        key = _fp_key(host, port, match)
+        # Keep earliest sort_order when www./non-www collapse to the same key
+        if key in next_map:
+            continue
+        next_map[key] = i
     with _lock:
         global _order_idx, _loaded
         _order_idx = next_map
@@ -81,7 +85,13 @@ def order_index_map() -> dict[tuple[str, int, str], int]:
 
 
 def link_order_index(link: str) -> int:
-    """Sort rank for a share link; large number if not in the global list."""
+    """Sort rank for a share link; large number if not in the global list.
+
+    Match priority:
+      1) exact host:port:match_host (www. already normalized away)
+      2) host:port with empty match_host (general row)
+    Never collapse different SNIs on the same host:port — those are distinct slots.
+    """
     ep = extract_link_endpoint(link)
     if not ep:
         return 10**6
@@ -92,7 +102,14 @@ def link_order_index(link: str) -> int:
         return 10**6
     host, port, match = norm
     with _lock:
-        return _order_idx.get(_fp_key(host, port, match), 10**6)
+        exact = _order_idx.get(_fp_key(host, port, match))
+        if exact is not None:
+            return exact
+        if match:
+            general = _order_idx.get(_fp_key(host, port, ""))
+            if general is not None:
+                return general
+        return 10**6
 
 
 def _normalize_label(raw: str | None) -> str | None:
@@ -106,7 +123,10 @@ async def _get_order_sample_user(db: AsyncSession) -> User | None:
     result = await db.execute(
         select(User)
         .where(User.username == ORDER_SAMPLE_USERNAME)
-        .options(selectinload(User.panel_accounts).selectinload(PanelAccount.panel))
+        .options(
+            selectinload(User.groups),
+            selectinload(User.panel_accounts).selectinload(PanelAccount.panel),
+        )
         .execution_options(populate_existing=True)
     )
     return result.scalar_one_or_none()
@@ -135,55 +155,45 @@ async def _ensure_order_sample_user(db: AsyncSession) -> User:
     return reloaded or user
 
 
-async def _resolve_all_active_panels(
+async def _all_enabled_group_ids(db: AsyncSession) -> list[int]:
+    result = await db.execute(
+        select(Group.id)
+        .where(Group.is_disabled.is_(False))
+        .order_by(Group.id.asc())
+    )
+    return [int(gid) for gid in result.scalars().all()]
+
+
+async def _resolve_order_sample_targets(
     db: AsyncSession,
 ) -> list[tuple[Panel, dict, int]]:
-    """One target per active panel; merge GroupPanel configs so all inbounds appear."""
-    panels = list(
-        (
-            await db.execute(
-                select(Panel).where(Panel.is_active.is_(True)).order_by(Panel.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    if not panels:
+    """Same targets as creating a user with every enabled sales group.
+
+    One (panel, config, group_id) per GroupPanel — not a merged one-account-per-panel
+    probe (that inflated fingerprints vs real multi-group users).
+    """
+    gids = await _all_enabled_group_ids(db)
+    if not gids:
         return []
+    return await orchestrator.resolve_panels_for_groups(db, gids)
 
-    links = list(
-        (
-            await db.execute(
-                select(GroupPanel)
-                .join(Group, Group.id == GroupPanel.group_id)
-                .where(
-                    GroupPanel.panel_id.in_([p.id for p in panels]),
-                    Group.is_disabled.is_(False),
-                )
-                .order_by(GroupPanel.priority.desc(), GroupPanel.id.asc())
-            )
-        )
-        .scalars()
-        .all()
-    )
-    merged: dict[int, dict] = {}
-    for link in links:
-        cfg = dict(link.config or {})
-        prev = merged.get(int(link.panel_id))
-        if prev is None:
-            merged[int(link.panel_id)] = cfg
-        else:
-            merged[int(link.panel_id)] = orchestrator.merge_group_panel_configs(prev, cfg)
 
-    return [(p, dict(merged.get(int(p.id)) or {}), 0) for p in panels]
+async def _sync_order_sample_groups(
+    db: AsyncSession, user: User, group_ids: list[int]
+) -> None:
+    """Keep order-sample membership identical to an all-groups user."""
+    await db.execute(delete(UserGroup).where(UserGroup.user_id == user.id))
+    for i, gid in enumerate(group_ids):
+        db.add(UserGroup(user_id=user.id, group_id=int(gid), sort_order=i))
+    await db.flush()
 
 
 async def _wipe_order_sample_on_remotes(
     db: AsyncSession,
     user: User,
-    panels: list[tuple[Panel, dict, int]],
+    targets: list[tuple[Panel, dict, int]],
 ) -> None:
-    """Hard-delete previous order probe on remotes (incl. Rebecca), then wipe local rows."""
+    """Hard-delete every previous order-probe remote (panel×group), then wipe local rows."""
     existing = list(
         (
             await db.execute(
@@ -195,11 +205,8 @@ async def _wipe_order_sample_on_remotes(
         .scalars()
         .all()
     )
-    by_panel: dict[int, PanelAccount] = {}
-    for acc in existing:
-        by_panel.setdefault(int(acc.panel_id), acc)
 
-    panel_map: dict[int, Panel] = {int(p.id): p for p, _c, _g in panels}
+    panel_map: dict[int, Panel] = {int(p.id): p for p, _c, _g in targets}
     for acc in existing:
         if acc.panel is not None:
             panel_map[int(acc.panel_id)] = acc.panel
@@ -224,23 +231,27 @@ async def _wipe_order_sample_on_remotes(
             except Exception:  # noqa: BLE001
                 pass
 
-    # Delete on every target panel + any orphan account panel from last run
+    # One remote DELETE per local account (unique remote_username when multi-group)
     jobs: list[tuple[Panel, PanelAccount | None]] = []
-    seen: set[int] = set()
-    for panel, _c, _g in panels:
-        pid = int(panel.id)
-        if pid in seen:
-            continue
-        seen.add(pid)
-        jobs.append((panel, by_panel.get(pid)))
-    for pid, acc in by_panel.items():
-        if pid in seen:
-            continue
-        panel = panel_map.get(pid)
+    seen_names: set[tuple[int, str]] = set()
+    for acc in existing:
+        panel = panel_map.get(int(acc.panel_id))
         if panel is None:
             continue
-        seen.add(pid)
+        rname = (acc.remote_username or user.username or "").strip()
+        key = (int(panel.id), rname)
+        if key in seen_names:
+            continue
+        seen_names.add(key)
         jobs.append((panel, acc))
+
+    # Also try base username once per target panel (legacy merged probe)
+    for panel, _c, _g in targets:
+        key = (int(panel.id), user.username)
+        if key in seen_names:
+            continue
+        seen_names.add(key)
+        jobs.append((panel, None))
 
     if jobs:
         await asyncio.gather(*[_remote_delete(p, a) for p, a in jobs])
@@ -351,49 +362,79 @@ def _item_out(
 
 
 async def _sample_fingerprints(db: AsyncSession) -> dict[tuple[str, int, str], dict[str, Any]]:
-    """Unique endpoints from order-sample on ALL panels (+ any leftover group samples)."""
-    from app.models.group_config import GroupConfigItem
+    """Unique endpoints from the order-sample user — same set a full-group sub would emit.
 
+    Uses ``collect_links_detailed`` (panel×group membership + share-link rules) then
+    fingerprint-dedupes like the live subscription. Does not pull stale GroupConfigItem
+    leftovers (those inflated the order page vs real users).
+    """
     out: dict[tuple[str, int, str], dict[str, Any]] = {}
-    user = await _get_order_sample_user(db)
-    if user is not None:
+    result = await db.execute(
+        select(User)
+        .where(User.username == ORDER_SAMPLE_USERNAME)
+        .options(
+            selectinload(User.groups),
+            selectinload(User.panel_accounts).selectinload(PanelAccount.panel),
+        )
+        .execution_options(populate_existing=True)
+    )
+    user = result.scalar_one_or_none()
+    if user is None:
+        return out
+
+    try:
+        rows = await orchestrator.collect_links_detailed(
+            user,
+            include_notices=False,
+            include_hidden=True,
+            db=db,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("order-sample collect_links failed; falling back to raw accounts")
+        rows = []
         for account in user.panel_accounts or []:
             status_val = getattr(account.status, "value", account.status)
-            if status_val not in (PanelAccountStatus.active.value, "active"):
+            if status_val not in (
+                PanelAccountStatus.active.value,
+                "active",
+                PanelAccountStatus.error.value,
+                "error",
+            ):
                 continue
             panel_name = ""
             if account.panel is not None:
                 panel_name = str(getattr(account.panel, "name", "") or "")
             for link in account.links or []:
                 if isinstance(link, str) and is_share_link(link):
-                    _ingest_link(out, link, panel_name=panel_name)
+                    rows.append({"link": link, "panel": panel_name})
 
-    # Supplement so nothing is missing if a panel only appeared in group samples
-    result = await db.execute(
-        select(GroupConfigItem)
-        .options(
-            selectinload(GroupConfigItem.panel),
-            selectinload(GroupConfigItem.group),
-        )
-        .order_by(GroupConfigItem.sort_order, GroupConfigItem.id)
-    )
-    for item in result.scalars().all():
-        link = (item.sample_link or "").strip()
+    # Mirror subscription fingerprint collapse (host:port[+SNI])
+    seen_fp: set[tuple[str, int, str]] = set()
+    for row in rows:
+        link = str(row.get("link") or "").strip()
         if not link or not is_share_link(link):
             continue
-        panel_name = ""
-        if item.panel is not None:
-            panel_name = str(getattr(item.panel, "name", "") or "")
+        ep = extract_link_endpoint(link)
+        if not ep:
+            continue
+        match = extract_link_match_host(link) or ""
+        norm = try_normalize_endpoint(ep[0], ep[1], match)
+        if not norm or norm in seen_fp:
+            continue
+        seen_fp.add(norm)
+        panel_name = str(row.get("panel") or "")
         group_name = ""
-        if item.group is not None:
-            group_name = str(getattr(item.group, "name", "") or "")
+        gid = row.get("group_id")
+        if gid is not None:
+            for g in user.groups or []:
+                if int(g.id) == int(gid):
+                    group_name = str(g.name or "")
+                    break
         _ingest_link(
             out,
             link,
             panel_name=panel_name,
             group_name=group_name,
-            label=(item.label or None),
-            protocol=(item.protocol or None),
         )
     return out
 
@@ -419,6 +460,9 @@ async def list_workspace(db: AsyncSession) -> ConfigOrderWorkspaceOut:
         except (ValueError, TypeError):
             continue
         key = _fp_key(host, port, match)
+        if key in seen:
+            # www./non-www (or other normalize collapses) — keep earliest row
+            continue
         sample = samples.get(key)
         items.append(
             _item_out(
@@ -426,7 +470,7 @@ async def list_workspace(db: AsyncSession) -> ConfigOrderWorkspaceOut:
                 port=port,
                 match_host=match,
                 label=row.label or (sample or {}).get("label"),
-                sort_order=i,
+                sort_order=len(items),
                 in_sample=sample is not None,
                 sample=sample,
             )
@@ -563,47 +607,54 @@ async def reconcile_order_with_sample(db: AsyncSession) -> int:
 
 
 async def create_or_refresh_samples(db: AsyncSession) -> dict:
-    """Build order probe on every active panel: wipe previous remotes, then recreate."""
-    panels = await _resolve_all_active_panels(db)
-    if not panels:
-        raise ValueError("هیچ پنل فعالی ثبت نشده است")
+    """Rebuild order probe exactly like creating a user on every enabled group."""
+    group_ids = await _all_enabled_group_ids(db)
+    targets = await _resolve_order_sample_targets(db)
+    if not targets:
+        raise ValueError("هیچ پنل فعالی در گروه‌های فروش ثبت نشده است")
 
     user = await _ensure_order_sample_user(db)
+    await _sync_order_sample_groups(db, user, group_ids)
     # Always remove previous test accounts on remotes before rebuild
-    await _wipe_order_sample_on_remotes(db, user, panels)
+    await _wipe_order_sample_on_remotes(db, user, targets)
     await asyncio.sleep(0.5)
 
     user = await _get_order_sample_user(db) or user
+    await _sync_order_sample_groups(db, user, group_ids)
 
-    # Rebecca soft-deletes usernames — each rebuild needs a fresh remote name
+    # Rebecca soft-deletes usernames — pre-seed fresh remote names per (panel×group)
     rebecca_targets = [
-        (p, c, g) for p, c, g in panels if getattr(p, "type", None) == PanelType.rebecca
+        (p, c, g)
+        for p, c, g in targets
+        if getattr(p, "type", None) == PanelType.rebecca
     ]
     if rebecca_targets:
-        for panel, _cfg, _gid in rebecca_targets:
+        for panel, _cfg, gid in rebecca_targets:
             fresh = f"astra_o{secrets.token_hex(5)}"[:32]
             db.add(
                 PanelAccount(
                     user_id=user.id,
                     panel_id=panel.id,
-                    group_id=None,
+                    group_id=int(gid) if gid else None,
                     status=PanelAccountStatus.pending,
                     remote_username=fresh,
                 )
             )
         await db.flush()
 
-    await orchestrator.provision_user_on_panels(db, user, panels)
+    await orchestrator.provision_user_on_panels(db, user, targets)
 
     # If Rebecca still trapped (soft-delete), rotate remote name once more
     user = await _get_order_sample_user(db) or user
     trapped_rebecca: list[tuple[Panel, dict, int]] = []
     for panel, cfg, gid in rebecca_targets:
+        gid_i = int(gid) if gid else 0
         acc = next(
             (
                 a
                 for a in (user.panel_accounts or [])
                 if int(a.panel_id) == int(panel.id)
+                and int(getattr(a, "group_id", 0) or 0) == gid_i
             ),
             None,
         )
@@ -671,49 +722,65 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
     ordered_n = await reconcile_order_with_sample(db)
 
     user = await _get_order_sample_user(db)
+    fps = await _sample_fingerprints(db)
+    link_count = len(fps)
+
+    # Per unique panel status for the toast (aggregate panel×group accounts)
     rows: list[dict[str, Any]] = []
     ok_count = 0
     fail_count = 0
-    link_count = 0
-    accounts_by_panel: dict[int, PanelAccount] = {}
+    by_panel: dict[int, list[PanelAccount]] = {}
     if user is not None:
         for acc in user.panel_accounts or []:
-            accounts_by_panel[int(acc.panel_id)] = acc
+            by_panel.setdefault(int(acc.panel_id), []).append(acc)
 
-    for panel, _cfg, _gid in panels:
-        acc = accounts_by_panel.get(int(panel.id))
-        n_links = (
-            sum(1 for x in (acc.links or []) if x and is_share_link(str(x)))
-            if acc
-            else 0
+    seen_panels: set[int] = set()
+    panel_rows: list[tuple[Panel, list[PanelAccount]]] = []
+    for panel, _cfg, _gid in targets:
+        pid = int(panel.id)
+        if pid in seen_panels:
+            continue
+        seen_panels.add(pid)
+        panel_rows.append((panel, by_panel.get(pid) or []))
+
+    for panel, accs in panel_rows:
+        n_links = sum(
+            sum(1 for x in (a.links or []) if x and is_share_link(str(x)))
+            for a in accs
         )
-        status_val = getattr(acc.status, "value", acc.status) if acc else None
-        is_active = status_val == PanelAccountStatus.active.value or status_val == "active"
-        ok = bool(acc and is_active and n_links > 0)
+        any_active = any(
+            getattr(a.status, "value", a.status)
+            in (PanelAccountStatus.active.value, "active")
+            for a in accs
+        )
+        ok = bool(accs and any_active and n_links > 0)
         if ok:
             ok_count += 1
-            link_count += n_links
         else:
             fail_count += 1
+        err = None
+        if not ok:
+            err = next(
+                (a.error_message for a in accs if a.error_message),
+                "بدون لینک" if accs and any_active else "ساخت ناموفق",
+            )
         rows.append(
             {
                 "panel_id": int(panel.id),
                 "panel_name": panel.name,
                 "ok": ok,
                 "links_count": n_links,
-                "error": None
-                if ok
-                else (
-                    (acc.error_message if acc else None)
-                    or ("بدون لینک" if acc and is_active else "ساخت ناموفق")
-                ),
+                "accounts": len(accs),
+                "error": err,
             }
         )
 
     return {
         "ok_count": ok_count,
         "fail_count": fail_count,
-        "panels_count": len(panels),
+        "panels_count": len(panel_rows),
+        "targets_count": len(targets),
+        "groups_count": len(group_ids),
         "links_count": link_count,
         "ordered_count": ordered_n,
         "sample_username": ORDER_SAMPLE_USERNAME,

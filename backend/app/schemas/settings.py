@@ -12,6 +12,8 @@ class SiteSettingsOut(BaseModel):
     promo_config_enabled: bool = False
     promo_config_text: str = ""
     promo_config_text_2: str = ""
+    status_line_template: str = "✨ {username} - {remain} - {expire} ✨"
+    status_panel_label: str = "وضعیت"
     ssl_available: bool = False
     panel_domain: str = ""
     sub_domain: str = ""
@@ -29,6 +31,8 @@ class SiteSettingsUpdate(BaseModel):
     promo_config_enabled: bool | None = None
     promo_config_text: str | None = Field(default=None, max_length=200)
     promo_config_text_2: str | None = Field(default=None, max_length=200)
+    status_line_template: str | None = Field(default=None, max_length=200)
+    status_panel_label: str | None = Field(default=None, max_length=48)
     reset_sub_base_url: bool = False
     reset_panel_base_url: bool = False
     reset_brand_name: bool = False
@@ -37,6 +41,7 @@ class SiteSettingsUpdate(BaseModel):
     clear_link_app: bool = False
     clear_config_brand_tag: bool = False
     clear_promo_config: bool = False
+    reset_status_line: bool = False
 
 
 class SslIssueRequest(BaseModel):

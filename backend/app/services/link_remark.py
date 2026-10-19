@@ -296,24 +296,81 @@ def build_notice_link(text: str) -> str:
     return f"{_NOTICE_LINK_BASE}#{quote(remark, safe='')}"
 
 
+DEFAULT_STATUS_LINE_TEMPLATE = "✨ {username} - {remain} - {expire} ✨"
+DEFAULT_STATUS_PANEL_LABEL = "وضعیت"
+
+_STATUS_VAR_RE = re.compile(r"\{([a-zA-Z0-9_]+)\}")
+
+
+def status_template_vars(
+    *,
+    username: str,
+    used: int,
+    limit: int,
+    expire: int | None,
+) -> dict[str, str]:
+    """Build placeholders for the customizable status remark line."""
+    name = " ".join(to_en_digits(username or "user").split()).strip() or "user"
+    name = re.sub(r"[\x00-\x1f\x7f]", "", name)[:32]
+    used_i = max(0, int(used or 0))
+    lim = int(limit or 0)
+    if lim <= 0:
+        remain = "∞"
+        limit_s = "∞"
+        used_pct = "0"
+        remain_pct = "100"
+    else:
+        rem_i = max(0, lim - used_i)
+        remain = format_bytes_compact(rem_i)
+        limit_s = format_bytes_compact(lim)
+        used_pct = str(min(100, int(round((used_i / lim) * 100))))
+        remain_pct = str(max(0, min(100, int(round((rem_i / lim) * 100)))))
+    used_s = format_bytes_compact(used_i) if used_i > 0 else "0B"
+    expire_s = format_expire_compact(expire)
+    return {
+        "username": name,
+        "user": name,
+        "remain": remain,
+        "remain_traffic": remain,
+        "used": used_s,
+        "used_traffic": used_s,
+        "limit": limit_s,
+        "total": limit_s,
+        "expire": expire_s,
+        "time": expire_s,
+        "days": expire_s,
+        "used_pct": used_pct,
+        "remain_pct": remain_pct,
+    }
+
+
+def render_status_template(template: str | None, variables: dict[str, str]) -> str:
+    """Replace ``{var}`` placeholders; unknown keys become empty."""
+    raw = (template or "").strip() or DEFAULT_STATUS_LINE_TEMPLATE
+    # Accept both {username} and {USERNAME}
+    lowered = {str(k).lower(): str(v) for k, v in (variables or {}).items()}
+    text = _STATUS_VAR_RE.sub(
+        lambda m: lowered.get(m.group(1).lower(), ""),
+        raw,
+    )
+    text = " ".join(to_en_digits(text).split()).strip()
+    text = re.sub(r"[\x00-\x1f\x7f]", "", text)
+    return text[:200] or DEFAULT_STATUS_LINE_TEMPLATE
+
+
 def build_status_remark(
     *,
     username: str,
     used: int,
     limit: int,
     expire: int | None,
+    template: str | None = None,
 ) -> str:
-    """First sub line: ``✨ user - 2.5G - 30d ✨`` (updates on every sub refresh)."""
-    name = " ".join(to_en_digits(username or "user").split()).strip() or "user"
-    name = re.sub(r"[\x00-\x1f\x7f]", "", name)[:32]
-    lim = int(limit or 0)
-    if lim <= 0:
-        hajm = "∞"
-    else:
-        hajm = format_bytes_compact(max(0, lim - max(0, int(used or 0))))
-    t = format_expire_compact(expire)
-    # Emoji bookends — display-only; ping intentionally fails
-    return f"✨ {name} - {hajm} - {t} ✨"
+    """First sub line — customizable via settings template (live on every refresh)."""
+    variables = status_template_vars(
+        username=username, used=used, limit=limit, expire=expire
+    )
+    return render_status_template(template, variables)
 
 
 def build_status_row(
@@ -322,14 +379,22 @@ def build_status_row(
     used: int,
     limit: int,
     expire: int | None,
+    template: str | None = None,
+    panel_label: str | None = None,
 ) -> dict:
     remark = build_status_remark(
-        username=username, used=used, limit=limit, expire=expire
+        username=username,
+        used=used,
+        limit=limit,
+        expire=expire,
+        template=template,
     )
     link = build_notice_link(remark)
+    label = " ".join((panel_label or DEFAULT_STATUS_PANEL_LABEL).split()).strip()
+    label = re.sub(r"[\x00-\x1f\x7f]", "", label)[:48] or DEFAULT_STATUS_PANEL_LABEL
     return {
         "link": link,
-        "panel": "وضعیت",
+        "panel": label,
         "panel_id": 0,
         "remark": remark,
         "kind": "status",

@@ -374,7 +374,13 @@ def _migrate_panel_account_group_unique(connection: Connection) -> list[str]:
 
 
 def _migrate_config_location_match_host(connection: Connection) -> list[str]:
-    """Add match_host uniqueness (host+port+optional header host)."""
+    """Ensure uniqueness is (host, port, match_host) — not legacy (host, port).
+
+    Older installs still have ``CONSTRAINT UNIQUE (host, port)`` which blocks
+    setting a flag when match_host is normalized (e.g. www. stripped) while the
+    existing row still stores the www. form. SQLite keeps that as an autoindex;
+    DROP INDEX by the old name is not enough — rebuild the table when needed.
+    """
     inspector = inspect(connection)
     if "config_locations" not in set(inspector.get_table_names()):
         return []
@@ -385,11 +391,117 @@ def _migrate_config_location_match_host(connection: Connection) -> list[str]:
     names = {u.get("name") for u in uniques if u.get("name")}
     names.update({ix.get("name") for ix in indexes if ix.get("name")})
 
-    # Drop legacy unique on (host, port) only
+    def _cols(obj: dict) -> list[str]:
+        return [str(c).lower() for c in (obj.get("column_names") or [])]
+
+    legacy_host_port = False
+    for u in uniques:
+        cols = _cols(u)
+        if cols == ["host", "port"]:
+            legacy_host_port = True
+            break
+    for ix in indexes:
+        if not ix.get("unique"):
+            continue
+        cols = _cols(ix)
+        if cols == ["host", "port"]:
+            legacy_host_port = True
+            break
+    # SQLite table-constraint UNIQUE shows up as sqlite_autoindex_*
+    if dialect == "sqlite" and not legacy_host_port:
+        try:
+            for row in connection.execute(text("PRAGMA index_list('config_locations')")):
+                # row: (seq, name, unique, origin, partial)
+                ix_name = row[1]
+                is_unique = bool(row[2])
+                if not is_unique:
+                    continue
+                cols = [
+                    r[2]
+                    for r in connection.execute(text(f'PRAGMA index_info("{ix_name}")'))
+                ]
+                if [str(c).lower() for c in cols] == ["host", "port"]:
+                    legacy_host_port = True
+                    break
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PRAGMA index_list config_locations failed: %s", exc)
+
+    if dialect == "sqlite" and legacy_host_port:
+        try:
+            connection.execute(text("PRAGMA foreign_keys=OFF"))
+            connection.execute(text("DROP TABLE IF EXISTS config_locations__new"))
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE config_locations__new (
+                        id INTEGER NOT NULL PRIMARY KEY,
+                        host VARCHAR(253) NOT NULL,
+                        port INTEGER NOT NULL,
+                        match_host VARCHAR(253) NOT NULL DEFAULT '',
+                        country_code VARCHAR(2) NOT NULL,
+                        label VARCHAR(64),
+                        created_at DATETIME DEFAULT (CURRENT_TIMESTAMP) NOT NULL,
+                        updated_at DATETIME DEFAULT (CURRENT_TIMESTAMP) NOT NULL,
+                        CONSTRAINT uq_config_location_host_port_match
+                            UNIQUE (host, port, match_host)
+                    )
+                    """
+                )
+            )
+            # Copy + strip www. on match_host; earliest id wins on collision
+            connection.execute(
+                text(
+                    """
+                    INSERT OR IGNORE INTO config_locations__new
+                        (id, host, port, match_host, country_code, label, created_at, updated_at)
+                    SELECT
+                        id,
+                        host,
+                        port,
+                        CASE
+                            WHEN lower(COALESCE(match_host, '')) LIKE 'www.%'
+                                THEN substr(lower(match_host), 5)
+                            ELSE lower(COALESCE(match_host, ''))
+                        END AS match_host,
+                        country_code,
+                        label,
+                        created_at,
+                        updated_at
+                    FROM config_locations
+                    ORDER BY id ASC
+                    """
+                )
+            )
+            connection.execute(text("DROP TABLE config_locations"))
+            connection.execute(
+                text("ALTER TABLE config_locations__new RENAME TO config_locations")
+            )
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_config_locations_host "
+                    "ON config_locations (host)"
+                )
+            )
+            connection.execute(text("PRAGMA foreign_keys=ON"))
+            changed.append("rebuild:config_locations_drop_host_port_unique")
+            logger.info(
+                "Rebuilt config_locations without legacy UNIQUE(host, port)"
+            )
+            return changed
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("config_locations rebuild failed: %s", exc)
+            try:
+                connection.execute(text("PRAGMA foreign_keys=ON"))
+            except Exception:  # noqa: BLE001
+                pass
+
+    # Non-SQLite / already-clean path: drop named legacy constraint if present
     if "uq_config_location_host_port" in names:
         try:
             if dialect == "sqlite":
-                connection.execute(text('DROP INDEX IF EXISTS "uq_config_location_host_port"'))
+                connection.execute(
+                    text('DROP INDEX IF EXISTS "uq_config_location_host_port"')
+                )
             else:
                 connection.execute(
                     text(
@@ -406,7 +518,7 @@ def _migrate_config_location_match_host(connection: Connection) -> list[str]:
         try:
             connection.execute(
                 text(
-                    'CREATE UNIQUE INDEX IF NOT EXISTS '
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
                     '"uq_config_location_host_port_match" '
                     'ON "config_locations" ("host", "port", "match_host")'
                 )
@@ -414,7 +526,9 @@ def _migrate_config_location_match_host(connection: Connection) -> list[str]:
             changed.append("uq_config_location_host_port_match")
             logger.info("Created uq_config_location_host_port_match")
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not create uq_config_location_host_port_match: %s", exc)
+            logger.warning(
+                "Could not create uq_config_location_host_port_match: %s", exc
+            )
 
     return changed
 

@@ -1,5 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
 import {
   AlertTriangle,
   BarChart3,
@@ -33,6 +35,7 @@ import {
   expireToDaysInput,
   gbToBytes,
   Group,
+  GroupCategory,
   PanelAccount,
   User,
 } from "../lib/api";
@@ -277,7 +280,9 @@ function groupUsageRows(u: User, groups: Group[]): GroupUsageRow[] {
 export default function UsersPage() {
   const qc = useQueryClient();
   const [open, setOpen] = useState(false);
-  const [search, setSearch] = useState("");
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [searchParams] = useSearchParams();
+  const [search, setSearch] = useState(() => searchParams.get("q")?.trim() || "");
   const [page, setPage] = useState(0);
   const [filter, setFilter] = useState<FilterKey>("all");
   const [filterGroupId, setFilterGroupId] = useState<number | "">("");
@@ -287,6 +292,22 @@ export default function UsersPage() {
   const [days, setDays] = useState("30");
   const [groupIds, setGroupIds] = useState<number[]>([]);
   const [groupSearch, setGroupSearch] = useState("");
+  /** Filter/focus in create modal: all | uncategorized | category id */
+  const [createCatTab, setCreateCatTab] = useState<number | "all" | "none">("all");
+  const [editCatTab, setEditCatTab] = useState<number | "all" | "none">("all");
+  const [bulkPrefix, setBulkPrefix] = useState("");
+  const [bulkCount, setBulkCount] = useState("5");
+  const [bulkDisplayName, setBulkDisplayName] = useState("");
+  const [bulkDataGb, setBulkDataGb] = useState("50");
+  const [bulkDays, setBulkDays] = useState("30");
+  const [bulkGroupIds, setBulkGroupIds] = useState<number[]>([]);
+  const [bulkGroupSearch, setBulkGroupSearch] = useState("");
+  const [bulkCatTab, setBulkCatTab] = useState<number | "all" | "none">("all");
+  const [bulkResult, setBulkResult] = useState<{
+    created: User[];
+    failed: { username: string; message: string }[];
+    total_requested: number;
+  } | null>(null);
   const [copied, setCopied] = useState("");
   const [confirmUser, setConfirmUser] = useState<User | null>(null);
   const [resetUser, setResetUser] = useState<User | null>(null);
@@ -305,6 +326,8 @@ export default function UsersPage() {
   const [usageLoading, setUsageLoading] = useState(false);
   /** Bumps on open/close so a late API reply cannot reopen the usage modal. */
   const usageFetchId = useRef(0);
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const skipListScroll = useRef(true);
   const [qrDataUrl, setQrDataUrl] = useState("");
   const [actionMsg, setActionMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
   const [syncingUsage, setSyncingUsage] = useState(false);
@@ -330,25 +353,69 @@ export default function UsersPage() {
     return () => window.clearTimeout(t);
   }, [search]);
 
+  // Dashboard «پرمصرف‌ها» → /users?q=username (also when already on this page)
+  useEffect(() => {
+    const q = searchParams.get("q")?.trim() || "";
+    if (!q) return;
+    setSearch(q);
+    setSearchDebounced(q);
+    setPage(0);
+    setFilter("all");
+  }, [searchParams]);
+
+  useEffect(() => {
+    if (skipListScroll.current) {
+      skipListScroll.current = false;
+      return;
+    }
+    const el = listRef.current;
+    if (!el) return;
+    // Wait a beat so the new page content paints, then ease to the list top
+    const t = window.setTimeout(() => {
+      el.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 40);
+    return () => window.clearTimeout(t);
+  }, [page]);
+
   useEffect(() => {
     setPage(0);
-  }, [searchDebounced, filterGroupId]);
+  }, [searchDebounced, filterGroupId, filter]);
 
-  const usersQueryKey = ["users", searchDebounced, filterGroupId, page] as const;
+  type UsersListPayload = {
+    users: User[];
+    total: number;
+    counts?: {
+      all: number;
+      active: number;
+      error: number;
+      expired: number;
+    };
+  };
+
+  const usersQueryKey = [
+    "users",
+    searchDebounced,
+    filterGroupId,
+    filter,
+    page,
+  ] as const;
+
+  function buildUsersQs(opts: { refresh: boolean; pageIndex: number }) {
+    const qs = new URLSearchParams({
+      limit: String(PAGE_SIZE),
+      offset: String(opts.pageIndex * PAGE_SIZE),
+      refresh: opts.refresh ? "true" : "false",
+      filter,
+    });
+    if (searchDebounced.trim()) qs.set("search", searchDebounced.trim());
+    if (filterGroupId !== "") qs.set("group_id", String(filterGroupId));
+    return qs;
+  }
 
   const { data, isLoading, isFetching, isSuccess } = useQuery({
     queryKey: usersQueryKey,
-    queryFn: () => {
-      const qs = new URLSearchParams({
-        limit: String(PAGE_SIZE),
-        offset: String(page * PAGE_SIZE),
-        // Instant list from DB — live usage patches in right after
-        refresh: "false",
-      });
-      if (searchDebounced.trim()) qs.set("search", searchDebounced.trim());
-      if (filterGroupId !== "") qs.set("group_id", String(filterGroupId));
-      return api<{ users: User[]; total: number }>(`/api/users?${qs}`);
-    },
+    queryFn: () =>
+      api<UsersListPayload>(`/api/users?${buildUsersQs({ refresh: false, pageIndex: page })}`),
     staleTime: 15_000,
     refetchInterval: 60_000,
     refetchOnMount: true,
@@ -359,14 +426,9 @@ export default function UsersPage() {
   async function syncUsageNow(silent = false) {
     setSyncingUsage(true);
     try {
-      const qs = new URLSearchParams({
-        limit: String(PAGE_SIZE),
-        offset: String(page * PAGE_SIZE),
-        refresh: "true",
-      });
-      if (searchDebounced.trim()) qs.set("search", searchDebounced.trim());
-      if (filterGroupId !== "") qs.set("group_id", String(filterGroupId));
-      const fresh = await api<{ users: User[]; total: number }>(`/api/users?${qs}`);
+      const fresh = await api<UsersListPayload>(
+        `/api/users?${buildUsersQs({ refresh: true, pageIndex: page })}`
+      );
       qc.setQueryData(usersQueryKey, fresh);
       if (!silent) {
         setActionMsg({ type: "ok", text: "مصرف این صفحه همگام شد" });
@@ -396,10 +458,15 @@ export default function UsersPage() {
       window.clearTimeout(t);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isSuccess, searchDebounced, filterGroupId, page]);
+  }, [isSuccess, searchDebounced, filterGroupId, filter, page]);
   const { data: groups = [] } = useQuery({
     queryKey: ["groups"],
     queryFn: () => api<Group[]>("/api/groups"),
+    staleTime: 60_000,
+  });
+  const { data: groupCategories = [] } = useQuery({
+    queryKey: ["group-categories"],
+    queryFn: () => api<GroupCategory[]>("/api/group-categories"),
     staleTime: 60_000,
   });
 
@@ -431,6 +498,7 @@ export default function UsersPage() {
       setDays("30");
       setGroupIds([]);
       setGroupSearch("");
+      setCreateCatTab("all");
       setActionMsg({ type: "ok", text: "کاربر ساخته شد" });
     },
   });
@@ -447,22 +515,134 @@ export default function UsersPage() {
     return err instanceof Error ? err.message : "خطا در ساخت کاربر";
   })();
 
+  type BulkCreateResponse = {
+    created: User[];
+    failed: { username: string; message: string }[];
+    total_requested: number;
+  };
+
+  const bulkCreate = useMutation({
+    mutationFn: () => {
+      const gb = Number(bulkDataGb);
+      const dayN = Number(bulkDays);
+      const count = Math.floor(Number(bulkCount) || 0);
+      const expire =
+        dayN > 0 ? Math.floor(Date.now() / 1000) + Math.floor(dayN * 86400) : 0;
+      const dn = bulkDisplayName.trim();
+      return api<BulkCreateResponse>("/api/users/bulk", {
+        method: "POST",
+        body: JSON.stringify({
+          username_prefix: bulkPrefix.trim(),
+          count,
+          display_name: dn || null,
+          data_limit: gb > 0 ? gbToBytes(gb) : 0,
+          expire,
+          status: "active",
+          group_ids: bulkGroupIds,
+        }),
+      });
+    },
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["users"] });
+      setBulkOpen(false);
+      setBulkPrefix("");
+      setBulkCount("5");
+      setBulkDisplayName("");
+      setBulkDataGb("50");
+      setBulkDays("30");
+      setBulkGroupIds([]);
+      setBulkGroupSearch("");
+      setBulkCatTab("all");
+      setBulkResult(res);
+    },
+  });
+
+  const bulkErrorText = (() => {
+    if (!bulkCreate.isError) return null;
+    const err = bulkCreate.error;
+    if (err instanceof ApiError) {
+      if (err.code === "USERNAME_EXISTS" || err.status === 409) {
+        return err.message || "برخی یوزرنیم‌ها از قبل وجود دارند";
+      }
+      return err.message;
+    }
+    return err instanceof Error ? err.message : "خطا در ساخت گروهی";
+  })();
+
+  const bulkCountN = Math.min(50, Math.max(0, Math.floor(Number(bulkCount) || 0)));
+  const bulkPreviewNames = useMemo(() => {
+    const p = bulkPrefix.trim();
+    if (!p || bulkCountN < 1) return [];
+    const n = Math.min(bulkCountN, 5);
+    const list = Array.from({ length: n }, (_, i) => `${p}_${i + 1}`);
+    if (bulkCountN > 5) list.push(`… ${p}_${bulkCountN}`);
+    return list;
+  }, [bulkPrefix, bulkCountN]);
+
+  function resetBulkForm() {
+    setBulkPrefix("");
+    setBulkCount("5");
+    setBulkDisplayName("");
+    setBulkDataGb("50");
+    setBulkDays("30");
+    setBulkGroupIds([]);
+    setBulkGroupSearch("");
+    setBulkCatTab("all");
+  }
+
+  function toggleBulkGroup(id: number) {
+    setBulkGroupIds((cur) =>
+      cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]
+    );
+  }
+
+  function onBulkSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (bulkGroupIds.length === 0) return;
+    if (!bulkPrefix.trim() || bulkCountN < 1) return;
+    bulkCreate.mutate();
+  }
+
+  function copyAllBulkSubs() {
+    const lines = (bulkResult?.created || [])
+      .map((u) => `${u.username}\t${u.subscription_url}`)
+      .join("\n");
+    if (!lines) return;
+    copy(lines, "bulk-all");
+  }
+
+  function copyAllBulkLinksOnly() {
+    const lines = (bulkResult?.created || [])
+      .map((u) => u.subscription_url)
+      .filter(Boolean)
+      .join("\n");
+    if (!lines) return;
+    copy(lines, "bulk-links");
+  }
+
   const remove = useMutation({
     mutationFn: (u: string) =>
-      api<{ detail?: string }>(`/api/user/${encodeURIComponent(u)}`, {
-        method: "DELETE",
-      }),
-    onSuccess: () => {
+      api<{ detail?: string; skipped_count?: number }>(
+        `/api/user/${encodeURIComponent(u)}`,
+        { method: "DELETE" }
+      ),
+    onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["users"] });
       setConfirmUser(null);
-      setActionMsg({ type: "ok", text: "کاربر از Astra و همه پنل‌های اصلی حذف شد" });
+      const skipped = Number(res?.skipped_count || 0);
+      setActionMsg({
+        type: "ok",
+        text:
+          skipped > 0
+            ? `کاربر حذف شد — ${toFaDigits(skipped)} پنل خاموش/قطع رد شد`
+            : "کاربر از Astra و پنل‌ها حذف شد",
+      });
     },
     onError: (e: Error) => {
       qc.invalidateQueries({ queryKey: ["users"] });
-      // Keep confirm open so admin sees the remote failure and can retry
       setActionMsg({
         type: "err",
-        text: e.message || "حذف از پنل اصلی ناموفق — کاربر در Astra باقی ماند",
+        text: e.message || "حذف کاربر ناموفق بود",
       });
     },
   });
@@ -472,7 +652,11 @@ export default function UsersPage() {
       api(`/api/user/${encodeURIComponent(u)}/retry`, { method: "POST" }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["users"] });
-      setActionMsg({ type: "ok", text: "تلاش مجدد انجام شد" });
+      setErrorsUser(null);
+      setActionMsg({
+        type: "ok",
+        text: "تلاش مجدد انجام شد — پنل‌های خاموش از خطا حذف شدند",
+      });
     },
     onError: (e: Error) => setActionMsg({ type: "err", text: e.message }),
   });
@@ -567,6 +751,7 @@ export default function UsersPage() {
     setEditInitialGroupIds(ids);
     setEditGroupIds(ids);
     setEditGroupSearch("");
+    setEditCatTab("all");
   }
 
   function toggleEditGroup(id: number) {
@@ -682,10 +867,36 @@ export default function UsersPage() {
     [groups]
   );
 
-  const filteredCreateGroups = useMemo(() => {
-    const q = groupSearch.trim().toLowerCase();
-    if (!q) return activeGroups;
-    return activeGroups.filter((g) => {
+  const uncategorizedActive = useMemo(
+    () => activeGroups.filter((g) => g.category_id == null),
+    [activeGroups]
+  );
+
+  const groupsInCategory = useMemo(() => {
+    const map = new Map<number, Group[]>();
+    for (const g of activeGroups) {
+      const cid = g.category_id;
+      if (cid == null) continue;
+      const list = map.get(cid) || [];
+      list.push(g);
+      map.set(cid, list);
+    }
+    return map;
+  }, [activeGroups]);
+
+  function filterGroupsByCatAndSearch(
+    catTab: number | "all" | "none",
+    searchQ: string
+  ): Group[] {
+    let list = activeGroups;
+    if (catTab === "none") {
+      list = uncategorizedActive;
+    } else if (catTab !== "all") {
+      list = groupsInCategory.get(catTab) || [];
+    }
+    const q = searchQ.trim().toLowerCase();
+    if (!q) return list;
+    return list.filter((g) => {
       if (g.name.toLowerCase().includes(q)) return true;
       return (g.panels || []).some(
         (gp) =>
@@ -693,12 +904,30 @@ export default function UsersPage() {
           (gp.panel_type || "").toLowerCase().includes(q)
       );
     });
-  }, [activeGroups, groupSearch]);
+  }
+
+  const filteredCreateGroups = useMemo(
+    () => filterGroupsByCatAndSearch(createCatTab, groupSearch),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeGroups, createCatTab, groupSearch, groupsInCategory, uncategorizedActive]
+  );
+
+  const filteredBulkGroups = useMemo(
+    () => filterGroupsByCatAndSearch(bulkCatTab, bulkGroupSearch),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeGroups, bulkCatTab, bulkGroupSearch, groupsInCategory, uncategorizedActive]
+  );
 
   const filteredEditGroups = useMemo(() => {
+    let list = activeGroups;
+    if (editCatTab === "none") {
+      list = uncategorizedActive;
+    } else if (editCatTab !== "all") {
+      list = groupsInCategory.get(editCatTab) || [];
+    }
     const q = editGroupSearch.trim().toLowerCase();
-    if (!q) return activeGroups;
-    return activeGroups.filter((g) => {
+    if (!q) return list;
+    return list.filter((g) => {
       if (g.name.toLowerCase().includes(q)) return true;
       return (g.panels || []).some(
         (gp) =>
@@ -706,7 +935,36 @@ export default function UsersPage() {
           (gp.panel_type || "").toLowerCase().includes(q)
       );
     });
-  }, [activeGroups, editGroupSearch]);
+  }, [
+    activeGroups,
+    editCatTab,
+    editGroupSearch,
+    groupsInCategory,
+    uncategorizedActive,
+  ]);
+
+  function selectCategoryGroups(
+    categoryId: number | null,
+    mode: "create" | "edit" | "bulk" = "create"
+  ) {
+    const ids =
+      categoryId == null
+        ? uncategorizedActive.map((g) => g.id)
+        : (groupsInCategory.get(categoryId) || []).map((g) => g.id);
+    if (!ids.length) return;
+    if (mode === "edit") {
+      setEditGroupIds((cur) => [...new Set([...cur, ...ids])]);
+      setEditCatTab(categoryId == null ? "none" : categoryId);
+      return;
+    }
+    if (mode === "bulk") {
+      setBulkGroupIds((cur) => [...new Set([...cur, ...ids])]);
+      setBulkCatTab(categoryId == null ? "none" : categoryId);
+      return;
+    }
+    setGroupIds((cur) => [...new Set([...cur, ...ids])]);
+    setCreateCatTab(categoryId == null ? "none" : categoryId);
+  }
 
   const editAddedCount = useMemo(() => {
     const initial = new Set(editInitialGroupIds);
@@ -770,35 +1028,32 @@ export default function UsersPage() {
     rebecca: "ربکا",
   };
 
+  const counts = data?.counts;
   const stats = useMemo(() => {
-    const total = totalUsers;
-    let active = 0;
-    let withError = 0;
-    let expired = 0;
+    const now = Math.floor(Date.now() / 1000);
     let expiringSoon = 0;
     let usedSum = 0;
     let limited = 0;
-    const now = Math.floor(Date.now() / 1000);
     for (const u of users) {
       usedSum += Number(u.used_traffic) || 0;
       if ((Number(u.data_limit) || 0) > 0) limited += 1;
-      if (userHasErrors(u)) withError += 1;
-      if (userIsExpired(u)) expired += 1;
-      else if (u.status === "active") active += 1;
       const exp = Number(u.expire) || 0;
       if (exp > now && exp - now <= 7 * 86400) expiringSoon += 1;
     }
-    return { total, active, withError, expired, expiringSoon, usedSum, limited, loaded: users.length };
-  }, [users, totalUsers]);
+    return {
+      total: counts?.all ?? totalUsers,
+      active: counts?.active ?? 0,
+      withError: counts?.error ?? 0,
+      expired: counts?.expired ?? 0,
+      expiringSoon,
+      usedSum,
+      limited,
+      loaded: users.length,
+    };
+  }, [users, totalUsers, counts]);
 
-  const filtered = useMemo(() => {
-    return users.filter((u) => {
-      if (filter === "active") return u.status === "active" && !userIsExpired(u);
-      if (filter === "error") return userHasErrors(u);
-      if (filter === "expired") return userIsExpired(u);
-      return true;
-    });
-  }, [users, filter]);
+  // Server already filters by chip — list is the current page of that filter
+  const filtered = users;
 
   useEffect(() => {
     if (page > 0 && page >= totalPages) setPage(Math.max(0, totalPages - 1));
@@ -813,7 +1068,7 @@ export default function UsersPage() {
     filterGroupId === "" ? null : groupsById.get(Number(filterGroupId))?.name || null;
 
   const filters: { key: FilterKey; label: string; count: number }[] = [
-    { key: "all", label: "همه", count: stats.loaded },
+    { key: "all", label: "همه", count: stats.total },
     { key: "active", label: "فعال", count: stats.active },
     { key: "error", label: "خطا", count: stats.withError },
     { key: "expired", label: "منقضی", count: stats.expired },
@@ -844,7 +1099,25 @@ export default function UsersPage() {
             <RefreshCw size={15} className={syncingUsage ? "spin" : undefined} />
             <span className="users-sync-label">تازه‌سازی</span>
           </button>
-          <button type="button" className="btn users-add" onClick={() => setOpen(true)}>
+          <button
+            type="button"
+            className="btn ghost sm users-bulk-btn"
+            onClick={() => {
+              resetBulkForm();
+              setBulkOpen(true);
+            }}
+          >
+            <Layers size={15} />
+            <span className="users-bulk-label">ساخت گروهی</span>
+          </button>
+          <button
+            type="button"
+            className="btn users-add"
+            onClick={() => {
+              setCreateCatTab("all");
+              setOpen(true);
+            }}
+          >
             <Plus size={16} />
             <span>کاربر جدید</span>
           </button>
@@ -977,7 +1250,8 @@ export default function UsersPage() {
       )}
 
       {isLoading ? (
-        <div className="users-skel">
+        <div className="users-skel" aria-hidden>
+          <div className="users-skel-card" />
           <div className="users-skel-card" />
           <div className="users-skel-card" />
           <div className="users-skel-card" />
@@ -991,14 +1265,20 @@ export default function UsersPage() {
               : "هنوز کاربری نیست"}
           </p>
           {!hasExtraFilter && (
-            <button className="btn" onClick={() => setOpen(true)}>
+            <button
+              className="btn"
+              onClick={() => {
+                setCreateCatTab("all");
+                setOpen(true);
+              }}
+            >
               ساخت اولین کاربر
             </button>
           )}
         </div>
       ) : (
         <>
-        <div className="users-list" role="list">
+        <div className="users-list" role="list" ref={listRef}>
           {filtered.map((u) => {
             const errors = (u.panel_accounts || []).filter((a) => a.status === "error");
             const { ok, total: panels, errorPanels } = uniquePanelStats(u);
@@ -1021,19 +1301,24 @@ export default function UsersPage() {
               <article
                 key={u.username}
                 role="listitem"
-                className={`user-card${errors.length ? " has-err" : ""}${isOff ? " is-off" : ""}${menuOpen ? " menu-open" : ""}`}
+                className={`user-card tone-${st.tone}${errors.length ? " has-err" : ""}${isOff ? " is-off" : ""}${menuOpen ? " menu-open" : ""}`}
               >
+                <span className={`user-card-rail ${st.tone}`} aria-hidden />
                 <div className="user-card-top">
                   <div className={`user-card-avatar ${st.tone}`} aria-hidden>
                     {initial}
                   </div>
                   <div className="user-card-who">
                     <div className="user-card-name">
-                      <b dir="ltr">{u.username}</b>
+                      <b dir="ltr" title={u.username}>
+                        {u.username}
+                      </b>
                       <span className={`badge ${st.tone}`}>{st.text}</span>
                     </div>
                     {u.display_name ? (
-                      <div className="user-card-display">{u.display_name}</div>
+                      <div className="user-card-display" title={u.display_name}>
+                        {u.display_name}
+                      </div>
                     ) : null}
                     <div className="user-card-groups" title={groupTitle || undefined}>
                       {userGroupList.length === 0 ? (
@@ -1089,6 +1374,11 @@ export default function UsersPage() {
                       style={{ width: pct == null ? "0%" : `${Math.min(100, pct)}%` }}
                     />
                   </div>
+                  <div className="user-card-usage-remain">
+                    {remain != null
+                      ? `باقی‌مانده: ${formatTraffic(remain, { empty: "۰" })}`
+                      : "حجم نامحدود"}
+                  </div>
                 </div>
 
                 <div className="user-card-foot">
@@ -1099,11 +1389,6 @@ export default function UsersPage() {
                   <span className="user-card-chip">
                     <Wifi size={12} />
                     {toFaDigits(ok)}/{toFaDigits(panels)} پنل
-                  </span>
-                  <span className="user-card-chip muted">
-                    {remain != null
-                      ? `باقی ${formatTraffic(remain, { empty: "۰" })}`
-                      : "حجم نامحدود"}
                   </span>
                   {errorPanels > 0 && (
                     <button
@@ -1452,6 +1737,67 @@ export default function UsersPage() {
                     </button>
                   </div>
                 </div>
+
+                {(groupCategories.length > 0 || uncategorizedActive.length > 0) && (
+                  <div
+                    className="user-create-cats"
+                    role="tablist"
+                    aria-label="دسته‌بندی گروه‌ها"
+                  >
+                    <button
+                      type="button"
+                      role="tab"
+                      className={`user-create-cat${createCatTab === "all" ? " on" : ""}`}
+                      aria-selected={createCatTab === "all"}
+                      onClick={() => setCreateCatTab("all")}
+                    >
+                      همه
+                      <em>{toFaDigits(activeGroups.length)}</em>
+                    </button>
+                    {groupCategories.map((c) => {
+                      const n = (groupsInCategory.get(c.id) || []).length;
+                      return (
+                        <button
+                          key={c.id}
+                          type="button"
+                          role="tab"
+                          className={`user-create-cat${createCatTab === c.id ? " on" : ""}`}
+                          aria-selected={createCatTab === c.id}
+                          disabled={n === 0}
+                          title={
+                            n === 0
+                              ? "گروهی در این دسته نیست"
+                              : "انتخاب همه گروه‌های این دسته"
+                          }
+                          onClick={() => selectCategoryGroups(c.id, "create")}
+                        >
+                          {c.name}
+                          <em>{toFaDigits(n)}</em>
+                        </button>
+                      );
+                    })}
+                    {uncategorizedActive.length > 0 && (
+                      <button
+                        type="button"
+                        role="tab"
+                        className={`user-create-cat${createCatTab === "none" ? " on" : ""}`}
+                        aria-selected={createCatTab === "none"}
+                        title="انتخاب گروه‌های بدون دسته"
+                        onClick={() => selectCategoryGroups(null, "create")}
+                      >
+                        بدون دسته
+                        <em>{toFaDigits(uncategorizedActive.length)}</em>
+                      </button>
+                    )}
+                  </div>
+                )}
+                {createCatTab !== "all" && (
+                  <p className="field-hint user-create-cat-hint">
+                    گروه‌های این دسته به‌صورت پیش‌فرض انتخاب شدند — می‌توانید هر کدام را
+                    حذف کنید
+                  </p>
+                )}
+
                 <div className="user-create-groups-search">
                   <Search size={16} aria-hidden />
                   <input
@@ -1610,6 +1956,408 @@ export default function UsersPage() {
         </div>
       )}
 
+      {bulkOpen && (
+        <div
+          className="modal-backdrop"
+          onClick={() => !bulkCreate.isPending && setBulkOpen(false)}
+        >
+          <div
+            className="modal user-create-modal user-bulk-modal"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <header className="modal-head">
+              <div>
+                <h3>ساخت گروهی کاربر</h3>
+                <p className="modal-sub">
+                  چند کاربر با یک پیشوند بسازید —{" "}
+                  <span dir="ltr">prefix_1 … prefix_N</span>
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                disabled={bulkCreate.isPending}
+                onClick={() => setBulkOpen(false)}
+                aria-label="بستن"
+              >
+                ×
+              </button>
+            </header>
+            <form onSubmit={onBulkSubmit} className="user-create-form">
+              <div className="user-create-grid">
+                <div className="field">
+                  <label>پیشوند یوزرنیم</label>
+                  <input
+                    required
+                    pattern="[a-zA-Z0-9_]{1,28}"
+                    value={bulkPrefix}
+                    onChange={(e) => setBulkPrefix(e.target.value)}
+                    dir="ltr"
+                    autoFocus
+                    disabled={bulkCreate.isPending}
+                  />
+                </div>
+                <div className="field">
+                  <label>تعداد کاربر</label>
+                  <input
+                    type="number"
+                    required
+                    min={1}
+                    max={50}
+                    step={1}
+                    inputMode="numeric"
+                    value={bulkCount}
+                    onChange={(e) => setBulkCount(e.target.value)}
+                    dir="ltr"
+                    placeholder="5"
+                    disabled={bulkCreate.isPending}
+                  />
+                  <p className="field-hint">حداکثر ۵۰ کاربر در هر بار</p>
+                </div>
+              </div>
+
+              {bulkPreviewNames.length > 0 && (
+                <div className="user-bulk-preview" dir="ltr" aria-live="polite">
+                  {bulkPreviewNames.map((n) => (
+                    <span key={n} className="user-bulk-preview-chip">
+                      {n}
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              <div className="field">
+                <label>نام نمایشی (اختیاری)</label>
+                <input
+                  value={bulkDisplayName}
+                  onChange={(e) => setBulkDisplayName(e.target.value)}
+                  placeholder="برای همه یکسان"
+                  maxLength={64}
+                  disabled={bulkCreate.isPending}
+                />
+              </div>
+
+              <div className="field user-create-groups-field">
+                <div className="user-create-groups-head">
+                  <label>انتخاب گروه</label>
+                  <div className="user-create-groups-actions">
+                    <button
+                      type="button"
+                      className="btn ghost sm"
+                      disabled={!filteredBulkGroups.length || bulkCreate.isPending}
+                      onClick={() =>
+                        setBulkGroupIds((cur) => [
+                          ...new Set([
+                            ...cur,
+                            ...filteredBulkGroups.map((g) => g.id),
+                          ]),
+                        ])
+                      }
+                    >
+                      انتخاب همه
+                    </button>
+                    <button
+                      type="button"
+                      className="btn ghost sm"
+                      disabled={!bulkGroupIds.length || bulkCreate.isPending}
+                      onClick={() => setBulkGroupIds([])}
+                    >
+                      پاک کردن
+                    </button>
+                  </div>
+                </div>
+
+                {(groupCategories.length > 0 || uncategorizedActive.length > 0) && (
+                  <div
+                    className="user-create-cats"
+                    role="tablist"
+                    aria-label="دسته‌بندی گروه‌ها"
+                  >
+                    <button
+                      type="button"
+                      role="tab"
+                      className={`user-create-cat${bulkCatTab === "all" ? " on" : ""}`}
+                      aria-selected={bulkCatTab === "all"}
+                      disabled={bulkCreate.isPending}
+                      onClick={() => setBulkCatTab("all")}
+                    >
+                      همه
+                      <em>{toFaDigits(activeGroups.length)}</em>
+                    </button>
+                    {groupCategories.map((c) => {
+                      const n = (groupsInCategory.get(c.id) || []).length;
+                      return (
+                        <button
+                          key={c.id}
+                          type="button"
+                          role="tab"
+                          className={`user-create-cat${bulkCatTab === c.id ? " on" : ""}`}
+                          aria-selected={bulkCatTab === c.id}
+                          disabled={n === 0 || bulkCreate.isPending}
+                          onClick={() => selectCategoryGroups(c.id, "bulk")}
+                        >
+                          {c.name}
+                          <em>{toFaDigits(n)}</em>
+                        </button>
+                      );
+                    })}
+                    {uncategorizedActive.length > 0 && (
+                      <button
+                        type="button"
+                        role="tab"
+                        className={`user-create-cat${bulkCatTab === "none" ? " on" : ""}`}
+                        aria-selected={bulkCatTab === "none"}
+                        disabled={bulkCreate.isPending}
+                        onClick={() => selectCategoryGroups(null, "bulk")}
+                      >
+                        بدون دسته
+                        <em>{toFaDigits(uncategorizedActive.length)}</em>
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                <div className="user-create-groups-search">
+                  <Search size={16} aria-hidden />
+                  <input
+                    type="search"
+                    value={bulkGroupSearch}
+                    onChange={(e) => setBulkGroupSearch(e.target.value)}
+                    placeholder="جستجوی گروه…"
+                    disabled={bulkCreate.isPending}
+                  />
+                </div>
+
+                {bulkGroupIds.length > 0 && (
+                  <div className="user-create-selected">
+                    {bulkGroupIds.map((id) => {
+                      const g = groupsById.get(id);
+                      if (!g) return null;
+                      return (
+                        <button
+                          key={id}
+                          type="button"
+                          className="user-create-chip"
+                          disabled={bulkCreate.isPending}
+                          onClick={() => toggleBulkGroup(id)}
+                        >
+                          {g.name}
+                          <X size={14} aria-hidden />
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <div className="user-create-groups" role="group">
+                  {filteredBulkGroups.length === 0 ? (
+                    <p className="field-hint user-create-empty">نتیجه‌ای پیدا نشد</p>
+                  ) : (
+                    filteredBulkGroups.map((g) => {
+                      const on = bulkGroupIds.includes(g.id);
+                      return (
+                        <button
+                          key={g.id}
+                          type="button"
+                          className={`user-create-group-card${on ? " on" : ""}`}
+                          disabled={bulkCreate.isPending}
+                          onClick={() => toggleBulkGroup(g.id)}
+                          aria-pressed={on}
+                        >
+                          <span className={`user-create-check${on ? " on" : ""}`}>
+                            {on ? <Check size={12} /> : null}
+                          </span>
+                          <span className="user-create-group-body">
+                            <span className="user-create-group-name">{g.name}</span>
+                            <span className="user-create-group-meta">
+                              {toFaDigits(g.panels?.length || 0)} پنل
+                            </span>
+                          </span>
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+
+              <div className="user-create-grid">
+                <div className="field">
+                  <label>حجم (GB)</label>
+                  <input
+                    type="number"
+                    min={0}
+                    step="any"
+                    inputMode="decimal"
+                    value={bulkDataGb}
+                    onChange={(e) => setBulkDataGb(e.target.value)}
+                    dir="ltr"
+                    disabled={bulkCreate.isPending}
+                  />
+                </div>
+                <div className="field">
+                  <label>روز اعتبار</label>
+                  <input
+                    type="number"
+                    min={0}
+                    step={1}
+                    inputMode="numeric"
+                    value={bulkDays}
+                    onChange={(e) => setBulkDays(e.target.value)}
+                    dir="ltr"
+                    disabled={bulkCreate.isPending}
+                  />
+                </div>
+              </div>
+
+              {bulkErrorText && <p className="error">{bulkErrorText}</p>}
+              <footer className="modal-foot">
+                <button
+                  type="button"
+                  className="btn ghost"
+                  disabled={bulkCreate.isPending}
+                  onClick={() => setBulkOpen(false)}
+                >
+                  انصراف
+                </button>
+                <button
+                  className="btn"
+                  disabled={
+                    bulkCreate.isPending ||
+                    bulkGroupIds.length === 0 ||
+                    !bulkPrefix.trim() ||
+                    bulkCountN < 1
+                  }
+                >
+                  {bulkCreate.isPending
+                    ? `در حال ساخت ${toFaDigits(bulkCountN)} کاربر…`
+                    : `ساخت ${toFaDigits(bulkCountN || 0)} کاربر`}
+                </button>
+              </footer>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {bulkResult &&
+        createPortal(
+          <div
+            className="modal-backdrop user-bulk-result-backdrop"
+            onClick={() => setBulkResult(null)}
+          >
+            <div
+              className="modal user-bulk-result-modal"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="bulk-result-title"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <header className="modal-head">
+                <div>
+                  <h3 id="bulk-result-title">کاربران ساخته شدند</h3>
+                  <p className="modal-sub">
+                    {toFaDigits(bulkResult.created.length)} از{" "}
+                    {toFaDigits(bulkResult.total_requested)} موفق
+                    {bulkResult.failed.length > 0
+                      ? ` · ${toFaDigits(bulkResult.failed.length)} ناموفق`
+                      : ""}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="modal-close"
+                  onClick={() => setBulkResult(null)}
+                  aria-label="بستن"
+                >
+                  ×
+                </button>
+              </header>
+
+              <div className="user-bulk-result-actions">
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={copyAllBulkLinksOnly}
+                  disabled={!bulkResult.created.length}
+                >
+                  {copied === "bulk-links" ? (
+                    <>
+                      <Check size={15} /> کپی شد
+                    </>
+                  ) : (
+                    <>
+                      <Copy size={15} /> کپی همه لینک‌ها
+                    </>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  className="btn ghost"
+                  onClick={copyAllBulkSubs}
+                  disabled={!bulkResult.created.length}
+                >
+                  {copied === "bulk-all" ? (
+                    <>
+                      <Check size={15} /> کپی شد
+                    </>
+                  ) : (
+                    <>
+                      <Copy size={15} /> کپی یوزرنیم + لینک
+                    </>
+                  )}
+                </button>
+              </div>
+
+              <div className="user-bulk-result-list">
+                {bulkResult.created.map((u, i) => (
+                  <article key={u.username} className="user-bulk-result-row">
+                    <span className="user-bulk-result-rank" aria-hidden>
+                      {toFaDigits(i + 1)}
+                    </span>
+                    <div className="user-bulk-result-meta">
+                      <strong dir="ltr">{u.username}</strong>
+                      <span className="user-bulk-result-url" dir="ltr" title={u.subscription_url}>
+                        {u.subscription_url}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      className="btn ghost sm"
+                      onClick={() => copy(u.subscription_url, `bulk-${u.username}`)}
+                      title="کپی لینک ساب"
+                    >
+                      {copied === `bulk-${u.username}` ? (
+                        <Check size={14} />
+                      ) : (
+                        <Copy size={14} />
+                      )}
+                    </button>
+                  </article>
+                ))}
+              </div>
+
+              {bulkResult.failed.length > 0 && (
+                <div className="user-bulk-result-failed">
+                  <p>ناموفق:</p>
+                  <ul>
+                    {bulkResult.failed.map((f) => (
+                      <li key={f.username}>
+                        <strong dir="ltr">{f.username}</strong> — {f.message}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              <footer className="modal-foot">
+                <button type="button" className="btn" onClick={() => setBulkResult(null)}>
+                  بستن
+                </button>
+              </footer>
+            </div>
+          </div>,
+          document.body
+        )}
+
       {editUser && (
         <div
           className="modal-backdrop"
@@ -1697,6 +2445,59 @@ export default function UsersPage() {
                     ? ` · ${toFaDigits(editRemovedCount)} حذف`
                     : ""}
                 </p>
+                {(groupCategories.length > 0 || uncategorizedActive.length > 0) && (
+                  <div
+                    className="user-create-cats"
+                    role="tablist"
+                    aria-label="دسته‌بندی گروه‌ها"
+                  >
+                    <button
+                      type="button"
+                      role="tab"
+                      className={`user-create-cat${editCatTab === "all" ? " on" : ""}`}
+                      aria-selected={editCatTab === "all"}
+                      onClick={() => setEditCatTab("all")}
+                    >
+                      همه
+                      <em>{toFaDigits(activeGroups.length)}</em>
+                    </button>
+                    {groupCategories.map((c) => {
+                      const n = (groupsInCategory.get(c.id) || []).length;
+                      return (
+                        <button
+                          key={c.id}
+                          type="button"
+                          role="tab"
+                          className={`user-create-cat${editCatTab === c.id ? " on" : ""}`}
+                          aria-selected={editCatTab === c.id}
+                          disabled={n === 0}
+                          title={
+                            n === 0
+                              ? "گروهی در این دسته نیست"
+                              : "افزودن همه گروه‌های این دسته"
+                          }
+                          onClick={() => selectCategoryGroups(c.id, "edit")}
+                        >
+                          {c.name}
+                          <em>{toFaDigits(n)}</em>
+                        </button>
+                      );
+                    })}
+                    {uncategorizedActive.length > 0 && (
+                      <button
+                        type="button"
+                        role="tab"
+                        className={`user-create-cat${editCatTab === "none" ? " on" : ""}`}
+                        aria-selected={editCatTab === "none"}
+                        title="افزودن گروه‌های بدون دسته"
+                        onClick={() => selectCategoryGroups(null, "edit")}
+                      >
+                        بدون دسته
+                        <em>{toFaDigits(uncategorizedActive.length)}</em>
+                      </button>
+                    )}
+                  </div>
+                )}
                 <div className="user-create-groups-search">
                   <Search size={16} aria-hidden />
                   <input
@@ -2136,7 +2937,7 @@ export default function UsersPage() {
               <div>
                 <h3>تأیید حذف</h3>
                 <p className="modal-sub">
-                  کاربر از دیتابیس Astra و از همه پنل‌های ریموت حذف می‌شود
+                  کاربر از Astra حذف می‌شود؛ پنل‌های خاموش یا قطع خودکار رد می‌شوند
                 </p>
               </div>
               <button

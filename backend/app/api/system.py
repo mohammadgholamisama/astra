@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_admin, oauth2_scheme
@@ -53,9 +53,43 @@ async def system_stats(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
+    import time as _time
+
+    now_ts = int(_time.time())
     users_total = (await db.execute(select(func.count(User.id)))).scalar() or 0
     users_active = (
         await db.execute(select(func.count(User.id)).where(User.status == UserStatus.active))
+    ).scalar() or 0
+    users_expired = (
+        await db.execute(
+            select(func.count(User.id)).where(
+                or_(
+                    User.status == UserStatus.expired,
+                    and_(
+                        User.expire.is_not(None),
+                        User.expire > 0,
+                        User.expire <= now_ts,
+                    ),
+                )
+            )
+        )
+    ).scalar() or 0
+    users_limited = (
+        await db.execute(
+            select(func.count(User.id)).where(User.status == UserStatus.limited)
+        )
+    ).scalar() or 0
+    # Distinct users that still have an error on an active panel
+    users_with_errors = (
+        await db.execute(
+            select(func.count(func.distinct(PanelAccount.user_id)))
+            .select_from(PanelAccount)
+            .join(Panel, Panel.id == PanelAccount.panel_id)
+            .where(
+                PanelAccount.status == PanelAccountStatus.error,
+                Panel.is_active.is_(True),
+            )
+        )
     ).scalar() or 0
     panels_total = (await db.execute(select(func.count(Panel.id)))).scalar() or 0
     panels_active = (
@@ -69,16 +103,47 @@ async def system_stats(
     ).scalar() or 0
     traffic = (await db.execute(select(func.coalesce(func.sum(User.used_traffic), 0)))).scalar() or 0
 
+    top_rows = (
+        await db.execute(
+            select(
+                User.username,
+                User.display_name,
+                User.used_traffic,
+                User.data_limit,
+                User.status,
+                User.expire,
+            )
+            .where(User.used_traffic > 0)
+            .order_by(User.used_traffic.desc())
+            .limit(8)
+        )
+    ).all()
+    top_users = [
+        {
+            "username": r.username,
+            "display_name": r.display_name,
+            "used_traffic": int(r.used_traffic or 0),
+            "data_limit": int(r.data_limit or 0),
+            "status": getattr(r.status, "value", r.status),
+            "expire": int(r.expire or 0) if r.expire else 0,
+        }
+        for r in top_rows
+    ]
+
     return {
         "version": get_version(),
         "panel": settings.PANEL_NAME,
         "users_total": users_total,
         "users_active": users_active,
+        "users_expired": int(users_expired),
+        "users_limited": int(users_limited),
+        "users_with_errors": int(users_with_errors),
         "panels_total": panels_total,
         "panels_active": panels_active,
         "groups_total": groups_total,
         "sync_errors": sync_errors,
         "total_used_traffic": int(traffic),
+        "top_users": top_users,
         "update_supported": update_ops.available(),
     }
 

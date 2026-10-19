@@ -337,6 +337,10 @@ async def update_panel(
 
     if only_active:
         # Toggle on/off must not require a live probe (panel may be temporarily down)
+        if was_active and not bool(panel.is_active):
+            from app.services.orchestrator import drop_inactive_panel_errors
+
+            await drop_inactive_panel_errors(db, panel.id)
         await db.commit()
         await db.refresh(panel)
         if (not was_active) and bool(panel.is_active):
@@ -380,6 +384,10 @@ async def set_panel_active(
         raise HTTPException(status_code=404, detail="Panel not found")
     was_active = bool(panel.is_active)
     panel.is_active = bool(body.is_active)
+    if was_active and not bool(panel.is_active):
+        from app.services.orchestrator import drop_inactive_panel_errors
+
+        await drop_inactive_panel_errors(db, panel.id)
     await db.commit()
     await db.refresh(panel)
     if (not was_active) and bool(panel.is_active):

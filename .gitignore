@@ -24,3 +24,14 @@ data/
 *.db-*
 backend/astra.db
 astra.db
+
+# Local ops / probe outputs (often contain host credentials)
+scripts/_*.txt
+scripts/_out*.txt
+scripts/_pg_*.txt
+scripts/_link_samples.txt
+scripts/_tag_check.txt
+scripts/_hydrate_out.txt
+scripts/_overlap_out.txt
+scripts/_slow_out.txt
+scripts/_audit_out.txt

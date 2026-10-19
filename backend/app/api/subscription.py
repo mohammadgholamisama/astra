@@ -128,6 +128,23 @@ async def _bg_sub_maintain(user_id: int) -> None:
             user = result.scalar_one_or_none()
             if not user:
                 return
+            # If some panels failed at create time, retry them when sub is opened
+            # so configs appear automatically once the panel is reachable again.
+            try:
+                from app.models.user import PanelAccountStatus
+                from app.services.orchestrator import retry_failed_accounts
+
+                has_fail = any(
+                    a.status
+                    in (PanelAccountStatus.error, PanelAccountStatus.pending)
+                    for a in (user.panel_accounts or [])
+                )
+                if has_fail:
+                    await asyncio.wait_for(
+                        retry_failed_accounts(db, user), timeout=20.0
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("bg heal user_id=%s: %s", user_id, exc)
             try:
                 await asyncio.wait_for(hydrate_share_links(db, user), timeout=6.0)
             except Exception as exc:  # noqa: BLE001

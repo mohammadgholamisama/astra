@@ -127,12 +127,9 @@ export default function Layout() {
         aria-hidden={!menuOpen}
       />
 
-      <aside className="sidebar" aria-label="منوی کناری">
+      <aside className="sidebar sidebar-v3" aria-label="منوی کناری">
         <div className="sidebar-head">
           <div className="brand">
-            <div className="brand-mark" aria-hidden>
-              <img src="/astra-vpn.svg" alt="" width={28} height={28} draggable={false} />
-            </div>
             <div className="brand-text">
               <span className="brand-name">Astra</span>
               <span className="brand-tag">پنل فروش کانفیگ</span>
@@ -164,6 +161,7 @@ export default function Layout() {
                         `nav-link${isActive ? " active" : ""}`
                       }
                     >
+                      <span className="nav-indicator" aria-hidden />
                       <span className="nav-icon">
                         <Icon size={17} strokeWidth={2.1} aria-hidden />
                       </span>
@@ -177,21 +175,27 @@ export default function Layout() {
         </nav>
 
         <div className="sidebar-foot">
-          <ThemeToggle variant="switch" className="sidebar-theme" />
-          <div className="sidebar-foot-row">
-            <a
-              className="sidebar-foot-link"
-              href={docsHref()}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              <BookOpen size={15} strokeWidth={2.1} aria-hidden />
-              <span>مستندات</span>
-            </a>
-            <button type="button" className="sidebar-foot-link danger" onClick={doLogout}>
-              <LogOut size={15} strokeWidth={2.1} aria-hidden />
-              <span>خروج</span>
-            </button>
+          <div className="sidebar-foot-card">
+            <ThemeToggle variant="switch" className="sidebar-theme" />
+            <div className="sidebar-foot-row">
+              <a
+                className="sidebar-foot-link"
+                href={docsHref()}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                <BookOpen size={15} strokeWidth={2.1} aria-hidden />
+                <span>مستندات</span>
+              </a>
+              <button
+                type="button"
+                className="sidebar-foot-link danger"
+                onClick={doLogout}
+              >
+                <LogOut size={15} strokeWidth={2.1} aria-hidden />
+                <span>خروج</span>
+              </button>
+            </div>
           </div>
         </div>
       </aside>

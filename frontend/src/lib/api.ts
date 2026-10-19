@@ -181,16 +181,29 @@ export interface User {
   created_at?: string;
 }
 
+export interface TopUserStat {
+  username: string;
+  display_name: string | null;
+  used_traffic: number;
+  data_limit: number;
+  status: string;
+  expire: number;
+}
+
 export interface SystemStats {
   version: string;
   panel: string;
   users_total: number;
   users_active: number;
+  users_expired?: number;
+  users_limited?: number;
+  users_with_errors?: number;
   panels_total: number;
   panels_active: number;
   groups_total: number;
   sync_errors: number;
   total_used_traffic: number;
+  top_users?: TopUserStat[];
   update_supported?: boolean;
 }
 

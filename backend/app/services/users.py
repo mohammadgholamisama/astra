@@ -68,6 +68,9 @@ def to_user_response(user: User, *, include_links: bool = True) -> UserResponse:
             continue
         # Only use panel if already loaded — never trigger async lazy IO
         panel = a.__dict__.get("panel")
+        # Off / missing panel must not keep showing as a user error or live account
+        if panel is None or not bool(getattr(panel, "is_active", True)):
+            continue
         panel_type = None
         panel_base = None
         if panel is not None:

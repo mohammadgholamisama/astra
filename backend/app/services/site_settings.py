@@ -29,6 +29,9 @@ KEY_CONFIG_BRAND_TAG = "config_brand_tag"
 KEY_PROMO_CONFIG_ENABLED = "promo_config_enabled"
 KEY_PROMO_CONFIG_TEXT = "promo_config_text"
 KEY_PROMO_CONFIG_TEXT_2 = "promo_config_text_2"
+# First sub line (status remark) template + group label
+KEY_STATUS_LINE_TEMPLATE = "status_line_template"
+KEY_STATUS_PANEL_LABEL = "status_panel_label"
 
 _ALLOWED_KEYS = frozenset(
     {
@@ -42,6 +45,8 @@ _ALLOWED_KEYS = frozenset(
         KEY_PROMO_CONFIG_ENABLED,
         KEY_PROMO_CONFIG_TEXT,
         KEY_PROMO_CONFIG_TEXT_2,
+        KEY_STATUS_LINE_TEMPLATE,
+        KEY_STATUS_PANEL_LABEL,
     }
 )
 
@@ -250,6 +255,54 @@ def normalize_promo_text(raw: str | None) -> str:
     return text
 
 
+_DEFAULT_STATUS_LINE = "✨ {username} - {remain} - {expire} ✨"
+_DEFAULT_STATUS_LABEL = "وضعیت"
+_STATUS_TEMPLATE_ALLOWED = frozenset(
+    {
+        "username",
+        "user",
+        "remain",
+        "remain_traffic",
+        "used",
+        "used_traffic",
+        "limit",
+        "total",
+        "expire",
+        "time",
+        "days",
+        "used_pct",
+        "remain_pct",
+    }
+)
+
+
+def normalize_status_line_template(raw: str | None) -> str:
+    text = _CTRL.sub("", (raw or "").strip())
+    text = _HTML.sub("", text)
+    text = re.sub(r"[ \t]+", " ", text).strip()
+    if len(text) > 200:
+        raise ValueError("قالب وضعیت حداکثر ۲۰۰ کاراکتر است")
+    if not text:
+        return ""
+    # Reject obviously broken braces
+    if text.count("{") != text.count("}"):
+        raise ValueError("آکولادهای قالب وضعیت نامعتبر است")
+    for m in re.finditer(r"\{([^{}]+)\}", text):
+        key = m.group(1).strip().lower()
+        if key and key not in _STATUS_TEMPLATE_ALLOWED:
+            raise ValueError(f"متغیر ناشناخته در قالب وضعیت: {{{key}}}")
+    return text
+
+
+def normalize_status_panel_label(raw: str | None) -> str:
+    text = _CTRL.sub("", (raw or "").strip())
+    text = _HTML.sub("", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > 48:
+        raise ValueError("برچسب وضعیت حداکثر ۴۸ کاراکتر است")
+    return text
+
+
 def get_config_brand_tag() -> str:
     with _lock:
         if _loaded:
@@ -293,6 +346,24 @@ def get_promo_config_texts() -> list[str]:
         if text:
             out.append(text)
     return out
+
+
+def get_status_line_template() -> str:
+    with _lock:
+        if _loaded:
+            text = (_cache.get(KEY_STATUS_LINE_TEMPLATE) or "").strip()
+            if text:
+                return text
+    return _DEFAULT_STATUS_LINE
+
+
+def get_status_panel_label() -> str:
+    with _lock:
+        if _loaded:
+            text = (_cache.get(KEY_STATUS_PANEL_LABEL) or "").strip()
+            if text:
+                return text
+    return _DEFAULT_STATUS_LABEL
 
 
 def ssl_helper_available() -> bool:
@@ -344,6 +415,8 @@ async def read_settings(db: AsyncSession) -> dict:
         "promo_config_enabled": get_promo_config_enabled(),
         "promo_config_text": get_promo_config_text(),
         "promo_config_text_2": get_promo_config_text_2(),
+        "status_line_template": get_status_line_template(),
+        "status_panel_label": get_status_panel_label(),
         "ssl_available": ssl_helper_available(),
         "panel_domain": panel_dom,
         "sub_domain": sub_dom,
@@ -358,6 +431,8 @@ async def read_settings(db: AsyncSession) -> dict:
             "promo_config_enabled": "0",
             "promo_config_text": "",
             "promo_config_text_2": "",
+            "status_line_template": _DEFAULT_STATUS_LINE,
+            "status_panel_label": _DEFAULT_STATUS_LABEL,
         },
     }
 
@@ -392,6 +467,8 @@ async def update_settings(
     promo_config_enabled: bool | None = None,
     promo_config_text: str | None = None,
     promo_config_text_2: str | None = None,
+    status_line_template: str | None = None,
+    status_panel_label: str | None = None,
     reset_sub_base_url: bool = False,
     reset_panel_base_url: bool = False,
     reset_brand_name: bool = False,
@@ -400,6 +477,7 @@ async def update_settings(
     clear_link_app: bool = False,
     clear_config_brand_tag: bool = False,
     clear_promo_config: bool = False,
+    reset_status_line: bool = False,
 ) -> dict:
     if reset_sub_base_url:
         await _delete_key(db, KEY_SUB_BASE_URL)
@@ -467,6 +545,23 @@ async def update_settings(
                 await _upsert_key(db, KEY_PROMO_CONFIG_TEXT_2, text2)
             else:
                 await _delete_key(db, KEY_PROMO_CONFIG_TEXT_2)
+
+    if reset_status_line:
+        await _delete_key(db, KEY_STATUS_LINE_TEMPLATE)
+        await _delete_key(db, KEY_STATUS_PANEL_LABEL)
+    else:
+        if status_line_template is not None:
+            tpl = normalize_status_line_template(status_line_template)
+            if tpl and tpl != _DEFAULT_STATUS_LINE:
+                await _upsert_key(db, KEY_STATUS_LINE_TEMPLATE, tpl)
+            else:
+                await _delete_key(db, KEY_STATUS_LINE_TEMPLATE)
+        if status_panel_label is not None:
+            label = normalize_status_panel_label(status_panel_label)
+            if label and label != _DEFAULT_STATUS_LABEL:
+                await _upsert_key(db, KEY_STATUS_PANEL_LABEL, label)
+            else:
+                await _delete_key(db, KEY_STATUS_PANEL_LABEL)
 
     await db.commit()
     await refresh_cache(db)

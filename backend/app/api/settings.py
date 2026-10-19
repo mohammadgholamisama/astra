@@ -89,6 +89,8 @@ async def put_settings_api(
             promo_config_enabled=body.promo_config_enabled,
             promo_config_text=body.promo_config_text,
             promo_config_text_2=body.promo_config_text_2,
+            status_line_template=body.status_line_template,
+            status_panel_label=body.status_panel_label,
             reset_sub_base_url=body.reset_sub_base_url,
             reset_panel_base_url=body.reset_panel_base_url,
             reset_brand_name=body.reset_brand_name,
@@ -97,6 +99,7 @@ async def put_settings_api(
             clear_link_app=body.clear_link_app,
             clear_config_brand_tag=body.clear_config_brand_tag,
             clear_promo_config=body.clear_promo_config,
+            reset_status_line=body.reset_status_line,
         )
     except ValueError as exc:
         raise HTTPException(

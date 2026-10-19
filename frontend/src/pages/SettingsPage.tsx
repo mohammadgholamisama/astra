@@ -9,10 +9,47 @@ import {
   Save,
   Settings,
   ShieldCheck,
+  Sparkles,
   Trash2,
 } from "lucide-react";
 import { ApiError, ApiKey, api } from "../lib/api";
 import { toFaDigits } from "../lib/format";
+
+const DEFAULT_STATUS_LINE = "✨ {username} - {remain} - {expire} ✨";
+const DEFAULT_STATUS_LABEL = "وضعیت";
+
+const STATUS_SAMPLE_VARS: Record<string, string> = {
+  username: "zprobe_7877de",
+  user: "zprobe_7877de",
+  remain: "1G",
+  remain_traffic: "1G",
+  used: "2.5G",
+  used_traffic: "2.5G",
+  limit: "3G",
+  total: "3G",
+  expire: "2d",
+  time: "2d",
+  days: "2d",
+  used_pct: "83",
+  remain_pct: "17",
+};
+
+const STATUS_VAR_HELP: { key: string; desc: string }[] = [
+  { key: "{username}", desc: "نام کاربری" },
+  { key: "{remain}", desc: "حجم باقی‌مانده (مثل 1G)" },
+  { key: "{used}", desc: "حجم مصرف‌شده" },
+  { key: "{limit}", desc: "سقف حجم (∞ اگر نامحدود)" },
+  { key: "{expire}", desc: "زمان باقی‌مانده (مثل 2d)" },
+  { key: "{used_pct}", desc: "درصد مصرف" },
+  { key: "{remain_pct}", desc: "درصد باقی‌مانده" },
+];
+
+function previewStatusLine(template: string): string {
+  const raw = (template || "").trim() || DEFAULT_STATUS_LINE;
+  return raw.replace(/\{([a-zA-Z0-9_]+)\}/g, (_, key: string) => {
+    return STATUS_SAMPLE_VARS[key.toLowerCase()] ?? "";
+  });
+}
 
 type SiteSettings = {
   sub_base_url: string;
@@ -24,6 +61,8 @@ type SiteSettings = {
   promo_config_enabled: boolean;
   promo_config_text: string;
   promo_config_text_2: string;
+  status_line_template: string;
+  status_panel_label: string;
   ssl_available: boolean;
   panel_domain: string;
   sub_domain: string;
@@ -31,6 +70,8 @@ type SiteSettings = {
     sub_base_url: string;
     panel_base_url: string;
     brand_name: string;
+    status_line_template?: string;
+    status_panel_label?: string;
   };
 };
 
@@ -56,6 +97,8 @@ export default function SettingsPage() {
   const [promoEnabled, setPromoEnabled] = useState(false);
   const [promoText, setPromoText] = useState("");
   const [promoText2, setPromoText2] = useState("");
+  const [statusTemplate, setStatusTemplate] = useState(DEFAULT_STATUS_LINE);
+  const [statusLabel, setStatusLabel] = useState(DEFAULT_STATUS_LABEL);
   const [sslPanelDomain, setSslPanelDomain] = useState("");
   const [sslSubDomain, setSslSubDomain] = useState("");
   const [curPass, setCurPass] = useState("");
@@ -113,6 +156,8 @@ export default function SettingsPage() {
     setPromoEnabled(!!data.promo_config_enabled);
     setPromoText(data.promo_config_text || "");
     setPromoText2(data.promo_config_text_2 || "");
+    setStatusTemplate(data.status_line_template || DEFAULT_STATUS_LINE);
+    setStatusLabel(data.status_panel_label || DEFAULT_STATUS_LABEL);
     setSslPanelDomain(data.panel_domain || hostFromUrl(data.panel_base_url) || "");
     setSslSubDomain(data.sub_domain || hostFromUrl(data.sub_base_url) || "");
   }, [data]);
@@ -131,6 +176,8 @@ export default function SettingsPage() {
           promo_config_enabled: promoEnabled,
           promo_config_text: promoText.trim(),
           promo_config_text_2: promoText2.trim(),
+          status_line_template: statusTemplate.trim() || DEFAULT_STATUS_LINE,
+          status_panel_label: statusLabel.trim() || DEFAULT_STATUS_LABEL,
         }),
       }),
     onSuccess: (res) => {
@@ -144,6 +191,8 @@ export default function SettingsPage() {
       setPromoEnabled(!!res.promo_config_enabled);
       setPromoText(res.promo_config_text || "");
       setPromoText2(res.promo_config_text_2 || "");
+      setStatusTemplate(res.status_line_template || DEFAULT_STATUS_LINE);
+      setStatusLabel(res.status_panel_label || DEFAULT_STATUS_LABEL);
       setMsg({ type: "ok", text: "تنظیمات ذخیره شد" });
     },
     onError: (e: Error) => {
@@ -153,7 +202,7 @@ export default function SettingsPage() {
   });
 
   const resetField = useMutation({
-    mutationFn: (which: "panel" | "sub" | "brand") =>
+    mutationFn: (which: "panel" | "sub" | "brand" | "status") =>
       api<SiteSettings>("/api/admin/settings", {
         method: "PUT",
         body: JSON.stringify(
@@ -161,7 +210,9 @@ export default function SettingsPage() {
             ? { reset_panel_base_url: true }
             : which === "sub"
               ? { reset_sub_base_url: true }
-              : { reset_brand_name: true }
+              : which === "status"
+                ? { reset_status_line: true }
+                : { reset_brand_name: true }
         ),
       }),
     onSuccess: (res) => {
@@ -172,6 +223,8 @@ export default function SettingsPage() {
       setLinkChannel(res.link_channel || "");
       setLinkSupport(res.link_support || "");
       setLinkApp(res.link_app || "");
+      setStatusTemplate(res.status_line_template || DEFAULT_STATUS_LINE);
+      setStatusLabel(res.status_panel_label || DEFAULT_STATUS_LABEL);
       setMsg({ type: "ok", text: "به مقدار پیش‌فرض برگردانده شد" });
     },
     onError: (e: Error) => {
@@ -342,6 +395,86 @@ export default function SettingsPage() {
             </div>
           </div>
 
+          <div className="settings-card settings-card-wide settings-status-line">
+            <header className="settings-card-head">
+              <Sparkles size={20} />
+              <div>
+                <h2>خط وضعیت ساب</h2>
+                <p>
+                  اولین کانفیگ نمایشی ساب (بدون پینگ). با متغیرها شخصی‌سازی کنید —
+                  مقدارها در هر بار رفرش ساب به‌روز می‌شوند.
+                </p>
+              </div>
+            </header>
+
+            <div className="settings-status-body">
+              <div className="field">
+                <label>برچسب گروه (بالای خط)</label>
+                <input
+                  value={statusLabel}
+                  onChange={(e) => setStatusLabel(e.target.value)}
+                  placeholder={DEFAULT_STATUS_LABEL}
+                  maxLength={48}
+                />
+              </div>
+
+              <div className="field">
+                <label>قالب خط وضعیت</label>
+                <textarea
+                  value={statusTemplate}
+                  onChange={(e) => setStatusTemplate(e.target.value)}
+                  placeholder={DEFAULT_STATUS_LINE}
+                  maxLength={200}
+                  rows={2}
+                  dir="ltr"
+                  className="settings-status-template"
+                  spellCheck={false}
+                />
+                <span className="settings-promo-count">
+                  {toFaDigits(statusTemplate.length)} / ۲۰۰
+                </span>
+              </div>
+
+              <div className="settings-status-vars" aria-label="متغیرهای قابل استفاده">
+                {STATUS_VAR_HELP.map((v) => (
+                  <button
+                    key={v.key}
+                    type="button"
+                    className="settings-status-var"
+                    title={v.desc}
+                    onClick={() =>
+                      setStatusTemplate((cur) => `${cur}${cur.endsWith(" ") || !cur ? "" : " "}${v.key}`)
+                    }
+                  >
+                    <code dir="ltr">{v.key}</code>
+                    <span>{v.desc}</span>
+                  </button>
+                ))}
+              </div>
+
+              <div className="settings-status-preview" dir="ltr">
+                <span className="settings-status-preview-label">
+                  {statusLabel.trim() || DEFAULT_STATUS_LABEL}
+                </span>
+                <strong>{previewStatusLine(statusTemplate)}</strong>
+                <p className="field-hint">
+                  نمونه با مقادیر آزمایشی · قالب پیش‌فرض:{" "}
+                  <code dir="ltr">{DEFAULT_STATUS_LINE}</code>
+                </p>
+              </div>
+
+              <button
+                type="button"
+                className="btn ghost sm settings-reset"
+                disabled={resetField.isPending}
+                onClick={() => resetField.mutate("status")}
+              >
+                <RotateCcw size={14} />
+                بازگشت به پیش‌فرض
+              </button>
+            </div>
+          </div>
+
           <div
             className={`settings-card settings-card-wide settings-promo${
               promoEnabled ? " is-on" : ""
@@ -352,8 +485,8 @@ export default function SettingsPage() {
               <div className="settings-promo-head-text">
                 <h2>کانفیگ تبلیغاتی ساب</h2>
                 <p>
-                  بعد از خط وضعیت (✨ یوزر - حجم - زمان ✨) تا دو شعار تبلیغاتی در همه ساب‌ها
-                  نشان داده می‌شود — بدون پینگ، فقط نمایش.
+                  بعد از خط وضعیت تا دو شعار تبلیغاتی در همه ساب‌ها نشان داده می‌شود —
+                  بدون پینگ، فقط نمایش.
                 </p>
               </div>
               <button

@@ -10,7 +10,8 @@ settings = get_settings()
 
 _engine_kwargs: dict = {"echo": False}
 if settings.DATABASE_URL.startswith("sqlite"):
-    _engine_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
+    # 60s busy wait — usage sync + admin writes compete on one WAL writer
+    _engine_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 60}
 else:
     _engine_kwargs.update(
         pool_pre_ping=True,
@@ -28,7 +29,7 @@ if settings.DATABASE_URL.startswith("sqlite"):
         cursor = dbapi_conn.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA synchronous=NORMAL")
-        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA busy_timeout=60000")
         cursor.execute("PRAGMA temp_store=MEMORY")
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.close()

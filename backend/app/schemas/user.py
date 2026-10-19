@@ -71,12 +71,54 @@ class UserResponse(ORMModel):
     panel_accounts: list[PanelAccountOut] = Field(default_factory=list)
 
 
+class UsersListCounts(BaseModel):
+    """Global chip totals for the current search/group scope (all pages)."""
+
+    all: int = 0
+    active: int = 0
+    error: int = 0
+    expired: int = 0
+
+
 class UsersListResponse(BaseModel):
     users: list[UserResponse]
     total: int
+    counts: UsersListCounts = Field(default_factory=UsersListCounts)
 
 
 class UserFromTemplate(BaseModel):
     user_template_id: int
     username: str = Field(min_length=3, max_length=32)
     note: str | None = None
+
+
+class UserBulkCreate(BaseModel):
+    """Create many users: ``{prefix}_1`` … ``{prefix}_{count}``."""
+
+    username_prefix: str = Field(
+        min_length=1,
+        max_length=28,
+        pattern=r"^[a-zA-Z0-9_]+$",
+    )
+    count: int = Field(ge=1, le=50)
+    display_name: str | None = Field(default=None, max_length=64)
+    status: UserStatus = UserStatus.active
+    data_limit: int = 0
+    expire: int | None = 0
+    note: str | None = None
+    group_ids: list[int] = Field(default_factory=list)
+    proxies: dict[str, Any] = Field(default_factory=dict)
+    proxy_settings: dict[str, Any] = Field(default_factory=dict)
+    inbounds: dict[str, Any] = Field(default_factory=dict)
+    data_limit_reset_strategy: str = "no_reset"
+
+
+class UserBulkFail(BaseModel):
+    username: str
+    message: str
+
+
+class UserBulkCreateResponse(BaseModel):
+    created: list[UserResponse] = Field(default_factory=list)
+    failed: list[UserBulkFail] = Field(default_factory=list)
+    total_requested: int = 0

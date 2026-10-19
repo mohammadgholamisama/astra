@@ -89,12 +89,16 @@ def normalize_host(raw: str) -> str:
 
 
 def normalize_match_host(raw: str | None) -> str:
-    """Optional header/SNI host. Empty string = match domain+port only."""
+    """Optional header/SNI host. Empty string = match domain+port only.
+
+    Leading ``www.`` is stripped so ``aparat.com`` and ``www.aparat.com``
+    fingerprint the same (order page ↔ subscription stay aligned).
+    """
     text = _CTRL.sub("", str(raw or "")).strip()
     if not text:
         return ""
     try:
-        return normalize_host(text)
+        host = normalize_host(text)
     except ValueError:
         # Exotic SNI tokens (long reality ids, etc.) — keep as lowercase fingerprint
         host = text.strip("[]").rstrip(".").lower()
@@ -106,7 +110,9 @@ def normalize_match_host(raw: str | None) -> str:
             or "@" in host
         ):
             raise ValueError("هاست هدر نامعتبر است") from None
-        return host
+    if host.startswith("www."):
+        host = host[4:]
+    return host
 
 
 def try_normalize_endpoint(
@@ -390,6 +396,36 @@ async def refresh_cache(db: AsyncSession) -> int:
     return len(rows)
 
 
+async def _find_endpoint_rows(
+    db: AsyncSession, *, host: str, port: int, match_host: str
+) -> list[ConfigLocation]:
+    """Find rows for this fingerprint, including legacy ``www.`` match_host variants."""
+    h = host
+    p = int(port)
+    m = match_host or ""
+    result = await db.execute(
+        select(ConfigLocation).where(
+            ConfigLocation.host == h,
+            ConfigLocation.port == p,
+        )
+    )
+    rows = list(result.scalars().all())
+    if not rows:
+        return []
+    matched: list[ConfigLocation] = []
+    for row in rows:
+        raw = getattr(row, "match_host", None) or ""
+        try:
+            norm = normalize_match_host(raw)
+        except ValueError:
+            norm = str(raw).strip().lower()
+            if norm.startswith("www."):
+                norm = norm[4:]
+        if norm == m:
+            matched.append(row)
+    return matched
+
+
 async def upsert_endpoint_location(
     db: AsyncSession,
     *,
@@ -402,39 +438,74 @@ async def upsert_endpoint_location(
 
     ``country_code=None`` deletes that exact rule only (does not touch other SNI variants).
     Returns the saved row as ``to_out`` dict, or ``None`` when cleared.
+
+    Also merges legacy rows that still store ``www.`` on match_host so flag set
+    never hits a false “already registered” unique conflict.
     """
+    from sqlalchemy.exc import IntegrityError
+
     h = normalize_host(host)
     p = int(port)
     if p < 1 or p > 65535:
         raise ValueError("پورت نامعتبر است")
     m = normalize_match_host(match_host or "")
 
-    result = await db.execute(
-        select(ConfigLocation).where(
-            ConfigLocation.host == h,
-            ConfigLocation.port == p,
-            ConfigLocation.match_host == m,
-        )
-    )
-    row = result.scalar_one_or_none()
+    matched = await _find_endpoint_rows(db, host=h, port=p, match_host=m)
+    # Prefer exact normalized row; else any www./legacy variant
+    row = next((r for r in matched if (r.match_host or "") == m), None)
+    if row is None and matched:
+        row = matched[0]
+    # Drop duplicate variants (www. vs bare) so one fingerprint → one row
+    extras = [r for r in matched if r is not row]
 
     if country_code is None or str(country_code).strip() == "":
-        if row is not None:
-            await db.delete(row)
-            await db.commit()
-            await refresh_cache(db)
-        else:
-            await db.commit()
+        for r in matched:
+            await db.delete(r)
+        await db.commit()
+        await refresh_cache(db)
         return None
 
     code = normalize_country_code(country_code)
     flag_from_country_code(code)  # validate
+
     if row is None:
         row = ConfigLocation(host=h, port=p, match_host=m, country_code=code, label=None)
         db.add(row)
     else:
+        row.host = h
+        row.port = p
+        row.match_host = m
         row.country_code = code
-    await db.commit()
+    for extra in extras:
+        await db.delete(extra)
+
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Legacy UNIQUE(host,port) or race — reload and update in place
+        await db.rollback()
+        matched = await _find_endpoint_rows(db, host=h, port=p, match_host=m)
+        if not matched:
+            # Same host:port with different match still blocked by legacy unique:
+            # update the sole host:port row to this fingerprint
+            result = await db.execute(
+                select(ConfigLocation).where(
+                    ConfigLocation.host == h,
+                    ConfigLocation.port == p,
+                )
+            )
+            matched = list(result.scalars().all())
+        if not matched:
+            raise
+        row = matched[0]
+        row.host = h
+        row.port = p
+        row.match_host = m
+        row.country_code = code
+        for extra in matched[1:]:
+            await db.delete(extra)
+        await db.commit()
+
     await db.refresh(row)
     await refresh_cache(db)
     return to_out(row)
