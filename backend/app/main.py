@@ -70,7 +70,7 @@ async def _heal_failed_panels_loop() -> None:
 
 
 async def _usage_sync_loop() -> None:
-    """Every ~30s: pull raw usage × coeff, and disable remotes when quota ends.
+    """Every ~USAGE_REFRESH_SECONDS: pull raw usage × coeff, disable remotes on quota end.
 
     When Astra weighted used_traffic hits data_limit, status → limited and
     sync_modify freezes configs on every panel (Marzban/PasarGuard/Sanaei/Rebecca).
@@ -144,7 +144,8 @@ async def _usage_sync_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("usage sync loop failed")
-        await asyncio.sleep(30)
+        # Default 20s — faster freeze across all remotes when Astra quota ends
+        await asyncio.sleep(max(5, int(settings.USAGE_REFRESH_SECONDS or 20)))
 
 
 def _resolve_frontend_dist() -> Path | None:

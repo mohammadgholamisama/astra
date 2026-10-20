@@ -1005,6 +1005,10 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
             used_raw_on_panel=int(account.used_traffic or 0),
             remote_username=rem_name,
         )
+        # PasarGuard disable API needs numeric by-id — pass through stored remote_id
+        rid = (account.remote_id or "").strip()
+        if rid:
+            payload.config = {**(payload.config or {}), "_remote_id": rid}
         jobs.append((account, panel, payload))
 
     sem = _remote_sem()

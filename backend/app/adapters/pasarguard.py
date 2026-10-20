@@ -147,10 +147,84 @@ class PasarGuardAdapter(MarzbanAdapter):
             "هیچ گروهی در پنل پاسارگاد پیدا نشد؛ ابتدا در پنل گروه بسازید یا default_group_ids در meta تنظیم کنید"
         )
 
+    @staticmethod
+    def _want_disabled(payload: UserPayload) -> bool:
+        """Astra limited/expired/disabled → PasarGuard must cut traffic (disabled=true)."""
+        return (payload.status or "").lower() in ("limited", "expired", "disabled")
+
+    async def _resolve_numeric_user_id(
+        self,
+        username: str,
+        *,
+        hint: str | int | None = None,
+    ) -> int | None:
+        """PasarGuard disable API needs numeric id: /api/user/by-id/{id}/disabled."""
+        if hint is not None:
+            s = str(hint).strip()
+            if s.isdigit():
+                return int(s)
+        uname = (username or "").strip()
+        if not uname:
+            return None
+        try:
+            import httpx
+
+            client, headers = await self._authed()
+            resp = await client.get(
+                f"/api/user/{uname}",
+                headers=headers,
+                timeout=httpx.Timeout(12.0, connect=6.0),
+            )
+            ok, data = ok_json(resp)
+            if ok and isinstance(data, dict) and data.get("id") is not None:
+                return int(data["id"])
+        except Exception:
+            return None
+        return None
+
+    async def _set_disabled_by_id(self, user_id: int, disabled: bool) -> AdapterResult:
+        """PUT /api/user/by-id/{id}/disabled  body: {\"disabled\": true|false}
+
+        This is what PasarGuard UI uses to turn a user off in edit — status-only
+        modify does not reliably stop traffic when Astra quota (with coeff) ends.
+        """
+        try:
+            import httpx
+
+            uid = int(user_id)
+            client, headers = await self._authed()
+            resp = await client.put(
+                f"/api/user/by-id/{uid}/disabled",
+                headers=headers,
+                json={"disabled": bool(disabled)},
+                timeout=httpx.Timeout(15.0, connect=6.0),
+            )
+            ok, data = ok_json(resp)
+            if ok or resp.status_code in (200, 204):
+                return AdapterResult(
+                    success=True,
+                    remote_id=str(uid),
+                    raw=data if isinstance(data, dict) else {"disabled": bool(disabled)},
+                )
+            return AdapterResult(
+                success=False,
+                remote_id=str(uid),
+                error=err_msg(data, f"HTTP {resp.status_code}"),
+            )
+        except Exception as e:
+            return AdapterResult(
+                success=False,
+                remote_id=str(user_id),
+                error=str(e).strip() or e.__class__.__name__,
+            )
+
     def _build_pg_body(self, payload: UserPayload, group_ids: list[int]) -> dict[str, Any]:
         # PasarGuard (Marzban-family): pass through, map unknown → disabled
         _ok = ("active", "on_hold", "disabled", "limited", "expired")
         status = payload.status if payload.status in _ok else "disabled"
+        # Freeze path: UI "خاموش" uses disabled flag; mirror status for edit screen
+        if status in ("limited", "expired"):
+            status = "disabled"
         body: dict[str, Any] = {
             "username": payload.username,
             "status": status,
@@ -318,7 +392,18 @@ class PasarGuardAdapter(MarzbanAdapter):
         return AdapterResult(success=False, error=f"{last_err} (group_ids={group_ids})")
 
     async def modify_user(self, payload: UserPayload) -> AdapterResult:
-        """PUT /api/user/{username} — PasarGuard docs."""
+        """PUT /api/user/{username} + PUT /api/user/by-id/{id}/disabled.
+
+        Quota freeze on Astra must call the same disable endpoint as PasarGuard's
+        edit UI ({disabled: true}); status/data_limit alone leaves leftover traffic
+        usable when coefficients exhaust Astra before the raw remote cap.
+        """
+        want_disabled = self._want_disabled(payload)
+        hint = (payload.config or {}).get("_remote_id") or (payload.config or {}).get(
+            "remote_id"
+        )
+        mod = AdapterResult(success=False, error="modify not attempted")
+        group_ids: list[int] = []
         try:
             group_ids = await self._resolve_group_ids(payload)
             body = self._build_pg_body(payload, group_ids)
@@ -332,11 +417,72 @@ class PasarGuardAdapter(MarzbanAdapter):
             )
             ok, data = ok_json(resp)
             if ok and isinstance(data, dict):
-                return self._from_pg_response(data, payload.username)
-            err = err_msg(data, f"HTTP {resp.status_code}")
+                mod = self._from_pg_response(data, payload.username)
+            else:
+                err = err_msg(data, f"HTTP {resp.status_code}")
+                mod = AdapterResult(
+                    success=False,
+                    error=f"{err} (group_ids={group_ids})",
+                )
+        except Exception as e:
+            mod = AdapterResult(
+                success=False, error=str(e).strip() or e.__class__.__name__
+            )
+
+        uid: int | None = None
+        if mod.success and mod.remote_id and str(mod.remote_id).strip().isdigit():
+            uid = int(str(mod.remote_id).strip())
+        if uid is None:
+            uid = await self._resolve_numeric_user_id(payload.username, hint=hint)
+
+        if uid is None:
+            if want_disabled:
+                return AdapterResult(
+                    success=False,
+                    error=(
+                        (mod.error + " | " if mod.error else "")
+                        + "PasarGuard user id پیدا نشد؛ خاموش‌سازی by-id ممکن نیست"
+                    ),
+                    remote_username=payload.username,
+                )
+            return mod
+
+        dis = await self._set_disabled_by_id(uid, want_disabled)
+        if want_disabled:
+            if dis.success:
+                if mod.success:
+                    mod.remote_id = str(uid)
+                    return mod
+                return AdapterResult(
+                    success=True,
+                    remote_username=payload.username,
+                    remote_id=str(uid),
+                    raw=dis.raw,
+                )
             return AdapterResult(
                 success=False,
-                error=f"{err} (group_ids={group_ids})",
+                remote_username=payload.username,
+                remote_id=str(uid),
+                error=(
+                    f"خاموش‌سازی پاسارگاد ناموفق: {dis.error or 'unknown'}"
+                    + (f" | modify: {mod.error}" if mod.error else "")
+                ),
             )
-        except Exception as e:
-            return AdapterResult(success=False, error=str(e).strip() or e.__class__.__name__)
+
+        # Re-enable path: disabled=false must succeed
+        if not dis.success:
+            return AdapterResult(
+                success=False,
+                remote_username=payload.username,
+                remote_id=str(uid),
+                error=f"روشن‌سازی پاسارگاد (disabled=false) ناموفق: {dis.error or 'unknown'}",
+            )
+        if mod.success:
+            mod.remote_id = str(uid)
+            return mod
+        return AdapterResult(
+            success=True,
+            remote_username=payload.username,
+            remote_id=str(uid),
+            raw=dis.raw,
+        )
