@@ -4,6 +4,7 @@ import Layout from "./components/Layout";
 import LoginPage from "./pages/LoginPage";
 import DashboardPage from "./pages/DashboardPage";
 import PanelsPage from "./pages/PanelsPage";
+import OutboundsPage from "./pages/OutboundsPage";
 import GroupsPage from "./pages/GroupsPage";
 import UsersPage from "./pages/UsersPage";
 import BackupPage from "./pages/BackupPage";
@@ -30,6 +31,7 @@ export default function App() {
       >
         <Route index element={<DashboardPage />} />
         <Route path="panels" element={<PanelsPage />} />
+        <Route path="panels/:panelId/outbounds" element={<OutboundsPage />} />
         <Route path="groups" element={<GroupsPage />} />
         <Route path="users" element={<UsersPage />} />
         <Route path="configs" element={<Navigate to="/config-order" replace />} />

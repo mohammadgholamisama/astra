@@ -212,12 +212,12 @@ async def expand_subscription_links(
         "Accept": "text/plain, */*",
         **(headers or {}),
     }
-    # Fail-fast per-sub — many panels in parallel must not stall the feed
-    sub_timeout = httpx.Timeout(3.0, connect=1.8)
+    # Large Marzban/PasarGuard /sub bodies (100–300 configs) need a real read
+    # window. 3s used to abort mid-body → clients only saw ~30 configs.
+    sub_timeout = httpx.Timeout(12.0, connect=4.0)
 
     async def _fetch_absolute(url: str) -> list[str]:
-        # Fail fast on dead CDN hosts so we can fall back to panel /sub
-        abs_timeout = httpx.Timeout(2.8, connect=1.6)
+        abs_timeout = httpx.Timeout(12.0, connect=4.0)
         try:
             async with httpx.AsyncClient(
                 timeout=abs_timeout,

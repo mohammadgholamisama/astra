@@ -111,7 +111,17 @@ def sanitize_share_link(link: str) -> str:
             continue
         cleaned.append((key, v))
 
-    if lower.startswith(("vless://", "trojan://")) and not saw_header_type:
+    # headerType is for TCP/KCP camouflage — never force it on xhttp/ws/grpc.
+    qtype = ""
+    for key, val in cleaned:
+        if key.lower() == "type":
+            qtype = (val or "").strip().lower()
+            break
+    if (
+        lower.startswith(("vless://", "trojan://"))
+        and not saw_header_type
+        and qtype in ("", "tcp", "kcp", "raw")
+    ):
         cleaned.append(("headerType", "none"))
 
     new_query = urlencode(cleaned, doseq=True)

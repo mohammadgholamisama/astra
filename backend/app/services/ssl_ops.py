@@ -54,31 +54,39 @@ async def _run(cmd: list[str], *, timeout: float = 300) -> tuple[int, str, str]:
 
 
 async def issue_ssl(db: AsyncSession, *, target: str, domain: str) -> dict:
-    """Issue SSL for panel or sub domain and sync URLs in DB + helper env."""
+    """Issue SSL for panel / sub / node (outbound CDN) domain via astra-helper."""
     if not available():
         raise ValueError(
             "صدور SSL فقط روی سرور با نصب رسمی Astra فعال است (astra-helper)"
         )
 
     t = (target or "").strip().lower()
-    if t not in ("panel", "sub"):
-        raise ValueError("target باید panel یا sub باشد")
+    if t not in ("panel", "sub", "node"):
+        raise ValueError("target باید panel یا sub یا node باشد")
 
     d = (domain or "").strip().lower().rstrip(".")
     if not d or not _SAFE_DOMAIN.match(d):
         raise ValueError("دامنه نامعتبر است")
 
     helper = helper_path()
-    # Prefer passwordless sudo as configured by install.sh
-    code, out, err = await _run(["sudo", "-n", helper, "set-env", f"ASTRA_{t.upper()}_DOMAIN", d])
-    if code != 0:
-        code, out, err = await _run([helper, "set-env", f"ASTRA_{t.upper()}_DOMAIN", d])
-    if code != 0:
-        raise RuntimeError((err or out or "set-env failed").strip()[:800])
 
-    code, out, err = await _run(["sudo", "-n", helper, "issue-ssl", d], timeout=420)
-    if code != 0:
-        code, out, err = await _run([helper, "issue-ssl", d], timeout=420)
+    async def _helper(*args: str, timeout: float = 300) -> tuple[int, str, str]:
+        code, out, err = await _run(["sudo", "-n", helper, *args], timeout=timeout)
+        if code != 0:
+            code, out, err = await _run([helper, *args], timeout=timeout)
+        return code, out, err
+
+    if t in ("panel", "sub"):
+        code, out, err = await _helper("set-env", f"ASTRA_{t.upper()}_DOMAIN", d)
+        if code != 0:
+            raise RuntimeError((err or out or "set-env failed").strip()[:800])
+    else:
+        # Register outbound edge host so nginx has server_name before ACME
+        code, out, err = await _helper("add-node-domain", d)
+        if code != 0:
+            raise RuntimeError((err or out or "add-node-domain failed").strip()[:800])
+
+    code, out, err = await _helper("issue-ssl", d, timeout=420)
     if code != 0:
         msg = (err or out or "certbot failed").strip()
         logger.error("SSL issue failed for %s: %s", d, msg)
@@ -87,12 +95,16 @@ async def issue_ssl(db: AsyncSession, *, target: str, domain: str) -> dict:
     https_url = f"https://{d}"
     if t == "panel":
         await site_svc.update_settings(db, panel_base_url=https_url)
-    else:
+    elif t == "sub":
         await site_svc.update_settings(db, sub_base_url=https_url)
+
+    msg = f"گواهی SSL برای {d} صادر شد"
+    if t == "node":
+        msg += " — دامنه آمادهٔ پنل اوتباند است (هاست عمومی را همین دامنه بگذارید)"
 
     return {
         "ok": True,
-        "message": f"گواهی SSL برای {d} صادر شد",
+        "message": msg,
         "domain": d,
         "target": t,
     }

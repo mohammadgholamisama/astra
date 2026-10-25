@@ -101,6 +101,7 @@ export default function SettingsPage() {
   const [statusLabel, setStatusLabel] = useState(DEFAULT_STATUS_LABEL);
   const [sslPanelDomain, setSslPanelDomain] = useState("");
   const [sslSubDomain, setSslSubDomain] = useState("");
+  const [sslNodeDomain, setSslNodeDomain] = useState("");
   const [curPass, setCurPass] = useState("");
   const [newPass, setNewPass] = useState("");
   const [newPass2, setNewPass2] = useState("");
@@ -253,7 +254,7 @@ export default function SettingsPage() {
   });
 
   const issueSsl = useMutation({
-    mutationFn: (payload: { target: "panel" | "sub"; domain: string }) =>
+    mutationFn: (payload: { target: "panel" | "sub" | "node"; domain: string }) =>
       api<{ ok: boolean; message: string }>("/api/admin/settings/ssl", {
         method: "POST",
         body: JSON.stringify(payload),
@@ -621,9 +622,37 @@ export default function SettingsPage() {
                     {issueSsl.isPending ? "در حال صدور…" : "دریافت SSL ساب"}
                   </button>
                 </div>
+
+                <div className="field">
+                  <label>SSL دامنه اوتباند (نود)</label>
+                  <input
+                    dir="ltr"
+                    value={sslNodeDomain}
+                    onChange={(e) => setSslNodeDomain(e.target.value)}
+                    placeholder="out.example.com"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  <button
+                    type="button"
+                    className="btn ghost sm settings-reset"
+                    disabled={issueSsl.isPending || !sslNodeDomain.trim()}
+                    onClick={() => {
+                      setMsg(null);
+                      issueSsl.mutate({
+                        target: "node",
+                        domain: sslNodeDomain.trim(),
+                      });
+                    }}
+                  >
+                    <ShieldCheck size={14} />
+                    {issueSsl.isPending ? "در حال صدور…" : "دریافت SSL اوتباند"}
+                  </button>
+                </div>
               </div>
               <p className="field-hint">
-                از ترمینال هم می‌توانید با دستور <code dir="ltr">x-astra</code> دامنه و SSL را تنظیم کنید.
+                دامنهٔ اوتباند را بعد از SSL در صفحهٔ پنل‌ها به‌عنوان هاست عمومی بگذارید.
+                از ترمینال هم می‌توانید با <code dir="ltr">x-astra</code> دامنه و SSL را تنظیم کنید.
               </p>
             </div>
           )}

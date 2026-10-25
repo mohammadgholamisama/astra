@@ -11,6 +11,7 @@ from app.models.group import Group
 from app.models.panel import Panel
 from app.models.user import PanelAccount, PanelAccountStatus, User, UserStatus
 from app.services import update_ops
+from app.services.host_metrics import collect_host_metrics
 from app.services.version_info import get_version
 
 router = APIRouter(tags=["System"])
@@ -146,6 +147,14 @@ async def system_stats(
         "top_users": top_users,
         "update_supported": update_ops.available(),
     }
+
+
+@router.get("/api/system/host")
+async def system_host(_admin=Depends(get_current_admin)):
+    """CPU / RAM / disk / uptime / systemd services for the dashboard."""
+    import asyncio
+
+    return await asyncio.to_thread(collect_host_metrics)
 
 
 @router.get("/api/system/update")

@@ -22,6 +22,7 @@ from app.schemas.user import (
     UserFromTemplate,
     UserModify,
     UserResponse,
+    UserRetryErrorsResponse,
     UsersListCounts,
     UsersListResponse,
 )
@@ -555,6 +556,7 @@ async def modify_user(
         if body.proxy_settings is not None:
             ps.update(body.proxy_settings)
         user.proxy_settings = ps
+    groups_changed = False
     if body.group_ids is not None:
         if not body.group_ids:
             raise HTTPException(
@@ -566,9 +568,12 @@ async def modify_user(
             )
 
         ug = await db.execute(
-            select(UserGroup.group_id).where(UserGroup.user_id == user.id)
+            select(UserGroup.group_id)
+            .where(UserGroup.user_id == user.id)
+            .order_by(UserGroup.sort_order.asc(), UserGroup.id.asc())
         )
-        old_gids = {int(row[0]) for row in ug.all() if row[0] is not None}
+        old_order = [int(row[0]) for row in ug.all() if row[0] is not None]
+        old_gids = set(old_order)
 
         # Normalize wanted ids (preserve order, drop dupes)
         wanted: list[int] = []
@@ -585,57 +590,85 @@ async def modify_user(
         wanted_set = set(wanted)
         removed = sorted(old_gids - wanted_set)
         added = [g for g in wanted if g not in old_gids]
+        # Skip heavy provision when groups (and order) are unchanged
+        groups_changed = old_order != wanted
 
-        # 1) Remove remotes for dropped groups BEFORE rewriting membership
-        if removed:
-            results = await orchestrator.sync_delete_user_group_accounts(
-                db, user, removed
-            )
-            failed = [r for r in results if not r.get("ok")]
-            if failed:
-                await db.commit()  # persist per-panel error_message
-                parts = [
-                    f"{r.get('panel_name') or r.get('panel_id')}: {r.get('error') or 'خطا'}"
-                    for r in failed
-                ]
-                raise HTTPException(
-                    status_code=502,
-                    detail="حذف کانفیگ گروه از پنل اصلی ناموفق بود — عضویت گروه عوض نشد: "
-                    + "؛ ".join(parts),
+        if groups_changed:
+            # 1) Remove remotes for dropped groups BEFORE rewriting membership
+            if removed:
+                results = await orchestrator.sync_delete_user_group_accounts(
+                    db, user, removed
                 )
+                failed = [r for r in results if not r.get("ok")]
+                if failed:
+                    await db.commit()  # persist per-panel error_message
+                    parts = [
+                        f"{r.get('panel_name') or r.get('panel_id')}: {r.get('error') or 'خطا'}"
+                        for r in failed
+                    ]
+                    raise HTTPException(
+                        status_code=502,
+                        detail="حذف کانفیگ گروه از پنل اصلی ناموفق بود — عضویت گروه عوض نشد: "
+                        + "؛ ".join(parts),
+                    )
 
-        # 2) Replace membership (add + remove + order) — sub_token unchanged
-        await _attach_groups(db, user, wanted)
+            # 2) Replace membership (add + remove + order) — sub_token unchanged
+            await _attach_groups(db, user, wanted)
 
-        # 3) Provision current (panel×group) set — creates missing for added groups
-        panels = await orchestrator.resolve_panels_for_groups(db, wanted)
-        if not panels:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "code": "NO_ACTIVE_PANELS",
-                    "message": "گروه‌های انتخاب‌شده هیچ پنل فعالی ندارند",
-                },
-            )
-        await orchestrator.provision_user_on_panels(db, user, panels)
-        try:
-            fresh = await load_user(db, username)
-            if fresh:
-                await orchestrator.hydrate_share_links(db, fresh)
-                user = fresh
-        except Exception:  # noqa: BLE001
-            pass
-        _ = added  # reserved for future audit hooks
+            # 3) Provision current (panel×group) set — creates missing for added groups
+            panels = await orchestrator.resolve_panels_for_groups(db, wanted)
+            if not panels:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "NO_ACTIVE_PANELS",
+                        "message": "گروه‌های انتخاب‌شده هیچ پنل فعالی ندارند",
+                    },
+                )
+            await orchestrator.provision_user_on_panels(db, user, panels)
+            try:
+                fresh = await load_user(db, username)
+                if fresh:
+                    await orchestrator.hydrate_share_links(db, fresh)
+                    user = fresh
+            except Exception:  # noqa: BLE001
+                pass
+            _ = added  # reserved for future audit hooks
 
-    # After admin re-enable, re-apply expire/limit before pushing remotes
-    if body.status == UserStatus.active:
+    # Re-evaluate quota whenever volume / expire / status change.
+    # Raising data_limit while status was "limited" must flip back to active
+    # BEFORE sync_modify — otherwise remotes stay frozen at used_raw and the
+    # new purchase never appears (especially Astra outbound panels).
+    if (
+        body.data_limit is not None
+        or body.expire is not None
+        or body.status is not None
+    ):
         await orchestrator.enforce_user_quota(db, user)
 
-    # Push full purchased data_limit + status to ALL remotes (coeff is usage-only).
-    # Upserts missing remotes (create-if-not-found) without wiping usage math.
-    # Also recalculates weighted usage (skips deleted group accounts).
-    await orchestrator.sync_modify_user(db, user)
-    await db.commit()
+    # Fast path for volume/expire edits: push Astra node immediately (local DB),
+    # then sync foreign remotes in the background so the admin UI isn't blocked.
+    from app.models.panel import PanelType
+
+    if groups_changed:
+        await orchestrator.sync_modify_user(db, user)
+        await db.commit()
+    else:
+        await orchestrator.sync_modify_user(
+            db,
+            user,
+            only_types={PanelType.astra},
+            remote_timeout=20,
+            skip_nginx_sync=True,
+        )
+        await db.commit()
+        uid = int(user.id)
+        asyncio.create_task(
+            orchestrator.sync_modify_user_background(
+                uid, exclude_types={PanelType.astra}
+            ),
+            name=f"astra-sync-remotes-{username}",
+        )
     user = await load_user(db, username)
     return to_user_response(user)  # type: ignore[arg-type]
 
@@ -681,13 +714,26 @@ async def reset_user_traffic(
     user = await load_user(db, username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    results = await orchestrator.reset_user_traffic_on_panels(db, user)
+    from app.models.panel import PanelType
+
+    # Astra first (local, fast) so UI/volume update immediately; remotes follow.
+    results = await orchestrator.reset_user_traffic_on_panels(
+        db,
+        user,
+        prefer_types={PanelType.astra},
+        remote_timeout=8,
+        sync_after=True,
+        sync_only_types={PanelType.astra},
+    )
     await db.commit()
+    uid = int(user.id)
+    asyncio.create_task(
+        orchestrator.reset_remotes_background(uid, exclude_types={PanelType.astra}),
+        name=f"astra-reset-remotes-{username}",
+    )
     user = await load_user(db, username)
     failed = [r for r in results if not r.get("ok")]
     if failed and user:
-        # Still return user (local reset done) but surface soft warning via header-friendly detail
-        # Keep 200 so UI can refresh; message is logged for admin toast via query invalidate
         parts = [f"{r.get('panel_name')}: {r.get('error')}" for r in failed]
         logger = __import__("logging").getLogger("astra.users")
         logger.warning("reset partial user=%s: %s", username, " | ".join(parts))
@@ -722,6 +768,24 @@ async def retry_provision(
     await db.commit()
     user = await load_user(db, username)
     return to_user_response(user)  # type: ignore[arg-type]
+
+
+@router.post("/api/users/retry-errors", response_model=UserRetryErrorsResponse)
+async def retry_all_errors(
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """Retry every error/pending remote account in one shot.
+
+    Unreachable panels are probed once and skipped (errors stay). Recovered
+    panels clear their user errors. Remaining failures stay on the Users page.
+    """
+    stats = await orchestrator.retry_all_failed_accounts(db)
+    try:
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        pass
+    return UserRetryErrorsResponse(**stats)
 
 
 def _user_list_scope(

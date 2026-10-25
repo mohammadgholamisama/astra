@@ -13,7 +13,7 @@ from app.adapters.base import AdapterResult, UserPayload
 from app.adapters.factory import get_adapter
 from app.core.config import get_settings
 from app.models.group import GroupPanel, UserGroup
-from app.models.panel import Panel
+from app.models.panel import Panel, PanelType
 from app.models.user import PanelAccount, PanelAccountStatus, User, UserStatus
 from app.services import quota as quota_math
 
@@ -28,6 +28,8 @@ _locks_guard = asyncio.Lock()
 
 # Shared cap for parallel remote create/delete/modify (lazy-init for event loop)
 _panel_remote_sem: asyncio.Semaphore | None = None
+# One admin/heal bulk retry at a time — avoids stampede on a recovering panel
+_bulk_retry_lock = asyncio.Lock()
 
 
 def _remote_sem() -> asyncio.Semaphore:
@@ -861,7 +863,15 @@ async def provision_user_on_panels(
 
 
 
-async def reset_user_traffic_on_panels(db: AsyncSession, user: User) -> list[dict]:
+async def reset_user_traffic_on_panels(
+    db: AsyncSession,
+    user: User,
+    *,
+    prefer_types: set[PanelType] | None = None,
+    remote_timeout: float = 18,
+    sync_after: bool = True,
+    sync_only_types: set[PanelType] | None = None,
+) -> list[dict]:
     """Reset used traffic on every remote panel, then clear local counters.
 
     Returns per-panel {panel_id, panel_name, ok, error}.
@@ -872,6 +882,12 @@ async def reset_user_traffic_on_panels(db: AsyncSession, user: User) -> list[dic
         .options(selectinload(PanelAccount.panel))
     )
     accounts = list(result.scalars().all())
+    if prefer_types:
+        accounts = [
+            a
+            for a in accounts
+            if a.panel is not None and a.panel.type in prefer_types
+        ]
 
     async def _one(account: PanelAccount) -> dict:
         panel = account.panel
@@ -890,17 +906,57 @@ async def reset_user_traffic_on_panels(db: AsyncSession, user: User) -> list[dic
                 "ok": True,
                 "error": None,
             }
-        adapter = get_adapter(panel)
         uname = (account.remote_username or user.username or "").strip()
         rid = account.remote_id or account.remote_username or uname
+        # Astra: same-session reset (no SQLite lock / no xray unless enable flips)
+        if panel.type == PanelType.astra:
+            from app.services import astra_node as astra_node_svc
+
+            try:
+                client = await astra_node_svc.reset_client_usage(
+                    db,
+                    panel,
+                    uname,
+                    re_enable=True,
+                    rebuild=True,
+                    sync_nginx=False,
+                )
+                if not client and rid and str(rid) != uname:
+                    client = await astra_node_svc.reset_client_usage(
+                        db,
+                        panel,
+                        str(rid),
+                        re_enable=True,
+                        rebuild=True,
+                        sync_nginx=False,
+                    )
+                ok = client is not None
+                err = None if ok else "user not found"
+            except Exception as exc:  # noqa: BLE001
+                ok = False
+                err = _exc_msg(exc)
+            account.used_traffic = 0
+            account.coeff_anchor_raw = 0
+            account.coeff_anchor_weighted = 0
+            if ok:
+                account.error_message = None
+                account.last_sync_at = datetime.now(timezone.utc)
+            return {
+                "panel_id": account.panel_id,
+                "panel_name": name,
+                "ok": ok,
+                "error": err,
+            }
+
+        adapter = get_adapter(panel)
         try:
             res = await asyncio.wait_for(
-                adapter.reset_usage(uname, rid), timeout=18
+                adapter.reset_usage(uname, rid), timeout=remote_timeout
             )
         except Exception as exc:  # noqa: BLE001
             res = _fail_result(_exc_msg(exc))
         if res.success:
-            account.used_traffic = int(res.used_traffic or 0)
+            account.used_traffic = 0
             account.coeff_anchor_raw = 0
             account.coeff_anchor_weighted = 0
             account.error_message = None
@@ -922,20 +978,158 @@ async def reset_user_traffic_on_panels(db: AsyncSession, user: User) -> list[dic
             "error": res.error or "بازنشانی روی پنل ناموفق",
         }
 
-    outcomes = await asyncio.gather(*[_one(a) for a in accounts]) if accounts else []
+    # Astra accounts are sequential (shared session); foreign remotes parallel.
+    astra_accounts = [a for a in accounts if a.panel and a.panel.type == PanelType.astra]
+    other_accounts = [
+        a for a in accounts if not a.panel or a.panel.type != PanelType.astra
+    ]
+    outcomes: list[dict] = []
+    for a in astra_accounts:
+        outcomes.append(await _one(a))
+    if other_accounts:
+        outcomes.extend(await asyncio.gather(*[_one(a) for a in other_accounts]))
+    # Always clear Astra-side user totals even if only a subset of panels was reset
     user.lifetime_used_traffic = int(user.lifetime_used_traffic or 0) + int(
         user.used_traffic or 0
     )
     user.used_traffic = 0
     if user.status == UserStatus.limited:
         user.status = UserStatus.active
+    # Zero ALL panel accounts locally so weighted usage is 0 immediately
+    all_acc_result = await db.execute(
+        select(PanelAccount)
+        .where(PanelAccount.user_id == user.id)
+        .options(selectinload(PanelAccount.panel))
+    )
+    all_accounts = list(all_acc_result.scalars().all())
+    for account in all_accounts:
+        if account.status == PanelAccountStatus.deleted:
+            continue
+        account.used_traffic = 0
+        account.coeff_anchor_raw = 0
+        account.coeff_anchor_weighted = 0
     await db.flush()
-    # Re-push fresh shared caps / active status
-    await sync_modify_user(db, user)
+    if sync_after:
+        await sync_modify_user(
+            db,
+            user,
+            only_types=sync_only_types,
+            remote_timeout=20,
+            skip_nginx_sync=True,
+        )
+        for account in all_accounts:
+            if account.status != PanelAccountStatus.deleted:
+                account.used_traffic = 0
+                account.coeff_anchor_raw = 0
+                account.coeff_anchor_weighted = 0
+    account_coeffs = await account_coefficients_for_user(db, user, all_accounts)
+    user.used_traffic = await _weighted_total(all_accounts, account_coeffs)
+    await db.flush()
     return list(outcomes)
 
 
-async def sync_modify_user(db: AsyncSession, user: User) -> None:
+async def sync_modify_user_background(
+    user_id: int,
+    *,
+    exclude_types: set[PanelType] | None = None,
+    only_types: set[PanelType] | None = None,
+) -> None:
+    """Best-effort remote sync after a fast Astra-local edit/reset."""
+    from app.core.database import AsyncSessionLocal
+    from app.services.users import load_user
+
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(User).where(User.id == user_id))
+            row = result.scalar_one_or_none()
+            if not row:
+                return
+            user = await load_user(db, row.username)
+            if not user:
+                return
+            await sync_modify_user(
+                db,
+                user,
+                only_types=only_types,
+                exclude_types=exclude_types,
+                remote_timeout=20,
+                skip_nginx_sync=True,
+            )
+            await db.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception("background sync_modify failed user_id=%s", user_id)
+
+
+async def reset_remotes_background(
+    user_id: int, *, exclude_types: set[PanelType] | None = None
+) -> None:
+    """Reset + re-push quota on foreign remotes after a fast Astra reset."""
+    from app.core.database import AsyncSessionLocal
+    from app.services.users import load_user
+
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(User).where(User.id == user_id))
+            row = result.scalar_one_or_none()
+            if not row:
+                return
+            user = await load_user(db, row.username)
+            if not user:
+                return
+            # Reset only non-excluded panels, then push caps
+            result = await db.execute(
+                select(PanelAccount)
+                .where(PanelAccount.user_id == user.id)
+                .options(selectinload(PanelAccount.panel))
+            )
+            accounts = list(result.scalars().all())
+            targets = [
+                a
+                for a in accounts
+                if a.panel
+                and a.panel.is_active
+                and a.status != PanelAccountStatus.deleted
+                and (not exclude_types or a.panel.type not in exclude_types)
+            ]
+
+            async def _one(account: PanelAccount) -> None:
+                panel = account.panel
+                if not panel:
+                    return
+                adapter = get_adapter(panel)
+                uname = (account.remote_username or user.username or "").strip()
+                rid = account.remote_id or account.remote_username or uname
+                try:
+                    await asyncio.wait_for(
+                        adapter.reset_usage(uname, rid), timeout=12
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                account.used_traffic = 0
+
+            if targets:
+                await asyncio.gather(*[_one(a) for a in targets])
+            await sync_modify_user(
+                db,
+                user,
+                exclude_types=exclude_types,
+                remote_timeout=20,
+                skip_nginx_sync=True,
+            )
+            await db.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception("background reset remotes failed user_id=%s", user_id)
+
+
+async def sync_modify_user(
+    db: AsyncSession,
+    user: User,
+    *,
+    only_types: set[PanelType] | None = None,
+    exclude_types: set[PanelType] | None = None,
+    remote_timeout: float = 25,
+    skip_nginx_sync: bool = False,
+) -> None:
     """Push status + shared remaining quota to every remote panel account.
 
     When Astra is limited/expired/disabled, every panel type (Marzban / PasarGuard /
@@ -996,6 +1190,10 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
                 (dict(c) for (pid, _g), c in claim_cfg.items() if pid == account.panel_id),
                 {},
             )
+        if only_types is not None and panel.type not in only_types:
+            continue
+        if exclude_types is not None and panel.type in exclude_types:
+            continue
         rem_name = (account.remote_username or user.username or "").strip()
         payload = build_user_payload(
             user,
@@ -1009,21 +1207,33 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
         rid = (account.remote_id or "").strip()
         if rid:
             payload.config = {**(payload.config or {}), "_remote_id": rid}
+        # Quota-only Astra upserts: skip nginx; xray reload only if enable flips
+        if panel.type == PanelType.astra and skip_nginx_sync:
+            payload.config = {
+                **(payload.config or {}),
+                "_astra_skip_nginx": True,
+            }
         jobs.append((account, panel, payload))
 
     sem = _remote_sem()
 
     async def _remote(
-        panel: Panel, payload: UserPayload, account: PanelAccount
+        panel: Panel,
+        payload: UserPayload,
+        account: PanelAccount,
+        *,
+        timeout: float = 25,
     ) -> AdapterResult:
-        attempts = 2 if blocked else 1
+        # Freeze pushes get extra retries — soft-fail left remotes online before
+        attempts = 3 if blocked else 1
         last = _fail_result("modify failed")
         for i in range(attempts):
             adapter = get_adapter(panel)
             try:
                 async with sem:
                     last = await asyncio.wait_for(
-                        adapter.modify_user(payload), timeout=25
+                        adapter.modify_user(payload),
+                        timeout=timeout if not blocked else max(timeout, 14),
                     )
                 if last.success:
                     return last
@@ -1034,7 +1244,7 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
                         payload,
                         astra_username=user.username,
                         panel_id=panel.id,
-                        timeout=30.0,
+                        timeout=min(30.0, timeout + 5),
                     )
                     if created.success:
                         return created
@@ -1050,13 +1260,93 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
                 await asyncio.sleep(0.2)
         return last
 
+    async def _astra_inline(
+        panel: Panel, payload: UserPayload
+    ) -> AdapterResult:
+        """Apply Astra upsert on the SAME db session (avoids SQLite lock/timeout)."""
+        from app.services import astra_node as astra_node_svc
+
+        try:
+            enable = (payload.status or "active").lower() in ("active", "on_hold")
+            limit_ip = 0
+            cfg = payload.config or {}
+            try:
+                limit_ip = max(0, int(cfg.get("limit_ip", cfg.get("ip_limit", 0)) or 0))
+            except (TypeError, ValueError):
+                limit_ip = 0
+            client = await astra_node_svc.upsert_client(
+                db,
+                panel,
+                email=payload.username,
+                uuid=payload.uuid,
+                data_limit=int(payload.data_limit or 0),
+                expire=int(payload.expire or 0),
+                enable=enable,
+                limit_ip=limit_ip,
+                rebuild=True,
+                sync_nginx=False,
+            )
+            used = int(client.used_up or 0) + int(client.used_down or 0)
+            # Soft quota without full client_usage_and_links (no extra rebuilds)
+            if (
+                enable
+                and int(payload.data_limit or 0) > 0
+                and used >= int(payload.data_limit or 0)
+                and client.enable
+            ):
+                client.enable = False
+                await db.flush()
+                await astra_node_svc.rebuild_xray_config(
+                    db, panel, sync_nginx=False
+                )
+            return AdapterResult(
+                success=True,
+                remote_username=payload.username,
+                remote_id=str(client.id),
+                uuid=client.uuid,
+                links=[],
+                used_traffic=used,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("astra inline modify failed panel=%s", panel.id)
+            return _fail_result(_exc_msg(e))
+
     if not jobs:
         await db.flush()
         return
 
-    results = await asyncio.gather(
-        *[_remote(panel, payload, account) for account, panel, payload in jobs]
-    )
+    astra_jobs = [j for j in jobs if j[1].type == PanelType.astra]
+    other_jobs = [j for j in jobs if j[1].type != PanelType.astra]
+
+    results_by_key: dict[tuple[int, int], AdapterResult] = {}
+
+    # Foreign remotes in parallel (HTTP). Astra sequentially on shared session.
+    if other_jobs:
+        other_res = await asyncio.gather(
+            *[
+                _remote(panel, payload, account, timeout=remote_timeout)
+                for account, panel, payload in other_jobs
+            ]
+        )
+        for (account, panel, payload), res in zip(other_jobs, other_res):
+            results_by_key[(int(account.panel_id), int(account.id))] = res
+
+    for account, panel, payload in astra_jobs:
+        res = await _astra_inline(panel, payload)
+        results_by_key[(int(account.panel_id), int(account.id))] = res
+
+    if astra_jobs and not skip_nginx_sync:
+        try:
+            from app.services import astra_node as astra_node_svc
+
+            await astra_node_svc.sync_nginx_ws_upstreams(db)
+        except Exception:  # noqa: BLE001
+            logger.debug("astra nginx sync after modify failed", exc_info=True)
+
+    results = [
+        results_by_key[(int(account.panel_id), int(account.id))]
+        for account, panel, payload in jobs
+    ]
     now = datetime.now(timezone.utc)
     for (account, panel, payload), res in zip(jobs, results):
         if res.success:
@@ -1072,12 +1362,18 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
                 account.uuid = res.uuid
             if res.links:
                 account.links = res.links
-            # Only update raw usage when panel returned a real reading — never wipe
+            # Only update raw usage when panel returned a real reading
             if res.used_traffic is not None and int(res.used_traffic) >= 0:
-                # Prefer max so a create-on-missing (0) does not erase prior raw
                 prev = int(account.used_traffic or 0)
                 got = int(res.used_traffic or 0)
-                account.used_traffic = max(prev, got) if prev > 0 and got == 0 else got
+                # Astra node is authoritative (supports real resets to 0).
+                # Other remotes: never wipe a positive raw with a flaky 0.
+                if panel and panel.type == PanelType.astra:
+                    account.used_traffic = got
+                else:
+                    account.used_traffic = (
+                        max(prev, got) if prev > 0 and got == 0 else got
+                    )
             account.error_message = None
             account.last_sync_at = now
             if panel:
@@ -1093,7 +1389,19 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
                 err=res.error or "به‌روزرسانی پنل ناموفق",
                 username=payload.username,
             )
-            if was_ok and not _is_not_found_err(res.error):
+            if blocked:
+                # Quota freeze MUST NOT soft-keep active — that left remotes
+                # online until an admin opened Astra. Mark error so the next
+                # watch cycle retries hard.
+                account.status = PanelAccountStatus.error
+                account.error_message = msg
+                logger.warning(
+                    "failed to freeze remote user=%s panel=%s: %s",
+                    user.username,
+                    account.panel_id,
+                    msg,
+                )
+            elif was_ok and not _is_not_found_err(res.error):
                 # Transient modify fail — keep active, store detail for admin
                 account.error_message = None
                 logger.warning(
@@ -1105,13 +1413,6 @@ async def sync_modify_user(db: AsyncSession, user: User) -> None:
             else:
                 account.status = PanelAccountStatus.error
                 account.error_message = msg
-            if blocked:
-                logger.warning(
-                    "failed to freeze remote user=%s panel=%s: %s",
-                    user.username,
-                    account.panel_id,
-                    account.error_message or msg,
-                )
     await db.flush()
     # Recompute weighted usage after any raw changes (existing panels unchanged)
     account_coeffs = await account_coefficients_for_user(db, user, accounts)
@@ -1574,6 +1875,398 @@ async def retry_failed_accounts(db: AsyncSession, user: User) -> list[PanelAccou
     )
 
 
+def _empty_retry_all_stats() -> dict:
+    return {
+        "attempted": 0,
+        "recovered": 0,
+        "remaining": 0,
+        "dropped": 0,
+        "skipped_unreachable": 0,
+        "panels_ok": [],
+        "panels_down": [],
+        "users_recovered": 0,
+        "users_remaining": 0,
+    }
+
+
+async def retry_all_failed_accounts(
+    db: AsyncSession,
+    *,
+    overall_timeout: float = 85.0,
+    per_remote_timeout: float = 16.0,
+    probe_timeout: float = 5.0,
+    concurrency: int = 20,
+    limit_accounts: int | None = None,
+) -> dict:
+    """Retry every error/pending account, grouped by panel.
+
+    Fast path: probe each unique panel once. Unreachable panels are skipped
+    (their user errors stay). Live panels retry accounts in parallel with a
+    shared adapter (one login). Success clears the error; remaining failures
+    keep ``status=error`` for the Users page.
+    """
+    async with _bulk_retry_lock:
+        return await _retry_all_failed_accounts_inner(
+            db,
+            overall_timeout=overall_timeout,
+            per_remote_timeout=per_remote_timeout,
+            probe_timeout=probe_timeout,
+            concurrency=concurrency,
+            limit_accounts=limit_accounts,
+        )
+
+
+async def _probe_panel_alive(panel: Panel, timeout: float) -> tuple[bool, str]:
+    adapter = get_adapter(panel)
+    try:
+        result = await asyncio.wait_for(adapter.test_connection(), timeout=timeout)
+        if result.success:
+            return True, ""
+        return False, (result.error or "probe failed").strip() or "probe failed"
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        return False, _exc_msg(exc) or "Timeout waiting for panel response"
+    finally:
+        try:
+            await adapter.close()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _retry_all_failed_accounts_inner(
+    db: AsyncSession,
+    *,
+    overall_timeout: float,
+    per_remote_timeout: float,
+    probe_timeout: float,
+    concurrency: int,
+    limit_accounts: int | None,
+) -> dict:
+    t0 = time.monotonic()
+    stats = _empty_retry_all_stats()
+    result = await db.execute(
+        select(PanelAccount)
+        .where(
+            PanelAccount.status.in_(
+                (PanelAccountStatus.error, PanelAccountStatus.pending)
+            )
+        )
+        .options(
+            selectinload(PanelAccount.panel),
+            selectinload(PanelAccount.user),
+        )
+        .order_by(PanelAccount.id.asc())
+    )
+    failed = list(result.scalars().all())
+    if not failed:
+        return stats
+    start_error_users = {int(a.user_id) for a in failed}
+
+    live: list[PanelAccount] = []
+    dropped = 0
+    for a in failed:
+        panel = a.panel
+        if panel is None or not bool(getattr(panel, "is_active", True)):
+            a.status = PanelAccountStatus.deleted
+            a.error_message = None
+            a.links = []
+            a.links_by_group = {}
+            dropped += 1
+            continue
+        live.append(a)
+    stats["dropped"] = dropped
+    if dropped:
+        await db.flush()
+        try:
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            pass
+        logger.info("retry-all drop inactive-panel errors dropped=%s", dropped)
+
+    if limit_accounts is not None and limit_accounts > 0:
+        live = live[: int(limit_accounts)]
+    if not live:
+        stats["users_recovered"] = len(start_error_users)
+        return stats
+
+    panels_by_id: dict[int, Panel] = {}
+    for a in live:
+        if a.panel is not None:
+            panels_by_id[int(a.panel_id)] = a.panel
+
+    probe_tasks = {
+        pid: asyncio.create_task(_probe_panel_alive(panel, probe_timeout))
+        for pid, panel in panels_by_id.items()
+    }
+    probe_ok: dict[int, bool] = {}
+    if probe_tasks:
+        probe_done, probe_pending = await asyncio.wait(
+            probe_tasks.values(), timeout=probe_timeout + 2.0
+        )
+        for t in probe_pending:
+            t.cancel()
+        if probe_pending:
+            await asyncio.gather(*probe_pending, return_exceptions=True)
+        for pid, task in probe_tasks.items():
+            if task in probe_pending or task.cancelled():
+                probe_ok[pid] = False
+                continue
+            try:
+                ok, _err = task.result()
+                probe_ok[pid] = bool(ok)
+            except Exception:  # noqa: BLE001
+                probe_ok[pid] = False
+
+    panels_ok_names: list[str] = []
+    panels_down_names: list[str] = []
+    reachable: list[PanelAccount] = []
+    skipped = 0
+    for a in live:
+        pid = int(a.panel_id)
+        name = (a.panel.name if a.panel else None) or f"#{pid}"
+        if probe_ok.get(pid):
+            reachable.append(a)
+            if name not in panels_ok_names:
+                panels_ok_names.append(name)
+        else:
+            skipped += 1
+            if name not in panels_down_names:
+                panels_down_names.append(name)
+
+    stats["skipped_unreachable"] = skipped
+    stats["panels_ok"] = panels_ok_names
+    stats["panels_down"] = panels_down_names
+    stats["attempted"] = len(reachable)
+
+    if not reachable:
+        # Unreachable panels keep their existing error rows as-is
+        still_error_rows = [
+            a
+            for a in failed
+            if a.status
+            in (PanelAccountStatus.error, PanelAccountStatus.pending)
+        ]
+        end_error_users = {int(a.user_id) for a in still_error_rows}
+        stats["remaining"] = len(still_error_rows)
+        stats["users_remaining"] = len(end_error_users)
+        stats["users_recovered"] = len(start_error_users - end_error_users)
+        logger.info(
+            "retry-all skip all unreachable accounts=%s panels=%s dt=%.2fs",
+            skipped,
+            ",".join(panels_down_names) or "-",
+            time.monotonic() - t0,
+        )
+        return stats
+
+    user_ids = {int(a.user_id) for a in reachable}
+    ug = await db.execute(
+        select(UserGroup.user_id, UserGroup.group_id).where(
+            UserGroup.user_id.in_(user_ids or [-1])
+        )
+    )
+    user_gids: dict[int, set[int]] = {}
+    all_gids: set[int] = set()
+    for uid, gid in ug.all():
+        user_gids.setdefault(int(uid), set()).add(int(gid))
+        all_gids.add(int(gid))
+
+    claim_cfg: dict[tuple[int, int], dict] = {}
+    if all_gids:
+        for panel, cfg, gid in await resolve_panels_for_groups(db, list(all_gids)):
+            claim_cfg[(int(panel.id), int(gid))] = dict(cfg or {})
+
+    user_panel_n: dict[tuple[int, int], int] = {}
+    for uid, gids in user_gids.items():
+        for (pid, gid), _cfg in claim_cfg.items():
+            if gid in gids:
+                user_panel_n[(uid, pid)] = user_panel_n.get((uid, pid), 0) + 1
+
+    jobs: list[tuple[PanelAccount, Panel, User, UserPayload]] = []
+    for a in reachable:
+        user = a.user
+        panel = a.panel
+        if user is None or panel is None:
+            skipped += 1
+            continue
+        gid = int(getattr(a, "group_id", 0) or 0)
+        cfg = claim_cfg.get((int(a.panel_id), gid)) or next(
+            (c for (pid, _g), c in claim_cfg.items() if pid == a.panel_id),
+            {},
+        )
+        shared = user_panel_n.get((int(user.id), int(panel.id)), 0) > 1 and gid > 0
+        existing_name = (a.remote_username or "").strip()
+        if existing_name:
+            preferred = existing_name
+        elif shared:
+            preferred = make_group_remote_username(user.username, gid)
+        else:
+            preferred = (user.username or "").strip()
+        payload = build_user_payload(
+            user,
+            uuid=a.uuid,
+            panel_config=cfg,
+            remote_username=preferred,
+        )
+        jobs.append((a, panel, user, payload))
+
+    stats["attempted"] = len(jobs)
+    stats["skipped_unreachable"] = skipped
+    if not jobs:
+        still_error_rows = [
+            a
+            for a in failed
+            if a.status
+            in (PanelAccountStatus.error, PanelAccountStatus.pending)
+        ]
+        end_error_users = {int(a.user_id) for a in still_error_rows}
+        stats["remaining"] = len(still_error_rows)
+        stats["users_remaining"] = len(end_error_users)
+        stats["users_recovered"] = len(start_error_users - end_error_users)
+        return stats
+
+    adapters: dict[int, object] = {}
+    for _a, panel, _u, _p in jobs:
+        pid = int(panel.id)
+        if pid not in adapters:
+            adapters[pid] = get_adapter(panel)
+
+    sem = asyncio.Semaphore(max(4, min(int(concurrency), 32)))
+    create_timeout = float(per_remote_timeout)
+
+    async def _remote(
+        account: PanelAccount, panel: Panel, payload: UserPayload
+    ) -> AdapterResult:
+        adapter = adapters[int(panel.id)]
+        prefer_modify = bool((account.remote_username or "").strip())
+        try:
+            async with sem:
+                if prefer_modify:
+                    try:
+                        mod = await asyncio.wait_for(
+                            adapter.modify_user(payload),  # type: ignore[attr-defined]
+                            timeout=create_timeout,
+                        )
+                        if mod.success:
+                            return mod
+                        if not _is_not_found_err(mod.error) and _is_unreachable_err(
+                            mod.error
+                        ):
+                            return mod
+                    except asyncio.CancelledError:
+                        raise
+                    except asyncio.TimeoutError:
+                        return _fail_result("Timeout waiting for panel response")
+                    except Exception:  # noqa: BLE001
+                        pass
+                return await create_user_with_collision_alias(
+                    adapter,
+                    payload,
+                    astra_username=account.user.username if account.user else payload.username,
+                    panel_id=panel.id,
+                    timeout=create_timeout,
+                    max_alias_attempts=1,
+                    probe_timeout=min(3.0, probe_timeout),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return _fail_result(_exc_msg(exc) or "خطای پنل")
+
+    tasks = [
+        asyncio.create_task(_remote(account, panel, payload))
+        for account, panel, _user, payload in jobs
+    ]
+    budget = max(8.0, float(overall_timeout))
+    done, pending = await asyncio.wait(tasks, timeout=budget)
+    for t in pending:
+        t.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    now = datetime.now(timezone.utc)
+    recovered = 0
+    still_err = 0
+    recovered_users: set[int] = set()
+    remaining_users: set[int] = set()
+    for (account, panel, user, payload), task in zip(jobs, tasks):
+        uid = int(user.id)
+        if task in pending or task.cancelled():
+            # Keep the previous error visible — do not invent a new one
+            still_err += 1
+            remaining_users.add(uid)
+            continue
+        try:
+            remote = task.result()
+        except asyncio.CancelledError:
+            still_err += 1
+            remaining_users.add(uid)
+            continue
+        except Exception as exc:  # noqa: BLE001
+            remote = _fail_result(_exc_msg(exc) or "خطای پنل")
+
+        if remote.success:
+            account.status = PanelAccountStatus.active
+            account.remote_username = (
+                remote.remote_username or payload.username or user.username
+            )
+            account.remote_id = remote.remote_id or account.remote_id
+            account.uuid = remote.uuid or account.uuid
+            if remote.links:
+                account.links = remote.links
+            account.error_message = None
+            account.last_sync_at = now
+            panel.last_ok_at = now
+            recovered += 1
+            recovered_users.add(uid)
+        else:
+            account.status = PanelAccountStatus.error
+            account.error_message = _format_remote_error(
+                panel,
+                action="به‌روزرسانی / ساخت",
+                err=remote.error or "ایجاد در پنل ناموفق",
+                username=payload.username,
+            )
+            still_err += 1
+            remaining_users.add(uid)
+
+    await db.flush()
+    try:
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        pass
+
+    for adapter in adapters.values():
+        try:
+            await adapter.close()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+
+    still_error_rows = [
+        a
+        for a in failed
+        if a.status
+        in (PanelAccountStatus.error, PanelAccountStatus.pending)
+    ]
+    end_error_users = {int(a.user_id) for a in still_error_rows}
+    stats["recovered"] = recovered
+    stats["remaining"] = len(still_error_rows)
+    stats["users_remaining"] = len(end_error_users)
+    stats["users_recovered"] = len(start_error_users - end_error_users)
+    logger.info(
+        "retry-all attempted=%s recovered=%s remaining=%s skipped=%s "
+        "ok_panels=%s down_panels=%s dt=%.2fs",
+        stats["attempted"],
+        recovered,
+        stats["remaining"],
+        skipped,
+        ",".join(panels_ok_names) or "-",
+        ",".join(panels_down_names) or "-",
+        time.monotonic() - t0,
+    )
+    return stats
+
+
 async def drop_inactive_panel_errors(db: AsyncSession, panel_id: int) -> int:
     """When a panel is turned off, clear its error/pending rows on all users."""
     result = await db.execute(
@@ -1602,81 +2295,40 @@ async def heal_failed_panel_accounts_batch(
     *,
     limit_users: int = 25,
 ) -> int:
-    """Retry error/pending panel accounts for up to ``limit_users`` users.
+    """Retry error/pending panel accounts (probe-first, parallel by panel).
 
     Used by background heal loop and subscription maintain — when a panel
     comes back online, configs appear on the next successful heal.
     """
+    if _bulk_retry_lock.locked():
+        return 0
     from app.core.database import AsyncSessionLocal
 
     async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(PanelAccount.user_id)
-            .join(Panel, Panel.id == PanelAccount.panel_id)
-            .where(
-                PanelAccount.status.in_(
-                    (PanelAccountStatus.error, PanelAccountStatus.pending)
-                ),
-                Panel.is_active.is_(True),
+        try:
+            stats = await retry_all_failed_accounts(
+                db,
+                overall_timeout=70.0,
+                per_remote_timeout=16.0,
+                probe_timeout=5.0,
+                concurrency=16,
+                limit_accounts=max(40, int(limit_users) * 4),
             )
-            .distinct()
-            .limit(max(1, limit_users))
-        )
-        user_ids = [int(r[0]) for r in result.all()]
-
-    healed = 0
-    for uid in user_ids:
-        async with AsyncSessionLocal() as db:
+            healed = int(stats.get("users_recovered") or 0)
+            if healed:
+                logger.info(
+                    "heal bulk recovered_users=%s remaining=%s",
+                    healed,
+                    stats.get("remaining"),
+                )
+            return healed
+        except Exception as exc:  # noqa: BLE001
             try:
-                result = await db.execute(
-                    select(User)
-                    .where(User.id == uid)
-                    .options(
-                        selectinload(User.panel_accounts).selectinload(
-                            PanelAccount.panel
-                        ),
-                        selectinload(User.groups),
-                    )
-                )
-                user = result.scalar_one_or_none()
-                if user is None:
-                    continue
-                before = sum(
-                    1
-                    for a in (user.panel_accounts or [])
-                    if a.status
-                    in (PanelAccountStatus.error, PanelAccountStatus.pending)
-                )
-                if before <= 0:
-                    continue
-                await retry_failed_accounts(db, user)
-                await db.commit()
-                # reload status
-                result = await db.execute(
-                    select(PanelAccount).where(PanelAccount.user_id == uid)
-                )
-                after_err = sum(
-                    1
-                    for a in result.scalars().all()
-                    if a.status
-                    in (PanelAccountStatus.error, PanelAccountStatus.pending)
-                )
-                if after_err < before:
-                    healed += 1
-                    logger.info(
-                        "heal user=%s errors %s→%s",
-                        user.username,
-                        before,
-                        after_err,
-                    )
-            except Exception as exc:  # noqa: BLE001
-                try:
-                    await db.rollback()
-                except Exception:  # noqa: BLE001
-                    pass
-                logger.warning("heal failed user_id=%s: %s", uid, _exc_msg(exc))
-        await asyncio.sleep(0.05)
-    return healed
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            logger.warning("heal bulk retry failed: %s", _exc_msg(exc))
+            return 0
 
 
 def _normalize_config_tag(raw: object) -> str:
@@ -2195,6 +2847,34 @@ async def collect_links_detailed(
         and _panel_is_active(a.__dict__.get("panel") or getattr(a, "panel", None))
         and _account_in_membership(a)
     ]
+
+    # Astra: always rebuild share links from current public_host/port (domain change).
+    astra_links_cache: dict[int, dict[str, list[str]]] = {}
+    if db is not None:
+        from app.models.panel import PanelType
+        from app.services import astra_node as astra_node_svc
+
+        for acc in active_accounts:
+            panel = acc.__dict__.get("panel") or getattr(acc, "panel", None)
+            if panel is None or getattr(panel, "type", None) != PanelType.astra:
+                continue
+            pid = int(acc.panel_id)
+            if pid not in astra_links_cache:
+                try:
+                    astra_links_cache[pid] = await astra_node_svc.share_links_by_email(
+                        db, panel
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "astra live links failed panel=%s", pid, exc_info=True
+                    )
+                    astra_links_cache[pid] = {}
+            email = (acc.remote_username or "").strip()
+            fresh = list(astra_links_cache[pid].get(email) or [])
+            if list(acc.links or []) != fresh:
+                acc.links = fresh
+                acc.links_by_group = None
+
     # Per-group accounts already own one group's links; legacy merged rows still partition
     need_partition = [
         a for a in active_accounts if not getattr(a, "group_id", None)
@@ -2323,9 +3003,12 @@ async def collect_links_detailed(
         )
     )
 
-    # One share-link per order fingerprint so sub #N matches config-order #N.
-    # Multiple panels often expose the same host:port[+SNI] with different UUIDs.
-    seen_fp: set[tuple[str, int, str]] = set()
+    # One share-link per endpoint fingerprint so sub #N matches config-order #N.
+    # Same host:port[+SNI] with different UUIDs collapse (multi-panel duplicates).
+    # Distinct CDN paths (Astra WS/XHTTP on one domain:port) must BOTH stay.
+    from app.services.config_locations import extract_link_path
+
+    seen_fp: set[tuple] = set()
     deduped: list[dict] = []
     for row in rows:
         link = str(row.get("link") or "")
@@ -2334,9 +3017,10 @@ async def collect_links_detailed(
             mh = extract_link_match_host(link) or ""
             norm = try_normalize_endpoint(ep[0], ep[1], mh)
             if norm:
-                if norm in seen_fp:
+                key: tuple = (*norm, extract_link_path(link))
+                if key in seen_fp:
                     continue
-                seen_fp.add(norm)
+                seen_fp.add(key)
         deduped.append(row)
     rows = deduped
 
@@ -2353,8 +3037,8 @@ async def collect_links_detailed(
 async def hydrate_share_links(db: AsyncSession, user: User) -> int:
     """Parallel fetch of share links for every panel account missing them.
 
-    Wave 1 — expand stored /sub URLs concurrently (no admin auth, ~6s).
-    Wave 2 — get_usage + expand for remaining empties concurrently (~8s).
+    Wave 1 — expand stored /sub URLs concurrently (large bodies allowed).
+    Wave 2 — get_usage + expand for remaining empties concurrently.
     Slow panels are cancelled; fast panels' results are kept.
     """
     from app.adapters.http_utils import (
@@ -2401,13 +3085,13 @@ async def hydrate_share_links(db: AsyncSession, user: User) -> int:
         client = make_client(
             panel.base_url,
             bool((panel.meta or {}).get("verify_ssl", False)),
-            timeout=4.0,
+            timeout=14.0,
             xhr=False,
         )
         before_shares = sum(1 for x in stored if is_share_link(x))
         try:
             expanded = await asyncio.wait_for(
-                expand_subscription_links(client, stored), timeout=4.5
+                expand_subscription_links(client, stored), timeout=14.0
             )
         except Exception:
             expanded = []
@@ -2436,7 +3120,7 @@ async def hydrate_share_links(db: AsyncSession, user: User) -> int:
                 coro = adapter.get_usage(uname, rid, expand_links=False)  # type: ignore[call-arg]
             except TypeError:
                 coro = adapter.get_usage(uname, rid)
-            res = await asyncio.wait_for(coro, timeout=3.5)
+            res = await asyncio.wait_for(coro, timeout=12.0)
             if not res or not res.success:
                 return False
 
@@ -2446,12 +3130,12 @@ async def hydrate_share_links(db: AsyncSession, user: User) -> int:
                 client2 = make_client(
                     panel.base_url,
                     bool((panel.meta or {}).get("verify_ssl", False)),
-                    timeout=3.5,
+                    timeout=14.0,
                     xhr=False,
                 )
                 try:
                     shares = await asyncio.wait_for(
-                        expand_subscription_links(client2, raw_links), timeout=3.5
+                        expand_subscription_links(client2, raw_links), timeout=14.0
                     )
                 except Exception:
                     shares = []
@@ -2525,11 +3209,11 @@ async def hydrate_share_links(db: AsyncSession, user: User) -> int:
             if x and str(x).strip()
         )
     ]
-    updated += await _run_wave([_expand_stored(a) for a in need_expand], timeout=5.0)
+    updated += await _run_wave([_expand_stored(a) for a in need_expand], timeout=12.0)
 
     # Wave 2: remaining accounts still missing share links
     remaining = [a for a in targets if _needs_hydrate(a)]
-    updated += await _run_wave([_fetch_remote(a) for a in remaining], timeout=5.0)
+    updated += await _run_wave([_fetch_remote(a) for a in remaining], timeout=12.0)
 
     if updated:
         await db.flush()
@@ -2993,6 +3677,52 @@ async def refresh_usage(
 
     account_coeffs = await account_coefficients_for_user(db, user, accounts)
 
+    # Same-session Astra traffic sync — avoids nested SQLite sessions in the
+    # Astra adapter that used to stall / miss usage until the admin UI opened.
+    astra_synced: set[int] = set()
+    try:
+        from app.services import astra_node as astra_node_svc
+
+        for account in accounts:
+            panel = account.panel
+            if (
+                not panel
+                or panel.type != PanelType.astra
+                or not _panel_is_active(panel)
+            ):
+                continue
+            pid = int(panel.id)
+            if pid in astra_synced:
+                continue
+            try:
+                await astra_node_svc.sync_traffic_from_xray(db, panel)
+                astra_synced.add(pid)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "inline astra sync failed panel=%s", pid, exc_info=True
+                )
+        # Mirror Astra client cumulatives onto this user's accounts
+        for account in accounts:
+            panel = account.panel
+            if not panel or panel.type != PanelType.astra:
+                continue
+            if account.status not in (
+                PanelAccountStatus.active,
+                PanelAccountStatus.error,
+            ):
+                continue
+            email = (account.remote_username or user.username or "").strip()
+            if not email:
+                continue
+            client = await astra_node_svc.get_client(db, panel.id, email)
+            if not client:
+                continue
+            got = int(client.used_up or 0) + int(client.used_down or 0)
+            account.used_traffic = got
+            account.last_sync_at = datetime.now(timezone.utc)
+    except Exception:  # noqa: BLE001
+        logger.debug("astra inline usage apply failed", exc_info=True)
+
     need_remote = force or _accounts_need_remote_refresh(accounts, interval)
     if need_remote:
         # quick: fail-fast (sub bg / admin list); full: longer for forced sync
@@ -3020,6 +3750,9 @@ async def refresh_usage(
                     PanelAccountStatus.error,
                 )
             ):
+                return account, None
+            # Astra already applied above — skip nested-session HTTP
+            if account.panel.type == PanelType.astra:
                 return account, None
             if not (account.remote_username or account.remote_id or user.username):
                 return account, None
@@ -3057,7 +3790,10 @@ async def refresh_usage(
             return account, last
 
         # Hard overall budget — many panels must not block for minutes
-        tasks = [asyncio.create_task(_remote(a)) for a in accounts]
+        remote_accounts = [
+            a for a in accounts if not (a.panel and a.panel.type == PanelType.astra)
+        ]
+        tasks = [asyncio.create_task(_remote(a)) for a in remote_accounts]
         done, pending = await asyncio.wait(tasks, timeout=overall_budget)
         for t in pending:
             t.cancel()
@@ -3078,8 +3814,15 @@ async def refresh_usage(
                 continue
             if res.success:
                 ok_n += 1
-                # Trust live panel value (source of truth)
-                account.used_traffic = int(res.used_traffic or 0)
+                got = int(res.used_traffic or 0)
+                prev = int(account.used_traffic or 0)
+                # Astra local node is authoritative (resets must shrink to 0).
+                # Other remotes: never shrink on flaky/partial readings.
+                panel = account.panel
+                if panel is not None and panel.type == PanelType.astra:
+                    account.used_traffic = got
+                else:
+                    account.used_traffic = max(prev, got)
                 # Never replace real share links with raw /sub refs from usage pulls.
                 # Never shrink a richer stored set with a partial panel response
                 # (that was the main cause of fluctuating sub config counts).
@@ -3178,17 +3921,217 @@ async def enforce_user_quota(db: AsyncSession, user: User) -> bool:
     return True
 
 
-async def recount_group_usage_local(db: AsyncSession, group_id: int) -> int:
+async def sync_all_astra_traffic(db: AsyncSession) -> int:
+    """Pull Xray stats for every active Astra panel into DB (same session)."""
+    from app.services import astra_node as astra_node_svc
+
+    result = await db.execute(
+        select(Panel).where(
+            Panel.type == PanelType.astra,
+            Panel.is_active.is_(True),
+        )
+    )
+    panels = list(result.scalars().all())
+    n = 0
+    for panel in panels:
+        try:
+            await astra_node_svc.sync_traffic_from_xray(db, panel)
+            n += 1
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "astra traffic sync failed panel=%s", panel.id, exc_info=True
+            )
+    await db.flush()
+    return n
+
+
+async def run_quota_watch_cycle() -> dict[str, int]:
+    """Fast background quota: sync Astra → recount → freeze remotes immediately.
+
+    Designed so exhausted users are disabled on ALL panels within ~10s without
+    an admin opening the Astra UI.
+    """
+    from app.core.database import AsyncSessionLocal
+
+    stats = {
+        "astra_panels": 0,
+        "checked": 0,
+        "flipped": 0,
+        "freeze_ok": 0,
+        "freeze_fail": 0,
+        "usage_pulled": 0,
+    }
+    flipped_ids: list[int] = []
+    retry_ids: list[int] = []
+    near_limit_ids: list[int] = []
+
+    # --- Phase 1: Astra Xray counters (local, fast) ---
+    async with AsyncSessionLocal() as db:
+        stats["astra_panels"] = await sync_all_astra_traffic(db)
+        await db.commit()
+
+    # --- Phase 2: recount + detect flips; queue freezes ---
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(User)
+            .where(
+                User.status.in_(
+                    (
+                        UserStatus.active,
+                        UserStatus.on_hold,
+                        UserStatus.limited,
+                        UserStatus.expired,
+                    )
+                )
+            )
+            .options(
+                selectinload(User.panel_accounts).selectinload(PanelAccount.panel)
+            )
+            .order_by(User.id.desc())
+            .limit(3000)
+        )
+        users = list(result.scalars().unique().all())
+        now_ts = time.time()
+        for user in users:
+            accounts = [
+                a
+                for a in (user.panel_accounts or [])
+                if a.status
+                in (
+                    PanelAccountStatus.active,
+                    PanelAccountStatus.error,
+                    PanelAccountStatus.pending,
+                )
+            ]
+            if not accounts:
+                continue
+            # Skip unlimited + no-expire users (nothing to enforce)
+            has_limit = int(user.data_limit or 0) > 0
+            has_expire = bool(user.expire and int(user.expire) > 0)
+            if not has_limit and not has_expire:
+                continue
+            coeffs = await account_coefficients_for_user(db, user, accounts)
+            user.used_traffic = await _weighted_total(accounts, coeffs)
+            changed = await enforce_user_quota(db, user)
+            stats["checked"] += 1
+            blocked = user.status in (
+                UserStatus.limited,
+                UserStatus.expired,
+                UserStatus.disabled,
+            )
+            if changed:
+                stats["flipped"] += 1
+                flipped_ids.append(int(user.id))
+            elif blocked:
+                # Re-freeze only when last push failed or is very stale
+                needs = False
+                for a in accounts:
+                    if a.status == PanelAccountStatus.error:
+                        needs = True
+                        break
+                    ls = a.last_sync_at
+                    if ls is None:
+                        needs = True
+                        break
+                    try:
+                        age = now_ts - ls.timestamp()
+                    except Exception:  # noqa: BLE001
+                        age = 9999
+                    if age > 90:
+                        needs = True
+                        break
+                if needs:
+                    retry_ids.append(int(user.id))
+            elif has_limit:
+                lim = int(user.data_limit or 0)
+                used = int(user.used_traffic or 0)
+                # Near limit → pull foreign remotes this cycle for accuracy
+                if lim > 0 and used >= int(lim * 0.55):
+                    near_limit_ids.append(int(user.id))
+        await db.commit()
+
+    # --- Phase 3: pull foreign usage for near-limit + flipped (quick, capped) ---
+    pull_ids = list(dict.fromkeys(flipped_ids + near_limit_ids))[:40]
+    for uid in pull_ids:
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(User)
+                    .where(User.id == uid)
+                    .options(
+                        selectinload(User.panel_accounts).selectinload(
+                            PanelAccount.panel
+                        )
+                    )
+                )
+                user = result.scalar_one_or_none()
+                if not user:
+                    continue
+                await refresh_usage(db, user, force=True, quick=True)
+                changed = await enforce_user_quota(db, user)
+                await db.commit()
+                stats["usage_pulled"] += 1
+                if changed and int(user.id) not in flipped_ids:
+                    flipped_ids.append(int(user.id))
+                    stats["flipped"] += 1
+        except Exception:  # noqa: BLE001
+            logger.debug("near-limit usage pull failed user_id=%s", uid, exc_info=True)
+
+    # --- Phase 4: freeze remotes NOW — flipped first, then a few retries ---
+    freeze_ids = list(dict.fromkeys(flipped_ids + retry_ids[:15]))
+    for uid in freeze_ids:
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(User)
+                    .where(User.id == uid)
+                    .options(
+                        selectinload(User.panel_accounts).selectinload(
+                            PanelAccount.panel
+                        )
+                    )
+                )
+                user = result.scalar_one_or_none()
+                if not user:
+                    continue
+                if user.status not in (
+                    UserStatus.limited,
+                    UserStatus.expired,
+                    UserStatus.disabled,
+                ):
+                    continue
+                await sync_modify_user(
+                    db, user, remote_timeout=10, skip_nginx_sync=True
+                )
+                fail = any(
+                    a.status == PanelAccountStatus.error
+                    for a in (user.panel_accounts or [])
+                    if a.status != PanelAccountStatus.deleted
+                )
+                await db.commit()
+                if fail:
+                    stats["freeze_fail"] += 1
+                else:
+                    stats["freeze_ok"] += 1
+        except Exception:  # noqa: BLE001
+            stats["freeze_fail"] += 1
+            logger.warning(
+                "quota freeze failed user_id=%s", uid, exc_info=True
+            )
+
+    return stats
+
+
+async def recount_group_usage_local(db: AsyncSession, group_id: int) -> list[int]:
     """Apply live GroupPanel coefficients to Astra used_traffic (no remote I/O).
 
     Formula: used_astra = Σ (panel_account.raw × coeff of that account's group×panel).
-    Example: 1 GB raw with coeff 1.33 → 1.33 GB on Astra.
-    Call synchronously after group coefficient save so admin UI updates immediately.
+    Returns user ids whose quota status flipped (limited/expired/active).
     """
     ug = await db.execute(select(UserGroup.user_id).where(UserGroup.group_id == group_id))
     user_ids = [row[0] for row in ug.all()]
     if not user_ids:
-        return 0
+        return []
 
     from app.services.group_configs import sample_username_for_group
 
@@ -3199,14 +4142,63 @@ async def recount_group_usage_local(db: AsyncSession, group_id: int) -> int:
         .options(selectinload(User.panel_accounts))
     )
     users = [u for u in result.scalars().unique().all() if u.username != sample]
+    if not users:
+        return []
+
+    ug_all = await db.execute(
+        select(UserGroup).where(UserGroup.user_id.in_([int(u.id) for u in users]))
+    )
+    gids_by_user: dict[int, list[int]] = {}
+    all_gids: set[int] = set()
+    for row in ug_all.scalars().all():
+        uid = int(row.user_id)
+        gid = int(row.group_id)
+        gids_by_user.setdefault(uid, []).append(gid)
+        all_gids.add(gid)
+
+    claims: dict[tuple[int, int], float] = {}
+    if all_gids:
+        gp_rows = await db.execute(
+            select(GroupPanel).where(GroupPanel.group_id.in_(list(all_gids)))
+        )
+        for link in gp_rows.scalars().all():
+            claims[(int(link.panel_id), int(link.group_id))] = coefficient_from_config(
+                link.config if isinstance(link.config, dict) else {}
+            )
+
+    flipped: list[int] = []
     for user in users:
         accounts = list(user.panel_accounts or [])
-        account_coeffs = await account_coefficients_for_user(db, user, accounts)
+        user_gids = gids_by_user.get(int(user.id), [])
+        account_coeffs: dict[int, float] = {}
+        for account in accounts:
+            gid = getattr(account, "group_id", None)
+            if gid is not None:
+                account_coeffs[account.id] = _norm_coeff(
+                    claims.get((int(account.panel_id), int(gid)), 1.0)
+                )
+            else:
+                best = 1.0
+                found = False
+                for gg in user_gids:
+                    val = claims.get((int(account.panel_id), int(gg)))
+                    if val is None:
+                        continue
+                    if not found or val > best:
+                        best = val
+                        found = True
+                account_coeffs[account.id] = _norm_coeff(best)
         user.used_traffic = await _weighted_total(accounts, account_coeffs)
-        await enforce_user_quota(db, user)
+        if await enforce_user_quota(db, user):
+            flipped.append(int(user.id))
     await db.flush()
-    logger.info("group %s local coeff recount users=%s", group_id, len(users))
-    return len(users)
+    logger.info(
+        "group %s local coeff recount users=%s flipped=%s",
+        group_id,
+        len(users),
+        len(flipped),
+    )
+    return flipped
 
 
 async def resync_users_for_group(

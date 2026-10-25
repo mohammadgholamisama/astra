@@ -408,8 +408,10 @@ async def _sample_fingerprints(db: AsyncSession) -> dict[tuple[str, int, str], d
                 if isinstance(link, str) and is_share_link(link):
                     rows.append({"link": link, "panel": panel_name})
 
-    # Mirror subscription fingerprint collapse (host:port[+SNI])
-    seen_fp: set[tuple[str, int, str]] = set()
+    # Mirror subscription fingerprint collapse (host:port[+SNI][+path])
+    from app.services.config_locations import extract_link_path
+
+    seen_fp: set[tuple] = set()
     for row in rows:
         link = str(row.get("link") or "").strip()
         if not link or not is_share_link(link):
@@ -419,9 +421,12 @@ async def _sample_fingerprints(db: AsyncSession) -> dict[tuple[str, int, str], d
             continue
         match = extract_link_match_host(link) or ""
         norm = try_normalize_endpoint(ep[0], ep[1], match)
-        if not norm or norm in seen_fp:
+        if not norm:
             continue
-        seen_fp.add(norm)
+        key: tuple = (*norm, extract_link_path(link))
+        if key in seen_fp:
+            continue
+        seen_fp.add(key)
         panel_name = str(row.get("panel") or "")
         group_name = ""
         gid = row.get("group_id")

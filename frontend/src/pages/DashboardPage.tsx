@@ -8,12 +8,16 @@ import {
   ArrowUpLeft,
   CheckCircle2,
   Clock,
+  Cpu,
   Download,
   Flame,
   Gauge,
+  HardDrive,
   KeyRound,
   Layers,
   ListOrdered,
+  MemoryStick,
+  Network,
   RefreshCw,
   Server,
   Sparkles,
@@ -22,8 +26,64 @@ import {
   Wifi,
   X,
 } from "lucide-react";
-import { ApiError, api, SystemStats, TopUserStat, UpdateStatus } from "../lib/api";
+import {
+  ApiError,
+  api,
+  formatBytes,
+  HostMetrics,
+  SystemStats,
+  TopUserStat,
+  UpdateStatus,
+} from "../lib/api";
 import { formatTraffic, toFaDigits, usagePercent } from "../lib/format";
+
+function fmtHostBytes(n: number): string {
+  if (!n || n < 0) return "۰ B";
+  return toFaDigits(formatBytes(n).replace("∞", "0 B"));
+}
+
+function fmtUptime(sec: number): string {
+  const s = Math.max(0, Math.floor(sec || 0));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const parts: string[] = [];
+  if (d) parts.push(`${toFaDigits(d)} روز`);
+  if (h || d) parts.push(`${toFaDigits(h)} ساعت`);
+  parts.push(`${toFaDigits(m)} دقیقه`);
+  return parts.join(" و ");
+}
+
+function gaugeTone(pct: number): "ok" | "mid" | "hot" {
+  if (pct >= 90) return "hot";
+  if (pct >= 70) return "mid";
+  return "ok";
+}
+
+function serviceTone(state: string): "ok" | "warn" | "bad" | "mute" {
+  const s = (state || "").toLowerCase();
+  if (s === "active") return "ok";
+  if (s === "activating" || s === "deactivating") return "warn";
+  if (s === "failed" || s === "inactive") return "bad";
+  return "mute";
+}
+
+function serviceLabelFa(state: string): string {
+  switch ((state || "").toLowerCase()) {
+    case "active":
+      return "فعال";
+    case "inactive":
+      return "خاموش";
+    case "failed":
+      return "خطا";
+    case "activating":
+      return "در حال روشن";
+    case "deactivating":
+      return "در حال خاموش";
+    default:
+      return state || "نامشخص";
+  }
+}
 
 type StatCard = {
   key: string;
@@ -102,6 +162,19 @@ export default function DashboardPage() {
     queryFn: () => api<SystemStats>("/api/system"),
     staleTime: 0,
     refetchOnMount: "always",
+    refetchOnWindowFocus: true,
+  });
+
+  const {
+    data: host,
+    isLoading: hostLoading,
+    isFetching: hostFetching,
+    refetch: refetchHost,
+  } = useQuery({
+    queryKey: ["system-host"],
+    queryFn: () => api<HostMetrics>("/api/system/host"),
+    refetchInterval: 5000,
+    staleTime: 2000,
     refetchOnWindowFocus: true,
   });
 
@@ -441,6 +514,215 @@ export default function DashboardPage() {
           </div>,
           document.body
         )}
+
+      {(host || hostLoading) && (
+        <section className="board-host" aria-label="وضعیت سرور">
+          <div className="board-host-head">
+            <div>
+              <h2>
+                <Server size={16} aria-hidden />
+                وضعیت سرور
+              </h2>
+              <p>
+                {host
+                  ? `${host.hostname} · ${host.os} · ${host.arch}`
+                  : "در حال دریافت…"}
+              </p>
+            </div>
+            <button
+              type="button"
+              className="btn ghost sm board-refresh"
+              disabled={hostFetching}
+              onClick={() => void refetchHost()}
+              title="تازه‌سازی"
+            >
+              <RefreshCw
+                size={14}
+                className={hostFetching ? "spin" : undefined}
+              />
+              زنده
+            </button>
+          </div>
+
+          {hostLoading && !host ? (
+            <div className="board-host-skel" aria-hidden>
+              <div className="board-skel-block metric" />
+              <div className="board-skel-block metric" />
+              <div className="board-skel-block metric" />
+            </div>
+          ) : host ? (
+            <>
+              <div className="board-host-gauges">
+                {(
+                  [
+                    {
+                      key: "cpu",
+                      label: "CPU",
+                      pct: host.cpu_percent,
+                      icon: <Cpu size={18} />,
+                      detail: `${toFaDigits(host.cpu_count_logical)} هسته${
+                        host.cpu_freq_mhz
+                          ? ` · ${toFaDigits(Math.round(host.cpu_freq_mhz))} MHz`
+                          : ""
+                      }`,
+                    },
+                    {
+                      key: "ram",
+                      label: "رم",
+                      pct: host.memory.percent,
+                      icon: <MemoryStick size={18} />,
+                      detail: `${fmtHostBytes(host.memory.used)} / ${fmtHostBytes(
+                        host.memory.total
+                      )}`,
+                    },
+                    {
+                      key: "disk",
+                      label: "دیسک",
+                      pct: host.disks[0]?.percent ?? 0,
+                      icon: <HardDrive size={18} />,
+                      detail: host.disks[0]
+                        ? `${fmtHostBytes(host.disks[0].used)} / ${fmtHostBytes(
+                            host.disks[0].total
+                          )}`
+                        : "—",
+                    },
+                  ] as const
+                ).map((g) => {
+                  const tone = gaugeTone(g.pct);
+                  return (
+                    <article
+                      key={g.key}
+                      className={`board-host-gauge tone-${tone}`}
+                    >
+                      <div className="board-host-gauge-top">
+                        <span className="board-host-gauge-ico" aria-hidden>
+                          {g.icon}
+                        </span>
+                        <span>{g.label}</span>
+                        <strong dir="ltr">{toFaDigits(g.pct.toFixed(0))}٪</strong>
+                      </div>
+                      <div className="board-host-gauge-track" aria-hidden>
+                        <i style={{ width: `${Math.min(100, g.pct)}%` }} />
+                      </div>
+                      <p className="board-host-gauge-detail" dir="ltr">
+                        {g.detail}
+                      </p>
+                    </article>
+                  );
+                })}
+              </div>
+
+              <div className="board-host-meta">
+                <div>
+                  <span>آپتایم</span>
+                  <b>{fmtUptime(host.uptime_seconds)}</b>
+                </div>
+                <div>
+                  <span>Load</span>
+                  <b dir="ltr">
+                    {host.load_avg
+                      .map((n) => toFaDigits(Number(n).toFixed(2)))
+                      .join(" · ")}
+                  </b>
+                </div>
+                <div>
+                  <span>پردازه‌ها</span>
+                  <b>{toFaDigits(host.process_count)}</b>
+                </div>
+                <div>
+                  <span>شبکه ↓ / ↑</span>
+                  <b dir="ltr">
+                    {fmtHostBytes(host.net.bytes_recv)} /{" "}
+                    {fmtHostBytes(host.net.bytes_sent)}
+                  </b>
+                </div>
+                {host.swap.total > 0 ? (
+                  <div>
+                    <span>Swap</span>
+                    <b dir="ltr">
+                      {toFaDigits(host.swap.percent.toFixed(0))}٪ ·{" "}
+                      {fmtHostBytes(host.swap.used)} /{" "}
+                      {fmtHostBytes(host.swap.total)}
+                    </b>
+                  </div>
+                ) : null}
+                <div>
+                  <span>Python</span>
+                  <b dir="ltr">{host.python}</b>
+                </div>
+              </div>
+
+              {host.cpu_per_core.length > 1 ? (
+                <div className="board-host-cores" aria-label="هسته‌های CPU">
+                  {host.cpu_per_core.map((pct, i) => (
+                    <div
+                      key={i}
+                      className={`board-host-core tone-${gaugeTone(pct)}`}
+                      title={`Core ${i}: ${pct}%`}
+                    >
+                      <span>{toFaDigits(i + 1)}</span>
+                      <div className="board-host-core-track" aria-hidden>
+                        <i style={{ height: `${Math.min(100, pct)}%` }} />
+                      </div>
+                      <em dir="ltr">{toFaDigits(Math.round(pct))}٪</em>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+
+              {host.disks.length > 1 ? (
+                <div className="board-host-disks">
+                  {host.disks.slice(1).map((d) => (
+                    <div key={d.mount} className="board-host-disk-row">
+                      <HardDrive size={14} aria-hidden />
+                      <code dir="ltr">{d.mount}</code>
+                      <div className="board-host-gauge-track" aria-hidden>
+                        <i
+                          className={`tone-${gaugeTone(d.percent)}`}
+                          style={{ width: `${Math.min(100, d.percent)}%` }}
+                        />
+                      </div>
+                      <span dir="ltr">
+                        {toFaDigits(d.percent.toFixed(0))}٪ ·{" "}
+                        {fmtHostBytes(d.used)} / {fmtHostBytes(d.total)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+
+              <div className="board-host-services">
+                <div className="board-host-services-head">
+                  <Network size={14} aria-hidden />
+                  <h3>سرویس‌ها</h3>
+                </div>
+                <div className="board-host-svc-grid">
+                  {host.services.map((s) => {
+                    const tone = serviceTone(s.state);
+                    return (
+                      <div
+                        key={s.name}
+                        className={`board-host-svc tone-${tone}`}
+                        title={s.name}
+                      >
+                        <span className={`board-host-svc-dot tone-${tone}`} />
+                        <div>
+                          <strong>{s.label}</strong>
+                          <small>{serviceLabelFa(s.state)}</small>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {host.note ? (
+                <p className="board-host-note muted">{host.note}</p>
+              ) : null}
+            </>
+          ) : null}
+        </section>
+      )}
 
       {data && (
         <>

@@ -13,6 +13,7 @@ class PanelType(str, enum.Enum):
     pasarguard = "pasarguard"
     marzban = "marzban"
     rebecca = "rebecca"
+    astra = "astra"
 
 
 class Panel(Base):
@@ -34,3 +35,9 @@ class Panel(Base):
 
     group_links = relationship("GroupPanel", back_populates="panel", cascade="all, delete-orphan")
     accounts = relationship("PanelAccount", back_populates="panel", cascade="all, delete-orphan")
+    astra_outbounds = relationship(
+        "AstraOutbound", back_populates="panel", cascade="all, delete-orphan"
+    )
+    astra_node_clients = relationship(
+        "AstraNodeClient", back_populates="panel", cascade="all, delete-orphan"
+    )

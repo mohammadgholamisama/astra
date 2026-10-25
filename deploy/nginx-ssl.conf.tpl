@@ -16,8 +16,8 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    listen 443 ssl;
+    listen [::]:443 ssl;
     server_name __DOMAIN__;
 
     ssl_certificate     /etc/letsencrypt/live/__DOMAIN__/fullchain.pem;
@@ -48,7 +48,11 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Accept-Encoding "";
         proxy_read_timeout 120s;
+        gzip off;
+        proxy_buffering off;
+        chunked_transfer_encoding off;
     }
 
     location = /health {
@@ -78,6 +82,9 @@ server {
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
+
+    # Astra outbound node: VLESS+WS (TLS terminated here / Cloudflare)
+    include /opt/astra/nginx/astra-xray-ws.conf;
 
     location / {
         try_files $uri $uri/ /index.html;

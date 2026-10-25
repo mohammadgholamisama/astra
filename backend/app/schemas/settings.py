@@ -45,7 +45,7 @@ class SiteSettingsUpdate(BaseModel):
 
 
 class SslIssueRequest(BaseModel):
-    target: str = Field(description="panel or sub")
+    target: str = Field(description="panel | sub | node (outbound CDN host)")
     domain: str = Field(min_length=3, max_length=253)
 
 

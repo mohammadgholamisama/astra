@@ -661,6 +661,45 @@ export default function UsersPage() {
     onError: (e: Error) => setActionMsg({ type: "err", text: e.message }),
   });
 
+  type RetryAllResult = {
+    attempted: number;
+    recovered: number;
+    remaining: number;
+    dropped: number;
+    skipped_unreachable: number;
+    panels_ok: string[];
+    panels_down: string[];
+    users_recovered: number;
+    users_remaining: number;
+  };
+
+  const retryAll = useMutation({
+    mutationFn: () =>
+      api<RetryAllResult>("/api/users/retry-errors", { method: "POST" }),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: ["users"] });
+      setErrorsUser(null);
+      let text = "خطای فعالی برای تلاش مجدد نبود";
+      if (r.recovered > 0 && r.remaining <= 0) {
+        text = `همه خطاها برطرف شد (${toFaDigits(r.recovered)} مورد)`;
+      } else if (r.recovered > 0) {
+        text = `${toFaDigits(r.recovered)} خطا برطرف شد — ${toFaDigits(r.remaining)} هنوز خطا دارد`;
+      } else if (r.dropped > 0 && r.remaining <= 0) {
+        text = `خطاهای پنل خاموش پاک شد (${toFaDigits(r.dropped)})`;
+      } else if (r.skipped_unreachable > 0 || r.remaining > 0) {
+        const names = (r.panels_down || []).slice(0, 3).join("، ");
+        text = names
+          ? `پنل ${names} هنوز پاسخ نمی‌دهد — خطاها باقی ماند`
+          : "پنل‌ها هنوز پاسخ ندادند — خطاها باقی ماند";
+      }
+      setActionMsg({
+        type: r.remaining > 0 && r.recovered <= 0 ? "err" : "ok",
+        text,
+      });
+    },
+    onError: (e: Error) => setActionMsg({ type: "err", text: e.message }),
+  });
+
   const togglePower = useMutation({
     mutationFn: ({ username, enable }: { username: string; enable: boolean }) =>
       api<User>(`/api/user/${encodeURIComponent(username)}`, {
@@ -679,18 +718,47 @@ export default function UsersPage() {
     onError: (e: Error) => setActionMsg({ type: "err", text: e.message }),
   });
 
+  function patchUserInCache(updated: User) {
+    // Instant UI update — don't wait for refetch / full page refresh
+    qc.setQueryData(usersQueryKey, (prev: UsersListPayload | undefined) => {
+      if (!prev?.users) return prev;
+      let hit = false;
+      const users = prev.users.map((u) => {
+        if (u.username !== updated.username) return u;
+        hit = true;
+        return { ...u, ...updated };
+      });
+      return hit ? { ...prev, users } : prev;
+    });
+    qc.setQueriesData(
+      { queryKey: ["users"] },
+      (prev: UsersListPayload | undefined) => {
+        if (!prev?.users) return prev;
+        let hit = false;
+        const users = prev.users.map((u) => {
+          if (u.username !== updated.username) return u;
+          hit = true;
+          return { ...u, ...updated };
+        });
+        return hit ? { ...prev, users } : prev;
+      }
+    );
+  }
+
   const resetTraffic = useMutation({
     mutationFn: (username: string) =>
       api<User>(`/api/user/${encodeURIComponent(username)}/reset`, {
         method: "POST",
       }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["users"] });
+    onSuccess: (updated) => {
+      patchUserInCache(updated);
       setResetUser(null);
       setActionMsg({
         type: "ok",
-        text: "مصرف بازنشانی شد — روی Astra و پنل‌های اصلی صفر شد",
+        text: "مصرف بازنشانی شد",
       });
+      // Soft background refresh — UI already shows zeros
+      void qc.invalidateQueries({ queryKey: ["users"] });
     },
     onError: (e: Error) => {
       setResetUser(null);
@@ -714,14 +782,21 @@ export default function UsersPage() {
         clear_display_name: !dn,
         data_limit: gb > 0 ? gbToBytes(gb) : 0,
         expire,
-        group_ids: editGroupIds,
       };
+      // Only send group_ids when membership actually changed — avoids a full
+      // re-provision of every panel on every volume/expire edit (very slow).
+      const groupsChanged =
+        editGroupIds.length !== editInitialGroupIds.length ||
+        editGroupIds.some((id, i) => id !== editInitialGroupIds[i]);
+      if (groupsChanged) {
+        body.group_ids = editGroupIds;
+      }
       return api<User>(`/api/user/${encodeURIComponent(editUser.username)}`, {
         method: "PUT",
         body: JSON.stringify(body),
       });
     },
-    onSuccess: () => {
+    onSuccess: (updated) => {
       const initial = new Set(editInitialGroupIds);
       const next = new Set(editGroupIds);
       const added = editGroupIds.filter((id) => !initial.has(id)).length;
@@ -729,7 +804,7 @@ export default function UsersPage() {
       const parts: string[] = [];
       if (added) parts.push(`${toFaDigits(added)} گروه اضافه`);
       if (removed) parts.push(`${toFaDigits(removed)} گروه حذف از پنل و ساب`);
-      qc.invalidateQueries({ queryKey: ["users"] });
+      patchUserInCache(updated);
       setEditUser(null);
       setActionMsg({
         type: "ok",
@@ -737,6 +812,7 @@ export default function UsersPage() {
           ? `ذخیره شد · ${parts.join(" · ")}`
           : "ذخیره شد",
       });
+      void qc.invalidateQueries({ queryKey: ["users"] });
     },
     onError: (e: Error) => setActionMsg({ type: "err", text: e.message }),
   });
@@ -1025,6 +1101,7 @@ export default function UsersPage() {
     marzban: "مرزبان",
     pasarguard: "پاسارگاد",
     sanaei: "سنایی",
+    astra: "آسترا",
     rebecca: "ربکا",
   };
 
@@ -1088,6 +1165,21 @@ export default function UsersPage() {
           </p>
         </div>
         <div className="users-head-actions">
+          {stats.withError > 0 && (
+            <button
+              type="button"
+              className="btn ghost sm users-retry-all-btn"
+              onClick={() => retryAll.mutate()}
+              disabled={retryAll.isPending || retry.isPending}
+              title="تلاش مجدد همه خطاهای پنل"
+              aria-label="تلاش مجدد همه خطاها"
+            >
+              <RefreshCw size={15} className={retryAll.isPending ? "spin" : undefined} />
+              <span className="users-retry-all-label">
+                {retryAll.isPending ? "در حال تلاش…" : "تلاش مجدد همه"}
+              </span>
+            </button>
+          )}
           <button
             type="button"
             className="btn ghost sm users-sync-btn"
@@ -1245,6 +1337,25 @@ export default function UsersPage() {
           <span>{actionMsg.text}</span>
           <button type="button" className="btn ghost sm" onClick={() => setActionMsg(null)}>
             بستن
+          </button>
+        </div>
+      )}
+
+      {stats.withError > 0 && (
+        <div className="users-retry-banner">
+          <AlertTriangle size={16} />
+          <p>
+            {toFaDigits(stats.withError)} کاربر با خطای پنل — بعد از وصل شدن پنل، همه را یک‌جا تلاش
+            مجدد کنید. خطاهایی که هنوز پنل‌شان پاسخ ندهد باقی می‌مانند.
+          </p>
+          <button
+            type="button"
+            className="btn sm"
+            onClick={() => retryAll.mutate()}
+            disabled={retryAll.isPending || retry.isPending}
+          >
+            <RefreshCw size={14} className={retryAll.isPending ? "spin" : undefined} />
+            {retryAll.isPending ? "در حال تلاش مجدد…" : "تلاش مجدد همه خطاها"}
           </button>
         </div>
       )}
@@ -1629,7 +1740,7 @@ export default function UsersPage() {
                   <button
                     type="button"
                     role="menuitem"
-                    disabled={retry.isPending}
+                    disabled={retry.isPending || retryAll.isPending}
                     onClick={() => {
                       setMenuUser(null);
                       retry.mutate(u.username);
@@ -3028,7 +3139,7 @@ export default function UsersPage() {
                 <button
                   type="button"
                   className="btn"
-                  disabled={retry.isPending}
+                  disabled={retry.isPending || retryAll.isPending}
                   onClick={() => {
                     retry.mutate(errorsUser.username);
                     setErrorsUser(null);

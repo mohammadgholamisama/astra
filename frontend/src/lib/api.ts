@@ -96,7 +96,48 @@ export async function login(username: string, password: string) {
   return res.json() as Promise<{ access_token: string; token_type: string }>;
 }
 
-export type PanelType = "sanaei" | "pasarguard" | "marzban" | "rebecca";
+export type PanelType = "sanaei" | "pasarguard" | "marzban" | "rebecca" | "astra";
+
+export interface AstraOutbound {
+  id: number;
+  panel_id: number;
+  uri: string;
+  remark: string;
+  protocol: string;
+  host: string;
+  port: number;
+  is_enabled: boolean;
+  last_ping_ms: number | null;
+  last_ping_ok: boolean | null;
+  last_ping_at: string | null;
+  sort_order: number;
+  created_at?: string | null;
+}
+
+export interface AstraNodeClient {
+  id: number;
+  panel_id: number;
+  email: string;
+  uuid: string;
+  enable: boolean;
+  data_limit: number;
+  used_traffic: number;
+  weighted_used: number;
+  coefficient: number;
+  limit_ip: number;
+  expire: number;
+  links_count: number;
+  share_links?: string[];
+  subscription_url?: string | null;
+  user_id: number | null;
+  astra_username: string | null;
+  user_status: string | null;
+  group_id: number | null;
+  group_name: string | null;
+  account_status: string | null;
+  account_used_traffic: number | null;
+  created_at?: string | null;
+}
 
 export interface Panel {
   id: number;
@@ -205,6 +246,54 @@ export interface SystemStats {
   total_used_traffic: number;
   top_users?: TopUserStat[];
   update_supported?: boolean;
+}
+
+export interface HostBytesStat {
+  total: number;
+  used: number;
+  free: number;
+  percent: number;
+  available?: number;
+}
+
+export interface HostDiskStat extends HostBytesStat {
+  mount: string;
+}
+
+export interface HostServiceStat {
+  name: string;
+  label: string;
+  state: string;
+}
+
+export interface HostMetrics {
+  ok: boolean;
+  engine: string;
+  hostname: string;
+  os: string;
+  arch: string;
+  python: string;
+  collected_at: number;
+  cpu_percent: number;
+  cpu_count_logical: number;
+  cpu_count_physical?: number | null;
+  cpu_per_core: number[];
+  cpu_freq_mhz?: number | null;
+  load_avg: [number, number, number] | number[];
+  memory: HostBytesStat;
+  swap: HostBytesStat;
+  disks: HostDiskStat[];
+  uptime_seconds: number;
+  boot_time: number;
+  process_count: number;
+  net: {
+    bytes_sent: number;
+    bytes_recv: number;
+    packets_sent: number;
+    packets_recv: number;
+  };
+  services: HostServiceStat[];
+  note?: string;
 }
 
 export interface UpdateStatus {

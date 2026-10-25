@@ -122,3 +122,17 @@ class UserBulkCreateResponse(BaseModel):
     created: list[UserResponse] = Field(default_factory=list)
     failed: list[UserBulkFail] = Field(default_factory=list)
     total_requested: int = 0
+
+
+class UserRetryErrorsResponse(BaseModel):
+    """Bulk retry of error/pending remote accounts across all users."""
+
+    attempted: int = 0
+    recovered: int = 0
+    remaining: int = 0
+    dropped: int = 0
+    skipped_unreachable: int = 0
+    panels_ok: list[str] = Field(default_factory=list)
+    panels_down: list[str] = Field(default_factory=list)
+    users_recovered: int = 0
+    users_remaining: int = 0

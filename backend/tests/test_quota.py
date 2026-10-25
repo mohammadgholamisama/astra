@@ -27,6 +27,15 @@ def test_weighted_coeff_1_33():
     assert weighted_bytes(1000, 1.33) == 1330
 
 
+def test_norm_coeff_no_upper_cap():
+    from app.services.quota import norm_coeff
+
+    assert abs(norm_coeff(1000) - 1000) < 1e-9
+    assert abs(norm_coeff(5000) - 5000) < 1e-9
+    assert abs(norm_coeff("12345.75") - 12345.75) < 1e-9
+    assert abs(norm_coeff(1_000_000) - 1_000_000) < 1e-9
+
+
 def test_multi_group_coeffs_sum_exact():
     """10×2 + 20×3 + 10×4 + 45×1 = 165 MB (shared-panel style)."""
     mb = 1024**2

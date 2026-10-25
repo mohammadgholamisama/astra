@@ -25,7 +25,7 @@ class GroupConfigItemOut(ORMModel):
 
 class GroupConfigItemUpdate(BaseModel):
     id: int
-    coefficient: float = Field(default=1.0, ge=0.01, le=1000)
+    coefficient: float = Field(default=1.0, ge=0.01)
     ip_limit_enabled: bool = False
     ip_limit: int = Field(default=0, ge=0, le=10000)
     label: str | None = None

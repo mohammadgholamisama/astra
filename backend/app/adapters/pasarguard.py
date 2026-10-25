@@ -96,6 +96,9 @@ class PasarGuardAdapter(MarzbanAdapter):
 
         NOTE: GET /api/group is invalid (POST-only create) → 405.
         """
+        cached = getattr(self, "_groups_memo", None)
+        if cached is not None:
+            return cached
         client, headers = await self._authed()
         # Operators: read_simple only. Owners: both work.
         attempts: list[tuple[str, dict[str, Any] | None]] = [
@@ -116,11 +119,13 @@ class PasarGuardAdapter(MarzbanAdapter):
             if parsed is None:
                 errors.append(f"{path}: unexpected response shape")
                 continue
+            self._groups_memo = parsed
             return parsed
 
         # Last resort for restricted operators
         fallback = await self._groups_from_admin_profile(headers)
         if fallback is not None:
+            self._groups_memo = fallback
             return fallback
 
         hint = (

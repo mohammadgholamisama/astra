@@ -47,8 +47,6 @@ def norm_coeff(raw: float | str | None, default: float = 1.0) -> float:
         c = float(default)
     if c < 0.01:
         c = 0.01
-    if c > 1000.0:
-        c = 1000.0
     return c
 
 

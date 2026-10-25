@@ -50,11 +50,24 @@ def _normalize_panel_config(config: Any) -> dict[str, Any]:
 
 
 def _panel_config_fingerprint(panels: list[Any]) -> tuple[tuple[int, str], ...]:
-    """Membership + config only (priority ignored) — drives coeff/remote resync."""
+    """Membership + full config (including coefficient)."""
     items: list[tuple[int, str]] = []
     for item in panels or []:
         pid = int(getattr(item, "panel_id"))
         cfg = _normalize_panel_config(getattr(item, "config", None) or {})
+        items.append(
+            (pid, json.dumps(cfg, sort_keys=True, default=str, ensure_ascii=False))
+        )
+    return tuple(sorted(items, key=lambda x: (x[0], x[1])))
+
+
+def _panel_remote_fingerprint(panels: list[Any]) -> tuple[tuple[int, str], ...]:
+    """Membership + remote-affecting config (coefficient is local-only)."""
+    items: list[tuple[int, str]] = []
+    for item in panels or []:
+        pid = int(getattr(item, "panel_id"))
+        cfg = _normalize_panel_config(getattr(item, "config", None) or {})
+        cfg.pop("coefficient", None)
         items.append(
             (pid, json.dumps(cfg, sort_keys=True, default=str, ensure_ascii=False))
         )
@@ -82,6 +95,54 @@ async def _bg_resync_group_users(
             )
     except Exception:  # noqa: BLE001
         logger.exception("bg group %s resync failed", group_id)
+
+
+async def _bg_recount_group_users(group_id: int) -> None:
+    """Coefficient-only save: recount Astra usage, freeze remotes that flipped."""
+    from sqlalchemy.orm import selectinload
+
+    from app.core.database import AsyncSessionLocal
+    from app.models.user import PanelAccount, User
+    from app.services.orchestrator import recount_group_usage_local, sync_modify_user
+
+    flipped: list[int] = []
+    try:
+        async with AsyncSessionLocal() as db:
+            flipped = await recount_group_usage_local(db, group_id)
+            await db.commit()
+            logger.info(
+                "bg group %s coeff recount flipped=%s", group_id, len(flipped)
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("bg group %s coeff recount failed", group_id)
+        return
+
+    for uid in flipped:
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(User)
+                    .where(User.id == uid)
+                    .options(
+                        selectinload(User.panel_accounts).selectinload(
+                            PanelAccount.panel
+                        )
+                    )
+                )
+                user = result.scalar_one_or_none()
+                if user is None:
+                    continue
+                await sync_modify_user(
+                    db, user, remote_timeout=10, skip_nginx_sync=True
+                )
+                await db.commit()
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "bg group %s freeze after coeff user_id=%s failed",
+                group_id,
+                uid,
+                exc_info=True,
+            )
 
 
 def _normalize_config_tag(raw: str | None) -> str:
@@ -391,34 +452,32 @@ async def update_group(
         group.category_id = None
     elif body.category_id is not None:
         group.category_id = await _ensure_category(db, body.category_id)
-    need_resync = False
+    need_full_resync = False
+    need_local_recount = False
     removed_panel_ids: list[int] = []
     if body.panels is not None:
         old_links = list(group.panel_links or [])
         old_fp = _panel_config_fingerprint(old_links)
         new_fp = _panel_config_fingerprint(body.panels)
+        old_remote_fp = _panel_remote_fingerprint(old_links)
+        new_remote_fp = _panel_remote_fingerprint(body.panels)
         old_pids = {int(link.panel_id) for link in old_links if link.panel_id is not None}
         new_pids = {int(getattr(p, "panel_id")) for p in body.panels}
         removed_panel_ids = sorted(old_pids - new_pids)
         await _set_panels(db, group, body.panels)
-        # Only remote-push when panel set / coefficient / inbounds / etc. actually changed
-        need_resync = old_fp != new_fp
-        # Removing a panel must always deprovision remotes even if fingerprint
-        # somehow matched (shouldn't) — belt and suspenders.
-        if removed_panel_ids:
-            need_resync = True
-    if need_resync:
-        # Apply raw×coeff to Astra used_traffic immediately (no remote I/O).
-        # Bg task still deletes remotes for removed panels + refreshes caps.
-        from app.services.orchestrator import recount_group_usage_local
-
-        await recount_group_usage_local(db, group_id)
+        need_local_recount = old_fp != new_fp
+        need_full_resync = old_remote_fp != new_remote_fp or bool(removed_panel_ids)
     await db.commit()
-    if need_resync:
-        # Never block PUT /api/group — large groups time out proxies (502/504).
+    # Never block PUT /api/group on remote I/O or a full user recount.
+    if need_full_resync:
         asyncio.create_task(
             _bg_resync_group_users(group_id, removed_panel_ids),
             name=f"astra-group-resync-{group_id}",
+        )
+    elif need_local_recount:
+        asyncio.create_task(
+            _bg_recount_group_users(group_id),
+            name=f"astra-group-recount-{group_id}",
         )
     group = await _load_group(db, group_id)
     return _to_out(group)  # type: ignore[arg-type]

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -14,6 +14,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api import (
     api_keys,
+    astra_outbounds,
     auth,
     backup,
     config_locations,
@@ -28,6 +29,7 @@ from app.api import (
     users,
 )
 # ensure new models are registered for schema sync
+from app.models import astra_outbound as _astra_outbound_model  # noqa: F401
 from app.models import config_link_order as _config_link_order_model  # noqa: F401
 from app.models import config_location as _config_location_model  # noqa: F401
 from app.models import group_config as _group_config_model  # noqa: F401
@@ -69,83 +71,85 @@ async def _heal_failed_panels_loop() -> None:
         await asyncio.sleep(45)
 
 
-async def _usage_sync_loop() -> None:
-    """Every ~USAGE_REFRESH_SECONDS: pull raw usage × coeff, disable remotes on quota end.
+async def _outbound_health_loop() -> None:
+    """Re-ping Astra outbounds so recovered ones reappear in subscription.
 
-    When Astra weighted used_traffic hits data_limit, status → limited and
-    sync_modify freezes configs on every panel (Marzban/PasarGuard/Sanaei/Rebecca).
-
-    SQLite: never hold one write transaction across hundreds of users + HTTP.
-    Each user gets its own short session so POST /api/user is not locked out.
+    When an outbound fails ping it is dropped from share-links; without this
+    loop it stayed missing until an admin clicked Ping even after recovery.
     """
-    from app.services.orchestrator import refresh_users_usage_batch
+    from app.models.panel import Panel, PanelType
+    from app.services import astra_node as node
 
-    await asyncio.sleep(8)
+    await asyncio.sleep(45)
     while True:
         try:
             async with AsyncSessionLocal() as db:
                 result = await db.execute(
-                    select(User.id)
-                    .where(
-                        User.status.in_(
-                            (
-                                UserStatus.active,
-                                UserStatus.on_hold,
-                                UserStatus.limited,
-                                UserStatus.expired,
-                            )
-                        )
+                    select(Panel).where(
+                        Panel.type == PanelType.astra,
+                        Panel.is_active.is_(True),
                     )
-                    .order_by(User.id.desc())
-                    .limit(2000)
                 )
-                user_ids = [int(r[0]) for r in result.all()]
-
-            if user_ids:
-                # Small chunks + low concurrency keep WAL writers brief on SQLite.
-                chunk_size = 12
-                done = 0
-                for i in range(0, len(user_ids), chunk_size):
-                    chunk = user_ids[i : i + chunk_size]
+                panels = list(result.scalars().all())
+                for panel in panels:
                     try:
-                        async with AsyncSessionLocal() as db:
-                            result = await db.execute(
-                                select(User)
-                                .where(User.id.in_(chunk))
-                                .options(
-                                    selectinload(User.panel_accounts).selectinload(
-                                        PanelAccount.panel
-                                    )
-                                )
+                        stats = await node.reconcile_outbounds_health(
+                            db, panel, concurrency=3
+                        )
+                        if stats.get("changed"):
+                            logger.info(
+                                "outbound health: panel=%s pinged=%s changed=%s ok=%s",
+                                panel.id,
+                                stats.get("pinged"),
+                                stats.get("changed"),
+                                stats.get("ok"),
                             )
-                            users = list(result.scalars().unique().all())
-                            if users:
-                                await refresh_users_usage_batch(
-                                    db,
-                                    users,
-                                    force=True,
-                                    # SQLite: one writer at a time — avoids "database is locked"
-                                    # on POST /api/user while sync_modify holds a transaction.
-                                    concurrency=1,
-                                    push_remotes=True,
-                                    quick=True,
-                                    isolated=True,
-                                )
-                            await db.commit()
-                            done += len(users)
                     except Exception:  # noqa: BLE001
                         logger.exception(
-                            "usage sync chunk failed ids=%s", chunk[:5]
+                            "outbound health reconcile failed panel=%s", panel.id
                         )
-                    # Yield so create/update requests can acquire the write lock
-                    await asyncio.sleep(0.05)
-                logger.info("usage sync loop: refreshed %s users", done)
+                await db.commit()
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
-            logger.exception("usage sync loop failed")
-        # Default 20s — faster freeze across all remotes when Astra quota ends
-        await asyncio.sleep(max(5, int(settings.USAGE_REFRESH_SECONDS or 20)))
+            logger.exception("outbound health loop failed")
+        await asyncio.sleep(120)
+
+
+async def _usage_sync_loop() -> None:
+    """Every ~10s: sync Astra traffic, detect quota end, freeze ALL remotes.
+
+    Does not depend on an admin opening the panel — exhausted users are
+    disabled on Marzban/PasarGuard/Sanaei/Rebecca/Astra as soon as the watch
+    cycle sees used ≥ limit.
+    """
+    import time as _time
+
+    from app.services.orchestrator import run_quota_watch_cycle
+
+    await asyncio.sleep(5)
+    while True:
+        t0 = _time.monotonic()
+        try:
+            stats = await run_quota_watch_cycle()
+            if stats.get("flipped") or stats.get("freeze_ok") or stats.get("freeze_fail"):
+                logger.info(
+                    "quota watch: astra=%s checked=%s flipped=%s freeze_ok=%s freeze_fail=%s pulled=%s",
+                    stats.get("astra_panels"),
+                    stats.get("checked"),
+                    stats.get("flipped"),
+                    stats.get("freeze_ok"),
+                    stats.get("freeze_fail"),
+                    stats.get("usage_pulled"),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("quota watch loop failed")
+        # Target cadence ≈ USAGE_REFRESH_SECONDS (default 10)
+        interval = max(5, int(settings.USAGE_REFRESH_SECONDS or 10))
+        elapsed = _time.monotonic() - t0
+        await asyncio.sleep(max(1.0, interval - elapsed))
 
 
 def _resolve_frontend_dist() -> Path | None:
@@ -183,12 +187,16 @@ async def lifespan(_app: FastAPI):
     heal_task = asyncio.create_task(
         _heal_failed_panels_loop(), name="astra-heal-panels"
     )
+    outbound_task = asyncio.create_task(
+        _outbound_health_loop(), name="astra-outbound-health"
+    )
     try:
         yield
     finally:
         usage_task.cancel()
         heal_task.cancel()
-        for task in (usage_task, heal_task):
+        outbound_task.cancel()
+        for task in (usage_task, heal_task, outbound_task):
             try:
                 await task
             except asyncio.CancelledError:
@@ -235,7 +243,21 @@ class SubHostGuardMiddleware(BaseHTTPMiddleware):
         return HTMLResponse(_SUB_HOST_LANDING, status_code=200)
 
 
-app.add_middleware(GZipMiddleware, minimum_size=800)
+class SubSkipGZipMiddleware(GZipMiddleware):
+    """v2rayNG / v2rayN / Streisand often read only the first ~16KB of gzip or
+    HTTP/2 DATA. Compressing /sub turns a 200-config feed into ~30 visible
+    servers until the user taps Update repeatedly."""
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            path = scope.get("path") or ""
+            if path.startswith("/sub"):
+                await self.app(scope, receive, send)
+                return
+        await super().__call__(scope, receive, send)
+
+
+app.add_middleware(SubSkipGZipMiddleware, minimum_size=800)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list + ["*"],
@@ -250,6 +272,7 @@ app.include_router(users.router)
 app.include_router(groups.router)
 app.include_router(group_configs.router)
 app.include_router(panels.router)
+app.include_router(astra_outbounds.router)
 app.include_router(templates.router)
 app.include_router(api_keys.router)
 app.include_router(settings_api.router)

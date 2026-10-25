@@ -303,6 +303,51 @@ def extract_link_match_host(link: str) -> str:
     return ""
 
 
+def extract_link_path(link: str) -> str:
+    """CDN/transport path from share link (ws / xhttp / grpc / httpupgrade / vmess).
+
+    Empty when the link has no path (raw TCP/Reality). Used so two Astra panels
+    on the same host:port[+SNI] with distinct paths are not collapsed in the sub.
+    """
+    from urllib.parse import parse_qs, unquote
+
+    raw = (link or "").strip()
+    if not raw or "://" not in raw:
+        return ""
+    scheme, rest = raw.split("://", 1)
+    scheme_l = scheme.lower()
+    rest = rest.split("#", 1)[0].strip()
+    if not rest:
+        return ""
+
+    path = ""
+    if scheme_l == "vmess":
+        try:
+            data = json.loads(_b64decode(rest).decode("utf-8", errors="ignore"))
+        except Exception:  # noqa: BLE001
+            return ""
+        if isinstance(data, dict):
+            path = str(data.get("path") or "").strip()
+    elif "?" in rest:
+        _auth, _, query = rest.partition("?")
+        qs = parse_qs(query, keep_blank_values=False)
+        for key in ("path", "serviceName", "service"):
+            vals = qs.get(key) or []
+            if vals and str(vals[0]).strip():
+                path = str(vals[0]).strip()
+                break
+
+    path = unquote(path or "").strip()
+    if not path or path == "/":
+        return ""
+    if not path.startswith("/"):
+        path = "/" + path
+    # Trailing slash variants of the same CDN base should fingerprint alike
+    if len(path) > 1:
+        path = path.rstrip("/")
+    return path.lower()
+
+
 def flag_for_link(link: str) -> str | None:
     """Resolve flag: specific (host+port+match_host) wins over general (host+port)."""
     info = resolve_location_for_link(link)

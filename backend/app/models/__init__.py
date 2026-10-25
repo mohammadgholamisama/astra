@@ -1,5 +1,6 @@
 from app.models.admin import Admin
 from app.models.api_key import ApiKey
+from app.models.astra_outbound import AstraNodeClient, AstraOutbound
 from app.models.config_link_order import ConfigLinkOrder
 from app.models.config_location import ConfigLocation
 from app.models.group import Group, GroupCategory, GroupPanel, UserGroup
@@ -13,6 +14,8 @@ from app.models.user import PanelAccount, PanelAccountStatus, User, UserStatus
 __all__ = [
     "Admin",
     "ApiKey",
+    "AstraOutbound",
+    "AstraNodeClient",
     "ConfigLinkOrder",
     "ConfigLocation",
     "Group",

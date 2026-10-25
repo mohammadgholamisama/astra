@@ -186,16 +186,51 @@ class RebeccaAdapter(MarzbanAdapter):
             "در پنل ربکا هیچ سرویسی تعریف نشده — اول در داشبورد ربکا یک Service بسازید"
         )
 
+    def _map_rebecca_status(self, payload: UserPayload, *, for_create: bool) -> tuple[str, int | None]:
+        """Rebecca status rules (probed on live Hajmi9_14):
+
+        - CREATE: only ``active`` | ``on_hold`` (on_hold needs on_hold_expire_duration > 0).
+          Sending ``disabled`` / ``limited`` / ``expired`` → ``invalid user status``.
+        - MODIFY: ``active`` | ``disabled`` | ``on_hold`` (with duration).
+          ``limited`` / ``expired`` are not writable — map to ``disabled``.
+        """
+        st = (payload.status or "active").lower().strip()
+        if st in ("limited", "expired"):
+            st = "disabled"
+        if st not in ("active", "on_hold", "disabled"):
+            st = "disabled"
+
+        hold_dur: int | None = None
+        raw_dur = (payload.config or {}).get("on_hold_expire_duration")
+        try:
+            hold_dur = int(raw_dur) if raw_dur is not None else None
+        except (TypeError, ValueError):
+            hold_dur = None
+        if hold_dur is not None and hold_dur <= 0:
+            hold_dur = None
+
+        if for_create:
+            # Create enum rejects disabled — create active then freeze via modify
+            if st == "on_hold" and hold_dur:
+                return "on_hold", hold_dur
+            return "active", None
+
+        if st == "on_hold":
+            if not hold_dur:
+                # Without duration Rebecca rejects on_hold; keep traffic cut via disabled
+                return "disabled", None
+            return "on_hold", hold_dur
+        return st, None
+
     async def _build_user_body(self, payload: UserPayload, *, include_username: bool) -> dict[str, Any]:
         """Match Rebecca dashboard POST /api/v2/users body."""
         service_id = await self._resolve_service_id(payload)
-        # Rebecca: no limited/expired — map those to disabled
-        st = payload.status or "active"
-        if st in ("limited", "expired"):
-            st = "disabled"
-        status = st if st in ("active", "on_hold", "disabled") else "disabled"
+        status, hold_dur = self._map_rebecca_status(payload, for_create=include_username)
         data_limit = int(payload.data_limit or 0)
         expire = int(payload.expire or 0) if payload.expire else 0
+        # on_hold cannot combine with expire on Rebecca/Marzban
+        if status == "on_hold":
+            expire = 0
         body: dict[str, Any] = {
             "service_id": service_id,
             "status": status,
@@ -207,7 +242,7 @@ class RebeccaAdapter(MarzbanAdapter):
             "data_limit_reset_strategy": payload.config.get("data_limit_reset_strategy", "no_reset"),
             "expire": expire if expire > 0 else None,
             "flow": None,
-            "on_hold_expire_duration": None,
+            "on_hold_expire_duration": hold_dur,
             "ip_limit": 0,
         }
         limit_ip = payload.config.get("limit_ip") or payload.config.get("ip_limit")
@@ -334,7 +369,15 @@ class RebeccaAdapter(MarzbanAdapter):
                 ok, data = ok_json(resp)
                 if ok and isinstance(data, dict):
                     result = self._from_user_response(data, payload.username)
-                    return await self._finalize_user_result(result, payload.username)
+                    result = await self._finalize_user_result(result, payload.username)
+                    # Created as active (create API rejects disabled). If Astra
+                    # user is limited/expired/disabled, freeze via modify.
+                    want, _ = self._map_rebecca_status(payload, for_create=False)
+                    if want == "disabled" and result.success:
+                        frozen = await self.modify_user(payload)
+                        if frozen.success:
+                            return frozen
+                    return result
                 last_err = err_msg(data, f"HTTP {resp.status_code} {path}")
                 # Don't try legacy if v2 clearly rejected the payload/auth
                 if resp.status_code in (401, 403, 422):

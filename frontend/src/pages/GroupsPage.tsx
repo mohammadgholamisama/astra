@@ -89,7 +89,7 @@ function emptyPick(panelId: number): PanelPick {
 /** Parse Astra usage coefficient; accepts 1.33 / 1,33 / فارسی digits. */
 function parseCoeff(raw: unknown, fallback = 1): number {
   if (typeof raw === "number") {
-    return !Number.isNaN(raw) && raw >= 0.01 ? raw : fallback;
+    return Number.isFinite(raw) && raw >= 0.01 ? raw : fallback;
   }
   let s = String(raw ?? "").trim();
   s = s
@@ -98,8 +98,8 @@ function parseCoeff(raw: unknown, fallback = 1): number {
     .replace(/,/g, ".");
   if (!s || s === ".") return fallback;
   const n = Number(s);
-  if (Number.isNaN(n) || n < 0.01) return fallback;
-  return Math.min(1000, n);
+  if (!Number.isFinite(n) || n < 0.01) return fallback;
+  return n;
 }
 
 function formatCoeffInput(c: number): string {
@@ -439,9 +439,6 @@ export default function GroupsPage() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["groups"] });
       qc.invalidateQueries({ queryKey: ["group-categories"] });
-      // Panel add/remove resyncs remotes + subs in the background
-      qc.invalidateQueries({ queryKey: ["users"] });
-      qc.invalidateQueries({ queryKey: ["configs"] });
       resetModal();
     },
   });
@@ -686,6 +683,9 @@ export default function GroupsPage() {
       return pick.protocols.length
         ? `${pick.protocols.length} از ${cat.protocols.length} سرویس`
         : `خودکار · ${cat.protocols.length} سرویس`;
+    }
+    if (panel.type === "astra") {
+      return "اوتباندهای نود آسترا (همهٔ سالم‌ها)";
     }
     return "";
   }
@@ -957,7 +957,69 @@ export default function GroupsPage() {
                         )}
                       </label>
 
-                      {on && pick && (
+                      {on && pick && p.type === "astra" && (
+                        <div className="group-panel-routes">
+                          <p className="field-hint">
+                            اوتباندها از صفحهٔ «اوتباندها»ی همین پنل مدیریت می‌شوند. با ساخت یوزر، همهٔ
+                            اوتباندهای سالم در ساب می‌آیند و مصرف روی نود آسترا قطع می‌شود.
+                          </p>
+                          <div className="user-create-grid" style={{ marginTop: 12 }}>
+                            <div className="field" style={{ marginBottom: 0 }}>
+                              <label>ضریب ساب Astra</label>
+                              <input
+                                type="text"
+                                inputMode="decimal"
+                                dir="ltr"
+                                placeholder="1"
+                                autoComplete="off"
+                                value={
+                                  coeffDrafts[p.id] !== undefined
+                                    ? coeffDrafts[p.id]
+                                    : formatCoeffInput(pick.coefficient)
+                                }
+                                onChange={(e) => {
+                                  const v = e.target.value;
+                                  setCoeffDrafts((prev) => ({ ...prev, [p.id]: v }));
+                                  const n = parseCoeff(v, NaN);
+                                  if (!Number.isNaN(n)) {
+                                    updatePick(p.id, { coefficient: n });
+                                  }
+                                }}
+                                onBlur={() => {
+                                  const draft = coeffDrafts[p.id];
+                                  const n = parseCoeff(
+                                    draft !== undefined ? draft : pick.coefficient,
+                                    1
+                                  );
+                                  updatePick(p.id, { coefficient: n });
+                                  setCoeffDrafts((prev) => {
+                                    const next = { ...prev };
+                                    delete next[p.id];
+                                    return next;
+                                  });
+                                }}
+                              />
+                            </div>
+                            <div className="field" style={{ marginBottom: 0 }}>
+                              <label>محدودیت IP (اختیاری)</label>
+                              <input
+                                type="number"
+                                min={0}
+                                dir="ltr"
+                                placeholder="0 = بدون محدودیت"
+                                value={pick.limit_ip || ""}
+                                onChange={(e) =>
+                                  updatePick(p.id, {
+                                    limit_ip: Math.max(0, Number(e.target.value) || 0),
+                                  })
+                                }
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {on && pick && p.type !== "astra" && (
                         <div className="group-panel-routes">
                           <div className="inbound-head">
                             <div>
@@ -1255,7 +1317,7 @@ export default function GroupsPage() {
                                 }}
                               />
                               <p className="field-hint" style={{ marginBottom: 0 }}>
-                                ۱ = همان حجم دانلود · ۱.۳۳ = مصرف Astra برابر خام × ۱.۳۳ (بیشتر از دانلود).
+                                ۱ = همان حجم دانلود · ۱.۳۳ = مصرف Astra برابر خام × ۱.۳۳. هر عدد مثبت پذیرفته می‌شود.
                               </p>
                             </div>
                             <div className="field" style={{ marginBottom: 0 }}>

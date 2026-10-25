@@ -100,6 +100,9 @@ async def _fetch_marz_protocols(panel: Panel) -> list[MarzProtocolOut]:
 
 
 def _validate_credentials(panel_type: PanelType, username: str | None, password: str | None, api_token: str | None) -> None:
+    if panel_type == PanelType.astra:
+        # Local node — no remote admin password; base_url = public entry host
+        return
     if panel_type == PanelType.sanaei:
         token = (api_token or "").strip()
         if token.lower().startswith("bearer "):
@@ -207,6 +210,43 @@ async def create_panel(
         raise HTTPException(status_code=409, detail="Panel name already exists")
     _validate_credentials(body.type, body.username, body.password, body.api_token)
 
+    meta = dict(body.meta or {})
+    if body.type == PanelType.astra:
+        from app.services.astra_node import ensure_panel_token
+
+        meta = ensure_panel_token(meta)
+        # Public client host — accept bare host or URL
+        base = str(body.base_url or "").strip() or "127.0.0.1"
+        if "://" not in base:
+            base = f"https://{base}"
+        panel = Panel(
+            name=body.name,
+            type=body.type,
+            base_url=normalize_panel_base_url(base),
+            username=None,
+            password=None,
+            api_token=str(meta.get("node_token") or ""),
+            meta=meta,
+            is_active=body.is_active,
+        )
+        db.add(panel)
+        await db.flush()
+        # Persist id into meta for adapter resolution, write initial xray config
+        meta = ensure_panel_token(meta, panel_id=panel.id)
+        meta["panel_id"] = panel.id
+        if not meta.get("public_host"):
+            meta["public_host"] = panel.base_url.replace("https://", "").replace(
+                "http://", ""
+            ).split("/")[0].split(":")[0]
+        panel.meta = meta
+        from app.services import astra_node as astra_node_svc
+
+        await astra_node_svc.rebuild_xray_config(db, panel)
+        panel.last_ok_at = datetime.now(timezone.utc)
+        await db.commit()
+        await db.refresh(panel)
+        return _to_out(panel)
+
     panel = Panel(
         name=body.name,
         type=body.type,
@@ -214,7 +254,7 @@ async def create_panel(
         username=(body.username or "").strip() or None,
         password=(body.password or "").strip() or None,
         api_token=(body.api_token or "").strip() or None,
-        meta=body.meta or {},
+        meta=meta,
         is_active=body.is_active,
     )
     # Test BEFORE persisting — wrong credentials must not create a row
@@ -328,6 +368,11 @@ async def update_panel(
     data = body.model_dump(exclude_unset=True)
     only_active = set(data.keys()) == {"is_active"}
     was_active = bool(panel.is_active)
+    old_astra_meta = (
+        dict(panel.meta or {})
+        if panel.type == PanelType.astra and isinstance(panel.meta, dict)
+        else {}
+    )
     for k, v in data.items():
         if k == "base_url" and v:
             v = normalize_panel_base_url(str(v))
@@ -351,9 +396,40 @@ async def update_panel(
         return _to_out(panel)
 
     _validate_credentials(panel.type, panel.username, panel.password, panel.api_token)
-    # Re-test with new credentials; reject update if remote rejects us
-    await _probe_panel(panel)
-    panel.last_ok_at = datetime.now(timezone.utc)
+    if panel.type == PanelType.astra:
+        from app.services import astra_node as astra_node_svc
+        from app.services.astra_node import ensure_panel_token
+
+        meta = ensure_panel_token(dict(panel.meta or {}), panel_id=panel.id)
+        meta["panel_id"] = panel.id
+        if body.base_url or meta.get("public_host"):
+            host = str(meta.get("public_host") or "").strip()
+            if not host:
+                raw = (panel.base_url or "").replace("https://", "").replace("http://", "")
+                host = raw.split("/")[0].split(":")[0]
+                meta["public_host"] = host
+            # Keep base_url aligned with public client host
+            if host:
+                panel.base_url = normalize_panel_base_url(f"https://{host}")
+        panel.meta = meta
+        panel.api_token = str(meta.get("node_token") or panel.api_token or "")
+        await astra_node_svc.rebuild_xray_config(db, panel)
+        # Always rewrite share links so subs pick up new host/port/path
+        n = await astra_node_svc.refresh_panel_account_links(db, panel)
+        logger.info(
+            "astra panel=%s link refresh: %s accounts · host %s→%s port %s→%s",
+            panel.id,
+            n,
+            old_astra_meta.get("public_host"),
+            meta.get("public_host"),
+            old_astra_meta.get("public_port"),
+            meta.get("public_port"),
+        )
+        panel.last_ok_at = datetime.now(timezone.utc)
+    else:
+        # Re-test with new credentials; reject update if remote rejects us
+        await _probe_panel(panel)
+        panel.last_ok_at = datetime.now(timezone.utc)
 
     await db.commit()
     await db.refresh(panel)
@@ -419,15 +495,42 @@ async def delete_panel(
     Every PanelAccount on this panel is deleted upstream (Marzban / PasarGuard /
     Sanaei / Rebecca) so old and new subs lose those configs and remotes stay clean.
     """
+    from sqlalchemy import delete as sa_delete
+
+    from app.models.astra_outbound import AstraNodeClient, AstraOutbound
+    from app.models.group import GroupPanel
     from app.services.orchestrator import deprovision_all_accounts_on_panel
 
     panel = await db.get(Panel, panel_id)
     if not panel:
         raise HTTPException(status_code=404, detail="Panel not found")
 
+    was_astra = panel.type == PanelType.astra
+    astra_meta = dict(panel.meta or {}) if was_astra else {}
+
     stats = await deprovision_all_accounts_on_panel(db, panel_id)
+
+    # Explicit child cleanup — avoids SQLite NOT NULL on FK nulling (async ORM)
+    await db.execute(sa_delete(AstraOutbound).where(AstraOutbound.panel_id == panel_id))
+    await db.execute(sa_delete(AstraNodeClient).where(AstraNodeClient.panel_id == panel_id))
+    await db.execute(sa_delete(GroupPanel).where(GroupPanel.panel_id == panel_id))
+
     await db.delete(panel)
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        await db.rollback()
+        logger.exception("delete panel=%s failed", panel_id)
+        raise HTTPException(status_code=500, detail=f"حذف پنل ناموفق: {exc}") from exc
+
+    if was_astra:
+        try:
+            from app.services import astra_node as astra_node_svc
+
+            await astra_node_svc.cleanup_panel_node(panel_id, astra_meta)
+        except Exception:  # noqa: BLE001
+            logger.exception("astra node cleanup panel=%s failed", panel_id)
+
     return {
         "detail": "Panel deleted",
         "remote_deleted": stats.get("ok", 0),

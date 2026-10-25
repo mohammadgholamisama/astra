@@ -146,7 +146,7 @@ async def _bg_sub_maintain(user_id: int) -> None:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("bg heal user_id=%s: %s", user_id, exc)
             try:
-                await asyncio.wait_for(hydrate_share_links(db, user), timeout=6.0)
+                await asyncio.wait_for(hydrate_share_links(db, user), timeout=18.0)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("bg hydrate user_id=%s: %s", user_id, exc)
             try:
@@ -155,7 +155,20 @@ async def _bg_sub_maintain(user_id: int) -> None:
                     refresh_usage(db, user, force=False, quick=True),
                     timeout=5.5,
                 )
-                await enforce_user_quota(db, user)
+                changed = await enforce_user_quota(db, user)
+                from app.models.user import UserStatus
+
+                blocked = user.status in (
+                    UserStatus.limited,
+                    UserStatus.expired,
+                    UserStatus.disabled,
+                )
+                if changed or blocked:
+                    # Freeze remotes immediately when sub client hits the limit
+                    await asyncio.wait_for(
+                        sync_modify_user(db, user, skip_nginx_sync=True),
+                        timeout=12.0,
+                    )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("bg usage user_id=%s: %s", user_id, exc)
             try:
@@ -200,12 +213,12 @@ def _sub_headers(user) -> dict[str, str]:
     sub = subscription_url(user)
     headers = {
         "profile-title": _header_base64(f"{brand}-{title_name}"),
-        # 1h so remark/tag changes (group config_tag) reach clients quickly
+        # Hours. Keep short so remark/tag changes reach clients quickly.
         "profile-update-interval": "1",
         "subscription-userinfo": f"upload={upload}; download={download}; total={total}; expire={expire}",
-        # filename ASCII only; some clients mishandle attachment — keep for PG parity
-        "content-disposition": f'attachment; filename="{file_base}"',
-        "cache-control": "no-store",
+        # inline — "attachment" makes some Android clients save a truncated file
+        "content-disposition": f'inline; filename="{file_base}.txt"',
+        "cache-control": "no-store, no-transform, private",
         "profile-web-page-url": sub,
     }
 
@@ -247,11 +260,16 @@ def _encode_feed(links: list[str]) -> bytes:
 
 
 def _feed_response(body: bytes, headers: dict[str, str]) -> Response:
-    """Plain feed with explicit Content-Length (avoid Transfer-Encoding: chunked)."""
-    hdrs = {**headers, "content-length": str(len(body))}
-    # Ensure we don't advertise chunked
+    """Plain uncompressed feed with Content-Length (no gzip, no chunked)."""
+    hdrs = {
+        **headers,
+        "content-length": str(len(body)),
+        "accept-ranges": "none",
+    }
     hdrs.pop("transfer-encoding", None)
     hdrs.pop("Transfer-Encoding", None)
+    hdrs.pop("content-encoding", None)
+    hdrs.pop("Content-Encoding", None)
     return Response(
         content=body,
         status_code=200,
@@ -265,7 +283,7 @@ async def _ensure_share_links(
     token: str,
     user,
     *,
-    timeout: float = 4.0,
+    timeout: float = 26.0,
     force: bool = False,
 ):
     """Hydrate missing share links with a hard budget (never block multi-panel users)."""
@@ -360,7 +378,7 @@ async def _render_info_page(db: AsyncSession, token: str, user) -> HTMLResponse:
         user = await load_user_by_token(db, token) or user
     else:
         user, _links = await _ensure_share_links(
-            db, token, user, timeout=3.5, force=True
+            db, token, user, timeout=26.0, force=True
         )
     _schedule_bg_maintain(int(user.id))
 
@@ -423,7 +441,7 @@ async def get_subscription(
         _schedule_bg_maintain(int(user.id))
     else:
         user, links = await _ensure_share_links(
-            db, token, user, timeout=4.0, force=True
+            db, token, user, timeout=26.0, force=True
         )
         _schedule_bg_maintain(int(user.id))
 

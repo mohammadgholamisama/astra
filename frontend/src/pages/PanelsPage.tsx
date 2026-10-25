@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2,
@@ -6,13 +7,23 @@ import {
   Plus,
   Power,
   Server,
+  ShieldCheck,
   Trash2,
   Wifi,
   XCircle,
 } from "lucide-react";
 import Select from "../components/Select";
-import { api, Panel, PanelType } from "../lib/api";
+import { api, ApiError, Panel, PanelType } from "../lib/api";
 import { toFaDigits } from "../lib/format";
+
+function hostFromBaseUrl(url: string): string {
+  return url
+    .replace(/^https?:\/\//i, "")
+    .split("/")[0]
+    .split(":")[0]
+    .trim()
+    .toLowerCase();
+}
 
 type InboundInfo = {
   id: number;
@@ -42,6 +53,11 @@ type MarzProtocolInfo = {
 };
 
 const TYPES: { value: PanelType; label: string; hint: string }[] = [
+  {
+    value: "astra",
+    label: "آسترا (اوتباند)",
+    hint: "اوتباند شِیر روی نود محلی — مصرف و خاموشی واقعی از طریق Astra",
+  },
   {
     value: "sanaei",
     label: "سنایی (3x-ui)",
@@ -98,12 +114,13 @@ function normalizeBaseUrl(url: string) {
 
 const emptyForm = {
   name: "",
-  type: "marzban" as PanelType,
+  type: "astra" as PanelType,
   base_url: "",
   username: "",
   password: "",
   api_token: "",
   is_active: true,
+  public_port: "443",
 };
 
 function inboundLabel(ib: InboundInfo) {
@@ -131,12 +148,15 @@ export default function PanelsPage() {
   const [marzErr, setMarzErr] = useState("");
   const [msg, setMsg] = useState("");
   const [confirmPanel, setConfirmPanel] = useState<Panel | null>(null);
+  const [sslDomain, setSslDomain] = useState("");
+  const [sslMsg, setSslMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
 
   const typeMeta = useMemo(() => TYPES.find((t) => t.value === form.type), [form.type]);
   const isSanaei = form.type === "sanaei";
   const isPasarguard = form.type === "pasarguard";
   const isMarzban = form.type === "marzban";
   const isRebecca = form.type === "rebecca";
+  const isAstra = form.type === "astra";
   const isEdit = !!editing;
 
   const { data = [], isLoading } = useQuery({
@@ -144,10 +164,19 @@ export default function PanelsPage() {
     queryFn: () => api<Panel[]>("/api/admin/panels"),
   });
 
+  const { data: siteSettings } = useQuery({
+    queryKey: ["site-settings"],
+    queryFn: () => api<{ ssl_available: boolean }>("/api/admin/settings"),
+    staleTime: 60_000,
+  });
+  const sslAvailable = Boolean(siteSettings?.ssl_available);
+
   function resetModal() {
     setOpen(false);
     setEditing(null);
     setForm(emptyForm);
+    setSslDomain("");
+    setSslMsg(null);
     setSelectedInbounds([]);
     setInbounds([]);
     setInboundsErr("");
@@ -165,6 +194,8 @@ export default function PanelsPage() {
   function openCreate() {
     setEditing(null);
     setForm(emptyForm);
+    setSslDomain("");
+    setSslMsg(null);
     setSelectedInbounds([]);
     setInbounds([]);
     setInboundsErr("");
@@ -187,6 +218,12 @@ export default function PanelsPage() {
       ? (meta.default_group_ids as unknown[]).map(Number).filter((n) => !Number.isNaN(n))
       : [];
     setEditing(p);
+    setSslMsg(null);
+    setSslDomain(
+      hostFromBaseUrl(
+        String((meta.public_host as string | undefined) || p.base_url || "")
+      )
+    );
     setForm({
       name: p.name,
       type: p.type,
@@ -195,6 +232,9 @@ export default function PanelsPage() {
       password: "",
       api_token: "",
       is_active: p.is_active,
+      public_port: String(
+        (meta.public_port as number | string | undefined) || "443"
+      ),
     });
     setSelectedInbounds(ids);
     setInbounds([]);
@@ -361,6 +401,19 @@ export default function PanelsPage() {
 
   function buildMeta(): Record<string, unknown> {
     const meta: Record<string, unknown> = isEdit ? { ...(editing?.meta || {}) } : {};
+    if (isAstra) {
+      // WS+TLS behind Cloudflare/nginx (Sanayi-style) — port goes into client links.
+      const port = Number(form.public_port) || 443;
+      meta.public_port = port;
+      meta.inbound_network = "ws";
+      meta.tls_terminate = "nginx";
+      const host = normalizeBaseUrl(form.base_url)
+        .replace(/^https?:\/\//i, "")
+        .split("/")[0]
+        .split(":")[0];
+      if (host) meta.public_host = host;
+      return meta;
+    }
     if (isSanaei) {
       if (selectedInbounds.length) meta.inbound_ids = selectedInbounds;
       else delete meta.inbound_ids;
@@ -422,18 +475,22 @@ export default function PanelsPage() {
           name: form.name,
           type: form.type,
           base_url: normalizeBaseUrl(form.base_url),
-          username: form.username || null,
-          password: form.password || null,
-          api_token: isSanaei ? form.api_token || null : form.api_token || null,
+          username: isAstra ? null : form.username || null,
+          password: isAstra ? null : form.password || null,
+          api_token: isAstra ? null : isSanaei ? form.api_token || null : form.api_token || null,
           is_active: form.is_active,
           meta,
         }),
       });
     },
-    onSuccess: () => {
+    onSuccess: (p) => {
       qc.invalidateQueries({ queryKey: ["panels"] });
       resetModal();
-      setMsg(isEdit ? "پنل به‌روزرسانی شد" : "اتصال موفق بود — پنل اضافه شد");
+      if (!isEdit && p?.type === "astra") {
+        setMsg("پنل آسترا ساخته شد — اوتباندها را اضافه کنید");
+      } else {
+        setMsg(isEdit ? "پنل به‌روزرسانی شد" : "اتصال موفق بود — پنل اضافه شد");
+      }
     },
     onError: (e: Error) => setMsg(e.message),
   });
@@ -494,6 +551,31 @@ export default function PanelsPage() {
     },
   });
 
+  const issueNodeSsl = useMutation({
+    mutationFn: (domain: string) =>
+      api<{ ok: boolean; message: string; domain: string }>("/api/admin/settings/ssl", {
+        method: "POST",
+        body: JSON.stringify({ target: "node", domain }),
+      }),
+    onSuccess: (res) => {
+      setSslMsg({ type: "ok", text: res.message || "SSL صادر شد" });
+      const d = (res.domain || sslDomain).trim();
+      if (d && isAstra) {
+        setForm((prev) => ({
+          ...prev,
+          base_url: prev.base_url.trim() ? prev.base_url : d,
+        }));
+        setSslDomain(d);
+      }
+    },
+    onError: (e: Error) => {
+      setSslMsg({
+        type: "err",
+        text: e instanceof ApiError ? e.message : e.message || "خطای SSL",
+      });
+    },
+  });
+
   const toggleActive = useMutation({
     mutationFn: ({ id, is_active }: { id: number; is_active: boolean }) =>
       api<Panel>(`/api/admin/panels/${id}/active`, {
@@ -530,16 +612,21 @@ export default function PanelsPage() {
 
   function onSubmit(e: FormEvent) {
     e.preventDefault();
-    if (!form.username.trim()) {
-      setMsg("نام کاربری الزامی است");
-      return;
-    }
-    if (!isEdit && !form.password.trim()) {
-      setMsg("رمز عبور الزامی است");
-      return;
-    }
-    if (!isEdit && isSanaei && !form.api_token.trim()) {
-      setMsg("برای سنایی API Token الزامی است");
+    if (!isAstra) {
+      if (!form.username.trim()) {
+        setMsg("نام کاربری الزامی است");
+        return;
+      }
+      if (!isEdit && !form.password.trim()) {
+        setMsg("رمز عبور الزامی است");
+        return;
+      }
+      if (!isEdit && isSanaei && !form.api_token.trim()) {
+        setMsg("برای سنایی API Token الزامی است");
+        return;
+      }
+    } else if (!form.base_url.trim()) {
+      setMsg("آدرس/هاست عمومی نود الزامی است");
       return;
     }
     save.mutate();
@@ -576,7 +663,7 @@ export default function PanelsPage() {
     <div className="admin-page">
       <h1 className="page-title">پنل‌ها</h1>
       <p className="page-sub">
-        اتصال به سنایی، پاسارگاد، مرزبان و ربکا. با دکمه روشن/خاموش، پنل از{" "}
+        اتصال به آسترا (اوتباند)، سنایی، پاسارگاد، مرزبان و ربکا. با دکمه روشن/خاموش، پنل از{" "}
         <b>همه ساب‌های قدیم و جدید</b> و ساخت روی گروه‌ها خارج یا دوباره فعال می‌شود.
       </p>
 
@@ -626,15 +713,22 @@ export default function PanelsPage() {
         <div className="admin-grid">
           {data.map((p) => {
             const typeLabel = TYPES.find((t) => t.value === p.type)?.label || p.type;
-            const credOk = p.type === "sanaei" ? p.has_token : p.has_password;
+            const credOk =
+              p.type === "astra"
+                ? true
+                : p.type === "sanaei"
+                  ? p.has_token
+                  : p.has_password;
             const credLabel =
-              p.type === "sanaei"
-                ? p.has_token
-                  ? "توکن دارد"
-                  : "بدون توکن"
-                : p.has_password
-                  ? "رمز تنظیم شده"
-                  : "رمز ناقص";
+              p.type === "astra"
+                ? "نود محلی"
+                : p.type === "sanaei"
+                  ? p.has_token
+                    ? "توکن دارد"
+                    : "بدون توکن"
+                  : p.has_password
+                    ? "رمز تنظیم شده"
+                    : "رمز ناقص";
             return (
               <article key={p.id} className={`admin-card ${p.is_active ? "" : "is-off"}`}>
                 <div className="admin-card-top">
@@ -679,6 +773,11 @@ export default function PanelsPage() {
                   {p.base_url}
                 </p>
                 <div className="admin-card-actions">
+                  {p.type === "astra" && (
+                    <Link to={`/panels/${p.id}/outbounds`} className="btn ghost sm">
+                      اوتباندها
+                    </Link>
+                  )}
                   <button type="button" className="btn ghost sm" onClick={() => openEdit(p)}>
                     <Pencil size={14} />
                     ویرایش
@@ -767,9 +866,11 @@ export default function PanelsPage() {
               <div>
                 <h3>{isEdit ? "ویرایش پنل" : "افزودن پنل"}</h3>
                 <p className="modal-sub">
-                  {isEdit
-                    ? "تغییرات فقط در صورت اتصال موفق ذخیره می‌شود"
-                    : "فقط پس از اتصال واقعی به پنل ریموت ذخیره می‌شود"}
+                  {isAstra
+                    ? "پنل محلی اوتباند — بعداً لینک‌ها را در صفحه اوتباندها اضافه کنید"
+                    : isEdit
+                      ? "تغییرات فقط در صورت اتصال موفق ذخیره می‌شود"
+                      : "فقط پس از اتصال واقعی به پنل ریموت ذخیره می‌شود"}
                 </p>
               </div>
               <button type="button" className="modal-close" onClick={resetModal} aria-label="بستن">
@@ -812,13 +913,15 @@ export default function PanelsPage() {
               <section className="panel-section">
                 <h4>اتصال</h4>
                 <div className="field">
-                  <label>آدرس پایه (Base URL)</label>
+                  <label>{isAstra ? "هاست عمومی نود (برای لینک مشتری)" : "آدرس پایه (Base URL)"}</label>
                   <input
                     required
                     placeholder={
-                      isSanaei
-                        ? "https://domain:2053/moj  (با webBasePath)"
-                        : "https://panel.example.com:8443  (بدون /dashboard)"
+                      isAstra
+                        ? "panel.example.com یا IP عمومی سرور"
+                        : isSanaei
+                          ? "https://domain:2053/moj  (با webBasePath)"
+                          : "https://panel.example.com:8443  (بدون /dashboard)"
                     }
                     value={form.base_url}
                     onChange={(e) => setForm({ ...form, base_url: e.target.value })}
@@ -830,34 +933,121 @@ export default function PanelsPage() {
                       <code dir="ltr">https://ir.example.com:2053/moj</code>
                     </p>
                   )}
+                  {isAstra && (
+                    <p className="field-hint">
+                      دامنهٔ لبه با پروکسی نارنجی Cloudflare؛ SSL را Full بگذارید. پورت
+                      عمومی همان پورتی است که داخل لینک مشتری می‌آید.
+                    </p>
+                  )}
                 </div>
-                <div className="form-grid">
+                {isAstra && (
                   <div className="field">
-                    <label>نام کاربری ادمین *</label>
+                    <label>پورت عمومی (لینک مشتری)</label>
                     <input
                       required
-                      name="panel_admin_username"
-                      autoComplete="off"
-                      value={form.username}
-                      onChange={(e) => setForm({ ...form, username: e.target.value })}
+                      value={form.public_port}
+                      onChange={(e) =>
+                        setForm({ ...form, public_port: e.target.value.replace(/\D/g, "") })
+                      }
                       dir="ltr"
+                      placeholder="443"
+                      inputMode="numeric"
                     />
+                    <p className="field-hint">
+                      مثل سنایی: پورت <code dir="ltr">443</code> + ابر نارنجی کلادفلر.
+                      پورت‌های دیگر CF:{" "}
+                      <code dir="ltr">2053, 2083, 2087, 2096, 8443</code>
+                    </p>
                   </div>
+                )}
+                {isAstra && sslAvailable && (
                   <div className="field">
-                    <label>
-                      {isEdit ? "رمز عبور (خالی = بدون تغییر)" : "رمز عبور *"}
-                    </label>
-                    <input
-                      required={!isEdit}
-                      type="password"
-                      name="panel_admin_password"
-                      value={form.password}
-                      onChange={(e) => setForm({ ...form, password: e.target.value })}
-                      dir="ltr"
-                      autoComplete="new-password"
-                    />
+                    <label>SSL دامنهٔ لبه (Let’s Encrypt)</label>
+                    <div className="form-grid" style={{ alignItems: "end" }}>
+                      <input
+                        dir="ltr"
+                        value={sslDomain}
+                        onChange={(e) => {
+                          setSslDomain(e.target.value);
+                          setSslMsg(null);
+                        }}
+                        onBlur={() => {
+                          if (!sslDomain.trim() && form.base_url.trim()) {
+                            setSslDomain(hostFromBaseUrl(form.base_url));
+                          }
+                        }}
+                        placeholder="out.example.com"
+                        autoComplete="off"
+                        spellCheck={false}
+                      />
+                      <button
+                        type="button"
+                        className="btn ghost"
+                        disabled={
+                          issueNodeSsl.isPending || !sslDomain.trim()
+                        }
+                        onClick={() => {
+                          const d =
+                            sslDomain.trim() || hostFromBaseUrl(form.base_url);
+                          if (!d) return;
+                          setSslDomain(d);
+                          setSslMsg(null);
+                          issueNodeSsl.mutate(d);
+                        }}
+                      >
+                        <ShieldCheck size={16} />
+                        {issueNodeSsl.isPending
+                          ? "در حال صدور…"
+                          : "دریافت SSL خودکار"}
+                      </button>
+                    </div>
+                    <p className="field-hint">
+                      DNS دامنه را به IP همین سرور بزن (برای صدور بهتر موقتاً ابر خاکستری)،
+                      بعد SSL بگیر و همان دامنه را به‌عنوان هاست عمومی پنل اوتباند ذخیره کن.
+                    </p>
+                    {sslMsg && (
+                      <p
+                        className="field-hint"
+                        style={{
+                          marginTop: 8,
+                          color:
+                            sslMsg.type === "ok" ? "var(--ok)" : "var(--danger)",
+                        }}
+                      >
+                        {sslMsg.text}
+                      </p>
+                    )}
                   </div>
-                </div>
+                )}
+                {!isAstra && (
+                  <div className="form-grid">
+                    <div className="field">
+                      <label>نام کاربری ادمین *</label>
+                      <input
+                        required
+                        name="panel_admin_username"
+                        autoComplete="off"
+                        value={form.username}
+                        onChange={(e) => setForm({ ...form, username: e.target.value })}
+                        dir="ltr"
+                      />
+                    </div>
+                    <div className="field">
+                      <label>
+                        {isEdit ? "رمز عبور (خالی = بدون تغییر)" : "رمز عبور *"}
+                      </label>
+                      <input
+                        required={!isEdit}
+                        type="password"
+                        name="panel_admin_password"
+                        value={form.password}
+                        onChange={(e) => setForm({ ...form, password: e.target.value })}
+                        dir="ltr"
+                        autoComplete="new-password"
+                      />
+                    </div>
+                  </div>
+                )}
 
                 {isSanaei && (
                   <div className="field">

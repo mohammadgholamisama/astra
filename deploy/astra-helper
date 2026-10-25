@@ -10,6 +10,7 @@ NGINX_LINK="/etc/nginx/sites-enabled/astra"
 HTTP_TPL="${ASTRA_ROOT}/deploy/nginx-http.conf.tpl"
 SSL_TPL="${ASTRA_ROOT}/deploy/nginx-ssl.conf.tpl"
 STATE_FILE="${ASTRA_ROOT}/deploy/install-state"
+NODE_DOMAINS_FILE="${ASTRA_ROOT}/nginx/node-domains.list"
 
 # Keys astra-helper may change in .env
 ALLOWED_ENV_KEYS=(
@@ -22,8 +23,10 @@ ALLOWED_ENV_KEYS=(
   CORS_ORIGINS
   ASTRA_PANEL_DOMAIN
   ASTRA_SUB_DOMAIN
+  ASTRA_NODE_DOMAIN
   ASTRA_SSL_PANEL
   ASTRA_SSL_SUB
+  ASTRA_SSL_NODE
   ASTRA_HELPER
   ADMIN_USERNAME
   ADMIN_PASSWORD
@@ -78,6 +81,27 @@ read_port() {
   echo "$p"
 }
 
+# /sub must stay uncompressed HTTP/1.1 with Content-Length.
+# gzip / HTTP/2 / chunked → v2rayNG often shows ~30 of 200 configs.
+sub_location_block() {
+  local port="$1"
+  cat <<EOF
+    location /sub {
+        proxy_pass http://127.0.0.1:${port};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Accept-Encoding "";
+        proxy_read_timeout 120s;
+        gzip off;
+        proxy_buffering off;
+        chunked_transfer_encoding off;
+    }
+EOF
+}
+
 # Panel / IP host: admin SPA + API + docs + sub
 panel_locations() {
   local port="$1"
@@ -92,15 +116,7 @@ panel_locations() {
         proxy_read_timeout 120s;
     }
 
-    location /sub {
-        proxy_pass http://127.0.0.1:${port};
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 120s;
-    }
+$(sub_location_block "$port")
 
     location = /health {
         proxy_pass http://127.0.0.1:${port};
@@ -130,6 +146,9 @@ panel_locations() {
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
 
+    # Astra outbound node: VLESS+WS (TLS terminated here / Cloudflare)
+    include /opt/astra/nginx/astra-xray-ws.conf;
+
     location / {
         try_files \$uri \$uri/ /index.html;
     }
@@ -140,21 +159,16 @@ EOF
 sub_locations() {
   local port="$1"
   cat <<EOF
-    location /sub {
-        proxy_pass http://127.0.0.1:${port};
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 120s;
-    }
+$(sub_location_block "$port")
 
     location = /health {
         proxy_pass http://127.0.0.1:${port};
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
+
+    # WS inbound may also be served on sub domain
+    include /opt/astra/nginx/astra-xray-ws.conf;
 
     location / {
         default_type text/html;
@@ -164,10 +178,37 @@ sub_locations() {
 EOF
 }
 
+# Node / CF edge host: VLESS+WS only (Cloudflare orange-cloud friendly)
+node_locations() {
+  # Camouflage as a bland static site (anti-probe) + WS path via include
+  cat <<EOF
+    include /opt/astra/nginx/astra-xray-ws.conf;
+
+    location = /health {
+        default_type text/plain;
+        return 200 'ok';
+    }
+
+    location = /robots.txt {
+        default_type text/plain;
+        return 200 'User-agent: *\nDisallow: /\n';
+    }
+
+    location / {
+        default_type text/html;
+        charset utf-8;
+        add_header Cache-Control "public, max-age=300";
+        return 200 '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Welcome</title><style>body{margin:0;font-family:Georgia,serif;background:#f7f5f0;color:#222}main{max-width:42rem;margin:12vh auto;padding:0 1.25rem}h1{font-size:1.75rem;font-weight:600}p{line-height:1.6;color:#555}</style></head><body><main><h1>Welcome</h1><p>This site is under maintenance. Please check back later.</p></main></body></html>';
+    }
+EOF
+}
+
 locations_for_mode() {
   local port="$1" mode="${2:-panel}"
   if [[ "$mode" == "sub" ]]; then
     sub_locations "$port"
+  elif [[ "$mode" == "node" ]]; then
+    node_locations
   else
     panel_locations "$port"
   fi
@@ -226,7 +267,7 @@ http_block_domain() {
   local domain="$1" port="$2" mode="${3:-panel}"
   local root_line="    root /opt/astra/frontend/dist;"
   local index_line="    index index.html;"
-  if [[ "$mode" == "sub" ]]; then
+  if [[ "$mode" == "sub" || "$mode" == "node" ]]; then
     root_line=""
     index_line=""
   fi
@@ -253,9 +294,39 @@ ssl_block_domain() {
   local ssl_opts="" dh=""
   local root_line="    root /opt/astra/frontend/dist;"
   local index_line="    index index.html;"
-  if [[ "$mode" == "sub" ]]; then
+  local extra_cf_listens=""
+  if [[ "$mode" == "sub" || "$mode" == "node" ]]; then
     root_line=""
     index_line=""
+  fi
+  # HTTP/1.1 only: HTTP/2 DATA frames make v2ray clients truncate /sub (~30 configs).
+  # Node also needs HTTP/1.1 for VLESS-WS ping.
+  local listen_443="    listen 443 ssl;\n    listen [::]:443 ssl;"
+  local node_tls_tuning=""
+  if [[ "$mode" == "node" || "$mode" == "sub" ]]; then
+    if [[ "$mode" == "node" ]]; then
+      # Low ssl_buffer_size → better ping (options-ssl-nginx may already set session_*)
+      node_tls_tuning="$(cat <<'EOL'
+    ssl_buffer_size 4k;
+    tcp_nodelay on;
+EOL
+)"
+    fi
+    # CF / Iran-edge alternate HTTPS ports — Iran→foreign:443 is often filtered,
+    # so stream SNI tunnels (sub/out) forward to these origin ports instead.
+    extra_cf_listens="$(cat <<'EOL'
+    listen 2053 ssl;
+    listen [::]:2053 ssl;
+    listen 2083 ssl;
+    listen [::]:2083 ssl;
+    listen 2087 ssl;
+    listen [::]:2087 ssl;
+    listen 2096 ssl;
+    listen [::]:2096 ssl;
+    listen 8443 ssl;
+    listen [::]:8443 ssl;
+EOL
+)"
   fi
   if [[ -f /etc/letsencrypt/options-ssl-nginx.conf ]]; then
     ssl_opts="    include /etc/letsencrypt/options-ssl-nginx.conf;"
@@ -279,14 +350,15 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+$(printf '%b' "$listen_443")
+${extra_cf_listens}
     server_name ${domain};
 
     ssl_certificate     /etc/letsencrypt/live/${domain}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
 ${ssl_opts}
 ${dh}
+${node_tls_tuning}
 
 ${root_line}
 ${index_line}
@@ -336,6 +408,53 @@ render_nginx() {
       http_block_domain "$sub_dom" "$port" "sub"
     fi
     echo
+  fi
+
+  # Edge / outbound CDN hosts (one or many) — VLESS path via astra-xray-ws.conf
+  local node_dom
+  while IFS= read -r node_dom; do
+    [[ -z "$node_dom" ]] && continue
+    [[ "$node_dom" == "$panel_dom" || "$node_dom" == "$sub_dom" ]] && continue
+    if [[ -f "/etc/letsencrypt/live/${node_dom}/fullchain.pem" ]]; then
+      ssl_block_domain "$node_dom" "$port" "node"
+    else
+      http_block_domain "$node_dom" "$port" "node"
+    fi
+    echo
+  done < <(list_node_domains)
+}
+
+add_node_domain() {
+  local d="${1:-}"
+  [[ -n "$d" ]] || return 1
+  valid_domain "$d" || die "invalid domain: $d"
+  mkdir -p "$(dirname "$NODE_DOMAINS_FILE")"
+  touch "$NODE_DOMAINS_FILE"
+  if ! grep -qxF "$d" "$NODE_DOMAINS_FILE" 2>/dev/null; then
+    echo "$d" >> "$NODE_DOMAINS_FILE"
+  fi
+  # Keep primary env key for older tooling / health checks
+  if [[ -z "$(get_env ASTRA_NODE_DOMAIN "")" ]]; then
+    set_env_key ASTRA_NODE_DOMAIN "$d"
+  fi
+}
+
+list_node_domains() {
+  local d primary seen="|"
+  primary="$(get_env ASTRA_NODE_DOMAIN "")"
+  if [[ -n "$primary" ]]; then
+    echo "$primary"
+    seen="|${primary}|"
+  fi
+  if [[ -f "$NODE_DOMAINS_FILE" ]]; then
+    while IFS= read -r d || [[ -n "${d:-}" ]]; do
+      d="${d//$'\r'/}"
+      d="$(echo "$d" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [[ -z "$d" || "$d" == \#* ]] && continue
+      [[ "$seen" == *"|${d}|"* ]] && continue
+      echo "$d"
+      seen="${seen}${d}|"
+    done < "$NODE_DOMAINS_FILE"
   fi
 }
 
@@ -439,6 +558,16 @@ cmd_issue_ssl() {
     die "certbot not installed"
   fi
 
+  local panel_dom sub_dom
+  panel_dom="$(get_env ASTRA_PANEL_DOMAIN "")"
+  sub_dom="$(get_env ASTRA_SUB_DOMAIN "")"
+
+  # Non panel/sub domains are outbound edge hosts — register before nginx write
+  # so ACME HTTP-01 has a matching server_name.
+  if [[ "$domain" != "$panel_dom" && "$domain" != "$sub_dom" ]]; then
+    add_node_domain "$domain"
+  fi
+
   # Ensure HTTP server_name exists before certbot --nginx
   cmd_write_nginx
 
@@ -452,9 +581,6 @@ cmd_issue_ssl() {
       --email "$email"
 
   # Mark SSL flags
-  local panel_dom sub_dom
-  panel_dom="$(get_env ASTRA_PANEL_DOMAIN "")"
-  sub_dom="$(get_env ASTRA_SUB_DOMAIN "")"
   if [[ "$domain" == "$panel_dom" ]]; then
     set_env_key ASTRA_SSL_PANEL 1
     set_env_key PANEL_BASE_URL "https://${domain}"
@@ -468,9 +594,24 @@ cmd_issue_ssl() {
   if [[ -z "$sub_dom" && "$domain" == "$panel_dom" ]]; then
     set_env_key SUB_BASE_URL "https://${domain}"
   fi
+  if [[ "$domain" != "$panel_dom" && "$domain" != "$sub_dom" ]]; then
+    add_node_domain "$domain"
+    set_env_key ASTRA_SSL_NODE 1
+  elif [[ "$domain" == "$(get_env ASTRA_NODE_DOMAIN "")" ]]; then
+    set_env_key ASTRA_SSL_NODE 1
+  fi
 
   cmd_write_nginx
   echo "SSL issued for $domain"
+}
+
+cmd_add_node_domain() {
+  need_root
+  local domain="${1:-}"
+  [[ -n "$domain" ]] || die "usage: add-node-domain <domain>"
+  add_node_domain "$domain"
+  cmd_write_nginx
+  echo "node domain registered: $domain"
 }
 
 cmd_set_env() {
@@ -480,7 +621,7 @@ cmd_set_env() {
   if [[ "$key" == "ASTRA_APP_PORT" ]]; then
     valid_port "$val" || die "invalid port"
   fi
-  if [[ "$key" == "ASTRA_PANEL_DOMAIN" || "$key" == "ASTRA_SUB_DOMAIN" ]]; then
+  if [[ "$key" == "ASTRA_PANEL_DOMAIN" || "$key" == "ASTRA_SUB_DOMAIN" || "$key" == "ASTRA_NODE_DOMAIN" ]]; then
     if [[ -n "$val" ]]; then
       valid_domain "$val" || die "invalid domain: $val"
     fi
@@ -494,6 +635,35 @@ cmd_restart_astra() {
   systemctl daemon-reload
   systemctl restart astra
   echo "astra restarted"
+}
+
+cmd_xray_restart() {
+  need_root
+  local pid="${1:-}"
+  [[ "$pid" =~ ^[0-9]+$ ]] || die "usage: xray-restart <panel_id>"
+  local unit="astra-xray@${pid}"
+  local unit_src="${ASTRA_ROOT}/deploy/astra-xray/astra-xray@.service"
+  if [[ -f "$unit_src" ]]; then
+    install -m 644 "$unit_src" /etc/systemd/system/astra-xray@.service
+    systemctl daemon-reload
+  fi
+  mkdir -p "${ASTRA_ROOT}/xray/panel_${pid}"
+  if [[ ! -f "${ASTRA_ROOT}/xray/panel_${pid}/config.json" ]]; then
+    die "missing xray config for panel ${pid}"
+  fi
+  systemctl enable --now "$unit"
+  systemctl restart "$unit"
+  systemctl is-active --quiet "$unit" || die "xray unit ${unit} failed to start"
+  echo "xray restarted ${unit}"
+}
+
+cmd_xray_stop() {
+  need_root
+  local pid="${1:-}"
+  [[ "$pid" =~ ^[0-9]+$ ]] || die "usage: xray-stop <panel_id>"
+  local unit="astra-xray@${pid}"
+  systemctl disable --now "$unit" 2>/dev/null || systemctl stop "$unit" 2>/dev/null || true
+  echo "xray stopped ${unit}"
 }
 
 read_local_version() {
@@ -807,9 +977,12 @@ Commands:
   reload-nginx
   write-nginx [path-to-conf]   # omit path → render from .env state
   issue-ssl <domain>
+  add-node-domain <domain>     # register outbound CDN host (HTTP/HTTPS vhost)
   set-env <KEY> <VALUE>        # allowed keys only
   set-admin <username> <password>
   restart-astra
+  xray-restart <panel_id>      # enable+restart astra-xray@N
+  xray-stop <panel_id>
   check-update                 # JSON status (preserves data)
   apply-update                 # pull latest; keeps .env + data/
   uninstall [--purge]          # remove Astra from server (other apps safe)
@@ -823,15 +996,18 @@ main() {
     reload-nginx)  cmd_reload_nginx ;;
     write-nginx)   cmd_write_nginx "${1:-}" ;;
     issue-ssl)     cmd_issue_ssl "${1:-}" ;;
+    add-node-domain) cmd_add_node_domain "${1:-}" ;;
     set-env)       cmd_set_env "${1:-}" "${2:-}" ;;
     set-admin)     cmd_set_admin "${1:-}" "${2:-}" ;;
     restart-astra) cmd_restart_astra ;;
+    xray-restart)  cmd_xray_restart "${1:-}" ;;
+    xray-stop)     cmd_xray_stop "${1:-}" ;;
     check-update)  cmd_check_update ;;
     apply-update)  cmd_apply_update ;;
     uninstall)     cmd_uninstall "${1:-}" ;;
     ""|-h|--help)  usage ;;
     *)             die "unknown command: $cmd" ;;
-  esac
+esac
 }
 
 main "$@"
