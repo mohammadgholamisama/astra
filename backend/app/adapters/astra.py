@@ -162,6 +162,8 @@ class AstraAdapter(BasePanelAdapter):
                 uuid=client.uuid,
                 links=links,
                 used_traffic=used,
+                remote_expire=int(client.expire or 0) or None,
+                remote_status="active" if client.enable else "disabled",
             )
         except Exception as e:  # noqa: BLE001
             return AdapterResult(success=False, error=str(e).strip() or e.__class__.__name__)

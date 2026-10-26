@@ -32,6 +32,38 @@ from app.services.users import load_user, to_user_response
 router = APIRouter(tags=["User"])
 
 
+def _hold_required_error() -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail={
+            "code": "HOLD_DURATION_REQUIRED",
+            "message": "برای شروع از اولین استفاده باید روز اعتبار بیشتر از صفر باشد",
+        },
+    )
+
+
+def _normalize_on_hold(
+    status: UserStatus,
+    expire: int | None,
+    duration: int | None,
+) -> tuple[UserStatus, int, int]:
+    """Map create/edit fields to (status, expire_ts, on_hold_duration_seconds).
+
+    on_hold: expire stays 0 until first traffic; duration is the purchased days.
+    """
+    if status != UserStatus.on_hold:
+        return status, int(expire or 0), 0
+    dur = int(duration or 0)
+    if dur <= 0:
+        now = int(time.time())
+        exp = int(expire or 0)
+        if exp > now:
+            dur = exp - now
+    if dur <= 0:
+        raise _hold_required_error()
+    return UserStatus.on_hold, 0, dur
+
+
 def _username_exists_error(username: str) -> HTTPException:
     """409 for bots/UI — code + Persian message."""
     return HTTPException(
@@ -137,12 +169,16 @@ async def create_user(
         )
 
     display = (body.display_name or "").strip() or None
+    status, expire, hold_dur = _normalize_on_hold(
+        body.status, body.expire, body.on_hold_expire_duration
+    )
     user = User(
         username=body.username,
         display_name=display,
-        status=body.status,
+        status=status,
         data_limit=body.data_limit or 0,
-        expire=body.expire or 0,
+        expire=expire,
+        on_hold_expire_duration=hold_dur,
         note=body.note,
         data_limit_reset_strategy=body.data_limit_reset_strategy,
         proxy_settings={
@@ -353,6 +389,9 @@ async def create_users_bulk(
         )
 
     display = (body.display_name or "").strip() or None
+    status, expire, hold_dur = _normalize_on_hold(
+        body.status, body.expire, body.on_hold_expire_duration
+    )
     now = datetime.now(timezone.utc)
     created_names: list[str] = []
     # Snapshot panel targets once — (panel_id, config, group_id) for fast reload
@@ -367,9 +406,10 @@ async def create_users_bulk(
             user = User(
                 username=uname,
                 display_name=display,
-                status=body.status,
+                status=status,
                 data_limit=body.data_limit or 0,
-                expire=body.expire or 0,
+                expire=expire,
+                on_hold_expire_duration=hold_dur,
                 note=body.note,
                 data_limit_reset_strategy=body.data_limit_reset_strategy,
                 proxy_settings={
@@ -540,11 +580,40 @@ async def modify_user(
     elif body.display_name is not None:
         user.display_name = body.display_name.strip() or None
     if body.status is not None:
-        user.status = body.status
+        incoming = body.status
+        # Re-enable an unused on-hold user → keep waiting for first use
+        if incoming == UserStatus.active:
+            unused_hold = (
+                int(getattr(user, "on_hold_expire_duration", 0) or 0) > 0
+                and int(user.expire or 0) <= 0
+                and int(user.used_traffic or 0) <= 0
+                and user.status in (UserStatus.disabled, UserStatus.on_hold)
+            )
+            if unused_hold:
+                incoming = UserStatus.on_hold
+        if incoming == UserStatus.on_hold:
+            dur = (
+                body.on_hold_expire_duration
+                if body.on_hold_expire_duration is not None
+                else int(getattr(user, "on_hold_expire_duration", 0) or 0)
+            )
+            st, exp, hold_dur = _normalize_on_hold(incoming, body.expire, dur)
+            user.status = st
+            user.expire = exp
+            user.on_hold_expire_duration = hold_dur
+        else:
+            user.status = incoming
     if body.data_limit is not None:
         user.data_limit = body.data_limit
-    if body.expire is not None:
+    if body.expire is not None and user.status != UserStatus.on_hold:
         user.expire = body.expire
+    if body.on_hold_expire_duration is not None and user.status == UserStatus.on_hold:
+        st, exp, hold_dur = _normalize_on_hold(
+            UserStatus.on_hold, 0, body.on_hold_expire_duration
+        )
+        user.status = st
+        user.expire = exp
+        user.on_hold_expire_duration = hold_dur
     if body.note is not None:
         user.note = body.note
     if body.data_limit_reset_strategy is not None:
@@ -974,15 +1043,24 @@ async def create_from_template(
         raise HTTPException(status_code=404, detail="Template not found or disabled")
 
     username = f"{tpl.username_prefix or ''}{body.username}{tpl.username_suffix or ''}"
+    tpl_status = (
+        UserStatus(tpl.status)
+        if tpl.status in UserStatus.__members__
+        else UserStatus.active
+    )
     expire = 0
-    if tpl.expire_duration:
+    hold_dur = 0
+    if tpl_status == UserStatus.on_hold:
+        hold_dur = int(tpl.expire_duration or 0)
+    elif tpl.expire_duration:
         expire = int(time.time()) + int(tpl.expire_duration)
 
     create_body = UserCreate(
         username=username,
-        status=UserStatus(tpl.status) if tpl.status in UserStatus.__members__ else UserStatus.active,
+        status=tpl_status,
         data_limit=tpl.data_limit,
         expire=expire,
+        on_hold_expire_duration=hold_dur,
         note=body.note or tpl.note,
         group_ids=list(tpl.group_ids or []),
         data_limit_reset_strategy=tpl.data_limit_reset_strategy,

@@ -19,7 +19,7 @@ from typing import Any
 
 import httpx
 
-from app.adapters.base import AdapterResult, BasePanelAdapter, UserPayload
+from app.adapters.base import AdapterResult, BasePanelAdapter, UserPayload, coerce_unix_ts
 from app.adapters.http_utils import err_msg, make_client, ok_json
 
 logger = logging.getLogger("astra.sanaei")
@@ -217,7 +217,15 @@ class SanaeiAdapter(BasePanelAdapter):
         email = payload.username
         sub_id = payload.config.get("sub_id") or secrets.token_hex(8)
         client_uuid = payload.uuid or str(uuid_lib.uuid4())
+        # 3x-ui «Start after first use»: negative expiryTime is duration in ms.
+        # First traffic converts it to now+|duration| on the panel.
         expiry_ms = int(payload.expire * 1000) if payload.expire else 0
+        if (payload.status or "") == "on_hold":
+            try:
+                hold_dur = int((payload.config or {}).get("on_hold_expire_duration") or 0)
+            except (TypeError, ValueError):
+                hold_dur = 0
+            expiry_ms = -hold_dur * 1000 if hold_dur > 0 else 0
         tg = payload.config.get("tg_id", 0)
         try:
             tg_id = int(tg) if tg not in (None, "") else 0
@@ -564,6 +572,43 @@ class SanaeiAdapter(BasePanelAdapter):
                 return SanaeiAdapter._sum_up_down(nested)
         return None
 
+    @staticmethod
+    def _sanaei_expiry_ms(obj: Any) -> int | None:
+        """3x-ui expiryTime in ms. Negative = still on_hold duration."""
+        if isinstance(obj, list):
+            best: int | None = None
+            for item in obj:
+                got = SanaeiAdapter._sanaei_expiry_ms(item)
+                if got is None:
+                    continue
+                if best is None:
+                    best = got
+                elif got > 0 and (best <= 0 or got > best):
+                    best = got
+            return best
+        if isinstance(obj, dict):
+            if "expiryTime" in obj:
+                try:
+                    return int(obj.get("expiryTime") or 0)
+                except (TypeError, ValueError):
+                    return None
+            nested = obj.get("obj") or obj.get("client")
+            if nested is not None and nested is not obj:
+                return SanaeiAdapter._sanaei_expiry_ms(nested)
+        return None
+
+    @staticmethod
+    def _sanaei_hold_fields(raw: Any) -> tuple[str | None, int | None]:
+        """Map 3x-ui expiryTime to (remote_status, remote_expire unix)."""
+        ems = SanaeiAdapter._sanaei_expiry_ms(raw)
+        if ems is None:
+            return None, None
+        if ems < 0:
+            return "on_hold", None
+        if ems == 0:
+            return None, None
+        return "active", coerce_unix_ts(ems) or None
+
     async def reset_usage(self, username: str, remote_id: str | None = None) -> AdapterResult:
         """Best-effort reset client traffic on 3x-ui / Sanaei."""
         try:
@@ -613,15 +658,18 @@ class SanaeiAdapter(BasePanelAdapter):
             logger.warning("sanaei raw inbounds failed: %s", exc)
             return []
 
-    async def _usage_from_inbounds_scan(self, email: str) -> int | None:
+    async def _usage_from_inbounds_scan(
+        self, email: str
+    ) -> tuple[int | None, Any]:
         """Sum up+down for this email across every inbound (multi-inbound clients)."""
         try:
             inbounds = await self._raw_inbounds_for_usage()
         except Exception as exc:  # noqa: BLE001
             logger.warning("sanaei inbound scan failed: %s", exc)
-            return None
+            return None, None
         total = 0
         found = False
+        best_raw: Any = None
         email_l = email.lower()
         for inbound in inbounds or []:
             if not isinstance(inbound, dict):
@@ -639,6 +687,7 @@ class SanaeiAdapter(BasePanelAdapter):
                     found = True
                     hit_stats = True
                     total += int(stat.get("up") or 0) + int(stat.get("down") or 0)
+                    best_raw = stat
             if hit_stats:
                 continue
             settings_raw = inbound.get("settings")
@@ -657,7 +706,8 @@ class SanaeiAdapter(BasePanelAdapter):
                     continue
                 found = True
                 total += int(client.get("up") or 0) + int(client.get("down") or 0)
-        return total if found else None
+                best_raw = client
+        return (total if found else None), best_raw
 
     async def get_usage(self, username: str, remote_id: str | None = None) -> AdapterResult:
         try:
@@ -688,24 +738,38 @@ class SanaeiAdapter(BasePanelAdapter):
                 if isinstance(data, dict):
                     obj = data.get("obj") if data.get("obj") is not None else data
                 used = self._sum_up_down(obj)
-                if used is None:
+                ems = self._sanaei_expiry_ms(obj)
+                if used is None and ems is None:
                     continue
+                if used is None:
+                    used = 0
                 # Keep the largest — some endpoints return one inbound only
                 if best is None or used > best:
                     best = used
                     best_raw = data
 
-            scanned = await self._usage_from_inbounds_scan(email)
+            scanned, scanned_raw = await self._usage_from_inbounds_scan(email)
             if scanned is not None and (best is None or scanned > best):
                 best = scanned
-                best_raw = {"scanned": True, "used": scanned}
+                best_raw = scanned_raw if scanned_raw is not None else {
+                    "scanned": True,
+                    "used": scanned,
+                }
 
             if best is not None:
+                st, exp = self._sanaei_hold_fields(best_raw)
+                if scanned_raw is not None:
+                    st2, exp2 = self._sanaei_hold_fields(scanned_raw)
+                    # Prefer a converted (positive) clock from any inbound
+                    if exp2 and (not exp or (st2 == "active" and st != "active")):
+                        st, exp = st2, exp2
                 return AdapterResult(
                     success=True,
                     remote_username=email,
                     used_traffic=int(best),
                     raw=best_raw,
+                    remote_status=st,
+                    remote_expire=exp,
                 )
 
             if last_resp is not None:

@@ -13,6 +13,7 @@ class UserCreate(BaseModel):
     status: UserStatus = UserStatus.active
     data_limit: int = 0
     expire: int | None = 0
+    on_hold_expire_duration: int = 0
     note: str | None = None
     group_ids: list[int] = Field(default_factory=list)
     proxies: dict[str, Any] = Field(default_factory=dict)
@@ -27,6 +28,7 @@ class UserModify(BaseModel):
     status: UserStatus | None = None
     data_limit: int | None = None
     expire: int | None = None
+    on_hold_expire_duration: int | None = None
     note: str | None = None
     group_ids: list[int] | None = None
     proxies: dict[str, Any] | None = None
@@ -61,6 +63,7 @@ class UserResponse(ORMModel):
     lifetime_used_traffic: int = 0
     data_limit: int = 0
     expire: int | None = None
+    on_hold_expire_duration: int = 0
     data_limit_reset_strategy: str = "no_reset"
     note: str | None = None
     created_at: datetime | None = None
@@ -105,6 +108,7 @@ class UserBulkCreate(BaseModel):
     status: UserStatus = UserStatus.active
     data_limit: int = 0
     expire: int | None = 0
+    on_hold_expire_duration: int = 0
     note: str | None = None
     group_ids: list[int] = Field(default_factory=list)
     proxies: dict[str, Any] = Field(default_factory=dict)

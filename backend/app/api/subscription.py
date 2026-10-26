@@ -13,6 +13,7 @@ from sqlalchemy.orm import selectinload
 from app.core.database import AsyncSessionLocal, get_db
 from app.models.user import PanelAccount, User, UserStatus
 from app.services.orchestrator import (
+    activate_on_hold_if_used,
     collect_links,
     collect_links_detailed,
     device_limit_for_user,
@@ -37,7 +38,7 @@ logger = logging.getLogger("astra.sub")
 
 # Debounce background maintain so many clients don't stampede one user
 _bg_last: dict[int, float] = {}
-_BG_MIN_INTERVAL = 25.0
+_BG_MIN_INTERVAL = 12.0
 
 
 def _account_has_ready_shares(account) -> bool:
@@ -146,7 +147,7 @@ async def _bg_sub_maintain(user_id: int) -> None:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("bg heal user_id=%s: %s", user_id, exc)
             try:
-                await asyncio.wait_for(hydrate_share_links(db, user), timeout=18.0)
+                await asyncio.wait_for(hydrate_share_links(db, user), timeout=30.0)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("bg hydrate user_id=%s: %s", user_id, exc)
             try:
@@ -155,7 +156,8 @@ async def _bg_sub_maintain(user_id: int) -> None:
                     refresh_usage(db, user, force=False, quick=True),
                     timeout=5.5,
                 )
-                changed = await enforce_user_quota(db, user)
+                activated = await activate_on_hold_if_used(db, user)
+                changed = bool(activated) or await enforce_user_quota(db, user)
                 from app.models.user import UserStatus
 
                 blocked = user.status in (
@@ -283,20 +285,19 @@ async def _ensure_share_links(
     token: str,
     user,
     *,
-    timeout: float = 26.0,
+    timeout: float = 18.0,
     force: bool = False,
 ):
-    """Hydrate missing share links with a hard budget (never block multi-panel users)."""
+    """Hydrate missing share links in parallel (one wave, per-panel deadlines)."""
     if not force and await _user_sub_links_complete(db, user):
-        # Every membership account already has expanded shares — serve immediately
         links = await collect_links(user, include_notices=False, db=db)
         return user, links
     try:
         n = await asyncio.wait_for(hydrate_share_links(db, user), timeout=timeout)
         if n:
             await db.commit()
-            user = await load_user_by_token(db, token) or user
             logger.info("sub hydrated user=%s accounts=%s", user.username, n)
+        user = await load_user_by_token(db, token) or user
     except Exception as exc:  # noqa: BLE001
         logger.warning("sub hydrate user=%s: %s", getattr(user, "username", "?"), exc)
         try:
@@ -304,7 +305,16 @@ async def _ensure_share_links(
         except Exception:  # noqa: BLE001
             pass
         user = await load_user_by_token(db, token) or user
-    links = await collect_links(user, include_notices=False, db=db)
+    try:
+        links = await collect_links(user, include_notices=False, db=db)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("sub collect user=%s: %s", getattr(user, "username", "?"), exc)
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        user = await load_user_by_token(db, token) or user
+        links = await collect_links(user, include_notices=False, db=db)
     if not links:
         logger.warning(
             "sub feed empty user=%s status=%s accounts=%s",
@@ -331,7 +341,8 @@ async def _pull_live_usage(db: AsyncSession, user, *, push: bool = False) -> Non
     try:
         # Parallel panel pulls need headroom (Marzban Cloud / multi-panel groups)
         await asyncio.wait_for(refresh_usage(db, user, force=True), timeout=28.0)
-        status_changed = await enforce_user_quota(db, user)
+        activated = await activate_on_hold_if_used(db, user)
+        status_changed = bool(activated) or await enforce_user_quota(db, user)
         await db.commit()
     except Exception as exc:  # noqa: BLE001
         logger.warning("sub usage refresh: %s", exc)
@@ -378,7 +389,7 @@ async def _render_info_page(db: AsyncSession, token: str, user) -> HTMLResponse:
         user = await load_user_by_token(db, token) or user
     else:
         user, _links = await _ensure_share_links(
-            db, token, user, timeout=26.0, force=True
+            db, token, user, timeout=18.0, force=True
         )
     _schedule_bg_maintain(int(user.id))
 
@@ -434,14 +445,14 @@ async def get_subscription(
 
     await ensure_loaded(db)
 
-    # Complete membership → serve immediately (stable count).
-    # Incomplete → short hydrate so multi-panel users don't get half a feed.
+    # Complete membership → serve immediately.
+    # Incomplete → one parallel hydrate wave across all panels, then serve.
     if await _user_sub_links_complete(db, user):
         links = await collect_links(user, include_notices=False, db=db)
         _schedule_bg_maintain(int(user.id))
     else:
         user, links = await _ensure_share_links(
-            db, token, user, timeout=26.0, force=True
+            db, token, user, timeout=18.0, force=True
         )
         _schedule_bg_maintain(int(user.id))
 

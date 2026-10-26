@@ -66,6 +66,7 @@ class AstraNodeClientOut(BaseModel):
     coefficient: float = 1.0
     limit_ip: int = 0
     expire: int = 0
+    on_hold_expire_duration: int = 0
     links_count: int = 0
     share_links: list[str] = []
     subscription_url: str | None = None

@@ -42,17 +42,39 @@ function parseApiDetail(body: unknown): { message: string; code?: string } {
   return { message: "خطای درخواست" };
 }
 
+type ApiOptions = RequestInit & { timeoutMs?: number };
+
 export async function api<T>(
   path: string,
-  options: RequestInit = {}
+  options: ApiOptions = {}
 ): Promise<T> {
+  const { timeoutMs, ...fetchInit } = options;
   const headers: HeadersInit = {
-    ...(options.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
+    ...(fetchInit.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
     ...authHeaders(),
-    ...(options.headers || {}),
+    ...(fetchInit.headers || {}),
   };
 
-  const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  const controller =
+    typeof timeoutMs === "number" && timeoutMs > 0 ? new AbortController() : null;
+  const timer = controller
+    ? window.setTimeout(() => controller.abort(), timeoutMs)
+    : null;
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`, {
+      ...fetchInit,
+      headers,
+      signal: controller?.signal ?? fetchInit.signal,
+    });
+  } catch (e) {
+    if (timer != null) window.clearTimeout(timer);
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new ApiError(504, "پاسخ از سرور نرسید (تایم‌اوت) — دوباره تلاش کنید");
+    }
+    throw e;
+  }
+  if (timer != null) window.clearTimeout(timer);
   if (!res.ok) {
     let message = res.statusText || "خطای درخواست";
     let code: string | undefined;
@@ -126,6 +148,7 @@ export interface AstraNodeClient {
   coefficient: number;
   limit_ip: number;
   expire: number;
+  on_hold_expire_duration?: number;
   links_count: number;
   share_links?: string[];
   subscription_url?: string | null;
@@ -214,6 +237,7 @@ export interface User {
   lifetime_used_traffic: number;
   data_limit: number;
   expire: number | null;
+  on_hold_expire_duration?: number;
   note: string | null;
   subscription_url: string;
   links: string[];

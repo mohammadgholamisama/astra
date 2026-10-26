@@ -8,6 +8,7 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    Integer,
     String,
     Text,
     UniqueConstraint,
@@ -53,6 +54,8 @@ class User(Base):
     used_traffic: Mapped[int] = mapped_column(BigInteger, default=0)
     lifetime_used_traffic: Mapped[int] = mapped_column(BigInteger, default=0)
     expire: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Seconds of validity after first use. Used while status=on_hold (expire=0).
+    on_hold_expire_duration: Mapped[int] = mapped_column(Integer, default=0)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
     sub_token: Mapped[str] = mapped_column(String(64), unique=True, index=True, default=generate_sub_token)
     data_limit_reset_strategy: Mapped[str] = mapped_column(String(32), default="no_reset")

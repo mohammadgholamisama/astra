@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.adapters.base import AdapterResult, UserPayload
+from app.adapters.base import AdapterResult, UserPayload, apply_remote_state
 from app.adapters.http_utils import err_msg, ok_json
 from app.adapters.marzban import MarzbanAdapter
 
@@ -224,29 +224,40 @@ class PasarGuardAdapter(MarzbanAdapter):
             )
 
     def _build_pg_body(self, payload: UserPayload, group_ids: list[int]) -> dict[str, Any]:
-        # PasarGuard (Marzban-family): pass through, map unknown → disabled
-        _ok = ("active", "on_hold", "disabled", "limited", "expired")
-        status = payload.status if payload.status in _ok else "disabled"
-        # Freeze path: UI "خاموش" uses disabled flag; mirror status for edit screen
-        if status in ("limited", "expired"):
-            status = "disabled"
+        # Cloud PasarGuard create/modify schema only accepts status ∈ {active, on_hold}.
+        # Freeze (limited/expired/disabled) is done via PUT .../disabled, not status=.
+        raw = (payload.status or "").lower().strip()
+        if raw == "on_hold":
+            status = "on_hold"
+        else:
+            status = "active"
         body: dict[str, Any] = {
             "username": payload.username,
             "status": status,
             "group_ids": group_ids,
             "data_limit": int(payload.data_limit or 0),
-            "data_limit_reset_strategy": payload.config.get("data_limit_reset_strategy", "no_reset"),
+            "data_limit_reset_strategy": payload.config.get(
+                "data_limit_reset_strategy", "no_reset"
+            ),
             "note": payload.note or "",
             "proxy_settings": payload.config.get("proxy_settings") or {},
         }
         # PasarGuard accepts expire unix timestamp (0/null = unlimited)
         body["expire"] = int(payload.expire or 0) or None
+        if status == "on_hold":
+            # Docs: status=on_hold + on_hold_expire_duration; expire must be empty
+            body["expire"] = None
+            try:
+                hold_dur = int((payload.config or {}).get("on_hold_expire_duration") or 0)
+            except (TypeError, ValueError):
+                hold_dur = 0
+            if hold_dur > 0:
+                body["on_hold_expire_duration"] = hold_dur
         limit_ip = payload.config.get("limit_ip")
         if limit_ip is not None:
             try:
                 n = int(limit_ip)
                 if n >= 0:
-                    # common field names across PG builds
                     body["max_ips"] = n
                     proxy = dict(body.get("proxy_settings") or {})
                     proxy["limit_ip"] = n
@@ -260,14 +271,17 @@ class PasarGuardAdapter(MarzbanAdapter):
         sub = data.get("subscription_url")
         if sub and str(sub) not in links:
             links.append(str(sub))
-        return AdapterResult(
-            success=True,
-            remote_username=data.get("username", fallback),
-            remote_id=str(data.get("id") or data.get("username") or fallback),
-            uuid=None,
-            links=links,
-            used_traffic=self._parse_used_traffic(data),
-            raw=data,
+        return apply_remote_state(
+            AdapterResult(
+                success=True,
+                remote_username=data.get("username", fallback),
+                remote_id=str(data.get("id") or data.get("username") or fallback),
+                uuid=None,
+                links=links,
+                used_traffic=self._parse_used_traffic(data),
+                raw=data,
+            ),
+            data,
         )
 
     async def test_connection(self) -> AdapterResult:
@@ -315,7 +329,24 @@ class PasarGuardAdapter(MarzbanAdapter):
                 ok, data = ok_json(resp)
                 if ok and isinstance(data, dict):
                     # Fast create — expand /sub later on subscription hydrate
-                    return self._from_pg_response(data, payload.username)
+                    created = self._from_pg_response(data, payload.username)
+                    # Create schema forbids status=disabled; freeze via by-id API
+                    if self._want_disabled(payload):
+                        uid = None
+                        if created.remote_id and str(created.remote_id).strip().isdigit():
+                            uid = int(str(created.remote_id).strip())
+                        if uid is None:
+                            uid = await self._resolve_numeric_user_id(
+                                created.remote_username or payload.username
+                            )
+                        if uid is not None:
+                            dis = await self._set_disabled_by_id(uid, True)
+                            if not dis.success:
+                                created.error = (
+                                    f"ساخته شد ولی خاموش‌سازی ناموفق: {dis.error or '?'}"
+                                )
+                            created.remote_id = str(uid)
+                    return created
                 err = err_msg(data, f"HTTP {resp.status_code}")
                 low = err.lower()
                 # "does not exist" / "not found" must NOT match the "already exists" branch

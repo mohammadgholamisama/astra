@@ -213,11 +213,11 @@ async def expand_subscription_links(
         **(headers or {}),
     }
     # Large Marzban/PasarGuard /sub bodies (100–300 configs) need a real read
-    # window. 3s used to abort mid-body → clients only saw ~30 configs.
-    sub_timeout = httpx.Timeout(12.0, connect=4.0)
+    # window. Too-short reads abort mid-body → clients only saw ~30 configs.
+    sub_timeout = httpx.Timeout(18.0, connect=3.0)
 
     async def _fetch_absolute(url: str) -> list[str]:
-        abs_timeout = httpx.Timeout(12.0, connect=4.0)
+        abs_timeout = httpx.Timeout(18.0, connect=3.0)
         try:
             async with httpx.AsyncClient(
                 timeout=abs_timeout,

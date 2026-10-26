@@ -1555,6 +1555,11 @@ async def list_clients_enriched(db: AsyncSession, panel: Panel) -> list[dict[str
                 "coefficient": coeff,
                 "limit_ip": limit_ip,
                 "expire": int(c.expire or 0),
+                "on_hold_expire_duration": (
+                    int(getattr(user, "on_hold_expire_duration", 0) or 0)
+                    if user
+                    else 0
+                ),
                 "links_count": len(links),
                 "share_links": links,
                 "subscription_url": user_subscription_url(user) if user else None,

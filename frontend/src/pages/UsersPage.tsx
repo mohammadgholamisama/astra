@@ -104,11 +104,23 @@ function userIsExpired(u: User) {
   return ts > 0 && ts <= Math.floor(Date.now() / 1000);
 }
 
+function expireChip(u: User) {
+  if (u.status === "on_hold") {
+    const dur = Number(u.on_hold_expire_duration) || 0;
+    const days = dur > 0 ? Math.max(1, Math.ceil(dur / 86400)) : 0;
+    return {
+      label: days > 0 ? `از اولین استفاده · ${toFaDigits(days)} روز` : "از اولین استفاده",
+      tone: "muted" as const,
+    };
+  }
+  return formatExpire(u.expire);
+}
+
 function statusLabel(u: User) {
   if (u.status === "disabled") return { text: "خاموش", tone: "muted" as const };
   if (u.status === "limited") return { text: "اتمام حجم", tone: "warn" as const };
   if (u.status === "expired" || userIsExpired(u)) return { text: "منقضی", tone: "danger" as const };
-  if (u.status === "on_hold") return { text: "معلق", tone: "muted" as const };
+  if (u.status === "on_hold") return { text: "از اولین استفاده", tone: "muted" as const };
   if (u.status === "active") return { text: "فعال", tone: "ok" as const };
   return { text: u.status || "—", tone: "muted" as const };
 }
@@ -290,6 +302,7 @@ export default function UsersPage() {
   const [displayName, setDisplayName] = useState("");
   const [dataGb, setDataGb] = useState("50");
   const [days, setDays] = useState("30");
+  const [startOnFirstUse, setStartOnFirstUse] = useState(false);
   const [groupIds, setGroupIds] = useState<number[]>([]);
   const [groupSearch, setGroupSearch] = useState("");
   /** Filter/focus in create modal: all | uncategorized | category id */
@@ -300,6 +313,7 @@ export default function UsersPage() {
   const [bulkDisplayName, setBulkDisplayName] = useState("");
   const [bulkDataGb, setBulkDataGb] = useState("50");
   const [bulkDays, setBulkDays] = useState("30");
+  const [bulkStartOnFirstUse, setBulkStartOnFirstUse] = useState(false);
   const [bulkGroupIds, setBulkGroupIds] = useState<number[]>([]);
   const [bulkGroupSearch, setBulkGroupSearch] = useState("");
   const [bulkCatTab, setBulkCatTab] = useState<number | "all" | "none">("all");
@@ -474,8 +488,12 @@ export default function UsersPage() {
     mutationFn: () => {
       const gb = Number(dataGb);
       const dayN = Number(days);
-      const expire =
-        dayN > 0 ? Math.floor(Date.now() / 1000) + Math.floor(dayN * 86400) : 0;
+      const hold = startOnFirstUse && dayN > 0;
+      const expire = hold
+        ? 0
+        : dayN > 0
+          ? Math.floor(Date.now() / 1000) + Math.floor(dayN * 86400)
+          : 0;
       const dn = displayName.trim();
       return api<User>("/api/user", {
         method: "POST",
@@ -484,7 +502,8 @@ export default function UsersPage() {
           display_name: dn || null,
           data_limit: gb > 0 ? gbToBytes(gb) : 0,
           expire,
-          status: "active",
+          status: hold ? "on_hold" : "active",
+          on_hold_expire_duration: hold ? Math.floor(dayN * 86400) : 0,
           group_ids: groupIds,
         }),
       });
@@ -496,6 +515,7 @@ export default function UsersPage() {
       setDisplayName("");
       setDataGb("50");
       setDays("30");
+      setStartOnFirstUse(false);
       setGroupIds([]);
       setGroupSearch("");
       setCreateCatTab("all");
@@ -509,6 +529,9 @@ export default function UsersPage() {
     if (err instanceof ApiError) {
       if (err.code === "USERNAME_EXISTS" || err.status === 409) {
         return "این یوزرنیم قبلاً ثبت شده است — یوزرنیم دیگری انتخاب کنید";
+      }
+      if (err.code === "HOLD_DURATION_REQUIRED") {
+        return "برای شروع از اولین استفاده باید روز اعتبار بیشتر از صفر باشد";
       }
       return err.message;
     }
@@ -526,8 +549,12 @@ export default function UsersPage() {
       const gb = Number(bulkDataGb);
       const dayN = Number(bulkDays);
       const count = Math.floor(Number(bulkCount) || 0);
-      const expire =
-        dayN > 0 ? Math.floor(Date.now() / 1000) + Math.floor(dayN * 86400) : 0;
+      const hold = bulkStartOnFirstUse && dayN > 0;
+      const expire = hold
+        ? 0
+        : dayN > 0
+          ? Math.floor(Date.now() / 1000) + Math.floor(dayN * 86400)
+          : 0;
       const dn = bulkDisplayName.trim();
       return api<BulkCreateResponse>("/api/users/bulk", {
         method: "POST",
@@ -537,7 +564,8 @@ export default function UsersPage() {
           display_name: dn || null,
           data_limit: gb > 0 ? gbToBytes(gb) : 0,
           expire,
-          status: "active",
+          status: hold ? "on_hold" : "active",
+          on_hold_expire_duration: hold ? Math.floor(dayN * 86400) : 0,
           group_ids: bulkGroupIds,
         }),
       });
@@ -564,6 +592,9 @@ export default function UsersPage() {
       if (err.code === "USERNAME_EXISTS" || err.status === 409) {
         return err.message || "برخی یوزرنیم‌ها از قبل وجود دارند";
       }
+      if (err.code === "HOLD_DURATION_REQUIRED") {
+        return "برای شروع از اولین استفاده باید روز اعتبار بیشتر از صفر باشد";
+      }
       return err.message;
     }
     return err instanceof Error ? err.message : "خطا در ساخت گروهی";
@@ -585,6 +616,7 @@ export default function UsersPage() {
     setBulkDisplayName("");
     setBulkDataGb("50");
     setBulkDays("30");
+    setBulkStartOnFirstUse(false);
     setBulkGroupIds([]);
     setBulkGroupSearch("");
     setBulkCatTab("all");
@@ -600,6 +632,7 @@ export default function UsersPage() {
     e.preventDefault();
     if (bulkGroupIds.length === 0) return;
     if (!bulkPrefix.trim() || bulkCountN < 1) return;
+    if (bulkStartOnFirstUse && Number(bulkDays) <= 0) return;
     bulkCreate.mutate();
   }
 
@@ -675,7 +708,10 @@ export default function UsersPage() {
 
   const retryAll = useMutation({
     mutationFn: () =>
-      api<RetryAllResult>("/api/users/retry-errors", { method: "POST" }),
+      api<RetryAllResult>("/api/users/retry-errors", {
+        method: "POST",
+        timeoutMs: 320_000,
+      }),
     onSuccess: (r) => {
       qc.invalidateQueries({ queryKey: ["users"] });
       setErrorsUser(null);
@@ -683,14 +719,17 @@ export default function UsersPage() {
       if (r.recovered > 0 && r.remaining <= 0) {
         text = `همه خطاها برطرف شد (${toFaDigits(r.recovered)} مورد)`;
       } else if (r.recovered > 0) {
-        text = `${toFaDigits(r.recovered)} خطا برطرف شد — ${toFaDigits(r.remaining)} هنوز خطا دارد`;
+        text = `${toFaDigits(r.recovered)} مورد درست شد — ${toFaDigits(r.remaining)} خطای واقعی باقی ماند`;
       } else if (r.dropped > 0 && r.remaining <= 0) {
         text = `خطاهای پنل خاموش پاک شد (${toFaDigits(r.dropped)})`;
-      } else if (r.skipped_unreachable > 0 || r.remaining > 0) {
+      } else if (r.remaining > 0) {
         const names = (r.panels_down || []).slice(0, 3).join("، ");
         text = names
-          ? `پنل ${names} هنوز پاسخ نمی‌دهد — خطاها باقی ماند`
-          : "پنل‌ها هنوز پاسخ ندادند — خطاها باقی ماند";
+          ? `${toFaDigits(r.remaining)} خطا باقی ماند (پنل قطع: ${names})`
+          : `${toFaDigits(r.remaining)} خطای واقعی پنل باقی ماند`;
+      } else if ((r.panels_down || []).length > 0) {
+        const names = (r.panels_down || []).slice(0, 3).join("، ");
+        text = `پنل قطع است: ${names}`;
       }
       setActionMsg({
         type: r.remaining > 0 && r.recovered <= 0 ? "err" : "ok",
@@ -774,8 +813,12 @@ export default function UsersPage() {
       }
       const gb = Number(editDataGb);
       const dayN = Number(editDays);
-      const expire =
-        dayN > 0 ? Math.floor(Date.now() / 1000) + Math.floor(dayN * 86400) : 0;
+      const stillHold = editUser.status === "on_hold";
+      const expire = stillHold
+        ? 0
+        : dayN > 0
+          ? Math.floor(Date.now() / 1000) + Math.floor(dayN * 86400)
+          : 0;
       const dn = editDisplayName.trim();
       const body: Record<string, unknown> = {
         display_name: dn || null,
@@ -783,6 +826,10 @@ export default function UsersPage() {
         data_limit: gb > 0 ? gbToBytes(gb) : 0,
         expire,
       };
+      if (stillHold) {
+        body.status = "on_hold";
+        body.on_hold_expire_duration = dayN > 0 ? Math.floor(dayN * 86400) : 0;
+      }
       // Only send group_ids when membership actually changed — avoids a full
       // re-provision of every panel on every volume/expire edit (very slow).
       const groupsChanged =
@@ -822,7 +869,13 @@ export default function UsersPage() {
     setEditUser(u);
     setEditDisplayName(u.display_name || "");
     setEditDataGb(bytesToGbInput(u.data_limit));
-    setEditDays(expireToDaysInput(u.expire));
+    if (u.status === "on_hold" && Number(u.on_hold_expire_duration) > 0) {
+      setEditDays(
+        String(Math.max(1, Math.ceil(Number(u.on_hold_expire_duration) / 86400)))
+      );
+    } else {
+      setEditDays(expireToDaysInput(u.expire));
+    }
     const ids = [...(u.group_ids || [])];
     setEditInitialGroupIds(ids);
     setEditGroupIds(ids);
@@ -920,6 +973,7 @@ export default function UsersPage() {
   function onSubmit(e: FormEvent) {
     e.preventDefault();
     if (groupIds.length === 0) return;
+    if (startOnFirstUse && Number(days) <= 0) return;
     create.mutate();
   }
 
@@ -1395,7 +1449,7 @@ export default function UsersPage() {
             const { ok, total: panels, errorPanels } = uniquePanelStats(u);
             const pct = usagePercent(u.used_traffic, u.data_limit);
             const remain = remainingBytes(u.used_traffic, u.data_limit);
-            const exp = formatExpire(u.expire);
+            const exp = expireChip(u);
             const st = statusLabel(u);
             const userGroupList = (u.group_ids || [])
               .map((id) => groupsById.get(id))
@@ -1562,7 +1616,7 @@ export default function UsersPage() {
         const errors = (u.panel_accounts || []).filter((a) => a.status === "error");
         const { ok, total: panels } = uniquePanelStats(u);
         const remain = remainingBytes(u.used_traffic, u.data_limit);
-        const exp = formatExpire(u.expire);
+        const exp = expireChip(u);
         const menuGroups = (u.group_ids || [])
           .map((id) => groupsById.get(id))
           .filter((g): g is Group => !!g);
@@ -2043,9 +2097,33 @@ export default function UsersPage() {
                     dir="ltr"
                     placeholder="30"
                   />
-                  <p className="field-hint">۰ = نامحدود</p>
+                  <p className="field-hint">
+                    {startOnFirstUse ? "از لحظهٔ اولین اتصال شمرده می‌شود" : "۰ = نامحدود"}
+                  </p>
                 </div>
               </div>
+              <button
+                type="button"
+                className={`settings-switch user-hold-switch${startOnFirstUse ? " on" : ""}`}
+                role="switch"
+                aria-checked={startOnFirstUse}
+                onClick={() => setStartOnFirstUse((v) => !v)}
+              >
+                <span className="settings-switch-track" aria-hidden>
+                  <span className="settings-switch-knob" />
+                </span>
+                <span className="user-hold-switch-copy">
+                  <strong>شروع از اولین استفاده</strong>
+                  <small>
+                    {startOnFirstUse
+                      ? "تایمر روز اعتبار بعد از اولین اتصال روی همه پنل‌ها با هم شروع می‌شود"
+                      : "خاموش: تایمر از همین الان شروع می‌شود"}
+                  </small>
+                </span>
+              </button>
+              {startOnFirstUse && Number(days) <= 0 && (
+                <p className="error">برای این گزینه باید روز اعتبار بیشتر از صفر باشد</p>
+              )}
               {createErrorText && <p className="error">{createErrorText}</p>}
               <footer className="modal-foot">
                 <button type="button" className="btn ghost" onClick={() => setOpen(false)}>
@@ -2053,7 +2131,11 @@ export default function UsersPage() {
                 </button>
                 <button
                   className="btn"
-                  disabled={create.isPending || groupIds.length === 0}
+                  disabled={
+                    create.isPending ||
+                    groupIds.length === 0 ||
+                    (startOnFirstUse && Number(days) <= 0)
+                  }
                 >
                   {create.isPending
                     ? "در حال ساخت…"
@@ -2317,8 +2399,36 @@ export default function UsersPage() {
                     dir="ltr"
                     disabled={bulkCreate.isPending}
                   />
+                  <p className="field-hint">
+                    {bulkStartOnFirstUse
+                      ? "از لحظهٔ اولین اتصال شمرده می‌شود"
+                      : "۰ = نامحدود"}
+                  </p>
                 </div>
               </div>
+              <button
+                type="button"
+                className={`settings-switch user-hold-switch${bulkStartOnFirstUse ? " on" : ""}`}
+                role="switch"
+                aria-checked={bulkStartOnFirstUse}
+                disabled={bulkCreate.isPending}
+                onClick={() => setBulkStartOnFirstUse((v) => !v)}
+              >
+                <span className="settings-switch-track" aria-hidden>
+                  <span className="settings-switch-knob" />
+                </span>
+                <span className="user-hold-switch-copy">
+                  <strong>شروع از اولین استفاده</strong>
+                  <small>
+                    {bulkStartOnFirstUse
+                      ? "تایمر روز اعتبار بعد از اولین اتصال روی همه پنل‌ها با هم شروع می‌شود"
+                      : "خاموش: تایمر از همین الان شروع می‌شود"}
+                  </small>
+                </span>
+              </button>
+              {bulkStartOnFirstUse && Number(bulkDays) <= 0 && (
+                <p className="error">برای این گزینه باید روز اعتبار بیشتر از صفر باشد</p>
+              )}
 
               {bulkErrorText && <p className="error">{bulkErrorText}</p>}
               <footer className="modal-foot">
@@ -2336,7 +2446,8 @@ export default function UsersPage() {
                     bulkCreate.isPending ||
                     bulkGroupIds.length === 0 ||
                     !bulkPrefix.trim() ||
-                    bulkCountN < 1
+                    bulkCountN < 1 ||
+                    (bulkStartOnFirstUse && Number(bulkDays) <= 0)
                   }
                 >
                   {bulkCreate.isPending
@@ -2497,6 +2608,7 @@ export default function UsersPage() {
               className="user-create-form"
               onSubmit={(e) => {
                 e.preventDefault();
+                if (editUser.status === "on_hold" && Number(editDays) <= 0) return;
                 saveEdit.mutate();
               }}
             >
@@ -2527,7 +2639,11 @@ export default function UsersPage() {
                   <p className="field-hint">۰ = نامحدود</p>
                 </div>
                 <div className="field">
-                  <label>روز اعتبار از الان</label>
+                  <label>
+                    {editUser.status === "on_hold"
+                      ? "روز اعتبار از اولین استفاده"
+                      : "روز اعتبار از الان"}
+                  </label>
                   <input
                     type="number"
                     min={0}
@@ -2538,7 +2654,11 @@ export default function UsersPage() {
                     dir="ltr"
                     placeholder="30"
                   />
-                  <p className="field-hint">۰ = نامحدود · از لحظه ذخیره محاسبه می‌شود</p>
+                  <p className="field-hint">
+                    {editUser.status === "on_hold"
+                      ? "تایمر هنوز شروع نشده — از اولین اتصال شمرده می‌شود"
+                      : "۰ = نامحدود · از لحظه ذخیره محاسبه می‌شود"}
+                  </p>
                 </div>
               </div>
 
@@ -2721,7 +2841,11 @@ export default function UsersPage() {
                 </button>
                 <button
                   className="btn"
-                  disabled={saveEdit.isPending || editGroupIds.length === 0}
+                  disabled={
+                    saveEdit.isPending ||
+                    editGroupIds.length === 0 ||
+                    (editUser.status === "on_hold" && Number(editDays) <= 0)
+                  }
                 >
                   {saveEdit.isPending ? "در حال ذخیره…" : "ذخیره تغییرات"}
                 </button>

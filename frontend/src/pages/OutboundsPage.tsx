@@ -74,7 +74,7 @@ function statusLabel(s: string | null | undefined): string {
     case "disabled":
       return "خاموش";
     case "on_hold":
-      return "معلق";
+      return "از اولین استفاده";
     case "pending":
       return "در صف";
     case "error":
@@ -82,6 +82,26 @@ function statusLabel(s: string | null | undefined): string {
     default:
       return s || "—";
   }
+}
+
+function clientExpireLabel(c: AstraNodeClient): string {
+  if ((c.user_status || "").toLowerCase() === "on_hold") {
+    const dur = Number(c.on_hold_expire_duration) || 0;
+    const days = dur > 0 ? Math.max(1, Math.ceil(dur / 86400)) : 0;
+    return days > 0
+      ? `از اولین استفاده · ${toFaDigits(days)} روز`
+      : "از اولین استفاده";
+  }
+  const ts = Number(c.expire) || 0;
+  if (ts <= 0) return "بدون انقضا";
+  const now = Math.floor(Date.now() / 1000);
+  const diff = ts - now;
+  if (diff <= 0) return "منقضی شده";
+  const days = Math.ceil(diff / 86400);
+  if (days >= 2) return `${toFaDigits(days)} روز مانده`;
+  const hours = Math.ceil(diff / 3600);
+  if (hours >= 2) return `${toFaDigits(hours)} ساعت مانده`;
+  return "کمتر از ۲ ساعت";
 }
 
 async function copyText(text: string): Promise<boolean> {
@@ -959,6 +979,7 @@ export default function OutboundsPage() {
                       <span dir="ltr" className="ob-client-email" title={c.email}>
                         {c.email}
                       </span>
+                      <span>{clientExpireLabel(c)}</span>
                       <span>{toFaDigits(c.links_count || (share ? 1 : 0))} لینک</span>
                     </div>
 

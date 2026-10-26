@@ -3457,6 +3457,36 @@ th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
   gap: 12px;
 }
 .user-create-form .field { margin-bottom: 0; }
+.user-hold-switch {
+  width: 100%;
+  justify-content: flex-start;
+  align-items: center;
+  gap: 12px;
+  margin-top: 4px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  text-align: start;
+}
+.user-hold-switch-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.user-hold-switch-copy strong {
+  font-size: 0.86rem;
+  font-weight: 800;
+  color: inherit;
+}
+.user-hold-switch-copy small {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--muted);
+  line-height: 1.45;
+}
+.user-hold-switch.on .user-hold-switch-copy small {
+  color: color-mix(in srgb, var(--accent) 70%, var(--text));
+}
 .user-create-form .field-hint {
   margin: 6px 0 0;
   font-size: 0.75rem;

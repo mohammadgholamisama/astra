@@ -15,7 +15,12 @@ from typing import Any
 
 import httpx
 
-from app.adapters.base import AdapterResult, BasePanelAdapter, UserPayload
+from app.adapters.base import (
+    AdapterResult,
+    BasePanelAdapter,
+    UserPayload,
+    apply_remote_state,
+)
 from app.adapters.http_utils import err_msg, make_client, ok_json
 
 # Protocols Marzban/Rebecca accept in proxies/inbounds
@@ -329,6 +334,15 @@ class MarzbanAdapter(BasePanelAdapter):
             "note": payload.note or "",
             "expire": int(payload.expire or 0),
         }
+        if status == "on_hold":
+            # Official schema: on_hold cannot combine with expire; duration starts on first use
+            body["expire"] = 0
+            try:
+                hold_dur = int((payload.config or {}).get("on_hold_expire_duration") or 0)
+            except (TypeError, ValueError):
+                hold_dur = 0
+            if hold_dur > 0:
+                body["on_hold_expire_duration"] = hold_dur
         if include_username:
             body["username"] = payload.username
         # Official Marzban schema has no limit_ip — do not send it (causes 400/422)
@@ -389,14 +403,17 @@ class MarzbanAdapter(BasePanelAdapter):
         sub = data.get("subscription_url")
         if sub and str(sub) not in links:
             links.append(str(sub))
-        return AdapterResult(
-            success=True,
-            remote_username=data.get("username", fallback_username),
-            remote_id=data.get("username", fallback_username),
-            uuid=uuid,
-            links=links,
-            used_traffic=self._parse_used_traffic(data),
-            raw=data,
+        return apply_remote_state(
+            AdapterResult(
+                success=True,
+                remote_username=data.get("username", fallback_username),
+                remote_id=data.get("username", fallback_username),
+                uuid=uuid,
+                links=links,
+                used_traffic=self._parse_used_traffic(data),
+                raw=data,
+            ),
+            data,
         )
 
     async def _expand_subscription_links(self, links: list[str]) -> list[str]:

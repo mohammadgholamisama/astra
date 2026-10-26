@@ -48,7 +48,7 @@ def _status_meta(status: str) -> tuple[str, str]:
     if s == "active":
         return "فعال", "ok"
     if s == "on_hold":
-        return "در انتظار", "warn"
+        return "از اولین استفاده", "warn"
     if s == "limited":
         return "اتمام حجم", "danger"
     if s == "expired":
@@ -148,7 +148,10 @@ def render_subscription_page(
         bar_tone = "ok" if pct < 70 else "warn" if pct < 90 else "danger"
 
     status_label, status_tone = _status_meta(status)
-    expire_label = format_jalali_from_unix(expire)
+    if (status or "").lower() == "on_hold":
+        expire_label = "از اولین استفاده"
+    else:
+        expire_label = format_jalali_from_unix(expire)
     used_label = _format_bytes(used_i)
     limit_label = "نامحدود" if unlimited else _format_bytes(limit_i)
     remain_label = "نامحدود" if remain is None else _format_bytes(remain)

@@ -118,6 +118,7 @@ def to_user_response(user: User, *, include_links: bool = True) -> UserResponse:
         lifetime_used_traffic=user.lifetime_used_traffic,
         data_limit=user.data_limit,
         expire=user.expire or 0,
+        on_hold_expire_duration=int(getattr(user, "on_hold_expire_duration", 0) or 0),
         data_limit_reset_strategy=user.data_limit_reset_strategy,
         note=user.note,
         created_at=created_at,
