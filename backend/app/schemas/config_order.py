@@ -23,6 +23,8 @@ class ConfigOrderItemOut(BaseModel):
     country_code: str | None = None
     flag: str | None = None
     flag_exact: bool = False
+    avg_ping: float | None = None
+    device_count: int | None = None
 
 
 class ConfigOrderWorkspaceOut(BaseModel):
@@ -34,3 +36,19 @@ class ConfigOrderWorkspaceOut(BaseModel):
 
 class ConfigOrderSaveBody(BaseModel):
     items: list[ConfigOrderItemIn]
+
+
+class PingRankItemIn(BaseModel):
+    """One fingerprint avg from multi-device ping hub (last 10 minutes)."""
+
+    host: str
+    port: int = Field(..., ge=1, le=65535)
+    match_host: str = ""
+    label: str | None = None
+    avg_ping: float = -1
+    sample_count: int = 0
+    device_count: int = 0
+
+
+class PingRankBody(BaseModel):
+    items: list[PingRankItemIn]

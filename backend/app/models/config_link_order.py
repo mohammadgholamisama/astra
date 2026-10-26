@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String, UniqueConstraint, func, text
+from sqlalchemy import DateTime, Float, Integer, String, UniqueConstraint, func, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -33,6 +33,9 @@ class ConfigLinkOrder(Base):
     )
     sort_order: Mapped[int] = mapped_column(Integer, default=0, index=True)
     label: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Last multi-device ping average applied by ping-hub (ms); null = never ranked
+    avg_ping: Mapped[float | None] = mapped_column(Float, nullable=True)
+    device_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

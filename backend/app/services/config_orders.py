@@ -340,6 +340,8 @@ def _item_out(
     sort_order: int,
     in_sample: bool,
     sample: dict[str, Any] | None,
+    avg_ping: float | None = None,
+    device_count: int | None = None,
 ) -> ConfigOrderItemOut:
     meta = _endpoint_meta(host, port, match_host)
     s = sample or {}
@@ -358,6 +360,8 @@ def _item_out(
         country_code=meta["country_code"],
         flag=meta["flag"],
         flag_exact=bool(meta["flag_exact"]),
+        avg_ping=avg_ping,
+        device_count=device_count,
     )
 
 
@@ -469,6 +473,16 @@ async def list_workspace(db: AsyncSession) -> ConfigOrderWorkspaceOut:
             # www./non-www (or other normalize collapses) — keep earliest row
             continue
         sample = samples.get(key)
+        avg = getattr(row, "avg_ping", None)
+        dcount = getattr(row, "device_count", None)
+        try:
+            avg_f = float(avg) if avg is not None else None
+        except (TypeError, ValueError):
+            avg_f = None
+        try:
+            dcount_i = int(dcount) if dcount is not None else None
+        except (TypeError, ValueError):
+            dcount_i = None
         items.append(
             _item_out(
                 host=host,
@@ -478,6 +492,8 @@ async def list_workspace(db: AsyncSession) -> ConfigOrderWorkspaceOut:
                 sort_order=len(items),
                 in_sample=sample is not None,
                 sample=sample,
+                avg_ping=avg_f,
+                device_count=dcount_i,
             )
         )
         seen.add(key)
@@ -505,6 +521,93 @@ async def list_workspace(db: AsyncSession) -> ConfigOrderWorkspaceOut:
         total_sample_links=len(samples),
         ordered_count=len(saved),
     )
+
+
+async def apply_ping_rank(
+    db: AsyncSession,
+    ranked: list[dict[str, Any]],
+) -> ConfigOrderWorkspaceOut:
+    """Reorder existing config-order by multi-device avg ping (host/port/match_host).
+
+    - Fingerprints with positive avg_ping rise to the top (lower ms = better).
+    - Failed / unknown stay after scored ones, keeping relative order.
+    - Labels from ping hub fill empty labels only.
+    """
+    workspace = await list_workspace(db)
+    current = list(workspace.items)
+
+    score: dict[tuple[str, int, str], float] = {}
+    devices: dict[tuple[str, int, str], int] = {}
+    labels: dict[tuple[str, int, str], str] = {}
+    for raw in ranked:
+        try:
+            host = str(raw.get("host") or "")
+            port = int(raw.get("port") or 0)
+            match = str(raw.get("match_host") or "")
+            avg = float(raw.get("avg_ping") if raw.get("avg_ping") is not None else -1)
+            dcount = int(raw.get("device_count") or 0)
+        except (TypeError, ValueError):
+            continue
+        norm = try_normalize_endpoint(host, port, match)
+        if not norm:
+            continue
+        key = _fp_key(*norm)
+        # Keep best (lowest positive) if duplicates
+        if avg > 0 and (key not in score or avg < score[key]):
+            score[key] = avg
+            devices[key] = dcount
+        label = _normalize_label(raw.get("label"))
+        if label and key not in labels:
+            labels[key] = label
+
+    def sort_key(it: ConfigOrderItemOut) -> tuple:
+        key = _fp_key(it.host, int(it.port), it.match_host or "")
+        if key in score:
+            return (0, score[key], it.sort_order)
+        return (1, float(it.sort_order), it.sort_order)
+
+    ordered = sorted(current, key=sort_key)
+    payload: list[ConfigOrderItemIn] = []
+    for it in ordered:
+        key = _fp_key(it.host, int(it.port), it.match_host or "")
+        label = it.label or labels.get(key)
+        payload.append(
+            ConfigOrderItemIn(
+                host=it.host,
+                port=int(it.port),
+                match_host=it.match_host or "",
+                label=label,
+            )
+        )
+
+    logger.info(
+        "apply_ping_rank scored=%s total=%s",
+        len(score),
+        len(payload),
+    )
+    ws = await save_order(db, payload)
+
+    # Persist avg_ping / device_count onto saved rows for the panel UI
+    result = await db.execute(select(ConfigLinkOrder))
+    rows = list(result.scalars().all())
+    for row in rows:
+        try:
+            key = _fp_key(
+                normalize_host(row.host),
+                int(row.port),
+                normalize_match_host(row.match_host or ""),
+            )
+        except (ValueError, TypeError):
+            continue
+        if key in score:
+            row.avg_ping = float(score[key])
+            row.device_count = int(devices.get(key) or 0)
+        else:
+            row.avg_ping = None
+            row.device_count = None
+    await db.commit()
+    await refresh_cache(db)
+    return await list_workspace(db)
 
 
 async def save_order(db: AsyncSession, items: list[ConfigOrderItemIn]) -> ConfigOrderWorkspaceOut:

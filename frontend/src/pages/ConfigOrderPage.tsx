@@ -33,6 +33,8 @@ type OrderItem = {
   country_code: string | null;
   flag: string | null;
   flag_exact: boolean;
+  avg_ping?: number | null;
+  device_count?: number | null;
 };
 
 type Workspace = {
@@ -490,10 +492,10 @@ export default function ConfigOrderPage() {
           <p className="configs-kicker">سابسکریپشن</p>
           <h1 className="page-title">ترتیب کانفیگ‌ها</h1>
           <p className="page-sub">
-            شمارهٔ <strong>#</strong> همان شمارهٔ صفحهٔ ساب است (فقط کانفیگ‌های
-            نمایش‌داده‌شده). هر ردیف با <strong>دامنه</strong>، <strong>پورت</strong> و در
-            صورت وجود <strong>هاست (SNI)</strong> مشخص می‌شود. پرچم و خاموش/روشن روی
-            همه ساب‌ها اعمال می‌شود.
+            شمارهٔ <strong>#</strong> همان شمارهٔ صفحهٔ ساب است. هر ردیف با{" "}
+            <strong>دامنه</strong>، <strong>پورت</strong> و <strong>هاست/SNI</strong>{" "}
+            مشخص می‌شود. هر ۱۰ دقیقه میانگین پینگ چند دستگاه از هاب می‌آید و ترتیب
+            خودکار بهتر می‌شود (پینگ کمتر = بالاتر).
           </p>
         </div>
         <div className="config-order-hero-actions">
@@ -651,6 +653,21 @@ export default function ConfigOrderPage() {
                     ) : null}
                     {it.protocol ? (
                       <span className="badge muted">{it.protocol}</span>
+                    ) : null}
+                    {it.avg_ping != null && Number.isFinite(it.avg_ping) ? (
+                      <span
+                        className="badge ok"
+                        title={
+                          it.device_count
+                            ? `میانگین از ${toFaDigits(it.device_count)} دستگاه`
+                            : "میانگین پینگ چند دستگاه"
+                        }
+                      >
+                        ⌀ {toFaDigits(Math.round(it.avg_ping))} ms
+                        {it.device_count
+                          ? ` · ${toFaDigits(it.device_count)} دستگاه`
+                          : ""}
+                      </span>
                     ) : null}
                     {it.hidden ? (
                       <span className="badge warn">مخفی از ساب</span>
