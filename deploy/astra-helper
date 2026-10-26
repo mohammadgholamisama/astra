@@ -116,6 +116,19 @@ panel_locations() {
         proxy_read_timeout 120s;
     }
 
+    # Multi-device ping hub (Go) — only panel host; does not touch /api Astra routes
+    location /ping-api/ {
+        proxy_pass http://127.0.0.1:18080/;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 120s;
+    }
+
 $(sub_location_block "$port")
 
     location = /health {
@@ -866,6 +879,12 @@ cmd_apply_update() {
   cmd_write_nginx
   cmd_restart_astra
 
+  # Optional companion: multi-device ping hub (mobile-app/backend-go)
+  if [[ -d "${ASTRA_ROOT}/mobile-app/backend-go" && -f "${ASTRA_ROOT}/deploy/ping-hub-install.sh" ]]; then
+    echo "astra-helper: installing / refreshing astra-ping-hub…"
+    bash "${ASTRA_ROOT}/deploy/ping-hub-install.sh" || echo "astra-helper: WARNING — ping-hub install failed (panel still up)" >&2
+  fi
+
   local ver
   ver="$(read_local_version)"
   printf '%s\n' "{\"ok\":true,\"local_version\":\"${ver}\",\"remote_version\":\"${ver}\",\"message\":\"updated\"}"
@@ -985,6 +1004,7 @@ Commands:
   xray-stop <panel_id>
   check-update                 # JSON status (preserves data)
   apply-update                 # pull latest; keeps .env + data/
+  install-ping-hub             # build/restart astra-ping-hub only
   uninstall [--purge]          # remove Astra from server (other apps safe)
 EOF
 }
@@ -1004,6 +1024,10 @@ main() {
     xray-stop)     cmd_xray_stop "${1:-}" ;;
     check-update)  cmd_check_update ;;
     apply-update)  cmd_apply_update ;;
+    install-ping-hub)
+      [[ -f "${ASTRA_ROOT}/deploy/ping-hub-install.sh" ]] || die "ping-hub-install.sh missing"
+      bash "${ASTRA_ROOT}/deploy/ping-hub-install.sh"
+      ;;
     uninstall)     cmd_uninstall "${1:-}" ;;
     ""|-h|--help)  usage ;;
     *)             die "unknown command: $cmd" ;;

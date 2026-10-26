@@ -1,0 +1,19 @@
+[Unit]
+Description=Astra multi-device ping hub (Go)
+After=network-online.target redis-server.service redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=astra
+Group=astra
+WorkingDirectory=/opt/astra/mobile-app/backend-go
+EnvironmentFile=-/opt/astra/mobile-app/backend-go/.env
+ExecStart=/opt/astra/mobile-app/backend-go/bin/ping-hub
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65535
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

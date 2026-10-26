@@ -35,3 +35,11 @@ scripts/_hydrate_out.txt
 scripts/_overlap_out.txt
 scripts/_slow_out.txt
 scripts/_audit_out.txt
+
+# Mobile ping hub / RN client
+mobile-app/backend-go/.env
+mobile-app/backend-go/bin/
+mobile-app/client/node_modules/
+mobile-app/client/android/app/build/
+mobile-app/client/android/.gradle/
+mobile-app/client/android/build/
