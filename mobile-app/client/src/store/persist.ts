@@ -9,6 +9,8 @@ export type SavedSettings = {
   operator?: Operator;
   subUrl?: string;
   nextRunAt?: number;
+  /** Auto-test interval in ms (2m / 5m / 10m / 15m / 30m). */
+  cycleIntervalMs?: number;
   backgroundEnabled?: boolean;
   lastBackgroundStatus?: string;
   permissionsAsked?: boolean;

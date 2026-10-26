@@ -15,7 +15,14 @@ function abortedError() {
   return new DOMException('Aborted', 'AbortError');
 }
 
-/** Reject as soon as AbortSignal fires — native pings can't be killed, but workers stop waiting. */
+function isAbort(e: unknown): boolean {
+  return (
+    (e instanceof DOMException && e.name === 'AbortError') ||
+    (e instanceof Error && /abort/i.test(e.message))
+  );
+}
+
+/** Reject as soon as AbortSignal fires. */
 function raceAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
   if (signal.aborted) return Promise.reject(abortedError());
@@ -39,9 +46,9 @@ export async function runPingQueue(
   configs: ParsedConfig[],
   options: PingQueueOptions = {},
 ): Promise<LocalPingResult[]> {
-  const concurrency = Math.max(1, options.concurrency ?? 28);
-  const timeoutMs = options.timeoutMs ?? 1600;
-  const tcpTimeoutMs = options.tcpTimeoutMs ?? 280;
+  const concurrency = Math.max(1, options.concurrency ?? 12);
+  const timeoutMs = options.timeoutMs ?? 1500;
+  const tcpTimeoutMs = options.tcpTimeoutMs ?? 250;
   const tcpPrecheck = options.tcpPrecheck !== false;
   const total = configs.length;
   const results: LocalPingResult[] = new Array(total);
@@ -49,6 +56,7 @@ export async function runPingQueue(
   let completed = 0;
 
   async function measureOne(cfg: ParsedConfig): Promise<number> {
+    if (options.signal?.aborted) throw abortedError();
     options.onStart?.(cfg);
     if (options.signal?.aborted) throw abortedError();
     if (tcpPrecheck) {
@@ -67,17 +75,14 @@ export async function runPingQueue(
       if (options.signal?.aborted) return;
       const i = nextIndex++;
       if (i >= total) return;
+      // Stop scheduling more work once aborted (index already taken — OK)
+      if (options.signal?.aborted) return;
       const cfg = configs[i]!;
       let pingMs = -1;
       try {
         pingMs = await measureOne(cfg);
       } catch (e) {
-        if (
-          (e instanceof DOMException && e.name === 'AbortError') ||
-          (e instanceof Error && /abort/i.test(e.message))
-        ) {
-          return;
-        }
+        if (isAbort(e)) return;
         pingMs = -1;
       }
       if (options.signal?.aborted) return;
@@ -98,9 +103,7 @@ export async function runPingQueue(
   );
   await Promise.all(workers);
 
-  if (options.signal?.aborted) {
-    throw abortedError();
-  }
+  // Always return whatever we have — caller decides abort vs complete
   return results.map((r, i) => {
     if (r) return r;
     return {

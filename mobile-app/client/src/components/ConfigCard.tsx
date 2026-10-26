@@ -1,44 +1,22 @@
-import React from 'react';
-import {
-  ActivityIndicator,
-  Pressable,
-  StyleSheet,
-  Text,
-  View,
-} from 'react-native';
-import {
-  Info,
-  Signal,
-  SignalHigh,
-  SignalLow,
-  SignalMedium,
-  SignalZero,
-} from 'lucide-react-native';
+import React, { memo } from 'react';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
 import type { RankedConfig } from '../types';
 import { formatMs, toFaDigits } from '../utils/format';
 import { colors, fonts, radii } from '../theme';
 
-function pingColor(ms: number, mode: 'wait' | 'fail' | 'live' = 'live'): string {
-  if (ms === -2) return colors.accent;
-  if (mode === 'wait') return colors.textMute;
-  if (ms < 0 || mode === 'fail') return colors.rose;
+const ROW_H = 64;
+
+function pingColor(ms: number, testing: boolean, fail: boolean, wait: boolean): string {
+  if (testing) return colors.accent;
+  if (wait) return colors.textMute;
+  if (fail || ms < 0) return colors.rose;
   if (ms < 180) return colors.mint;
   if (ms < 350) return colors.accent;
   if (ms < 600) return colors.amber;
   return colors.rose;
 }
 
-function SignalGlyph({ ms, mode }: { ms: number; mode: 'wait' | 'fail' | 'live' }) {
-  const c = pingColor(ms, mode);
-  if (mode === 'wait' || ms === -2) return <Signal size={14} color={c} strokeWidth={2.2} />;
-  if (ms < 0 || mode === 'fail') return <SignalZero size={14} color={c} strokeWidth={2.2} />;
-  if (ms < 180) return <SignalHigh size={14} color={c} strokeWidth={2.2} />;
-  if (ms < 350) return <SignalMedium size={14} color={c} strokeWidth={2.2} />;
-  if (ms < 600) return <SignalLow size={14} color={c} strokeWidth={2.2} />;
-  return <SignalZero size={14} color={c} strokeWidth={2.2} />;
-}
-
-export function ConfigCard({
+function ConfigCardInner({
   item,
   highlight,
   onDetails,
@@ -49,160 +27,93 @@ export function ConfigCard({
 }) {
   const avg = item.avg_ping;
   const testing = avg === -2 || !!highlight;
-  const measured = !!item.measured || (item.operator_pings?.length ?? 0) > 0;
-  const doneFail = measured && avg < 0;
-  const waiting = !testing && !measured;
-  const mode = testing ? 'live' : doneFail ? 'fail' : waiting ? 'wait' : 'live';
-  const avgLabel = testing ? '…' : doneFail ? 'قطع' : waiting ? '—' : formatMs(avg);
-  const quality = testing
-    ? 'در حال تست'
-    : doneFail
-      ? 'قطع'
-      : waiting
-        ? 'منتظر'
-        : avg < 180
-          ? 'عالی'
-          : avg < 350
-            ? 'خوب'
-            : avg < 600
-              ? 'متوسط'
-              : 'ضعیف';
+  const measured = !!item.measured;
+  const fail = measured && avg < 0;
+  const wait = !testing && !measured;
+  const color = pingColor(avg, testing, fail, wait);
+  const avgLabel = testing ? '…' : fail ? 'قطع' : wait ? '—' : formatMs(avg);
 
   return (
-    <View style={[styles.card, highlight && styles.cardActive]}>
-      <View style={[styles.rankCol, highlight && styles.rankColActive]}>
-        <Text style={styles.rankHash}>رتبه</Text>
-        <Text style={styles.rankNum}>{toFaDigits(item.rank)}</Text>
-      </View>
-
+    <Pressable
+      onPress={onDetails}
+      style={[styles.card, highlight && styles.cardActive]}
+    >
+      <Text style={styles.rank}>{toFaDigits(item.rank)}</Text>
       <View style={styles.body}>
-        <View style={styles.titleRow}>
-          <Pressable
-            onPress={onDetails}
-            hitSlop={8}
-            accessibilityLabel="جزئیات کانفیگ"
-            style={styles.infoBtn}
-          >
-            <Info size={16} color={colors.accent} strokeWidth={2.3} />
-          </Pressable>
-
-          <View style={styles.titleCol}>
-            <Text style={styles.title} numberOfLines={1}>
-              {item.remark || item.host || 'بدون نام'}
-            </Text>
-            <Text style={styles.host} numberOfLines={1}>
-              {item.host}:{item.port}
-            </Text>
-          </View>
-
-          <View style={styles.avgWrap}>
-            {testing ? (
-              <ActivityIndicator color={colors.accent} size="small" />
-            ) : (
-              <Text style={[styles.avg, { color: pingColor(avg, mode) }]}>{avgLabel}</Text>
-            )}
-            <View style={styles.qualityRow}>
-              <Text style={[styles.quality, { color: pingColor(avg, mode) }]}>{quality}</Text>
-              <SignalGlyph ms={avg} mode={mode} />
-            </View>
-          </View>
-        </View>
-
-        <View style={styles.metaRow}>
-          {!!item.protocol && (
-            <View style={[styles.chip, { backgroundColor: 'rgba(167,139,250,0.14)' }]}>
-              <Text style={[styles.chipText, { color: colors.violet }]}>
-                {item.protocol.toUpperCase()}
-              </Text>
-            </View>
-          )}
-          {item.security === 'reality' && (
-            <View style={[styles.chip, { backgroundColor: 'rgba(74,222,128,0.12)' }]}>
-              <Text style={[styles.chipText, { color: colors.mint }]}>Reality</Text>
-            </View>
-          )}
-          {!!item.transport && item.transport !== 'tcp' && (
-            <View style={[styles.chip, { backgroundColor: colors.accentDim }]}>
-              <Text style={[styles.chipText, { color: colors.accent }]}>
-                {item.transport.toUpperCase()}
-              </Text>
-            </View>
-          )}
-        </View>
+        <Text style={styles.title} numberOfLines={1}>
+          {item.remark || item.host || 'بدون نام'}
+        </Text>
+        <Text style={styles.host} numberOfLines={1}>
+          {item.host}:{item.port}
+          {item.protocol ? ` · ${item.protocol}` : ''}
+        </Text>
       </View>
-    </View>
+      <Text style={[styles.avg, { color }]}>{avgLabel}</Text>
+    </Pressable>
   );
 }
 
+function propsEqual(
+  a: { item: RankedConfig; highlight?: boolean },
+  b: { item: RankedConfig; highlight?: boolean },
+) {
+  return (
+    a.highlight === b.highlight &&
+    a.item.config_hash === b.item.config_hash &&
+    a.item.rank === b.item.rank &&
+    a.item.avg_ping === b.item.avg_ping &&
+    a.item.measured === b.item.measured &&
+    a.item.remark === b.item.remark
+  );
+}
+
+export const ConfigCard = memo(ConfigCardInner, propsEqual);
+export const CONFIG_ROW_HEIGHT = ROW_H;
+
 const styles = StyleSheet.create({
   card: {
+    height: ROW_H,
     flexDirection: 'row',
-    marginBottom: 10,
-    borderRadius: radii.xl,
-    borderWidth: 1,
+    alignItems: 'center',
+    marginBottom: 6,
+    paddingHorizontal: 10,
+    borderRadius: radii.lg,
+    borderWidth: StyleSheet.hairlineWidth,
     borderColor: colors.line,
     backgroundColor: colors.panel,
-    overflow: 'hidden',
+    gap: 8,
   },
   cardActive: {
-    borderColor: 'rgba(42,212,197,0.45)',
-    backgroundColor: '#122033',
+    borderColor: 'rgba(42,212,197,0.5)',
+    backgroundColor: '#101a28',
   },
-  rankCol: {
-    width: 54,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: colors.panelSoft,
-    borderRightWidth: StyleSheet.hairlineWidth,
-    borderRightColor: colors.lineStrong,
-    paddingVertical: 12,
+  rank: {
+    width: 28,
+    textAlign: 'center',
+    color: colors.accent,
+    fontSize: 15,
+    fontFamily: fonts.extraBold,
   },
-  rankColActive: { backgroundColor: 'rgba(42,212,197,0.12)' },
-  rankHash: { color: colors.textMute, fontSize: 9, fontFamily: fonts.medium },
-  rankNum: { color: colors.accent, fontSize: 20, fontFamily: fonts.extraBold, marginTop: 2 },
-  body: { flex: 1, paddingHorizontal: 13, paddingVertical: 12 },
-  titleRow: {
-    direction: 'ltr',
-    flexDirection: 'row-reverse',
-    alignItems: 'flex-start',
-    gap: 8,
-    marginBottom: 8,
-  },
-  infoBtn: {
-    width: 32,
-    height: 32,
-    borderRadius: 10,
-    backgroundColor: colors.accentDim,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginTop: 2,
-  },
-  titleCol: { flex: 1, alignItems: 'flex-end' },
+  body: { flex: 1, alignItems: 'flex-end' },
   title: {
-    alignSelf: 'stretch',
+    width: '100%',
     textAlign: 'right',
     color: colors.text,
-    fontSize: 14,
+    fontSize: 13,
     fontFamily: fonts.bold,
   },
   host: {
-    marginTop: 3,
-    alignSelf: 'stretch',
+    marginTop: 2,
+    width: '100%',
     textAlign: 'right',
     color: colors.textMute,
     fontSize: 11,
     fontFamily: fonts.regular,
   },
-  avgWrap: { alignItems: 'flex-end', minWidth: 68 },
-  avg: { fontSize: 19, fontFamily: fonts.extraBold },
-  qualityRow: { flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 2 },
-  quality: { fontSize: 10, fontFamily: fonts.bold },
-  metaRow: {
-    direction: 'ltr',
-    flexDirection: 'row-reverse',
-    flexWrap: 'wrap',
-    gap: 6,
+  avg: {
+    minWidth: 52,
+    textAlign: 'left',
+    fontSize: 15,
+    fontFamily: fonts.extraBold,
   },
-  chip: { borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3 },
-  chipText: { fontSize: 10, fontFamily: fonts.bold },
 });

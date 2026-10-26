@@ -12,11 +12,12 @@ import { MainDashboard } from './src/screens/MainDashboard';
 import { ErrorBoundary } from './src/components/ErrorBoundary';
 import { useAppStore } from './src/store/appStore';
 import { saveSnapshot } from './src/store/persist';
+import { cancelAllPings } from './src/native/XrayPing';
 
-// RTL once at boot — avoid flip-flop that blanks the UI on some devices
-if (!I18nManager.isRTL) {
+try {
   I18nManager.allowRTL(true);
-  I18nManager.forceRTL(true);
+} catch {
+  /* ignore */
 }
 
 function App(): React.JSX.Element {
@@ -26,23 +27,33 @@ function App(): React.JSX.Element {
     StatusBar.setBarStyle('light-content');
   }, []);
 
-  // Flush ranked order whenever app goes to background / inactive
+  // Leaving the app mid-test: stop native cores + persist so reopen is clean
   useEffect(() => {
     const onChange = (next: AppStateStatus) => {
       const prev = appState.current;
       appState.current = next;
-      if (
-        (prev === 'active' && next.match(/inactive|background/)) ||
-        next === 'background'
-      ) {
-        const { configs, ranked, subUrl, backgroundEnabled } =
-          useAppStore.getState();
-        if (configs.length > 0) {
-          void saveSnapshot(configs, ranked, {
-            subUrl,
-            backgroundEnabled,
-          });
-        }
+      const leaving =
+        (prev === 'active' && (next === 'inactive' || next === 'background')) ||
+        next === 'background';
+      if (!leaving) return;
+
+      const store = useAppStore.getState();
+      const wasTesting = store.testing;
+      if (wasTesting) {
+        store.cancelCycle();
+      } else {
+        void cancelAllPings();
+      }
+      const { configs, ranked, subUrl, backgroundEnabled } =
+        useAppStore.getState();
+      if (configs.length > 0) {
+        void saveSnapshot(configs, ranked, {
+          subUrl,
+          backgroundEnabled,
+          lastBackgroundStatus: wasTesting
+            ? 'تست متوقف شد — اپ بسته شد'
+            : undefined,
+        });
       }
     };
     const sub = AppState.addEventListener('change', onChange);

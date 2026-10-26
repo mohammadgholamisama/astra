@@ -15,7 +15,7 @@ import (
 
 const (
 	metaKeyPrefix = "cfg:meta:"
-	// Latest sample per device/operator/hash — TTL = window (default 10m)
+	// Latest sample per device/operator/hash — TTL = window (default 15m)
 	devPingKeyPrefix = "cfg:devping:"
 	indexSetKey      = "cfg:index"
 	fpIndexKey       = "cfg:fpindex"

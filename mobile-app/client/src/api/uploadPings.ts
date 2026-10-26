@@ -43,7 +43,7 @@ async function loadApiConfig(): Promise<ApiConfig | null> {
   }
 }
 
-/** Push this device's latest live pings to the hub (aggregated server-side for 10m). */
+/** Push this device's latest live pings to the hub (aggregated server-side for 15m). */
 export async function uploadCyclePings(
   operator: Operator,
   configs: ParsedConfig[],

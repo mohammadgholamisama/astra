@@ -11,31 +11,61 @@ import java.io.File
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Real-delay ping via LibXray (AndroidLibXrayLite):
- * spins an in-memory Xray instance per config (no system VPN) and measures
- * HTTP RTT to the probe URL — works for VLESS Reality / WS / gRPC / etc.
+ * Real-delay ping via LibXray. Supports hard cancel so closing the app / tapping
+ * «قطع تست» does not leave 16 Xray cores spinning (black screen / ANR on reopen).
  */
 class XrayPingModule(
   private val reactContext: ReactApplicationContext
 ) : ReactContextBaseJavaModule(reactContext) {
 
-  /** Parallel Xray measures — sized for 200+ config batches. */
-  private val measurePool = Executors.newFixedThreadPool(28)
-  /** Lightweight waiters so measure threads never block on Future.get. */
-  private val replyPool = Executors.newCachedThreadPool()
+  @Volatile private var measurePool: ExecutorService = Executors.newFixedThreadPool(12)
+  private val replyPool: ExecutorService = Executors.newCachedThreadPool()
   private val coreReady = AtomicBoolean(false)
+  private val generation = AtomicInteger(0)
+  private val inflight = ConcurrentHashMap.newKeySet<Future<*>>()
 
   override fun getName(): String = "XrayPing"
 
   @ReactMethod
   fun isAvailable(promise: Promise) {
     promise.resolve(ensureCore())
+  }
+
+  /** Abort every in-flight measure immediately and bump generation. */
+  @ReactMethod
+  fun cancelAllPings(promise: Promise) {
+    try {
+      generation.incrementAndGet()
+      val copy = inflight.toTypedArray()
+      inflight.clear()
+      for (f in copy) {
+        try {
+          f.cancel(true)
+        } catch (_: Throwable) {
+        }
+      }
+      // Drain stuck workers — LibXray may ignore interrupt, so replace the pool
+      val old = measurePool
+      measurePool = Executors.newFixedThreadPool(12)
+      try {
+        old.shutdownNow()
+      } catch (_: Throwable) {
+      }
+      promise.resolve(true)
+    } catch (t: Throwable) {
+      Log.w(TAG, "cancelAllPings: ${t.message}")
+      promise.resolve(false)
+    }
   }
 
   @ReactMethod
@@ -49,64 +79,105 @@ class XrayPingModule(
     }
   }
 
-  /**
-   * Real outbound delay through Xray core.
-   * Hard-caps wait with [timeoutMs] so dead configs don't stall the queue.
-   */
   @ReactMethod
   fun pingRealDelay(shareLink: String, timeoutMs: Double, promise: Promise) {
-    val capMs = timeoutMs.toLong().coerceIn(800L, 8_000L)
-    val future = measurePool.submit<Long> {
-      try {
-        if (!ensureCore()) {
-          -1L
-        } else {
-          val configJson = XrayConfigBuilder.fromShareLink(shareLink.trim())
-          if (configJson.isNullOrBlank()) {
-            Log.w(TAG, "failed to build xray json from link")
+    val capMs = timeoutMs.toLong().coerceIn(700L, 5_000L)
+    val myGen = generation.get()
+    val pool = measurePool
+    val future: Future<Long> = try {
+      pool.submit<Long> {
+        if (generation.get() != myGen) return@submit -1L
+        try {
+          if (!ensureCore()) {
             -1L
           } else {
-            val delay = Libv2ray.measureOutboundDelay(configJson, PROBE_URL)
-            when {
-              delay <= 0L -> -1L
-              delay > capMs -> -1L
-              else -> delay
+            val configJson = XrayConfigBuilder.fromShareLink(shareLink.trim())
+            if (configJson.isNullOrBlank()) {
+              -1L
+            } else {
+              if (generation.get() != myGen) return@submit -1L
+              val delay = Libv2ray.measureOutboundDelay(configJson, PROBE_URL)
+              when {
+                generation.get() != myGen -> -1L
+                delay <= 0L -> -1L
+                delay > capMs -> -1L
+                else -> delay
+              }
             }
           }
+        } catch (t: Throwable) {
+          Log.w(TAG, "measureOutboundDelay failed: ${t.message}")
+          -1L
         }
-      } catch (t: Throwable) {
-        Log.w(TAG, "measureOutboundDelay failed: ${t.message}")
-        -1L
       }
+    } catch (t: Throwable) {
+      promise.resolve(-1.0)
+      return
     }
+    inflight.add(future)
     replyPool.execute {
       val ms = try {
-        future.get(capMs + 250L, TimeUnit.MILLISECONDS)
+        if (generation.get() != myGen) {
+          future.cancel(true)
+          -1L
+        } else {
+          future.get(capMs + 200L, TimeUnit.MILLISECONDS)
+        }
       } catch (_: TimeoutException) {
         future.cancel(true)
         -1L
-      } catch (t: Throwable) {
+      } catch (_: Throwable) {
         future.cancel(true)
-        Log.w(TAG, "pingRealDelay wait failed: ${t.message}")
         -1L
+      } finally {
+        inflight.remove(future)
       }
-      promise.resolve(ms.toDouble())
+      try {
+        promise.resolve(ms.toDouble())
+      } catch (_: Throwable) {
+        // Bridge already torn down (activity destroyed)
+      }
     }
   }
 
   @ReactMethod
   fun pingTcp(host: String, port: Double, timeoutMs: Double, promise: Promise) {
-    measurePool.execute {
-      val ms = try {
-        tcpConnectMs(
-          host.trim(),
-          port.toInt().coerceIn(1, 65535),
-          timeoutMs.toInt().coerceIn(200, 5_000),
-        )
-      } catch (_: Throwable) {
-        -1L
+    val myGen = generation.get()
+    val pool = measurePool
+    val future: Future<*> = try {
+      pool.submit {
+        val ms = try {
+          if (generation.get() != myGen) {
+            -1L
+          } else {
+            tcpConnectMs(
+              host.trim(),
+              port.toInt().coerceIn(1, 65535),
+              timeoutMs.toInt().coerceIn(150, 3_000),
+            )
+          }
+        } catch (_: Throwable) {
+          -1L
+        }
+        try {
+          promise.resolve(ms.toDouble())
+        } catch (_: Throwable) {
+        }
       }
-      promise.resolve(ms.toDouble())
+    } catch (_: Throwable) {
+      promise.resolve(-1.0)
+      return
+    }
+    inflight.add(future)
+    // Remove when done — wrapped above resolves inside submit; clean up via reply
+    replyPool.execute {
+      try {
+        future.get(4, TimeUnit.SECONDS)
+      } catch (_: Throwable) {
+        future.cancel(true)
+      } finally {
+        inflight.remove(future)
+      }
     }
   }
 

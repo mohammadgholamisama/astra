@@ -17,6 +17,8 @@
       android:allowBackup="false"
       android:theme="@style/AppTheme"
       android:supportsRtl="true"
+      android:largeHeap="true"
+      android:hardwareAccelerated="true"
       android:usesCleartextTraffic="true">
       <activity
         android:name=".MainActivity"
@@ -24,6 +26,7 @@
         android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
         android:launchMode="singleTask"
         android:windowSoftInputMode="adjustResize"
+        android:hardwareAccelerated="true"
         android:exported="true">
         <intent-filter>
             <action android:name="android.intent.action.MAIN" />

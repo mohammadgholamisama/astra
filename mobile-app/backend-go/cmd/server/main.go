@@ -84,7 +84,7 @@ func main() {
 	v1.Get("/ranked", api.GetRanked)
 	v1.Post("/panel/sync", api.SyncPanelNow)
 
-	// Every PingTTL (default 10m): average multi-device samples → reorder Astra config-order.
+	// Every PingTTL (default 15m): average multi-device samples → reorder Astra config-order.
 	go api.RunPanelSyncLoop(cfg.PingTTL)
 
 	app.Use("/ws/ranked", func(c *fiber.Ctx) error {

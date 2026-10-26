@@ -2,67 +2,114 @@ import React from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { Gauge, X, Zap } from 'lucide-react-native';
 import { colors, fonts, radii } from '../theme';
-import { formatCountdown } from '../utils/format';
+import { formatCountdown, toFaDigits } from '../utils/format';
+import { CYCLE_OPTIONS } from '../utils/cycleInterval';
 
 export function TestActionBar({
   testing,
   disabled,
   remainingMs,
+  cycleIntervalMs,
   onTest,
   onCancel,
+  onCycleInterval,
 }: {
   testing: boolean;
   disabled: boolean;
   remainingMs: number;
+  cycleIntervalMs: number;
   onTest: () => void;
   onCancel: () => void;
+  onCycleInterval: (ms: number) => void;
 }) {
   return (
     <View style={styles.wrap}>
-      {testing ? (
-        <Pressable
-          onPress={onCancel}
-          hitSlop={12}
-          accessibilityRole="button"
-          accessibilityLabel="قطع تست"
-          style={({ pressed }) => [
-            styles.btn,
-            styles.btnCancel,
-            pressed && styles.btnPressed,
-          ]}
-        >
-          <View style={styles.btnCopy}>
-            <Text style={styles.btnTitleCancel}>قطع تست</Text>
-            <Text style={styles.btnHintCancel}>الان متوقف شود</Text>
-          </View>
-          <View style={[styles.btnIcon, styles.btnIconCancel]}>
-            <X size={18} color={colors.bg} strokeWidth={2.6} />
-          </View>
-        </Pressable>
-      ) : (
-        <Pressable
-          disabled={disabled}
-          onPress={onTest}
-          style={[styles.btn, disabled && styles.btnDisabled]}
-        >
-          <View style={styles.btnCopy}>
-            <Text style={styles.btnTitle}>تست الان</Text>
-            <Text style={styles.btnHint}>پینگ واقعی · سریع</Text>
-          </View>
-          <View style={styles.btnIcon}>
-            <Zap size={18} color={colors.bg} strokeWidth={2.4} fill={colors.bg} />
-          </View>
-        </Pressable>
-      )}
+      <View style={styles.row}>
+        {testing ? (
+          <Pressable
+            onPress={onCancel}
+            hitSlop={12}
+            accessibilityRole="button"
+            accessibilityLabel="قطع تست"
+            style={({ pressed }) => [
+              styles.btn,
+              styles.btnCancel,
+              pressed && styles.btnPressed,
+            ]}
+          >
+            <View style={styles.btnCopy}>
+              <Text style={styles.btnTitleCancel}>قطع تست</Text>
+              <Text style={styles.btnHintCancel}>الان متوقف شود</Text>
+            </View>
+            <View style={[styles.btnIcon, styles.btnIconCancel]}>
+              <X size={18} color={colors.bg} strokeWidth={2.6} />
+            </View>
+          </Pressable>
+        ) : (
+          <Pressable
+            disabled={disabled}
+            onPress={onTest}
+            style={({ pressed }) => [
+              styles.btn,
+              disabled && styles.btnDisabled,
+              pressed && !disabled && styles.btnPressed,
+            ]}
+          >
+            <View style={styles.btnCopy}>
+              <Text style={styles.btnTitle}>تست الان</Text>
+              <Text style={styles.btnHint}>پینگ واقعی · سریع</Text>
+            </View>
+            <View style={styles.btnIcon}>
+              <Zap
+                size={18}
+                color={colors.bg}
+                strokeWidth={2.4}
+                fill={colors.bg}
+              />
+            </View>
+          </Pressable>
+        )}
 
-      <View style={styles.timer}>
-        <View style={styles.timerTop}>
-          <Text style={styles.timerLabel}>چرخه بعدی</Text>
-          <Gauge size={13} color={colors.accent} strokeWidth={2.2} />
+        <View style={styles.timer}>
+          <View style={styles.timerTop}>
+            <Text style={styles.timerLabel}>چرخه بعدی</Text>
+            <Gauge size={13} color={colors.accent} strokeWidth={2.2} />
+          </View>
+          <Text style={styles.timerValue}>
+            {testing ? '—' : formatCountdown(remainingMs)}
+          </Text>
         </View>
-        <Text style={styles.timerValue}>
-          {testing ? '—' : formatCountdown(remainingMs)}
-        </Text>
+      </View>
+
+      <View style={styles.intervalBlock}>
+        <Text style={styles.intervalTitle}>بازهٔ چرخه (دقیقه)</Text>
+        <View style={styles.chips}>
+          {CYCLE_OPTIONS.map((opt) => {
+            const active = opt.ms === cycleIntervalMs;
+            return (
+              <Pressable
+                key={opt.ms}
+                disabled={testing}
+                onPress={() => onCycleInterval(opt.ms)}
+                style={({ pressed }) => [
+                  styles.chip,
+                  active && styles.chipActive,
+                  testing && styles.chipDisabled,
+                  pressed && !testing && styles.chipPressed,
+                ]}
+                accessibilityRole="button"
+                accessibilityState={{ selected: active }}
+                accessibilityLabel={`چرخه ${opt.minutes} دقیقه`}
+              >
+                <Text
+                  style={[styles.chipText, active && styles.chipTextActive]}
+                >
+                  {toFaDigits(opt.label)}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
       </View>
     </View>
   );
@@ -75,6 +122,9 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(42,212,197,0.22)',
     backgroundColor: colors.bgElevated,
     padding: 12,
+    gap: 12,
+  },
+  row: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
@@ -115,7 +165,11 @@ const styles = StyleSheet.create({
     marginTop: 2,
     fontFamily: fonts.medium,
   },
-  btnTitleCancel: { color: colors.bg, fontFamily: fonts.extraBold, fontSize: 16 },
+  btnTitleCancel: {
+    color: colors.bg,
+    fontFamily: fonts.extraBold,
+    fontSize: 16,
+  },
   btnHintCancel: {
     color: 'rgba(5,8,15,0.65)',
     fontSize: 10,
@@ -139,7 +193,11 @@ const styles = StyleSheet.create({
     alignSelf: 'stretch',
     justifyContent: 'flex-start',
   },
-  timerLabel: { color: colors.textMute, fontSize: 10, fontFamily: fonts.medium },
+  timerLabel: {
+    color: colors.textMute,
+    fontSize: 10,
+    fontFamily: fonts.medium,
+  },
   timerValue: {
     marginTop: 4,
     textAlign: 'right',
@@ -148,5 +206,46 @@ const styles = StyleSheet.create({
     fontSize: 26,
     fontFamily: fonts.extraBold,
     fontVariant: ['tabular-nums'],
+  },
+  intervalBlock: {
+    gap: 8,
+  },
+  intervalTitle: {
+    textAlign: 'right',
+    color: colors.textMute,
+    fontSize: 11,
+    fontFamily: fonts.medium,
+  },
+  chips: {
+    flexDirection: 'row-reverse',
+    flexWrap: 'wrap',
+    gap: 8,
+    justifyContent: 'flex-start',
+  },
+  chip: {
+    minWidth: 44,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.lineStrong,
+    backgroundColor: colors.panel,
+    alignItems: 'center',
+  },
+  chipActive: {
+    borderColor: 'rgba(42,212,197,0.55)',
+    backgroundColor: colors.accentDim,
+  },
+  chipDisabled: { opacity: 0.45 },
+  chipPressed: { opacity: 0.85 },
+  chipText: {
+    color: colors.textSoft,
+    fontSize: 14,
+    fontFamily: fonts.bold,
+    fontVariant: ['tabular-nums'],
+  },
+  chipTextActive: {
+    color: colors.accent,
+    fontFamily: fonts.extraBold,
   },
 });

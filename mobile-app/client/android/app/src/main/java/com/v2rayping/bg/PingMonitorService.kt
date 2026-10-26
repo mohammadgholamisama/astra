@@ -43,8 +43,13 @@ class PingMonitorService : Service() {
       }
       else -> {
         intervalMs = intent?.getLongExtra(EXTRA_INTERVAL, DEFAULT_INTERVAL) ?: DEFAULT_INTERVAL
+        if (intervalMs < 60_000L) intervalMs = DEFAULT_INTERVAL
         createChannel()
-        startForeground(NOTIF_ID, buildNotification("پایش خودکار هر ۵ دقیقه — حتی با اپ بسته‌شده"))
+        val mins = (intervalMs / 60_000L).coerceAtLeast(1)
+        startForeground(
+          NOTIF_ID,
+          buildNotification("پایش خودکار هر $mins دقیقه — حتی با اپ بسته‌شده"),
+        )
         handler.removeCallbacks(tickRunnable)
         // Don't fire immediately — manual «تست الان» covers that; timer owns background cycles
         handler.postDelayed(tickRunnable, intervalMs)

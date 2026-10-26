@@ -66,7 +66,7 @@ func (a *API) PostPings(c *fiber.Ctx) error {
 
 	a.Hub.BroadcastRanked(list)
 
-	// Panel reorder runs on the 10-minute scheduler — not on every live upload.
+	// Panel reorder runs on the PingTTL scheduler (default 15m) — not on every live upload.
 	return c.JSON(fiber.Map{
 		"ok":       true,
 		"accepted": n,
@@ -84,7 +84,7 @@ func (a *API) GetRanked(c *fiber.Ctx) error {
 
 type panelSyncBody struct {
 	// Optional: push exact page averages (host/port/match_host) from the app.
-	// When empty, falls back to multi-device 10m Redis window.
+	// When empty, falls back to multi-device 15m Redis window.
 	Items []models.FingerprintRank `json:"items"`
 }
 
@@ -132,7 +132,7 @@ func (a *API) SyncPanelNow(c *fiber.Ctx) error {
 // RunPanelSyncLoop aggregates the last window and reorders Astra every interval.
 func (a *API) RunPanelSyncLoop(interval time.Duration) {
 	if interval < time.Minute {
-		interval = 10 * time.Minute
+		interval = 15 * time.Minute
 	}
 	log.Printf("[panel-sync] scheduler every %s (first sync after one window)", interval)
 	ticker := time.NewTicker(interval)

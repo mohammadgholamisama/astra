@@ -1,16 +1,16 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
-  ScrollView,
+  FlatList,
   StyleSheet,
   Text,
   View,
+  type ListRenderItem,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { Activity } from 'lucide-react-native';
-import { AppHeader } from '../components/AppHeader';
-import { ConfigCard } from '../components/ConfigCard';
+import { ConfigCard, CONFIG_ROW_HEIGHT } from '../components/ConfigCard';
 import { ConfigDetailModal } from '../components/ConfigDetailModal';
+import { AppHeader } from '../components/AppHeader';
 import { SubLinkCard } from '../components/SubLinkCard';
 import { BgMonitorRow } from '../components/BgMonitorRow';
 import { TestActionBar } from '../components/TestActionBar';
@@ -28,36 +28,36 @@ export function MainDashboard() {
     parsed: ParsedConfig | null;
   } | null>(null);
 
-  const {
-    hydrate,
-    hydrated,
-    subUrl,
-    setSubUrl,
-    ranked,
-    configs,
-    testing,
-    testingHashes,
-    progressDone,
-    progressTotal,
-    remainingMs,
-    status,
-    error,
-    tick,
-    loadSub,
-    runCycle,
-    cancelCycle,
-    backgroundEnabled,
-    setBackgroundEnabled,
-    syncingPanel,
-    syncPanelOrder,
-  } = useAppStore();
+  const hydrate = useAppStore((s) => s.hydrate);
+  const hydrated = useAppStore((s) => s.hydrated);
+  const subUrl = useAppStore((s) => s.subUrl);
+  const setSubUrl = useAppStore((s) => s.setSubUrl);
+  const ranked = useAppStore((s) => s.ranked);
+  const configs = useAppStore((s) => s.configs);
+  const testing = useAppStore((s) => s.testing);
+  const testingHashes = useAppStore((s) => s.testingHashes);
+  const progressDone = useAppStore((s) => s.progressDone);
+  const progressTotal = useAppStore((s) => s.progressTotal);
+  const remainingMs = useAppStore((s) => s.remainingMs);
+  const cycleIntervalMs = useAppStore((s) => s.cycleIntervalMs);
+  const status = useAppStore((s) => s.status);
+  const error = useAppStore((s) => s.error);
+  const tick = useAppStore((s) => s.tick);
+  const loadSub = useAppStore((s) => s.loadSub);
+  const runCycle = useAppStore((s) => s.runCycle);
+  const cancelCycle = useAppStore((s) => s.cancelCycle);
+  const setCycleInterval = useAppStore((s) => s.setCycleInterval);
+  const backgroundEnabled = useAppStore((s) => s.backgroundEnabled);
+  const setBackgroundEnabled = useAppStore((s) => s.setBackgroundEnabled);
+  const syncingPanel = useAppStore((s) => s.syncingPanel);
+  const syncPanelOrder = useAppStore((s) => s.syncPanelOrder);
 
   useEffect(() => {
     void hydrate();
   }, [hydrate]);
 
   useEffect(() => {
-    const id = setInterval(() => tick(), 400);
+    const id = setInterval(() => tick(), 1000);
     return () => clearInterval(id);
   }, [tick]);
 
@@ -67,24 +67,169 @@ export function MainDashboard() {
   }, [progressDone, progressTotal]);
 
   const aliveCount = useMemo(
-    () => ranked.filter((r) => r.avg_ping > 0).length,
+    () => ranked.reduce((n, r) => (r.avg_ping > 0 ? n + 1 : n), 0),
     [ranked],
   );
 
+  const testingSet = useMemo(() => new Set(testingHashes), [testingHashes]);
+
   const byHash = useMemo(() => {
     const m = new Map<string, ParsedConfig>();
-    configs.forEach((c) => m.set(c.configHash, c));
+    for (const c of configs) m.set(c.configHash, c);
     return m;
   }, [configs]);
 
-  const onLoadSub = async () => {
+  const onLoadSub = useCallback(async () => {
     setLoadingSub(true);
     try {
       await loadSub();
     } finally {
       setLoadingSub(false);
     }
-  };
+  }, [loadSub]);
+
+  const onTest = useCallback(() => {
+    void runCycle(true);
+  }, [runCycle]);
+
+  const onCancel = useCallback(() => {
+    cancelCycle();
+  }, [cancelCycle]);
+
+  const onCycleInterval = useCallback(
+    (ms: number) => {
+      void setCycleInterval(ms);
+    },
+    [setCycleInterval],
+  );
+
+  const onSync = useCallback(() => {
+    void syncPanelOrder();
+  }, [syncPanelOrder]);
+
+  const openDetail = useCallback(
+    (item: RankedConfig) => {
+      setDetail({
+        ranked: item,
+        parsed: byHash.get(item.config_hash) ?? null,
+      });
+    },
+    [byHash],
+  );
+
+  const renderItem: ListRenderItem<RankedConfig> = useCallback(
+    ({ item }) => (
+      <ConfigCard
+        item={item}
+        highlight={testingSet.has(item.config_hash)}
+        onDetails={() => openDetail(item)}
+      />
+    ),
+    [openDetail, testingSet],
+  );
+
+  const keyExtractor = useCallback((item: RankedConfig) => item.config_hash, []);
+
+  const getItemLayout = useCallback(
+    (_: unknown, index: number) => ({
+      length: CONFIG_ROW_HEIGHT + 6,
+      offset: (CONFIG_ROW_HEIGHT + 6) * index,
+      index,
+    }),
+    [],
+  );
+
+  const listHeader = useMemo(
+    () => (
+      <View>
+        <AppHeader />
+        <View style={styles.stack}>
+          <SubLinkCard
+            value={subUrl}
+            onChange={setSubUrl}
+            onLoad={() => void onLoadSub()}
+            loading={loadingSub}
+            count={configs.length}
+          />
+          <BgMonitorRow
+            enabled={backgroundEnabled}
+            onChange={(v) => void setBackgroundEnabled(v)}
+          />
+          <TestActionBar
+            testing={testing}
+            disabled={false}
+            remainingMs={remainingMs}
+            cycleIntervalMs={cycleIntervalMs}
+            onTest={onTest}
+            onCancel={onCancel}
+            onCycleInterval={onCycleInterval}
+          />
+          <PanelSyncButton
+            busy={syncingPanel}
+            disabled={testing}
+            onPress={onSync}
+          />
+        </View>
+
+        {testing ? (
+          <View style={styles.progressCard}>
+            <View style={styles.progressTop}>
+              <Text style={styles.progressStatus} numberOfLines={1}>
+                {status}
+              </Text>
+              <Text style={styles.progressPct}>{toFaDigits(progressPct)}٪</Text>
+            </View>
+            <View style={styles.progressTrack}>
+              <View style={[styles.progressFill, { width: `${progressPct}%` }]} />
+            </View>
+            <Text style={styles.progressMeta}>
+              {toFaDigits(progressDone)} از {toFaDigits(progressTotal)}
+            </Text>
+          </View>
+        ) : status ? (
+          <Text style={styles.idleStatus}>{status}</Text>
+        ) : null}
+
+        {error ? (
+          <View style={styles.errorBox}>
+            <Text style={styles.errorText}>{error}</Text>
+          </View>
+        ) : null}
+
+        <View style={styles.listHeader}>
+          <Text style={styles.listStat}>
+            {toFaDigits(ranked.length)} کل
+            {aliveCount > 0 ? ` · ${toFaDigits(aliveCount)} فعال` : ''}
+          </Text>
+          <Text style={styles.listTitle}>رتبه‌بندی</Text>
+        </View>
+      </View>
+    ),
+    [
+      subUrl,
+      setSubUrl,
+      onLoadSub,
+      loadingSub,
+      configs.length,
+      backgroundEnabled,
+      setBackgroundEnabled,
+      testing,
+      remainingMs,
+      cycleIntervalMs,
+      onTest,
+      onCancel,
+      onCycleInterval,
+      syncingPanel,
+      onSync,
+      status,
+      progressPct,
+      progressDone,
+      progressTotal,
+      error,
+      ranked.length,
+      aliveCount,
+    ],
+  );
 
   if (!hydrated) {
     return (
@@ -97,116 +242,32 @@ export function MainDashboard() {
 
   return (
     <View style={[styles.root, { paddingTop: insets.top }]}>
-      <View pointerEvents="none" style={StyleSheet.absoluteFill}>
-        <View style={[styles.glow, styles.glowA]} />
-        <View style={[styles.glow, styles.glowB]} />
-      </View>
-
-      <ScrollView
-        contentContainerStyle={{
-          paddingBottom: insets.bottom + 36,
-          paddingHorizontal: 16,
-        }}
-        keyboardShouldPersistTaps="handled"
-        showsVerticalScrollIndicator={false}
-      >
-        <AppHeader />
-
-        <View style={styles.stack}>
-          <SubLinkCard
-            value={subUrl}
-            onChange={setSubUrl}
-            onLoad={() => void onLoadSub()}
-            loading={loadingSub}
-            count={configs.length}
-          />
-
-          <BgMonitorRow
-            enabled={backgroundEnabled}
-            onChange={(v) => void setBackgroundEnabled(v)}
-          />
-
-          <TestActionBar
-            testing={testing}
-            disabled={false}
-            remainingMs={remainingMs}
-            onTest={() => void runCycle(true)}
-            onCancel={() => cancelCycle()}
-          />
-
-          <PanelSyncButton
-            busy={syncingPanel}
-            disabled={testing}
-            onPress={() => void syncPanelOrder()}
-          />
-        </View>
-
-        {testing && (
-          <View style={styles.progressCard}>
-            <View style={styles.progressTop}>
-              <Text style={styles.progressStatus} numberOfLines={1}>
-                {status}
-              </Text>
-              <Text style={styles.progressPct}>{toFaDigits(progressPct)}٪</Text>
-            </View>
-            <View style={styles.progressTrack}>
-              <View style={[styles.progressFill, { width: `${progressPct}%` }]} />
-            </View>
-            <Text style={styles.progressMeta}>
-              {toFaDigits(progressDone)} از {toFaDigits(progressTotal)} · نمایش لحظه‌ای
-            </Text>
-          </View>
-        )}
-
-        {!testing && !!status && <Text style={styles.idleStatus}>{status}</Text>}
-
-        {error ? (
-          <View style={styles.errorBox}>
-            <Text style={styles.errorText}>{error}</Text>
-          </View>
-        ) : null}
-
-        <View style={styles.listHeader}>
-          <View style={styles.listStats}>
-            <Text style={styles.listStat}>{toFaDigits(ranked.length)} کل</Text>
-            {aliveCount > 0 && (
-              <View style={styles.alivePill}>
-                <Text style={styles.aliveText}>{toFaDigits(aliveCount)} فعال</Text>
-              </View>
-            )}
-          </View>
-          <View style={styles.listTitleRow}>
-            <Text style={styles.listTitle}>رتبه‌بندی زنده</Text>
-            <Activity size={16} color={colors.accent} strokeWidth={2.2} />
-          </View>
-        </View>
-
-        {ranked.length === 0 ? (
+      <FlatList
+        data={ranked}
+        keyExtractor={keyExtractor}
+        renderItem={renderItem}
+        getItemLayout={getItemLayout}
+        ListHeaderComponent={listHeader}
+        ListEmptyComponent={
           <View style={styles.empty}>
-            <View style={styles.emptyIcon}>
-              <Activity size={22} color={colors.accent} strokeWidth={2} />
-            </View>
             <Text style={styles.emptyTitle}>هنوز کانفیگی نیست</Text>
             <Text style={styles.emptyText}>
               لینک ساب را بارگذاری کن، بعد «تست الان» را بزن.
             </Text>
           </View>
-        ) : (
-          ranked.map((item) => (
-            <ConfigCard
-              key={item.config_hash}
-              item={item}
-              highlight={testingHashes.includes(item.config_hash)}
-              onDetails={() =>
-                setDetail({
-                  ranked: item,
-                  parsed: byHash.get(item.config_hash) ?? null,
-                })
-              }
-            />
-          ))
-        )}
-      </ScrollView>
+        }
+        contentContainerStyle={{
+          paddingBottom: insets.bottom + 28,
+          paddingHorizontal: 14,
+        }}
+        initialNumToRender={12}
+        maxToRenderPerBatch={8}
+        windowSize={7}
+        updateCellsBatchingPeriod={50}
+        removeClippedSubviews
+        keyboardShouldPersistTaps="handled"
+        showsVerticalScrollIndicator={false}
+      />
 
       <ConfigDetailModal
         visible={!!detail}
@@ -227,26 +288,21 @@ const styles = StyleSheet.create({
     textAlign: 'right',
     fontFamily: fonts.regular,
   },
-  glow: { position: 'absolute', width: 280, height: 280, borderRadius: 140 },
-  glowA: { top: -90, right: -80, backgroundColor: 'rgba(42,212,197,0.07)' },
-  glowB: { top: 360, left: -110, backgroundColor: 'rgba(0,163,224,0.05)' },
-
-  stack: { gap: 12, marginBottom: 4 },
-
+  stack: { gap: 10, marginBottom: 4 },
   progressCard: {
-    marginTop: 12,
-    marginBottom: 8,
+    marginTop: 10,
+    marginBottom: 6,
     borderRadius: radii.lg,
     backgroundColor: colors.panel,
     borderWidth: 1,
     borderColor: colors.line,
-    padding: 14,
+    padding: 12,
   },
   progressTop: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 10,
+    marginBottom: 8,
     gap: 8,
   },
   progressStatus: {
@@ -258,32 +314,32 @@ const styles = StyleSheet.create({
   },
   progressPct: { color: colors.mint, fontFamily: fonts.extraBold, fontSize: 14 },
   progressTrack: {
-    height: 7,
+    height: 6,
     borderRadius: 99,
     backgroundColor: colors.bg,
     overflow: 'hidden',
   },
   progressFill: { height: '100%', borderRadius: 99, backgroundColor: colors.mint },
   progressMeta: {
-    marginTop: 8,
+    marginTop: 6,
     textAlign: 'right',
     color: colors.textMute,
     fontSize: 11,
   },
   idleStatus: {
-    marginTop: 10,
-    marginBottom: 4,
+    marginTop: 8,
+    marginBottom: 2,
     textAlign: 'right',
     color: colors.textMute,
     fontSize: 12,
   },
   errorBox: {
-    marginTop: 10,
+    marginTop: 8,
     borderRadius: radii.md,
     borderWidth: 1,
     borderColor: 'rgba(251,113,133,0.35)',
     backgroundColor: 'rgba(251,113,133,0.1)',
-    padding: 12,
+    padding: 10,
   },
   errorText: {
     textAlign: 'right',
@@ -291,53 +347,29 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 20,
   },
-
   listHeader: {
-    marginTop: 18,
-    marginBottom: 12,
+    marginTop: 14,
+    marginBottom: 8,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
   },
-  listTitleRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
   listTitle: {
     textAlign: 'right',
     color: colors.text,
-    fontSize: 17,
+    fontSize: 16,
     fontFamily: fonts.extraBold,
   },
-  listStats: { flexDirection: 'row', gap: 8, alignItems: 'center' },
   listStat: { color: colors.textMute, fontSize: 12, fontFamily: fonts.medium },
-  alivePill: {
-    backgroundColor: 'rgba(74,222,128,0.12)',
-    borderRadius: radii.pill,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-  },
-  aliveText: { color: colors.mint, fontSize: 11, fontFamily: fonts.bold },
-
   empty: {
     borderRadius: radii.xl,
     borderWidth: 1,
     borderStyle: 'dashed',
     borderColor: colors.lineStrong,
     backgroundColor: colors.bgElevated,
-    paddingHorizontal: 22,
-    paddingVertical: 36,
+    paddingHorizontal: 20,
+    paddingVertical: 28,
     alignItems: 'center',
-  },
-  emptyIcon: {
-    width: 48,
-    height: 48,
-    borderRadius: 24,
-    backgroundColor: colors.accentDim,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginBottom: 12,
   },
   emptyTitle: {
     textAlign: 'center',

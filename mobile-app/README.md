@@ -8,7 +8,7 @@
 
 - گوش می‌دهد روی `127.0.0.1:18080`
 - از طریق nginx پنل: `https://<ASTRA_PANEL_DOMAIN>/ping-api/`
-- هر ۱۰ دقیقه میانگین پینگ‌ها را به `POST /api/admin/config-order/ping-rank` می‌فرستد
+- هر ۱۵ دقیقه میانگین پینگ‌ها را به `POST /api/admin/config-order/ping-rank` می‌فرستد
 - `.env` پنل و `data/` دست‌نخورده می‌مانند؛ env هاب جدا در `mobile-app/backend-go/.env` است
 
 ## توسعه لوکال

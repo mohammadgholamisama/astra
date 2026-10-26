@@ -34,36 +34,40 @@ export function BgMonitorRow({
       onPress={() => void toggle(!enabled)}
       style={[styles.wrap, enabled && styles.wrapOn]}
     >
-      {/* Parent app is RTL: first child = RIGHT side */}
+      {/*
+        Force visual LTR so layout is stable regardless of app RTL:
+        [ Switch LEFT ] ........ [ text + icon RIGHT ]
+      */}
       <View style={styles.row}>
-        <View style={styles.body}>
-          <View style={styles.titleRow}>
-            <View style={styles.iconWrap}>
-              <MoonStar size={14} color={colors.accent} strokeWidth={2.2} />
-            </View>
-            <Text style={styles.title}>پایش پس‌زمینه</Text>
-          </View>
-          <Text style={styles.desc}>
-            برای فعال‌سازی، دسترسی اعلان و کار در پس‌زمینه گرفته می‌شود
-          </Text>
-          {enabled ? (
-            <View style={styles.okRow}>
-              <ShieldCheck size={12} color={colors.mint} strokeWidth={2.4} />
-              <Text style={styles.okText}>فعال · حتی با اپ بسته‌شده</Text>
-            </View>
-          ) : null}
-        </View>
-
         {busy ? (
-          <ActivityIndicator color={colors.accent} />
+          <ActivityIndicator color={colors.accent} style={styles.switchSlot} />
         ) : (
           <Switch
             value={enabled}
             onValueChange={(v) => void toggle(v)}
             trackColor={{ false: '#2A3344', true: 'rgba(42,212,197,0.45)' }}
             thumbColor={enabled ? colors.accent : '#8A93A5'}
+            style={styles.switchSlot}
           />
         )}
+
+        <View style={styles.body}>
+          <View style={styles.titleRow}>
+            <Text style={styles.title}>پایش پس‌زمینه</Text>
+            <View style={styles.iconWrap}>
+              <MoonStar size={14} color={colors.accent} strokeWidth={2.2} />
+            </View>
+          </View>
+          <Text style={styles.desc}>
+            برای فعال‌سازی، دسترسی اعلان و کار در پس‌زمینه گرفته می‌شود
+          </Text>
+          {enabled ? (
+            <View style={styles.okRow}>
+              <Text style={styles.okText}>فعال · حتی با اپ بسته‌شده</Text>
+              <ShieldCheck size={12} color={colors.mint} strokeWidth={2.4} />
+            </View>
+          ) : null}
+        </View>
       </View>
     </Pressable>
   );
@@ -71,6 +75,7 @@ export function BgMonitorRow({
 
 const styles = StyleSheet.create({
   wrap: {
+    direction: 'ltr',
     borderRadius: radii.xl,
     borderWidth: 1,
     borderColor: colors.line,
@@ -83,19 +88,25 @@ const styles = StyleSheet.create({
     backgroundColor: colors.accentSoft,
   },
   row: {
+    direction: 'ltr',
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
     width: '100%',
   },
+  switchSlot: {
+    flexShrink: 0,
+  },
   body: {
     flex: 1,
-    alignItems: 'flex-start',
+    alignItems: 'flex-end',
   },
   titleRow: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'flex-end',
     gap: 8,
+    alignSelf: 'stretch',
   },
   iconWrap: {
     width: 26,
@@ -107,6 +118,7 @@ const styles = StyleSheet.create({
   },
   title: {
     textAlign: 'right',
+    writingDirection: 'rtl',
     color: colors.text,
     fontSize: 14,
     fontFamily: fonts.extraBold,
@@ -114,7 +126,8 @@ const styles = StyleSheet.create({
   desc: {
     marginTop: 5,
     textAlign: 'right',
-    width: '100%',
+    writingDirection: 'rtl',
+    alignSelf: 'stretch',
     color: colors.textMute,
     fontSize: 11,
     lineHeight: 18,
@@ -124,10 +137,13 @@ const styles = StyleSheet.create({
     marginTop: 8,
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'flex-end',
     gap: 5,
+    alignSelf: 'stretch',
   },
   okText: {
     textAlign: 'right',
+    writingDirection: 'rtl',
     color: colors.mint,
     fontSize: 11,
     fontFamily: fonts.medium,
