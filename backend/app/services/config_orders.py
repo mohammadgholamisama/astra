@@ -527,11 +527,15 @@ async def apply_ping_rank(
     db: AsyncSession,
     ranked: list[dict[str, Any]],
 ) -> ConfigOrderWorkspaceOut:
-    """Reorder existing config-order by multi-device avg ping (host/port/match_host).
+    """Reorder existing config-order by avg ping (host/port/match_host).
 
-    - Fingerprints with positive avg_ping rise to the top (lower ms = better).
-    - Failed / unknown stay after scored ones, keeping relative order.
-    - Labels from ping hub fill empty labels only.
+    Rules (clean / stable):
+    - Only fingerprints with avg_ping > 0 are scored.
+    - Scored rows rise to the top, sorted by lowest ping.
+    - Unscored / untested rows keep their relative order and stay after scored ones
+      (their mutual ranking is never shuffled).
+    - Ping items that don't match any panel fingerprint are ignored (nothing added).
+    - No-op if there is nothing scored.
     """
     workspace = await list_workspace(db)
     current = list(workspace.items)
@@ -548,25 +552,45 @@ async def apply_ping_rank(
             dcount = int(raw.get("device_count") or 0)
         except (TypeError, ValueError):
             continue
+        if avg <= 0:
+            continue
         norm = try_normalize_endpoint(host, port, match)
         if not norm:
             continue
         key = _fp_key(*norm)
         # Keep best (lowest positive) if duplicates
-        if avg > 0 and (key not in score or avg < score[key]):
+        if key not in score or avg < score[key]:
             score[key] = avg
-            devices[key] = dcount
+            devices[key] = max(dcount, 1)
         label = _normalize_label(raw.get("label"))
         if label and key not in labels:
             labels[key] = label
 
-    def sort_key(it: ConfigOrderItemOut) -> tuple:
+    if not score:
+        logger.info("apply_ping_rank skip — no positive avg_ping items")
+        return workspace
+
+    # Split: scored (will reorder) vs unscored (preserve relative order exactly)
+    scored_rows: list[tuple[float, int, ConfigOrderItemOut]] = []
+    unscored_rows: list[ConfigOrderItemOut] = []
+    for it in current:
         key = _fp_key(it.host, int(it.port), it.match_host or "")
         if key in score:
-            return (0, score[key], it.sort_order)
-        return (1, float(it.sort_order), it.sort_order)
+            scored_rows.append((score[key], int(it.sort_order), it))
+        else:
+            unscored_rows.append(it)
 
-    ordered = sorted(current, key=sort_key)
+    if not scored_rows:
+        # Ping payload didn't match any panel fingerprint — leave order alone
+        logger.info(
+            "apply_ping_rank skip — %s scores, 0 panel matches",
+            len(score),
+        )
+        return workspace
+
+    scored_rows.sort(key=lambda t: (t[0], t[1]))
+    ordered = [t[2] for t in scored_rows] + unscored_rows
+
     payload: list[ConfigOrderItemIn] = []
     for it in ordered:
         key = _fp_key(it.host, int(it.port), it.match_host or "")
@@ -581,13 +605,14 @@ async def apply_ping_rank(
         )
 
     logger.info(
-        "apply_ping_rank scored=%s total=%s",
-        len(score),
+        "apply_ping_rank scored=%s unscored=%s total=%s",
+        len(scored_rows),
+        len(unscored_rows),
         len(payload),
     )
-    ws = await save_order(db, payload)
+    await save_order(db, payload)
 
-    # Persist avg_ping / device_count onto saved rows for the panel UI
+    # Persist avg_ping only on scored fingerprints; leave others untouched
     result = await db.execute(select(ConfigLinkOrder))
     rows = list(result.scalars().all())
     for row in rows:
@@ -601,10 +626,8 @@ async def apply_ping_rank(
             continue
         if key in score:
             row.avg_ping = float(score[key])
-            row.device_count = int(devices.get(key) or 0)
-        else:
-            row.avg_ping = None
-            row.device_count = None
+            row.device_count = int(devices.get(key) or 1)
+        # do NOT wipe avg_ping on unscored — keeps prior readings stable
     await db.commit()
     await refresh_cache(db)
     return await list_workspace(db)

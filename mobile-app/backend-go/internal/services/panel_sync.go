@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -33,7 +34,8 @@ func NewPanelSyncService(cfg *config.Config) *PanelSyncService {
 	}
 }
 
-// SyncPingRanks reorders Astra config-order by multi-device avg ping (host/port/domain).
+// SyncPingRanks reorders Astra config-order by avg ping (host/port/domain).
+// Only positive averages are sent — failures never move panel ranks.
 func (s *PanelSyncService) SyncPingRanks(ctx context.Context, ranks []models.FingerprintRank) error {
 	if !s.enabled {
 		return nil
@@ -48,36 +50,59 @@ func (s *PanelSyncService) SyncPingRanks(ctx context.Context, ranks []models.Fin
 		return fmt.Errorf("no fingerprint ranks to sync")
 	}
 
-	items := make([]models.FingerprintRank, 0, len(ranks))
-	seen := map[string]struct{}{}
+	best := map[string]models.FingerprintRank{}
 	for _, r := range ranks {
+		if r.AvgPing <= 0 {
+			continue
+		}
 		host := strings.TrimSpace(strings.ToLower(r.Host))
 		if host == "" || r.Port < 1 || r.Port > 65535 {
 			continue
 		}
 		match := strings.TrimSpace(strings.ToLower(r.MatchHost))
 		key := fmt.Sprintf("%s|%d|%s", host, r.Port, match)
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
 		label := strings.TrimSpace(r.Label)
 		if len(label) > 128 {
 			label = label[:128]
 		}
-		items = append(items, models.FingerprintRank{
+		devN := r.DeviceCount
+		if devN < 1 {
+			devN = 1
+		}
+		sampleN := r.SampleCount
+		if sampleN < 1 {
+			sampleN = 1
+		}
+		cand := models.FingerprintRank{
 			Host:        host,
 			Port:        r.Port,
 			MatchHost:   match,
 			Label:       label,
 			AvgPing:     r.AvgPing,
-			SampleCount: r.SampleCount,
-			DeviceCount: r.DeviceCount,
-		})
+			SampleCount: sampleN,
+			DeviceCount: devN,
+		}
+		if prev, ok := best[key]; !ok || cand.AvgPing < prev.AvgPing {
+			best[key] = cand
+		}
 	}
-	if len(items) == 0 {
-		return fmt.Errorf("no valid fingerprints")
+	if len(best) == 0 {
+		return fmt.Errorf("no successful fingerprint ranks to sync")
 	}
+
+	items := make([]models.FingerprintRank, 0, len(best))
+	for _, r := range best {
+		items = append(items, r)
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].AvgPing != items[j].AvgPing {
+			return items[i].AvgPing < items[j].AvgPing
+		}
+		if items[i].Host != items[j].Host {
+			return items[i].Host < items[j].Host
+		}
+		return items[i].Port < items[j].Port
+	})
 
 	body := models.PingRankBody{Items: items}
 	payload, err := json.Marshal(body)
@@ -106,6 +131,7 @@ func (s *PanelSyncService) SyncPingRanks(ctx context.Context, ranks []models.Fin
 		return fmt.Errorf("panel sync HTTP %d in %s: %s",
 			resp.StatusCode, time.Since(start).Round(time.Millisecond), truncate(string(respBody), 400))
 	}
+	_ = start
 	return nil
 }
 

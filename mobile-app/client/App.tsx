@@ -1,29 +1,68 @@
-import React, { useEffect } from 'react';
-import { I18nManager, StatusBar, StyleSheet, View } from 'react-native';
+import React, { useEffect, useRef } from 'react';
+import {
+  AppState,
+  type AppStateStatus,
+  I18nManager,
+  StatusBar,
+  StyleSheet,
+  View,
+} from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { MainDashboard } from './src/screens/MainDashboard';
+import { ErrorBoundary } from './src/components/ErrorBoundary';
+import { useAppStore } from './src/store/appStore';
+import { saveSnapshot } from './src/store/persist';
 
-I18nManager.allowRTL(true);
-I18nManager.forceRTL(true);
+// RTL once at boot — avoid flip-flop that blanks the UI on some devices
+if (!I18nManager.isRTL) {
+  I18nManager.allowRTL(true);
+  I18nManager.forceRTL(true);
+}
 
 function App(): React.JSX.Element {
+  const appState = useRef(AppState.currentState);
+
   useEffect(() => {
     StatusBar.setBarStyle('light-content');
   }, []);
 
+  // Flush ranked order whenever app goes to background / inactive
+  useEffect(() => {
+    const onChange = (next: AppStateStatus) => {
+      const prev = appState.current;
+      appState.current = next;
+      if (
+        (prev === 'active' && next.match(/inactive|background/)) ||
+        next === 'background'
+      ) {
+        const { configs, ranked, subUrl, backgroundEnabled } =
+          useAppStore.getState();
+        if (configs.length > 0) {
+          void saveSnapshot(configs, ranked, {
+            subUrl,
+            backgroundEnabled,
+          });
+        }
+      }
+    };
+    const sub = AppState.addEventListener('change', onChange);
+    return () => sub.remove();
+  }, []);
+
   return (
     <SafeAreaProvider>
-      <View style={styles.root}>
-        <StatusBar barStyle="light-content" backgroundColor="#05080F" />
-        <MainDashboard />
-      </View>
+      <ErrorBoundary>
+        <View style={styles.root}>
+          <StatusBar barStyle="light-content" backgroundColor="#05080F" />
+          <MainDashboard />
+        </View>
+      </ErrorBoundary>
     </SafeAreaProvider>
   );
 }
 
 const styles = StyleSheet.create({
-  // Yoga RTL: row starts from the right; flex-start = right edge
-  root: { flex: 1, direction: 'rtl' },
+  root: { flex: 1, backgroundColor: '#05080F', direction: 'rtl' },
 });
 
 export default App;

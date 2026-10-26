@@ -57,7 +57,7 @@ react {
 /**
  * Set this to true to Run Proguard on Release builds to minify the Java bytecode.
  */
-def enableProguardInReleaseBuilds = false
+def enableProguardInReleaseBuilds = true
 
 /**
  * The preferred build flavor of JavaScriptCore (JSC)
@@ -82,8 +82,12 @@ android {
         applicationId "com.v2rayping"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        versionCode 3
+        versionName "1.2.0"
+        ndk {
+            // Phone ABIs only — skip emulator x86 to keep APK small
+            abiFilters "armeabi-v7a", "arm64-v8a"
+        }
     }
     signingConfigs {
         debug {
@@ -98,17 +102,32 @@ android {
             signingConfig signingConfigs.debug
         }
         release {
-            // Caution! In production, you need to generate your own keystore file.
-            // see https://reactnative.dev/docs/signed-apk-android.
+            // Sideload-friendly: uses debug keystore until a release key is provided.
             signingConfig signingConfigs.debug
             minifyEnabled enableProguardInReleaseBuilds
-            proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
+            shrinkResources enableProguardInReleaseBuilds
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+        }
+    }
+    splits {
+        abi {
+            enable true
+            reset()
+            include "armeabi-v7a", "arm64-v8a"
+            universalApk true
         }
     }
     packaging {
         jniLibs {
-            // Prefer arm64 only — smaller APK, matches this emulator
-            excludes += ["**/armeabi-v7a/**", "**/x86/**", "**/x86_64/**"]
+            excludes += ["**/x86/**", "**/x86_64/**"]
+        }
+        resources {
+            excludes += [
+                "META-INF/DEPENDENCIES",
+                "META-INF/LICENSE*",
+                "META-INF/NOTICE*",
+                "**/libv2ray-sources.jar",
+            ]
         }
     }
 }

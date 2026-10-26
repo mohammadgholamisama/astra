@@ -1,5 +1,11 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { buildPingSamples, DEFAULT_BASE, submitPingBatch, type ApiConfig } from './client';
+import {
+  buildPingSamples,
+  DEFAULT_API_KEY,
+  DEFAULT_BASE,
+  submitPingBatch,
+  type ApiConfig,
+} from './client';
 import type { LocalPingResult, Operator, ParsedConfig } from '../types';
 
 const SETTINGS_KEY = 'v2ray_ping_settings_v1';
@@ -21,23 +27,19 @@ async function loadApiConfig(): Promise<ApiConfig | null> {
   try {
     const raw = await AsyncStorage.getItem(SETTINGS_KEY);
     const saved = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
-    const baseUrl = String(saved.apiBaseUrl || DEFAULT_BASE).trim();
-    const apiKey = String(saved.apiKey || '').trim();
-    if (!apiKey) {
-      // Dev default — override via settings.apiKey in storage when deploying
-      return {
-        baseUrl,
-        apiKey: 'dev-local-key',
-        deviceId: await getDeviceId(),
-      };
-    }
+    const baseUrl = String(saved.apiBaseUrl || DEFAULT_BASE).trim() || DEFAULT_BASE;
+    const apiKey = String(saved.apiKey || DEFAULT_API_KEY).trim() || DEFAULT_API_KEY;
     return {
       baseUrl,
       apiKey,
       deviceId: await getDeviceId(),
     };
   } catch {
-    return null;
+    return {
+      baseUrl: DEFAULT_BASE,
+      apiKey: DEFAULT_API_KEY,
+      deviceId: await getDeviceId(),
+    };
   }
 }
 

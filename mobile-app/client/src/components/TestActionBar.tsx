@@ -1,6 +1,6 @@
 import React from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
-import { Gauge, Zap } from 'lucide-react-native';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { Gauge, X, Zap } from 'lucide-react-native';
 import { colors, fonts, radii } from '../theme';
 import { formatCountdown } from '../utils/format';
 
@@ -9,40 +9,60 @@ export function TestActionBar({
   disabled,
   remainingMs,
   onTest,
+  onCancel,
 }: {
   testing: boolean;
   disabled: boolean;
   remainingMs: number;
   onTest: () => void;
+  onCancel: () => void;
 }) {
   return (
     <View style={styles.wrap}>
-      <Pressable
-        disabled={testing || disabled}
-        onPress={onTest}
-        style={[styles.btn, (testing || disabled) && styles.btnDisabled]}
-      >
-        {testing ? (
-          <ActivityIndicator color={colors.bg} />
-        ) : (
-          <>
-            <View style={styles.btnCopy}>
-              <Text style={styles.btnTitle}>تست الان</Text>
-              <Text style={styles.btnHint}>پینگ زنده · هر کانفیگ جدا</Text>
-            </View>
-            <View style={styles.btnIcon}>
-              <Zap size={18} color={colors.bg} strokeWidth={2.4} fill={colors.bg} />
-            </View>
-          </>
-        )}
-      </Pressable>
+      {testing ? (
+        <Pressable
+          onPress={onCancel}
+          hitSlop={12}
+          accessibilityRole="button"
+          accessibilityLabel="قطع تست"
+          style={({ pressed }) => [
+            styles.btn,
+            styles.btnCancel,
+            pressed && styles.btnPressed,
+          ]}
+        >
+          <View style={styles.btnCopy}>
+            <Text style={styles.btnTitleCancel}>قطع تست</Text>
+            <Text style={styles.btnHintCancel}>الان متوقف شود</Text>
+          </View>
+          <View style={[styles.btnIcon, styles.btnIconCancel]}>
+            <X size={18} color={colors.bg} strokeWidth={2.6} />
+          </View>
+        </Pressable>
+      ) : (
+        <Pressable
+          disabled={disabled}
+          onPress={onTest}
+          style={[styles.btn, disabled && styles.btnDisabled]}
+        >
+          <View style={styles.btnCopy}>
+            <Text style={styles.btnTitle}>تست الان</Text>
+            <Text style={styles.btnHint}>پینگ واقعی · سریع</Text>
+          </View>
+          <View style={styles.btnIcon}>
+            <Zap size={18} color={colors.bg} strokeWidth={2.4} fill={colors.bg} />
+          </View>
+        </Pressable>
+      )}
 
       <View style={styles.timer}>
         <View style={styles.timerTop}>
           <Text style={styles.timerLabel}>چرخه بعدی</Text>
           <Gauge size={13} color={colors.accent} strokeWidth={2.2} />
         </View>
-        <Text style={styles.timerValue}>{formatCountdown(remainingMs)}</Text>
+        <Text style={styles.timerValue}>
+          {testing ? '—' : formatCountdown(remainingMs)}
+        </Text>
       </View>
     </View>
   );
@@ -71,6 +91,10 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     minHeight: 64,
   },
+  btnCancel: {
+    backgroundColor: '#E85D4C',
+  },
+  btnPressed: { opacity: 0.88 },
   btnDisabled: { backgroundColor: 'rgba(255,255,255,0.1)' },
   btnIcon: {
     width: 34,
@@ -80,10 +104,20 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  btnIconCancel: {
+    backgroundColor: 'rgba(5,8,15,0.18)',
+  },
   btnCopy: { alignItems: 'flex-end' },
   btnTitle: { color: colors.bg, fontFamily: fonts.extraBold, fontSize: 16 },
   btnHint: {
     color: 'rgba(5,8,15,0.55)',
+    fontSize: 10,
+    marginTop: 2,
+    fontFamily: fonts.medium,
+  },
+  btnTitleCancel: { color: colors.bg, fontFamily: fonts.extraBold, fontSize: 16 },
+  btnHintCancel: {
+    color: 'rgba(5,8,15,0.65)',
     fontSize: 10,
     marginTop: 2,
     fontFamily: fonts.medium,

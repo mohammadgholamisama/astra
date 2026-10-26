@@ -6,10 +6,11 @@ import type {
   LocalPingResult,
 } from '../types';
 
-// Emulator → host loopback; release builds → panel nginx /ping-api (override in settings).
-const DEFAULT_BASE = __DEV__
-  ? 'http://10.0.2.2:18080'
-  : 'https://p.vokqem.ir/ping-api';
+// Production hub behind panel nginx. Override via settings.apiBaseUrl if needed.
+// Emulator can still reach it over the public URL.
+export const DEFAULT_BASE = 'https://p.vokqem.ir/ping-api';
+/** Must match astra-ping-hub API_KEY on the panel server. */
+export const DEFAULT_API_KEY = 'hub_82e049ca9f786e9c1b0e2169603a2e654561be45c8def7e2';
 
 export interface ApiConfig {
   baseUrl: string;
@@ -28,6 +29,7 @@ async function request<T>(
 ): Promise<T> {
   const res = await fetch(joinUrl(cfg.baseUrl, path), {
     ...init,
+    signal: init.signal,
     headers: {
       'Content-Type': 'application/json',
       Accept: 'application/json',
@@ -94,6 +96,31 @@ export async function fetchRanked(cfg: ApiConfig): Promise<RankedListResponse> {
   return request(cfg, '/api/v1/ranked');
 }
 
+export type FingerprintRankPayload = {
+  host: string;
+  port: number;
+  match_host: string;
+  label?: string;
+  avg_ping: number;
+  sample_count?: number;
+  device_count?: number;
+};
+
+/** Reorder Astra config-order. Prefer `items` from the live page (fast + exact). */
+export async function syncPanelRanks(
+  cfg: ApiConfig,
+  signal?: AbortSignal,
+  items?: FingerprintRankPayload[],
+): Promise<{ ok: boolean; count: number; message?: string; source?: string }> {
+  const body =
+    items && items.length > 0 ? JSON.stringify({ items }) : '{}';
+  return request(cfg, '/api/v1/panel/sync', {
+    method: 'POST',
+    body,
+    signal,
+  });
+}
+
 export function openRankedSocket(
   cfg: ApiConfig,
   onMessage: (list: RankedListResponse) => void,
@@ -119,5 +146,3 @@ export function openRankedSocket(
   ws.onerror = (e) => onError?.(e);
   return ws;
 }
-
-export { DEFAULT_BASE };

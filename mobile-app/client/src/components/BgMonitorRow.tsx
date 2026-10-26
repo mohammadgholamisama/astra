@@ -34,7 +34,7 @@ export function BgMonitorRow({
       onPress={() => void toggle(!enabled)}
       style={[styles.wrap, enabled && styles.wrapOn]}
     >
-      {/* LTR row → سوییچ فیزیکی راست، متن راست‌چین کنارش */}
+      {/* Parent app is RTL: first child = RIGHT side */}
       <View style={styles.row}>
         <View style={styles.body}>
           <View style={styles.titleRow}>
@@ -55,14 +55,13 @@ export function BgMonitorRow({
         </View>
 
         {busy ? (
-          <ActivityIndicator color={colors.accent} style={styles.switchSlot} />
+          <ActivityIndicator color={colors.accent} />
         ) : (
           <Switch
             value={enabled}
             onValueChange={(v) => void toggle(v)}
             trackColor={{ false: '#2A3344', true: 'rgba(42,212,197,0.45)' }}
             thumbColor={enabled ? colors.accent : '#8A93A5'}
-            style={styles.switchSlot}
           />
         )}
       </View>
@@ -84,17 +83,16 @@ const styles = StyleSheet.create({
     backgroundColor: colors.accentSoft,
   },
   row: {
-    direction: 'ltr',
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
+    width: '100%',
   },
   body: {
     flex: 1,
-    alignItems: 'flex-end',
+    alignItems: 'flex-start',
   },
   titleRow: {
-    direction: 'rtl',
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
@@ -116,6 +114,7 @@ const styles = StyleSheet.create({
   desc: {
     marginTop: 5,
     textAlign: 'right',
+    width: '100%',
     color: colors.textMute,
     fontSize: 11,
     lineHeight: 18,
@@ -123,16 +122,14 @@ const styles = StyleSheet.create({
   },
   okRow: {
     marginTop: 8,
-    flexDirection: 'row-reverse',
+    flexDirection: 'row',
     alignItems: 'center',
     gap: 5,
   },
   okText: {
+    textAlign: 'right',
     color: colors.mint,
     fontSize: 11,
     fontFamily: fonts.medium,
-  },
-  switchSlot: {
-    marginLeft: 2,
   },
 });

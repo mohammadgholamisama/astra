@@ -1,5 +1,4 @@
-import type { LocalPingResult, Operator, ParsedConfig, RankedConfig } from '../types';
-import { OPERATORS } from '../types';
+import type { LocalPingResult, ParsedConfig, RankedConfig } from '../types';
 
 type LiveMap = Map<string, LocalPingResult>;
 
@@ -8,14 +7,14 @@ type LiveMap = Map<string, LocalPingResult>;
  * Untested stay at the bottom; successful rise by lowest ping.
  */
 export function rankLocally(
-  operator: Operator,
   configs: ParsedConfig[],
   results: LocalPingResult[] | LiveMap,
   testingHashes?: Set<string> | string | null,
 ): RankedConfig[] {
   const byHash: LiveMap =
-    results instanceof Map ? results : new Map(results.map((r) => [r.configHash, r]));
-  const opMeta = OPERATORS.find((o) => o.id === operator);
+    results instanceof Map
+      ? results
+      : new Map(results.map((r) => [r.configHash, r]));
   const testingSet =
     testingHashes instanceof Set
       ? testingHashes
@@ -25,10 +24,10 @@ export function rankLocally(
 
   const rows: RankedConfig[] = configs.map((c) => {
     const r = byHash.get(c.configHash);
-    const tested = !!r;
-    const ping = tested ? r!.pingMs : -1;
-    const ok = tested && ping > 0;
-    const testing = !tested && testingSet.has(c.configHash);
+    const measured = !!r;
+    const ping = measured ? r!.pingMs : -1;
+    const ok = measured && ping > 0;
+    const testing = !measured && testingSet.has(c.configHash);
 
     return {
       rank: 0,
@@ -41,38 +40,30 @@ export function rankLocally(
       port: c.port,
       match_host: c.matchHost,
       success_rate: ok ? 1 : 0,
-      avg_ping: tested ? (ok ? ping : -1) : testing ? -2 : -1,
-      operator_pings: tested
-        ? [
-            {
-              operator,
-              label_fa: opMeta?.label ?? operator,
-              ping_ms: ping,
-              updated_at: r!.measuredAt,
-              has_sample: true,
-            },
-          ]
-        : [],
+      avg_ping: measured ? (ok ? ping : -1) : testing ? -2 : -1,
+      measured,
+      raw: c.raw,
+      uuid: c.uuid,
+      path: c.path,
+      sni: c.sni,
+      tags: c.tags,
+      operator_pings: [],
       updated_at: new Date(r?.measuredAt ?? Date.now()).toISOString(),
     };
   });
 
   rows.sort((a, b) => {
-    const aTested = a.operator_pings.length > 0 || a.avg_ping === -2;
-    const bTested = b.operator_pings.length > 0 || b.avg_ping === -2;
-    const aDone = a.operator_pings.length > 0;
-    const bDone = b.operator_pings.length > 0;
+    const aDone = !!a.measured;
+    const bDone = !!b.measured;
 
-    // Done successes first, then done failures, then testing, then waiting
-    const tier = (x: RankedConfig, done: boolean, testedFlag: boolean) => {
+    const tier = (x: RankedConfig, done: boolean) => {
       if (done && x.success_rate > 0) return 0;
       if (done) return 1;
       if (x.avg_ping === -2) return 2;
-      if (!testedFlag) return 3;
       return 3;
     };
-    const ta = tier(a, aDone, aTested);
-    const tb = tier(b, bDone, bTested);
+    const ta = tier(a, aDone);
+    const tb = tier(b, bDone);
     if (ta !== tb) return ta - tb;
 
     if (a.success_rate > 0 && b.success_rate > 0) {
@@ -97,6 +88,12 @@ export function configsAsPending(configs: ParsedConfig[]): RankedConfig[] {
     match_host: c.matchHost,
     success_rate: 0,
     avg_ping: -1,
+    measured: false,
+    raw: c.raw,
+    uuid: c.uuid,
+    path: c.path,
+    sni: c.sni,
+    tags: c.tags,
     operator_pings: [],
     updated_at: new Date().toISOString(),
   }));

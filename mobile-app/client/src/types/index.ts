@@ -1,5 +1,8 @@
 export type Operator = 'irancell' | 'mci' | 'rightel';
 
+/** Hub sample tag — no UI picker. */
+export const DEFAULT_OPERATOR: Operator = 'irancell';
+
 export const OPERATORS: { id: Operator; label: string; color: string }[] = [
   { id: 'irancell', label: 'ایرانسل', color: '#FFCC00' },
   { id: 'mci', label: 'همراه اول', color: '#00A3E0' },
@@ -50,6 +53,13 @@ export interface RankedConfig {
   match_host: string;
   success_rate: number;
   avg_ping: number;
+  /** True after a ping attempt finished (success or fail). */
+  measured?: boolean;
+  raw?: string;
+  uuid?: string;
+  path?: string;
+  sni?: string;
+  tags?: string[];
   operator_pings: OperatorPing[];
   updated_at: string;
 }

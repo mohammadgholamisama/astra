@@ -3,21 +3,23 @@ import type { ParsedConfig, Protocol } from '../types';
 
 const encoder = new TextEncoder();
 
-/** SHA-256 hex — prefers Web Crypto / native, falls back to pure JS. */
+/** SHA-256 hex — native first (fast), then WebCrypto, then pure JS. */
 async function sha256Hex(input: string): Promise<string> {
-  const data = encoder.encode(input);
-
-  // React Native 0.76+ / Hermes may expose subtle
-  const subtle = (globalThis as { crypto?: Crypto }).crypto?.subtle;
-  if (subtle) {
-    const digest = await subtle.digest('SHA-256', data);
-    return bufferToHex(digest);
+  const native = NativeModules.XrayPing as
+    | { sha256?: (s: string) => Promise<string> }
+    | undefined;
+  if (native?.sha256) {
+    try {
+      return await native.sha256(input);
+    } catch {
+      /* fall through */
+    }
   }
 
-  // Optional TurboModule if you ship one later
-  const native = NativeModules.XrayPing as { sha256?: (s: string) => Promise<string> } | undefined;
-  if (native?.sha256) {
-    return native.sha256(input);
+  const subtle = (globalThis as { crypto?: Crypto }).crypto?.subtle;
+  if (subtle) {
+    const digest = await subtle.digest('SHA-256', encoder.encode(input));
+    return bufferToHex(digest);
   }
 
   return sha256Pure(input);
@@ -301,33 +303,77 @@ export function extractShareLinks(text: string): string[] {
   return [...new Set(found.map((l) => l.replace(/[,\];)]+$/, '')))];
 }
 
-export async function fetchSubscription(url: string, timeoutMs = 20000): Promise<string> {
+function yieldUi(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function fetchOnce(url: string, timeoutMs: number, signal?: AbortSignal): Promise<string> {
   const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  signal?.addEventListener('abort', onAbort);
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url.trim(), {
       signal: controller.signal,
       headers: {
-        'User-Agent': `V2RayPingApp/1.0 (${Platform.OS})`,
-        Accept: 'text/plain,*/*',
+        'User-Agent':
+          'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 AstraPing/1.1',
+        Accept: 'text/plain,text/html,application/octet-stream,*/*',
+        'Cache-Control': 'no-cache',
       },
     });
     if (!res.ok) {
-      throw new Error(`دریافت ساب ناموفق: HTTP ${res.status}`);
+      throw new Error(`HTTP ${res.status}`);
     }
     return await res.text();
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
   }
 }
 
-export async function parseSubscriptionBody(body: string): Promise<ParsedConfig[]> {
-  const trimmed = body.trim();
+/** Large subs can be slow — long timeout + retries. */
+export async function fetchSubscription(
+  url: string,
+  timeoutMs = 90000,
+  signal?: AbortSignal,
+): Promise<string> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    try {
+      const body = await fetchOnce(url, timeoutMs, signal);
+      if (!body || !body.trim()) {
+        throw new Error('پاسخ ساب خالی بود');
+      }
+      return body;
+    } catch (e) {
+      lastErr = e;
+      if (signal?.aborted) throw e;
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 600 * attempt));
+    }
+  }
+  const msg =
+    lastErr instanceof Error
+      ? lastErr.name === 'AbortError'
+        ? 'زمان دریافت ساب تمام شد — دوباره تلاش کنید'
+        : lastErr.message
+      : 'خطای شبکه';
+  throw new Error(`دریافت ساب ناموفق: ${msg}`);
+}
+
+export async function parseSubscriptionBody(
+  body: string,
+  onProgress?: (done: number, total: number) => void,
+): Promise<ParsedConfig[]> {
+  const trimmed = body.trim().replace(/^\uFEFF/, '');
   let text = trimmed;
   const direct = extractShareLinks(trimmed);
   if (direct.length === 0) {
     try {
-      text = decodeBase64Loose(trimmed);
+      // URL-safe / whitespace-stripped base64 payloads are common
+      const compact = trimmed.replace(/\s+/g, '');
+      text = decodeBase64Loose(compact);
     } catch {
       text = trimmed;
     }
@@ -335,12 +381,24 @@ export async function parseSubscriptionBody(body: string): Promise<ParsedConfig[
   const links = extractShareLinks(text);
   const out: ParsedConfig[] = [];
   const seen = new Set<string>();
+  const total = links.length;
 
-  for (const link of links) {
+  for (let i = 0; i < links.length; i++) {
+    const link = links[i]!;
     const protocol = protocolOf(link);
     const base =
-      protocol === 'vmess' ? parseVmess(link) : protocol === 'unknown' ? null : parseUriStyle(link, protocol);
-    if (!base) continue;
+      protocol === 'vmess'
+        ? parseVmess(link)
+        : protocol === 'unknown'
+          ? null
+          : parseUriStyle(link, protocol);
+    if (!base) {
+      if (i % 25 === 0) {
+        onProgress?.(i + 1, total);
+        await yieldUi();
+      }
+      continue;
+    }
 
     const fingerprint = [
       base.address.toLowerCase(),
@@ -350,21 +408,35 @@ export async function parseSubscriptionBody(body: string): Promise<ParsedConfig[
       base.sni.toLowerCase(),
     ].join(':');
     const configHash = await sha256Hex(fingerprint);
-    if (seen.has(configHash)) continue;
-    seen.add(configHash);
-
-    out.push({
-      ...base,
-      configHash,
-      tags: buildTags(base.protocol, base.transport, base.security),
-    });
+    if (!seen.has(configHash)) {
+      seen.add(configHash);
+      out.push({
+        ...base,
+        configHash,
+        tags: buildTags(base.protocol, base.transport, base.security),
+      });
+    }
+    if (i % 20 === 0 || i === links.length - 1) {
+      onProgress?.(i + 1, total);
+      await yieldUi();
+    }
   }
   return out;
 }
 
-export async function loadConfigsFromSubUrl(url: string): Promise<ParsedConfig[]> {
-  const body = await fetchSubscription(url);
-  return parseSubscriptionBody(body);
+export async function loadConfigsFromSubUrl(
+  url: string,
+  opts?: {
+    signal?: AbortSignal;
+    onStatus?: (msg: string) => void;
+  },
+): Promise<ParsedConfig[]> {
+  opts?.onStatus?.('دانلود ساب…');
+  const body = await fetchSubscription(url, 90000, opts?.signal);
+  opts?.onStatus?.('پارس کانفیگ‌ها…');
+  return parseSubscriptionBody(body, (done, total) => {
+    opts?.onStatus?.(`پارس ${done}/${total}`);
+  });
 }
 
 export { sha256Hex };

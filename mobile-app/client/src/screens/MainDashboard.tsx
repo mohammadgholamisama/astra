@@ -10,22 +10,27 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Activity } from 'lucide-react-native';
 import { AppHeader } from '../components/AppHeader';
 import { ConfigCard } from '../components/ConfigCard';
-import { OperatorPicker } from '../components/OperatorPicker';
+import { ConfigDetailModal } from '../components/ConfigDetailModal';
 import { SubLinkCard } from '../components/SubLinkCard';
 import { BgMonitorRow } from '../components/BgMonitorRow';
 import { TestActionBar } from '../components/TestActionBar';
+import { PanelSyncButton } from '../components/PanelSyncButton';
 import { useAppStore } from '../store/appStore';
+import type { ParsedConfig, RankedConfig } from '../types';
 import { toFaDigits } from '../utils/format';
 import { colors, fonts, radii } from '../theme';
 
 export function MainDashboard() {
   const insets = useSafeAreaInsets();
   const [loadingSub, setLoadingSub] = useState(false);
+  const [detail, setDetail] = useState<{
+    ranked: RankedConfig;
+    parsed: ParsedConfig | null;
+  } | null>(null);
+
   const {
     hydrate,
     hydrated,
-    operator,
-    setOperator,
     subUrl,
     setSubUrl,
     ranked,
@@ -40,8 +45,11 @@ export function MainDashboard() {
     tick,
     loadSub,
     runCycle,
+    cancelCycle,
     backgroundEnabled,
     setBackgroundEnabled,
+    syncingPanel,
+    syncPanelOrder,
   } = useAppStore();
 
   useEffect(() => {
@@ -62,6 +70,12 @@ export function MainDashboard() {
     () => ranked.filter((r) => r.avg_ping > 0).length,
     [ranked],
   );
+
+  const byHash = useMemo(() => {
+    const m = new Map<string, ParsedConfig>();
+    configs.forEach((c) => m.set(c.configHash, c));
+    return m;
+  }, [configs]);
 
   const onLoadSub = async () => {
     setLoadingSub(true);
@@ -99,8 +113,6 @@ export function MainDashboard() {
         <AppHeader />
 
         <View style={styles.stack}>
-          <OperatorPicker value={operator} onChange={setOperator} />
-
           <SubLinkCard
             value={subUrl}
             onChange={setSubUrl}
@@ -116,9 +128,16 @@ export function MainDashboard() {
 
           <TestActionBar
             testing={testing}
-            disabled={!operator}
+            disabled={false}
             remainingMs={remainingMs}
             onTest={() => void runCycle(true)}
+            onCancel={() => cancelCycle()}
+          />
+
+          <PanelSyncButton
+            busy={syncingPanel}
+            disabled={testing}
+            onPress={() => void syncPanelOrder()}
           />
         </View>
 
@@ -148,10 +167,6 @@ export function MainDashboard() {
         ) : null}
 
         <View style={styles.listHeader}>
-          <View style={styles.listTitleRow}>
-            <Text style={styles.listTitle}>رتبه‌بندی زنده</Text>
-            <Activity size={16} color={colors.accent} strokeWidth={2.2} />
-          </View>
           <View style={styles.listStats}>
             <Text style={styles.listStat}>{toFaDigits(ranked.length)} کل</Text>
             {aliveCount > 0 && (
@@ -159,6 +174,10 @@ export function MainDashboard() {
                 <Text style={styles.aliveText}>{toFaDigits(aliveCount)} فعال</Text>
               </View>
             )}
+          </View>
+          <View style={styles.listTitleRow}>
+            <Text style={styles.listTitle}>رتبه‌بندی زنده</Text>
+            <Activity size={16} color={colors.accent} strokeWidth={2.2} />
           </View>
         </View>
 
@@ -169,7 +188,7 @@ export function MainDashboard() {
             </View>
             <Text style={styles.emptyTitle}>هنوز کانفیگی نیست</Text>
             <Text style={styles.emptyText}>
-              اپراتور را انتخاب کن، ساب را بارگذاری کن، بعد «تست الان» را بزن.
+              لینک ساب را بارگذاری کن، بعد «تست الان» را بزن.
             </Text>
           </View>
         ) : (
@@ -178,10 +197,23 @@ export function MainDashboard() {
               key={item.config_hash}
               item={item}
               highlight={testingHashes.includes(item.config_hash)}
+              onDetails={() =>
+                setDetail({
+                  ranked: item,
+                  parsed: byHash.get(item.config_hash) ?? null,
+                })
+              }
             />
           ))
         )}
       </ScrollView>
+
+      <ConfigDetailModal
+        visible={!!detail}
+        ranked={detail?.ranked ?? null}
+        parsed={detail?.parsed ?? null}
+        onClose={() => setDetail(null)}
+      />
     </View>
   );
 }

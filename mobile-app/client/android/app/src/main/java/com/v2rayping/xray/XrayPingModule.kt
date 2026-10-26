@@ -8,11 +8,12 @@ import com.facebook.react.bridge.ReactMethod
 import go.Seq
 import libv2ray.Libv2ray
 import java.io.File
-import java.io.FileOutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.MessageDigest
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -24,7 +25,10 @@ class XrayPingModule(
   private val reactContext: ReactApplicationContext
 ) : ReactContextBaseJavaModule(reactContext) {
 
-  private val executor = Executors.newFixedThreadPool(3)
+  /** Parallel Xray measures — sized for 200+ config batches. */
+  private val measurePool = Executors.newFixedThreadPool(28)
+  /** Lightweight waiters so measure threads never block on Future.get. */
+  private val replyPool = Executors.newCachedThreadPool()
   private val coreReady = AtomicBoolean(false)
 
   override fun getName(): String = "XrayPing"
@@ -47,13 +51,13 @@ class XrayPingModule(
 
   /**
    * Real outbound delay through Xray core.
-   * @param shareLink vless/vmess/trojan/ss URI
-   * @param timeoutMs soft hint (core uses its own ~12s cap)
+   * Hard-caps wait with [timeoutMs] so dead configs don't stall the queue.
    */
   @ReactMethod
   fun pingRealDelay(shareLink: String, timeoutMs: Double, promise: Promise) {
-    executor.execute {
-      val ms = try {
+    val capMs = timeoutMs.toLong().coerceIn(800L, 8_000L)
+    val future = measurePool.submit<Long> {
+      try {
         if (!ensureCore()) {
           -1L
         } else {
@@ -62,11 +66,10 @@ class XrayPingModule(
             Log.w(TAG, "failed to build xray json from link")
             -1L
           } else {
-            // Prefer HTTPS generate_204 (same family as v2rayNG)
             val delay = Libv2ray.measureOutboundDelay(configJson, PROBE_URL)
             when {
               delay <= 0L -> -1L
-              timeoutMs > 0 && delay > timeoutMs -> -1L
+              delay > capMs -> -1L
               else -> delay
             }
           }
@@ -75,18 +78,30 @@ class XrayPingModule(
         Log.w(TAG, "measureOutboundDelay failed: ${t.message}")
         -1L
       }
+    }
+    replyPool.execute {
+      val ms = try {
+        future.get(capMs + 250L, TimeUnit.MILLISECONDS)
+      } catch (_: TimeoutException) {
+        future.cancel(true)
+        -1L
+      } catch (t: Throwable) {
+        future.cancel(true)
+        Log.w(TAG, "pingRealDelay wait failed: ${t.message}")
+        -1L
+      }
       promise.resolve(ms.toDouble())
     }
   }
 
   @ReactMethod
   fun pingTcp(host: String, port: Double, timeoutMs: Double, promise: Promise) {
-    executor.execute {
+    measurePool.execute {
       val ms = try {
         tcpConnectMs(
           host.trim(),
           port.toInt().coerceIn(1, 65535),
-          timeoutMs.toInt().coerceIn(500, 15_000),
+          timeoutMs.toInt().coerceIn(200, 5_000),
         )
       } catch (_: Throwable) {
         -1L
@@ -116,17 +131,14 @@ class XrayPingModule(
   private fun prepareGeoAssets(): File {
     val dir = File(reactContext.filesDir, "xray-assets")
     if (!dir.exists()) dir.mkdirs()
-    val names = listOf("geoip.dat", "geosite.dat", "geoip-only-cn-private.dat")
-    for (name in names) {
+    for (name in listOf("geoip.dat", "geosite.dat")) {
       val out = File(dir, name)
-      if (out.exists() && out.length() > 1024) continue
-      try {
-        reactContext.assets.open(name).use { input ->
-          FileOutputStream(out).use { output -> input.copyTo(output) }
+      if (!out.exists()) {
+        try {
+          out.writeBytes(ByteArray(0))
+        } catch (t: Throwable) {
+          Log.w(TAG, "stub $name: ${t.message}")
         }
-      } catch (t: Throwable) {
-        // AAR assets may already be merged; missing optional files are fine
-        Log.w(TAG, "asset $name: ${t.message}")
       }
     }
     return dir

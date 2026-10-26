@@ -6,7 +6,7 @@ export function AppHeader() {
   return (
     <View style={styles.wrap}>
       <View style={styles.brandBlock}>
-        <Text style={styles.brand}>پینگ واقعی</Text>
+        <Text style={styles.brand}>Astra Ping</Text>
         <View style={styles.dot} />
       </View>
     </View>
@@ -15,6 +15,9 @@ export function AppHeader() {
 
 const styles = StyleSheet.create({
   wrap: {
+    // Keep Latin brand on the visual LEFT even when app is RTL
+    direction: 'ltr',
+    width: '100%',
     marginTop: 6,
     marginBottom: 18,
     alignItems: 'flex-start',
@@ -25,11 +28,12 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   brand: {
-    textAlign: 'right',
+    textAlign: 'left',
+    writingDirection: 'ltr',
     color: colors.text,
     fontSize: 28,
     fontFamily: fonts.extraBold,
-    letterSpacing: -0.3,
+    letterSpacing: -0.4,
   },
   dot: {
     width: 8,

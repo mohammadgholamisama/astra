@@ -82,17 +82,50 @@ func (a *API) GetRanked(c *fiber.Ctx) error {
 	return c.JSON(list)
 }
 
+type panelSyncBody struct {
+	// Optional: push exact page averages (host/port/match_host) from the app.
+	// When empty, falls back to multi-device 10m Redis window.
+	Items []models.FingerprintRank `json:"items"`
+}
+
 func (a *API) SyncPanelNow(c *fiber.Ctx) error {
-	ranks, err := a.Agg.RankedFingerprints(c.Context())
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	var body panelSyncBody
+	_ = c.BodyParser(&body)
+
+	ranks := body.Items
+	source := "client"
+	if len(ranks) == 0 {
+		source = "window"
+		var err error
+		ranks, err = a.Agg.RankedFingerprints(c.Context())
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		}
 	}
-	if err := a.Panel.SyncPingRanks(c.Context(), ranks); err != nil {
+
+	// Keep only successful averages — untested/failed never reorder the panel
+	filtered := make([]models.FingerprintRank, 0, len(ranks))
+	for _, r := range ranks {
+		if r.AvgPing > 0 && strings.TrimSpace(r.Host) != "" && r.Port > 0 {
+			filtered = append(filtered, r)
+		}
+	}
+	if len(filtered) == 0 {
+		return c.JSON(fiber.Map{
+			"ok":      true,
+			"count":   0,
+			"source":  source,
+			"message": "no successful ping averages to apply",
+		})
+	}
+
+	if err := a.Panel.SyncPingRanks(c.Context(), filtered); err != nil {
 		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": err.Error()})
 	}
 	return c.JSON(fiber.Map{
-		"ok":    true,
-		"count": len(ranks),
+		"ok":     true,
+		"count":  len(filtered),
+		"source": source,
 	})
 }
 

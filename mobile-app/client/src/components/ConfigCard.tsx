@@ -1,11 +1,22 @@
 import React from 'react';
-import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
-import { Signal, SignalHigh, SignalLow, SignalMedium, SignalZero } from 'lucide-react-native';
+import {
+  ActivityIndicator,
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
+import {
+  Info,
+  Signal,
+  SignalHigh,
+  SignalLow,
+  SignalMedium,
+  SignalZero,
+} from 'lucide-react-native';
 import type { RankedConfig } from '../types';
-import { OPERATORS } from '../types';
 import { formatMs, toFaDigits } from '../utils/format';
 import { colors, fonts, radii } from '../theme';
-import { OperatorIcon } from './icons/OperatorIcons';
 
 function pingColor(ms: number, mode: 'wait' | 'fail' | 'live' = 'live'): string {
   if (ms === -2) return colors.accent;
@@ -30,14 +41,17 @@ function SignalGlyph({ ms, mode }: { ms: number; mode: 'wait' | 'fail' | 'live' 
 export function ConfigCard({
   item,
   highlight,
+  onDetails,
 }: {
   item: RankedConfig;
   highlight?: boolean;
+  onDetails?: () => void;
 }) {
   const avg = item.avg_ping;
   const testing = avg === -2 || !!highlight;
-  const doneFail = item.operator_pings.length > 0 && avg < 0;
-  const waiting = !testing && item.operator_pings.length === 0;
+  const measured = !!item.measured || (item.operator_pings?.length ?? 0) > 0;
+  const doneFail = measured && avg < 0;
+  const waiting = !testing && !measured;
   const mode = testing ? 'live' : doneFail ? 'fail' : waiting ? 'wait' : 'live';
   const avgLabel = testing ? '…' : doneFail ? 'قطع' : waiting ? '—' : formatMs(avg);
   const quality = testing
@@ -63,6 +77,15 @@ export function ConfigCard({
 
       <View style={styles.body}>
         <View style={styles.titleRow}>
+          <Pressable
+            onPress={onDetails}
+            hitSlop={8}
+            accessibilityLabel="جزئیات کانفیگ"
+            style={styles.infoBtn}
+          >
+            <Info size={16} color={colors.accent} strokeWidth={2.3} />
+          </Pressable>
+
           <View style={styles.titleCol}>
             <Text style={styles.title} numberOfLines={1}>
               {item.remark || item.host || 'بدون نام'}
@@ -106,28 +129,6 @@ export function ConfigCard({
             </View>
           )}
         </View>
-
-        {(item.operator_pings?.length ?? 0) > 0 && (
-          <View style={styles.ops}>
-            {item.operator_pings.map((op) => {
-              const meta = OPERATORS.find((o) => o.id === op.operator);
-              return (
-                <View key={op.operator} style={styles.opChip}>
-                  <Text
-                    style={[
-                      styles.opPing,
-                      { color: pingColor(op.ping_ms, op.ping_ms < 0 ? 'fail' : 'live') },
-                    ]}
-                  >
-                    {op.ping_ms < 0 ? 'قطع' : formatMs(op.ping_ms)}
-                  </Text>
-                  <Text style={styles.opLabel}>{op.label_fa}</Text>
-                  {meta ? <OperatorIcon id={meta.id} size={meta.id === 'irancell' ? 18 : 14} /> : null}
-                </View>
-              );
-            })}
-          </View>
-        )}
       </View>
     </View>
   );
@@ -161,13 +162,22 @@ const styles = StyleSheet.create({
   rankNum: { color: colors.accent, fontSize: 20, fontFamily: fonts.extraBold, marginTop: 2 },
   body: { flex: 1, paddingHorizontal: 13, paddingVertical: 12 },
   titleRow: {
-    flexDirection: 'row',
+    direction: 'ltr',
+    flexDirection: 'row-reverse',
     alignItems: 'flex-start',
-    justifyContent: 'space-between',
-    gap: 10,
+    gap: 8,
     marginBottom: 8,
   },
-  titleCol: { flex: 1, alignItems: 'flex-start' },
+  infoBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 10,
+    backgroundColor: colors.accentDim,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 2,
+  },
+  titleCol: { flex: 1, alignItems: 'flex-end' },
   title: {
     alignSelf: 'stretch',
     textAlign: 'right',
@@ -188,31 +198,11 @@ const styles = StyleSheet.create({
   qualityRow: { flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 2 },
   quality: { fontSize: 10, fontFamily: fonts.bold },
   metaRow: {
-    flexDirection: 'row',
+    direction: 'ltr',
+    flexDirection: 'row-reverse',
     flexWrap: 'wrap',
-    justifyContent: 'flex-start',
     gap: 6,
   },
   chip: { borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3 },
   chipText: { fontSize: 10, fontFamily: fonts.bold },
-  ops: {
-    marginTop: 8,
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'flex-start',
-    gap: 8,
-  },
-  opChip: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    backgroundColor: colors.bgElevated,
-    borderRadius: 10,
-    paddingHorizontal: 9,
-    paddingVertical: 5,
-    borderWidth: 1,
-    borderColor: colors.line,
-  },
-  opLabel: { fontSize: 11, color: colors.textMute, fontFamily: fonts.regular },
-  opPing: { fontSize: 12, fontFamily: fonts.bold },
 });
