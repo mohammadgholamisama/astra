@@ -841,6 +841,12 @@ cmd_apply_update() {
   [[ -f "$ENV_FILE" ]] || die ".env disappeared — abort"
   [[ "$data_ok" -eq 1 && ! -d "${ASTRA_ROOT}/data" ]] && die "data/ missing after update — abort"
 
+  # git fetch/reset as root can leave the tree root-owned / mode 700 — restore astra access
+  chown -R astra:astra "$ASTRA_ROOT"
+  chmod 755 "$ASTRA_ROOT"
+  chmod 750 "${ASTRA_ROOT}/data" 2>/dev/null || true
+  chmod 640 "$ENV_FILE" 2>/dev/null || true
+
   install -m 755 "${ASTRA_ROOT}/deploy/astra-helper" /usr/local/bin/astra-helper
   install -m 755 "${ASTRA_ROOT}/deploy/x-astra" /usr/local/bin/x-astra
   if [[ -f "${ASTRA_ROOT}/deploy/sudoers.astra" ]]; then

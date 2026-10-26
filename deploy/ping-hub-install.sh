@@ -72,33 +72,36 @@ ensure_panel_api_key() {
     fi
   fi
 
-  local raw db
+  local raw
   raw="ask_$(rand_hex)"
-  db="$(get_panel DATABASE_URL "sqlite+aiosqlite:////opt/astra/data/astra.db")"
-  # sqlite path from URL
-  local sqlite_path="${db#*////}"
-  sqlite_path="${sqlite_path#sqlite+aiosqlite:///}"
-  [[ -f "$sqlite_path" ]] || die "astra db not found at $sqlite_path"
-
-  local hash admin_id
-  hash="$(printf '%s' "$raw" | sha256sum | awk '{print $1}')"
-  admin_id="$(sqlite3 "$sqlite_path" "SELECT id FROM admins WHERE is_active=1 ORDER BY id LIMIT 1;" 2>/dev/null || true)"
-  [[ -n "$admin_id" ]] || die "no active admin in astra db"
-
-  # Upsert by name so reinstall rotates the secret cleanly
-  sqlite3 "$sqlite_path" <<SQL
-DELETE FROM api_keys WHERE name = 'ping-hub';
-INSERT INTO api_keys (admin_id, name, key_hash, key_prefix, note, is_active, created_at)
-VALUES (
-  ${admin_id},
-  'ping-hub',
-  '${hash}',
-  '$(printf '%s' "$raw" | cut -c1-8)',
-  'auto: astra-ping-hub panel sync',
-  1,
-  datetime('now')
-);
-SQL
+  # Use SQLAlchemy with busy_timeout — safe while astra.service holds the DB
+  sudo -u astra env RAW="$raw" bash -c '
+    set -e
+    cd /opt/astra/backend
+    . .venv/bin/activate
+    python3 - <<'"'"'PY'"'"'
+import hashlib, os
+from datetime import datetime, timezone
+from sqlalchemy import create_engine, text
+raw = os.environ["RAW"]
+engine = create_engine("sqlite:////opt/astra/data/astra.db", connect_args={"timeout": 30})
+h = hashlib.sha256(raw.encode()).hexdigest()
+with engine.begin() as conn:
+    conn.execute(text("PRAGMA busy_timeout=30000"))
+    admin_id = conn.execute(text("SELECT id FROM admins WHERE is_active=1 ORDER BY id LIMIT 1")).scalar()
+    if not admin_id:
+        raise SystemExit("no active admin")
+    conn.execute(text("DELETE FROM api_keys WHERE name=:n"), {"n": "ping-hub"})
+    conn.execute(
+        text("INSERT INTO api_keys (admin_id, name, key_hash, key_prefix, note, is_active, created_at) "
+             "VALUES (:a,:n,:h,:p,:note,1,:ts)"),
+        {"a": admin_id, "n": "ping-hub", "h": h, "p": raw[:8],
+         "note": "auto: astra-ping-hub panel sync",
+         "ts": datetime.now(timezone.utc).isoformat()},
+    )
+print("ok")
+PY
+  ' >/dev/null
   echo "$raw"
 }
 
