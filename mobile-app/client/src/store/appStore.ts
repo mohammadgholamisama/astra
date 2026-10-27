@@ -57,6 +57,8 @@ interface AppState {
 
 let cycleAbort: AbortController | null = null;
 let cycleStarting = false;
+/** After cancel, block accidental re-start from the same finger lift. */
+let cancelCooldownUntil = 0;
 
 function intervalOf(get: () => AppState): number {
   return normalizeCycleMs(get().cycleIntervalMs);
@@ -371,6 +373,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   cancelCycle: () => {
+    // Idempotent — ignore spam taps / onPressIn+onPress doubles
+    if (!get().testing && !cycleStarting && !cycleAbort) return;
+    cancelCooldownUntil = Date.now() + 750;
     // Flip UI FIRST so the button feels instant even under load
     set({
       testing: false,
@@ -395,6 +400,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   runCycle: async (manual = false) => {
     const state = get();
+    if (Date.now() < cancelCooldownUntil) return;
     if (state.testing || cycleStarting) return;
     if (!state.subUrl.trim() && state.configs.length === 0) {
       set({ error: 'لینک ساب را وارد کنید' });

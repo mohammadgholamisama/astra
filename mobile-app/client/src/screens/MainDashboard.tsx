@@ -20,6 +20,13 @@ import type { ParsedConfig, RankedConfig } from '../types';
 import { toFaDigits } from '../utils/format';
 import { colors, fonts, radii } from '../theme';
 
+function IdleStatusLine() {
+  const testing = useAppStore((s) => s.testing);
+  const status = useAppStore((s) => s.status);
+  if (testing || !status) return null;
+  return <Text style={styles.idleStatus}>{status}</Text>;
+}
+
 export function MainDashboard() {
   const insets = useSafeAreaInsets();
   const [loadingSub, setLoadingSub] = useState(false);
@@ -36,11 +43,6 @@ export function MainDashboard() {
   const configs = useAppStore((s) => s.configs);
   const testing = useAppStore((s) => s.testing);
   const testingHashes = useAppStore((s) => s.testingHashes);
-  const progressDone = useAppStore((s) => s.progressDone);
-  const progressTotal = useAppStore((s) => s.progressTotal);
-  const remainingMs = useAppStore((s) => s.remainingMs);
-  const cycleIntervalMs = useAppStore((s) => s.cycleIntervalMs);
-  const status = useAppStore((s) => s.status);
   const error = useAppStore((s) => s.error);
   const tick = useAppStore((s) => s.tick);
   const loadSub = useAppStore((s) => s.loadSub);
@@ -87,7 +89,6 @@ export function MainDashboard() {
     void runCycle(true);
   }, [runCycle]);
 
-  // Instant — cancel on press-in so it works even when JS is busy
   const onCancel = useCallback(() => {
     cancelCycle();
   }, [cancelCycle]);
@@ -135,14 +136,37 @@ export function MainDashboard() {
     [],
   );
 
-  // Only list chrome in FlatList header — controls stay OUTSIDE so they
-  // never remount while ranked[] updates during a test.
+  // Whole page scrolls together — header + test/cancel + config list
   const listHeader = useMemo(
     () => (
-      <View>
-        {!testing && status ? (
-          <Text style={styles.idleStatus}>{status}</Text>
-        ) : null}
+      <View style={styles.headerBlock}>
+        <AppHeader />
+        <View style={styles.stack}>
+          <SubLinkCard
+            value={subUrl}
+            onChange={setSubUrl}
+            onLoad={() => void onLoadSub()}
+            loading={loadingSub}
+            count={configs.length}
+          />
+          <BgMonitorRow
+            enabled={backgroundEnabled}
+            onChange={(v) => void setBackgroundEnabled(v)}
+          />
+          <TestActionBar
+            disabled={false}
+            onTest={onTest}
+            onCancel={onCancel}
+            onCycleInterval={onCycleInterval}
+          />
+          <PanelSyncButton
+            busy={syncingPanel}
+            disabled={testing}
+            onPress={onSync}
+          />
+        </View>
+
+        <IdleStatusLine />
 
         {error ? (
           <View style={styles.errorBox}>
@@ -159,7 +183,24 @@ export function MainDashboard() {
         </View>
       </View>
     ),
-    [testing, status, error, ranked.length, aliveCount],
+    [
+      subUrl,
+      setSubUrl,
+      onLoadSub,
+      loadingSub,
+      configs.length,
+      backgroundEnabled,
+      setBackgroundEnabled,
+      testing,
+      onTest,
+      onCancel,
+      onCycleInterval,
+      syncingPanel,
+      onSync,
+      error,
+      ranked.length,
+      aliveCount,
+    ],
   );
 
   if (!hydrated) {
@@ -173,41 +214,6 @@ export function MainDashboard() {
 
   return (
     <View style={[styles.root, { paddingTop: insets.top }]}>
-      {/* Sticky controls — outside FlatList so cancel always receives taps */}
-      <View style={styles.controls}>
-        <AppHeader />
-        <View style={styles.stack}>
-          <SubLinkCard
-            value={subUrl}
-            onChange={setSubUrl}
-            onLoad={() => void onLoadSub()}
-            loading={loadingSub}
-            count={configs.length}
-          />
-          <BgMonitorRow
-            enabled={backgroundEnabled}
-            onChange={(v) => void setBackgroundEnabled(v)}
-          />
-          <TestActionBar
-            testing={testing}
-            disabled={false}
-            remainingMs={remainingMs}
-            cycleIntervalMs={cycleIntervalMs}
-            progressDone={progressDone}
-            progressTotal={progressTotal}
-            progressStatus={status}
-            onTest={onTest}
-            onCancel={onCancel}
-            onCycleInterval={onCycleInterval}
-          />
-          <PanelSyncButton
-            busy={syncingPanel}
-            disabled={testing}
-            onPress={onSync}
-          />
-        </View>
-      </View>
-
       <FlatList
         style={styles.list}
         data={ranked}
@@ -231,7 +237,7 @@ export function MainDashboard() {
         maxToRenderPerBatch={6}
         windowSize={5}
         updateCellsBatchingPeriod={80}
-        removeClippedSubviews
+        removeClippedSubviews={false}
         keyboardShouldPersistTaps="handled"
         showsVerticalScrollIndicator={false}
       />
@@ -255,14 +261,11 @@ const styles = StyleSheet.create({
     textAlign: 'right',
     fontFamily: fonts.regular,
   },
-  controls: {
-    paddingHorizontal: 14,
-    paddingBottom: 4,
-    zIndex: 10,
-    elevation: 10,
-  },
-  stack: { gap: 10, marginBottom: 4 },
   list: { flex: 1 },
+  headerBlock: {
+    paddingBottom: 4,
+  },
+  stack: { gap: 10, marginBottom: 4, marginTop: 4 },
   idleStatus: {
     marginTop: 8,
     marginBottom: 2,

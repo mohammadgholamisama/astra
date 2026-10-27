@@ -1,52 +1,76 @@
-import React from 'react';
+import React, { useRef } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { Gauge, X, Zap } from 'lucide-react-native';
 import { colors, fonts, radii } from '../theme';
 import { formatCountdown, toFaDigits } from '../utils/format';
 import { CYCLE_OPTIONS } from '../utils/cycleInterval';
+import { useAppStore } from '../store/appStore';
 
+/**
+ * Subscribes to store itself so parent FlatList header does not remount
+ * on every progress tick (that used to reset button locks / eat taps).
+ */
 export function TestActionBar({
-  testing,
   disabled,
-  remainingMs,
-  cycleIntervalMs,
-  progressDone = 0,
-  progressTotal = 0,
-  progressStatus = '',
   onTest,
   onCancel,
   onCycleInterval,
 }: {
-  testing: boolean;
   disabled: boolean;
-  remainingMs: number;
-  cycleIntervalMs: number;
-  progressDone?: number;
-  progressTotal?: number;
-  progressStatus?: string;
   onTest: () => void;
   onCancel: () => void;
   onCycleInterval: (ms: number) => void;
 }) {
+  const testing = useAppStore((s) => s.testing);
+  const remainingMs = useAppStore((s) => s.remainingMs);
+  const cycleIntervalMs = useAppStore((s) => s.cycleIntervalMs);
+  const progressDone = useAppStore((s) => s.progressDone);
+  const progressTotal = useAppStore((s) => s.progressTotal);
+  const progressStatus = useAppStore((s) => s.status);
+
   const pct =
     progressTotal > 0
       ? Math.min(100, Math.round((progressDone / progressTotal) * 100))
       : 0;
 
+  const cancelLock = useRef(false);
+  const testLock = useRef(false);
+
+  const handleCancel = () => {
+    if (cancelLock.current) return;
+    cancelLock.current = true;
+    onCancel();
+    setTimeout(() => {
+      cancelLock.current = false;
+    }, 900);
+  };
+
+  const handleTest = () => {
+    if (testLock.current || testing || disabled) return;
+    testLock.current = true;
+    onTest();
+    setTimeout(() => {
+      testLock.current = false;
+    }, 900);
+  };
+
   return (
     <View style={styles.wrap}>
       <View style={styles.row}>
-        {testing ? (
+        {/* Both stay mounted — swapping mid-press caused multi-tap bugs */}
+        <View style={styles.btnSlot}>
           <Pressable
-            onPressIn={onCancel}
-            onPress={onCancel}
-            hitSlop={16}
+            onPressIn={handleCancel}
+            hitSlop={12}
             accessibilityRole="button"
             accessibilityLabel="قطع تست"
+            accessibilityState={{ disabled: !testing }}
+            pointerEvents={testing ? 'auto' : 'none'}
             style={({ pressed }) => [
               styles.btn,
               styles.btnCancel,
-              pressed && styles.btnPressed,
+              !testing && styles.btnGone,
+              pressed && testing && styles.btnPressed,
             ]}
           >
             <View style={styles.btnCopy}>
@@ -57,14 +81,21 @@ export function TestActionBar({
               <X size={18} color={colors.bg} strokeWidth={2.6} />
             </View>
           </Pressable>
-        ) : (
+
           <Pressable
-            disabled={disabled}
-            onPress={onTest}
+            onPress={handleTest}
+            disabled={disabled || testing}
+            hitSlop={12}
+            accessibilityRole="button"
+            accessibilityLabel="تست الان"
+            accessibilityState={{ disabled: disabled || testing }}
+            pointerEvents={testing ? 'none' : 'auto'}
             style={({ pressed }) => [
               styles.btn,
-              disabled && styles.btnDisabled,
-              pressed && !disabled && styles.btnPressed,
+              styles.btnTest,
+              testing && styles.btnGone,
+              (disabled || testing) && styles.btnDisabled,
+              pressed && !disabled && !testing && styles.btnPressed,
             ]}
           >
             <View style={styles.btnCopy}>
@@ -80,7 +111,7 @@ export function TestActionBar({
               />
             </View>
           </Pressable>
-        )}
+        </View>
 
         <View style={styles.timer}>
           <View style={styles.timerTop}>
@@ -158,20 +189,33 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 10,
   },
-  btn: {
+  btnSlot: {
     flex: 1,
+    minHeight: 64,
+    position: 'relative',
+  },
+  btn: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
     gap: 10,
     borderRadius: radii.lg,
-    backgroundColor: colors.accent,
     paddingVertical: 14,
     paddingHorizontal: 12,
     minHeight: 64,
   },
+  btnTest: {
+    backgroundColor: colors.accent,
+  },
   btnCancel: {
     backgroundColor: '#E85D4C',
+  },
+  btnGone: {
+    opacity: 0,
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 0,
   },
   btnPressed: { opacity: 0.88 },
   btnDisabled: { backgroundColor: 'rgba(255,255,255,0.1)' },
