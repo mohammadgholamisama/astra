@@ -5,6 +5,7 @@ from app.api.deps import get_current_admin
 from app.core.database import get_db
 from app.schemas.config_hide import (
     ConfigVisibilityAllOut,
+    ConfigVisibilityBulkSet,
     ConfigVisibilityOut,
     ConfigVisibilitySet,
     SampleAllOut,
@@ -186,15 +187,42 @@ async def set_config_visibility_global(
         ) from exc
 
 
+@router.put("/api/admin/config-visibility/bulk")
+async def set_config_visibility_bulk(
+    body: ConfigVisibilityBulkSet,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """Batch hide/show for many fingerprints (Config Order «نمایش همه»)."""
+    try:
+        items = [
+            (it.host, int(it.port), it.match_host or "", bool(it.hidden))
+            for it in (body.items or [])
+        ]
+        stats = await hide_svc.set_hidden_bulk(db, items)
+        return {"ok": True, **stats}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"خطا در تغییر گروهی نمایش: {exc}",
+        ) from exc
+
+
 @router.post("/api/admin/config-visibility/unhide-all")
 async def unhide_all_configs(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
-    """Clear every global hide rule — all configs show in every subscription again."""
+    """Clear every global hide rule — all configs reappear in every subscription."""
     try:
         cleared = await hide_svc.clear_all_hides(db)
-        return {"ok": True, "cleared": int(cleared)}
+        return {"ok": True, "cleared": cleared}
     except Exception as exc:  # noqa: BLE001
         try:
             await db.rollback()

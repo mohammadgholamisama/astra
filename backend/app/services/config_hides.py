@@ -95,18 +95,6 @@ async def list_hides(db: AsyncSession, group_id: int | None = None) -> list[Grou
     return list(result.scalars().all())
 
 
-async def clear_all_hides(db: AsyncSession) -> int:
-    """Remove every global hide rule so all endpoints show in subscriptions again."""
-    result = await db.execute(select(GroupConfigHide))
-    rows = list(result.scalars().all())
-    n = len(rows)
-    if n:
-        await db.execute(delete(GroupConfigHide))
-        await db.commit()
-    await refresh_cache(db)
-    return n
-
-
 async def set_hidden(
     db: AsyncSession,
     group_id: int | None,
@@ -177,6 +165,50 @@ async def set_hidden(
         await db.commit()
         await refresh_cache(db)
     return None
+
+
+async def clear_all_hides(db: AsyncSession, *, commit: bool = True) -> int:
+    """Remove every global hide rule so all fingerprints reappear in subscriptions."""
+    result = await db.execute(select(GroupConfigHide))
+    rows = list(result.scalars().all())
+    n = len(rows)
+    if n:
+        await db.execute(delete(GroupConfigHide))
+    if commit:
+        await db.commit()
+        await refresh_cache(db)
+    else:
+        with _lock:
+            global _hidden, _loaded
+            _hidden = set()
+            _loaded = True
+    return n
+
+
+async def set_hidden_bulk(
+    db: AsyncSession,
+    items: list[tuple[str, int, str, bool]],
+) -> dict[str, int]:
+    """Batch hide/unhide. Each item: (host, port, match_host, hidden)."""
+    shown = 0
+    hid = 0
+    for host, port, match_host, hidden in items:
+        await set_hidden(
+            db,
+            None,
+            host,
+            int(port),
+            hidden=bool(hidden),
+            match_host=match_host or "",
+            commit=False,
+        )
+        if hidden:
+            hid += 1
+        else:
+            shown += 1
+    await db.commit()
+    await refresh_cache(db)
+    return {"shown": shown, "hidden": hid, "total": len(items)}
 
 
 def _link_protocol(link: str) -> str:

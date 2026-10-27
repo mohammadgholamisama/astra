@@ -7555,7 +7555,7 @@ html[dir="rtl"] .configs-switch input:checked + .configs-switch-track::after,
   margin-inline-start: auto;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   white-space: nowrap;
 }
 .config-order-search {
@@ -8013,6 +8013,11 @@ html[dir="rtl"] .configs-switch input:checked + .configs-switch-track::after,
   }
   .config-order-toolbar .configs-filters button {
     flex: 1 1 0;
+  }
+  .config-order-unhide-all {
+    margin-inline-start: 0;
+    width: 100%;
+    justify-content: center;
   }
   .config-order-fp {
     grid-template-columns: 1fr;
