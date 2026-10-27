@@ -285,13 +285,27 @@ async def _ensure_share_links(
     token: str,
     user,
     *,
-    timeout: float = 18.0,
+    timeout: float = 12.0,
     force: bool = False,
 ):
-    """Hydrate missing share links in parallel (one wave, per-panel deadlines)."""
+    """Hydrate missing share links in parallel (one wave, per-panel deadlines).
+
+    Never raises — tunnel / slow remotes must still get a 200 with whatever
+    share links are already cached.
+    """
     if not force and await _user_sub_links_complete(db, user):
-        links = await collect_links(user, include_notices=False, db=db)
+        try:
+            links = await collect_links(user, include_notices=False, db=db)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("sub collect-complete user=%s: %s", user.username, exc)
+            links = []
         return user, links
+
+    # Already have some share links → keep hydrate short so tunnel clients
+    # don't hit nginx 502/504 ("Internal Server Error") on slow remotes.
+    if _user_has_share_links(user):
+        timeout = min(timeout, 6.0)
+
     try:
         n = await asyncio.wait_for(hydrate_share_links(db, user), timeout=timeout)
         if n:
@@ -304,7 +318,11 @@ async def _ensure_share_links(
             await db.rollback()
         except Exception:  # noqa: BLE001
             pass
-        user = await load_user_by_token(db, token) or user
+        try:
+            user = await load_user_by_token(db, token) or user
+        except Exception:  # noqa: BLE001
+            pass
+    links: list[str] = []
     try:
         links = await collect_links(user, include_notices=False, db=db)
     except Exception as exc:  # noqa: BLE001
@@ -313,8 +331,12 @@ async def _ensure_share_links(
             await db.rollback()
         except Exception:  # noqa: BLE001
             pass
-        user = await load_user_by_token(db, token) or user
-        links = await collect_links(user, include_notices=False, db=db)
+        try:
+            user = await load_user_by_token(db, token) or user
+            links = await collect_links(user, include_notices=False, db=db)
+        except Exception as exc2:  # noqa: BLE001
+            logger.warning("sub collect retry user=%s: %s", getattr(user, "username", "?"), exc2)
+            links = []
     if not links:
         logger.warning(
             "sub feed empty user=%s status=%s accounts=%s",
@@ -380,44 +402,93 @@ async def _pull_live_usage(db: AsyncSession, user, *, push: bool = False) -> Non
             pass
 
 
-async def _render_info_page(db: AsyncSession, token: str, user) -> HTMLResponse:
-    await ensure_loaded(db)
-    # Same policy as the feed: complete cached links, hydrate gaps, refresh in BG.
-    # Do NOT run request-time refresh_usage here — partial panel responses used to
-    # shrink stored links and make HTML/feed counts diverge.
-    if await _user_sub_links_complete(db, user):
-        user = await load_user_by_token(db, token) or user
-    else:
-        user, _links = await _ensure_share_links(
-            db, token, user, timeout=18.0, force=True
-        )
-    _schedule_bg_maintain(int(user.id))
+def _fallback_sub_html(username: str = "") -> str:
+    safe = (username or "کاربر").replace("<", "").replace(">", "")[:64]
+    return (
+        "<!DOCTYPE html><html lang='fa' dir='rtl'><head><meta charset='utf-8'/>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
+        "<title>اشتراک</title>"
+        "<style>body{margin:0;min-height:100vh;display:grid;place-items:center;"
+        "font-family:system-ui,sans-serif;background:#07141e;color:#ecfaf6}"
+        "main{text-align:center;padding:24px}h1{font-size:1.1rem;margin:0 0 8px}"
+        "p{margin:0;color:#7fa39a;font-size:.9rem}</style></head>"
+        f"<body><main><h1>اشتراک {safe}</h1>"
+        "<p>در حال آماده‌سازی کانفیگ‌ها — چند ثانیه بعد دوباره باز کنید.</p>"
+        "</main></body></html>"
+    )
 
-    configs = await collect_links_detailed(user, include_notices=True, db=db)
-    panels_usage = await usage_breakdown_for_user(db, user)
-    device_limit = await device_limit_for_user(db, user)
-    status = user.status.value if hasattr(user.status, "value") else str(user.status)
-    show_name = (getattr(user, "display_name", None) or "").strip() or user.username
-    html = render_subscription_page(
-        panel_name=get_brand_name(),
-        username=show_name,
-        status=status,
-        used=int(user.used_traffic or 0),
-        limit=int(user.data_limit or 0),
-        expire=user.expire,
-        sub_url=subscription_url(user),
-        configs=configs,
-        panels_usage=panels_usage,
-        device_limit=device_limit,
-        public_links=get_public_links(),
-    )
-    return HTMLResponse(
-        html,
-        headers={
-            "cache-control": "no-store",
-            "content-disposition": "inline",
-        },
-    )
+
+async def _render_info_page(db: AsyncSession, token: str, user) -> HTMLResponse:
+    """HTML info page — never 500; tunnel clients get a soft fallback page."""
+    try:
+        await ensure_loaded(db)
+        # Same policy as the feed: complete cached links, hydrate gaps, refresh in BG.
+        # Do NOT run request-time refresh_usage here — partial panel responses used to
+        # shrink stored links and make HTML/feed counts diverge.
+        try:
+            complete = await _user_sub_links_complete(db, user)
+        except Exception:  # noqa: BLE001
+            complete = False
+        if complete:
+            user = await load_user_by_token(db, token) or user
+        else:
+            user, _links = await _ensure_share_links(
+                db, token, user, timeout=8.0, force=True
+            )
+        try:
+            _schedule_bg_maintain(int(user.id))
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            configs = await collect_links_detailed(user, include_notices=True, db=db)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("sub detailed user=%s: %s", user.username, exc)
+            configs = []
+        try:
+            panels_usage = await usage_breakdown_for_user(db, user)
+        except Exception:  # noqa: BLE001
+            panels_usage = []
+        try:
+            device_limit = await device_limit_for_user(db, user)
+        except Exception:  # noqa: BLE001
+            device_limit = 0
+        status = user.status.value if hasattr(user.status, "value") else str(user.status)
+        show_name = (getattr(user, "display_name", None) or "").strip() or user.username
+        html = render_subscription_page(
+            panel_name=get_brand_name(),
+            username=show_name,
+            status=status,
+            used=int(user.used_traffic or 0),
+            limit=int(user.data_limit or 0),
+            expire=user.expire,
+            sub_url=subscription_url(user),
+            configs=configs,
+            panels_usage=panels_usage,
+            device_limit=device_limit,
+            public_links=get_public_links(),
+        )
+        return HTMLResponse(
+            html,
+            headers={
+                "cache-control": "no-store",
+                "content-disposition": "inline",
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "sub html failed user=%s", getattr(user, "username", "?")
+        )
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        name = getattr(user, "username", "") or ""
+        return HTMLResponse(
+            _fallback_sub_html(name),
+            status_code=200,
+            headers={"cache-control": "no-store"},
+        )
 
 
 @router.get("/sub/{token}")
@@ -433,44 +504,88 @@ async def get_subscription(
 
     Feed path is cache-first when EVERY membership account has ready share links.
     Incomplete accounts get a short hydrate, then we serve; BG maintain fills gaps.
+
+    Must never return 500 through the Iran reverse tunnel — clients show
+    "Internal Server Error" and abandon the update.
     """
-    user = await load_user_by_token(db, token)
+    try:
+        user = await load_user_by_token(db, token)
+    except Exception:  # noqa: BLE001
+        logger.exception("sub load token=%s…", (token or "")[:8])
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return PlainTextResponse("Temporarily unavailable", status_code=503)
+
     if not user:
         return PlainTextResponse("Not found", status_code=404)
 
-    if _wants_html_page(request):
-        return await _render_info_page(db, token, user)
+    try:
+        if _wants_html_page(request):
+            return await _render_info_page(db, token, user)
 
-    from app.services.site_settings import ensure_loaded
+        from app.services.site_settings import ensure_loaded
 
-    await ensure_loaded(db)
+        await ensure_loaded(db)
 
-    # Complete membership → serve immediately.
-    # Incomplete → one parallel hydrate wave across all panels, then serve.
-    if await _user_sub_links_complete(db, user):
-        links = await collect_links(user, include_notices=False, db=db)
-        _schedule_bg_maintain(int(user.id))
-    else:
-        user, links = await _ensure_share_links(
-            db, token, user, timeout=18.0, force=True
+        # Complete membership → serve immediately.
+        # Incomplete → short hydrate, then serve whatever is cached.
+        try:
+            complete = await _user_sub_links_complete(db, user)
+        except Exception:  # noqa: BLE001
+            complete = False
+
+        if complete:
+            try:
+                links = await collect_links(user, include_notices=False, db=db)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("sub collect user=%s: %s", user.username, exc)
+                links = []
+            _schedule_bg_maintain(int(user.id))
+        else:
+            user, links = await _ensure_share_links(
+                db, token, user, timeout=8.0, force=True
+            )
+            _schedule_bg_maintain(int(user.id))
+
+        headers = _sub_headers(user)
+
+        if user.status not in (UserStatus.active, UserStatus.on_hold):
+            return _feed_response(b"", headers)
+
+        body = _encode_feed(links)
+        if not body:
+            logger.warning(
+                "sub returning empty body user=%s token=%s…",
+                user.username,
+                token[:8],
+            )
+
+        return _feed_response(body, headers)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "sub feed failed user=%s", getattr(user, "username", "?")
         )
-        _schedule_bg_maintain(int(user.id))
-
-    headers = _sub_headers(user)
-
-    if user.status not in (UserStatus.active, UserStatus.on_hold):
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        # Soft 200 empty feed — better than Internal Server Error on tunnel
+        try:
+            headers = _sub_headers(user)
+        except Exception:  # noqa: BLE001
+            headers = {"cache-control": "no-store"}
         return _feed_response(b"", headers)
-
-    body = _encode_feed(links)
-    if not body:
-        logger.warning("sub returning empty body user=%s token=%s…", user.username, token[:8])
-
-    return _feed_response(body, headers)
 
 
 @router.get("/sub/{token}/info", response_class=HTMLResponse)
 async def subscription_page(token: str, db: AsyncSession = Depends(get_db)):
-    user = await load_user_by_token(db, token)
+    try:
+        user = await load_user_by_token(db, token)
+    except Exception:  # noqa: BLE001
+        logger.exception("sub info load token=%s…", (token or "")[:8])
+        return HTMLResponse(_fallback_sub_html(), status_code=200)
     if not user:
         return HTMLResponse("<h1>Not found</h1>", status_code=404)
     return await _render_info_page(db, token, user)
