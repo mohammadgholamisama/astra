@@ -45,5 +45,12 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
         try:
             yield session
+        except BaseException:
+            # PendingRollback / ExceptionGroup must not leave a dirty session
+            try:
+                await session.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
         finally:
             await session.close()

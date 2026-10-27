@@ -36,6 +36,19 @@ from app.services.users import load_user_by_token, subscription_url
 router = APIRouter(tags=["Subscription"])
 logger = logging.getLogger("astra.sub")
 
+
+async def _safe_rollback(db: AsyncSession | None) -> None:
+    if db is None:
+        return
+    try:
+        await db.rollback()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _is_cancel(exc: BaseException) -> bool:
+    return isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit))
+
 # Debounce background maintain so many clients don't stampede one user
 _bg_last: dict[int, float] = {}
 _BG_MIN_INTERVAL = 12.0
@@ -181,10 +194,17 @@ async def _bg_sub_maintain(user_id: int) -> None:
         logger.exception("bg sub maintain user_id=%s failed", user_id)
 
 
+async def _bg_sub_maintain_deferred(user_id: int) -> None:
+    # Let the HTTP request finish + release its DB session first so concurrent
+    # SQLite writers don't leave the request session in PendingRollback (500).
+    await asyncio.sleep(0.75)
+    await _bg_sub_maintain(user_id)
+
+
 def _schedule_bg_maintain(user_id: int) -> None:
     try:
         asyncio.create_task(
-            _bg_sub_maintain(user_id),
+            _bg_sub_maintain_deferred(user_id),
             name=f"astra-sub-bg-{user_id}",
         )
     except RuntimeError:
@@ -475,14 +495,13 @@ async def _render_info_page(db: AsyncSession, token: str, user) -> HTMLResponse:
                 "content-disposition": "inline",
             },
         )
-    except Exception:  # noqa: BLE001
+    except BaseException as exc:  # noqa: BLE001
+        if _is_cancel(exc):
+            raise
         logger.exception(
             "sub html failed user=%s", getattr(user, "username", "?")
         )
-        try:
-            await db.rollback()
-        except Exception:  # noqa: BLE001
-            pass
+        await _safe_rollback(db)
         name = getattr(user, "username", "") or ""
         return HTMLResponse(
             _fallback_sub_html(name),
@@ -510,12 +529,11 @@ async def get_subscription(
     """
     try:
         user = await load_user_by_token(db, token)
-    except Exception:  # noqa: BLE001
+    except BaseException as exc:  # noqa: BLE001
+        if _is_cancel(exc):
+            raise
         logger.exception("sub load token=%s…", (token or "")[:8])
-        try:
-            await db.rollback()
-        except Exception:  # noqa: BLE001
-            pass
+        await _safe_rollback(db)
         return PlainTextResponse("Temporarily unavailable", status_code=503)
 
     if not user:
@@ -563,14 +581,13 @@ async def get_subscription(
             )
 
         return _feed_response(body, headers)
-    except Exception:  # noqa: BLE001
+    except BaseException as exc:  # noqa: BLE001
+        if _is_cancel(exc):
+            raise
         logger.exception(
             "sub feed failed user=%s", getattr(user, "username", "?")
         )
-        try:
-            await db.rollback()
-        except Exception:  # noqa: BLE001
-            pass
+        await _safe_rollback(db)
         # Soft 200 empty feed — better than Internal Server Error on tunnel
         try:
             headers = _sub_headers(user)
@@ -583,8 +600,11 @@ async def get_subscription(
 async def subscription_page(token: str, db: AsyncSession = Depends(get_db)):
     try:
         user = await load_user_by_token(db, token)
-    except Exception:  # noqa: BLE001
+    except BaseException as exc:  # noqa: BLE001
+        if _is_cancel(exc):
+            raise
         logger.exception("sub info load token=%s…", (token or "")[:8])
+        await _safe_rollback(db)
         return HTMLResponse(_fallback_sub_html(), status_code=200)
     if not user:
         return HTMLResponse("<h1>Not found</h1>", status_code=404)
