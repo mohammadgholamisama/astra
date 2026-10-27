@@ -103,10 +103,21 @@ func (a *API) SyncPanelNow(c *fiber.Ctx) error {
 		}
 	}
 
-	// Keep only successful averages — untested/failed never reorder the panel
+	// Include failures so Astra can hide dead fingerprints from user subs.
+	// Successful ones reorder; all-fail ones auto-hide until any device recovers.
 	filtered := make([]models.FingerprintRank, 0, len(ranks))
+	okN := 0
 	for _, r := range ranks {
-		if r.AvgPing > 0 && strings.TrimSpace(r.Host) != "" && r.Port > 0 {
+		if strings.TrimSpace(r.Host) == "" || r.Port < 1 {
+			continue
+		}
+		if r.AvgPing > 0 {
+			okN++
+			filtered = append(filtered, r)
+			continue
+		}
+		// Only forward failures that were actually sampled
+		if r.SampleCount > 0 || r.FailDeviceCount > 0 {
 			filtered = append(filtered, r)
 		}
 	}
@@ -115,7 +126,7 @@ func (a *API) SyncPanelNow(c *fiber.Ctx) error {
 			"ok":      true,
 			"count":   0,
 			"source":  source,
-			"message": "no successful ping averages to apply",
+			"message": "no ping samples to apply",
 		})
 	}
 
@@ -124,7 +135,7 @@ func (a *API) SyncPanelNow(c *fiber.Ctx) error {
 	}
 	return c.JSON(fiber.Map{
 		"ok":     true,
-		"count":  len(filtered),
+		"count":  okN,
 		"source": source,
 	})
 }

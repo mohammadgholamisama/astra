@@ -1,4 +1,5 @@
 import type { RankedConfig } from '../types';
+import { arrangeByCategorySlots } from './configCategory';
 
 export type FingerprintRankItem = {
   host: string;
@@ -13,9 +14,8 @@ export type FingerprintRankItem = {
 /**
  * Build panel order payload from the live page ranking.
  * - Only measured + successful pings (avg_ping > 0)
- * - Grouped by host:port:match_host (domain/SNI)
- * - Averaged when several configs share the same fingerprint
- * - Sorted best-first
+ * - Grouped by host:port:match_host
+ * - Ordered: 5 مستقیم → 5 تانل → 5 گیمینگ → rest by ping
  */
 export function buildFingerprintRanksFromPage(
   ranked: RankedConfig[],
@@ -78,10 +78,5 @@ export function buildFingerprintRanksFromPage(
     });
   }
 
-  items.sort((a, b) => {
-    if (a.avg_ping !== b.avg_ping) return a.avg_ping - b.avg_ping;
-    if (a.host !== b.host) return a.host.localeCompare(b.host);
-    return a.port - b.port;
-  });
-  return items;
+  return arrangeByCategorySlots(items);
 }

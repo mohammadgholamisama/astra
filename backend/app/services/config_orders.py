@@ -527,22 +527,30 @@ async def apply_ping_rank(
     db: AsyncSession,
     ranked: list[dict[str, Any]],
 ) -> ConfigOrderWorkspaceOut:
-    """Reorder existing config-order by avg ping (host/port/match_host).
+    """Reorder config-order + auto hide/unhide from multi-device pings.
 
-    Rules (clean / stable):
-    - Only fingerprints with avg_ping > 0 are scored.
-    - Scored rows rise to the top, sorted by lowest ping.
-    - Unscored / untested rows keep their relative order and stay after scored ones
-      (their mutual ranking is never shuffled).
-    - Ping items that don't match any panel fingerprint are ignored (nothing added).
-    - No-op if there is nothing scored.
+    Order rules:
+    - Up to 5 best مستقیم, then 5 تانل, then 5 گیمینگ (by device_count then ping)
+    - Remaining successful fingerprints by quality
+    - Untested / unmatched keep relative order after scored ones
+
+    Sub visibility:
+    - All reporting devices failed → hide from every user subscription
+    - Any device succeeded → unhide (re-enter sub)
+    - Priority for ranking: more successful devices first
     """
+    from app.services.config_hides import set_hidden
+    from app.services.ping_category_order import arrange_by_category_slots
+
     workspace = await list_workspace(db)
     current = list(workspace.items)
 
     score: dict[tuple[str, int, str], float] = {}
     devices: dict[tuple[str, int, str], int] = {}
+    fails: dict[tuple[str, int, str], int] = {}
     labels: dict[tuple[str, int, str], str] = {}
+    tested_fail: set[tuple[str, int, str]] = set()
+
     for raw in ranked:
         try:
             host = str(raw.get("host") or "")
@@ -550,46 +558,108 @@ async def apply_ping_rank(
             match = str(raw.get("match_host") or "")
             avg = float(raw.get("avg_ping") if raw.get("avg_ping") is not None else -1)
             dcount = int(raw.get("device_count") or 0)
+            fcount = int(raw.get("fail_device_count") or 0)
+            samples = int(raw.get("sample_count") or 0)
         except (TypeError, ValueError):
-            continue
-        if avg <= 0:
             continue
         norm = try_normalize_endpoint(host, port, match)
         if not norm:
             continue
         key = _fp_key(*norm)
-        # Keep best (lowest positive) if duplicates
-        if key not in score or avg < score[key]:
-            score[key] = avg
-            devices[key] = max(dcount, 1)
         label = _normalize_label(raw.get("label"))
         if label and key not in labels:
             labels[key] = label
 
-    if not score:
-        logger.info("apply_ping_rank skip — no positive avg_ping items")
-        return workspace
+        if avg > 0:
+            if key not in score or avg < score[key]:
+                score[key] = avg
+                devices[key] = max(dcount, 1)
+            elif dcount > devices.get(key, 0):
+                devices[key] = dcount
+            # success always clears hide candidate
+            tested_fail.discard(key)
+        else:
+            # Tested but no positive device → candidate for hide
+            if samples > 0 or fcount > 0 or dcount == 0:
+                if key not in score:
+                    tested_fail.add(key)
+                    fails[key] = max(fcount, fails.get(key, 0), 1)
 
-    # Split: scored (will reorder) vs unscored (preserve relative order exactly)
-    scored_rows: list[tuple[float, int, ConfigOrderItemOut]] = []
+    # Auto hide / unhide for subscription feeds
+    hide_n = 0
+    show_n = 0
+    for it in current:
+        key = _fp_key(it.host, int(it.port), it.match_host or "")
+        try:
+            if key in score:
+                await set_hidden(
+                    db,
+                    None,
+                    it.host,
+                    int(it.port),
+                    hidden=False,
+                    match_host=it.match_host or "",
+                    commit=False,
+                )
+                show_n += 1
+            elif key in tested_fail:
+                await set_hidden(
+                    db,
+                    None,
+                    it.host,
+                    int(it.port),
+                    hidden=True,
+                    match_host=it.match_host or "",
+                    commit=False,
+                )
+                hide_n += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("apply_ping_rank hide/unhide %s: %s", key, exc)
+
+    if not score:
+        await db.commit()
+        from app.services.config_hides import refresh_cache as refresh_hides
+
+        await refresh_hides(db)
+        logger.info(
+            "apply_ping_rank no scores — hide=%s show=%s",
+            hide_n,
+            show_n,
+        )
+        return await list_workspace(db)
+
+    scored_items: list[ConfigOrderItemOut] = []
     unscored_rows: list[ConfigOrderItemOut] = []
     for it in current:
         key = _fp_key(it.host, int(it.port), it.match_host or "")
         if key in score:
-            scored_rows.append((score[key], int(it.sort_order), it))
+            scored_items.append(it)
         else:
             unscored_rows.append(it)
 
-    if not scored_rows:
-        # Ping payload didn't match any panel fingerprint — leave order alone
-        logger.info(
-            "apply_ping_rank skip — %s scores, 0 panel matches",
-            len(score),
-        )
-        return workspace
+    if not scored_items:
+        await db.commit()
+        from app.services.config_hides import refresh_cache as refresh_hides
 
-    scored_rows.sort(key=lambda t: (t[0], t[1]))
-    ordered = [t[2] for t in scored_rows] + unscored_rows
+        await refresh_hides(db)
+        logger.info(
+            "apply_ping_rank skip order — %s scores, 0 panel matches hide=%s",
+            len(score),
+            hide_n,
+        )
+        return await list_workspace(db)
+
+    arranged = arrange_by_category_slots(
+        scored_items,
+        avg_of=lambda it: score[_fp_key(it.host, int(it.port), it.match_host or "")],
+        label_of=lambda it: it.label
+        or labels.get(_fp_key(it.host, int(it.port), it.match_host or ""), "")
+        or "",
+        device_of=lambda it: devices.get(
+            _fp_key(it.host, int(it.port), it.match_host or ""), 1
+        ),
+    )
+    ordered = list(arranged) + unscored_rows
 
     payload: list[ConfigOrderItemIn] = []
     for it in ordered:
@@ -605,14 +675,15 @@ async def apply_ping_rank(
         )
 
     logger.info(
-        "apply_ping_rank scored=%s unscored=%s total=%s",
-        len(scored_rows),
+        "apply_ping_rank scored=%s unscored=%s hide=%s show=%s total=%s",
+        len(arranged),
         len(unscored_rows),
+        hide_n,
+        show_n,
         len(payload),
     )
     await save_order(db, payload)
 
-    # Persist avg_ping only on scored fingerprints; leave others untouched
     result = await db.execute(select(ConfigLinkOrder))
     rows = list(result.scalars().all())
     for row in rows:
@@ -627,9 +698,11 @@ async def apply_ping_rank(
         if key in score:
             row.avg_ping = float(score[key])
             row.device_count = int(devices.get(key) or 1)
-        # do NOT wipe avg_ping on unscored — keeps prior readings stable
     await db.commit()
     await refresh_cache(db)
+    from app.services.config_hides import refresh_cache as refresh_hides
+
+    await refresh_hides(db)
     return await list_workspace(db)
 
 

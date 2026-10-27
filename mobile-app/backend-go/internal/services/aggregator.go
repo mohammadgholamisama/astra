@@ -341,8 +341,9 @@ func (a *Aggregator) RankedFingerprints(ctx context.Context) ([]models.Fingerpri
 			continue
 		}
 
-		// deviceID → best positive ping in the window (across hashes/operators)
+		// deviceID → best positive ping; also track devices that only failed
 		bestByDevice := map[string]float64{}
+		failedDevices := map[string]struct{}{}
 		var label string
 		var sampleN int
 
@@ -372,13 +373,17 @@ func (a *Aggregator) RankedFingerprints(ctx context.Context) ([]models.Fingerpri
 						continue
 					}
 					sampleN++
-					if rec.PingMs <= 0 {
-						continue
-					}
 					id := rec.DeviceID
 					if id == "" {
 						id = dev
 					}
+					if rec.PingMs <= 0 {
+						if _, ok := bestByDevice[id]; !ok {
+							failedDevices[id] = struct{}{}
+						}
+						continue
+					}
+					delete(failedDevices, id)
 					ms := float64(rec.PingMs)
 					if prev, ok := bestByDevice[id]; !ok || ms < prev {
 						bestByDevice[id] = ms
@@ -396,34 +401,18 @@ func (a *Aggregator) RankedFingerprints(ctx context.Context) ([]models.Fingerpri
 			avg = math.Round((sum/float64(len(bestByDevice)))*10) / 10
 		}
 		out = append(out, models.FingerprintRank{
-			Host:        host,
-			Port:        port,
-			MatchHost:   match,
-			Label:       label,
-			AvgPing:     avg,
-			SampleCount: sampleN,
-			DeviceCount: len(bestByDevice),
+			Host:            host,
+			Port:            port,
+			MatchHost:       match,
+			Label:           label,
+			AvgPing:         avg,
+			SampleCount:     sampleN,
+			DeviceCount:     len(bestByDevice),
+			FailDeviceCount: len(failedDevices),
 		})
 	}
 
-	sort.SliceStable(out, func(i, j int) bool {
-		ai, aj := out[i].AvgPing, out[j].AvgPing
-		// positive first (lower better), then failures
-		if ai > 0 && aj > 0 {
-			if ai != aj {
-				return ai < aj
-			}
-			return out[i].Host < out[j].Host
-		}
-		if ai > 0 {
-			return true
-		}
-		if aj > 0 {
-			return false
-		}
-		return out[i].Host < out[j].Host
-	})
-	return out, nil
+	return arrangeFingerprintSlots(out), nil
 }
 
 func (a *Aggregator) avgDevicePings(

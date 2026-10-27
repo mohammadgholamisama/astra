@@ -39,7 +39,7 @@ class ConfigOrderSaveBody(BaseModel):
 
 
 class PingRankItemIn(BaseModel):
-    """One fingerprint avg from multi-device ping hub (last 10 minutes)."""
+    """One fingerprint avg from multi-device ping hub (last 15 minutes)."""
 
     host: str
     port: int = Field(..., ge=1, le=65535)
@@ -48,6 +48,8 @@ class PingRankItemIn(BaseModel):
     avg_ping: float = -1
     sample_count: int = 0
     device_count: int = 0
+    # Devices that reported a failed/timeout ping in the window (for auto-hide)
+    fail_device_count: int = 0
 
 
 class PingRankBody(BaseModel):

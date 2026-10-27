@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -52,13 +51,11 @@ func (s *PanelSyncService) SyncPingRanks(ctx context.Context, ranks []models.Fin
 
 	best := map[string]models.FingerprintRank{}
 	for _, r := range ranks {
-		if r.AvgPing <= 0 {
-			continue
-		}
 		host := strings.TrimSpace(strings.ToLower(r.Host))
 		if host == "" || r.Port < 1 || r.Port > 65535 {
 			continue
 		}
+		// Keep failures too (avg<=0) so Astra can auto-hide dead fingerprints
 		match := strings.TrimSpace(strings.ToLower(r.MatchHost))
 		key := fmt.Sprintf("%s|%d|%s", host, r.Port, match)
 		label := strings.TrimSpace(r.Label)
@@ -66,7 +63,7 @@ func (s *PanelSyncService) SyncPingRanks(ctx context.Context, ranks []models.Fin
 			label = label[:128]
 		}
 		devN := r.DeviceCount
-		if devN < 1 {
+		if r.AvgPing > 0 && devN < 1 {
 			devN = 1
 		}
 		sampleN := r.SampleCount
@@ -74,35 +71,38 @@ func (s *PanelSyncService) SyncPingRanks(ctx context.Context, ranks []models.Fin
 			sampleN = 1
 		}
 		cand := models.FingerprintRank{
-			Host:        host,
-			Port:        r.Port,
-			MatchHost:   match,
-			Label:       label,
-			AvgPing:     r.AvgPing,
-			SampleCount: sampleN,
-			DeviceCount: devN,
+			Host:            host,
+			Port:            r.Port,
+			MatchHost:       match,
+			Label:           label,
+			AvgPing:         r.AvgPing,
+			SampleCount:     sampleN,
+			DeviceCount:     devN,
+			FailDeviceCount: r.FailDeviceCount,
 		}
-		if prev, ok := best[key]; !ok || cand.AvgPing < prev.AvgPing {
+		prev, ok := best[key]
+		if !ok {
 			best[key] = cand
+			continue
+		}
+		// Prefer a successful reading over a failure
+		if cand.AvgPing > 0 && (prev.AvgPing <= 0 || cand.AvgPing < prev.AvgPing) {
+			best[key] = cand
+		} else if cand.AvgPing <= 0 && prev.AvgPing <= 0 {
+			if cand.FailDeviceCount > prev.FailDeviceCount {
+				best[key] = cand
+			}
 		}
 	}
 	if len(best) == 0 {
-		return fmt.Errorf("no successful fingerprint ranks to sync")
+		return fmt.Errorf("no fingerprint ranks to sync")
 	}
 
 	items := make([]models.FingerprintRank, 0, len(best))
 	for _, r := range best {
 		items = append(items, r)
 	}
-	sort.SliceStable(items, func(i, j int) bool {
-		if items[i].AvgPing != items[j].AvgPing {
-			return items[i].AvgPing < items[j].AvgPing
-		}
-		if items[i].Host != items[j].Host {
-			return items[i].Host < items[j].Host
-		}
-		return items[i].Port < items[j].Port
-	})
+	items = arrangeFingerprintSlots(items)
 
 	body := models.PingRankBody{Items: items}
 	payload, err := json.Marshal(body)

@@ -91,13 +91,14 @@ type RankedConfig struct {
 
 // FingerprintRank is host:port[+match_host] averaged across devices — Astra order key.
 type FingerprintRank struct {
-	Host        string  `json:"host"`
-	Port        int     `json:"port"`
-	MatchHost   string  `json:"match_host"`
-	Label       string  `json:"label,omitempty"`
-	AvgPing     float64 `json:"avg_ping"`
-	SampleCount int     `json:"sample_count"`
-	DeviceCount int     `json:"device_count"`
+	Host            string  `json:"host"`
+	Port            int     `json:"port"`
+	MatchHost       string  `json:"match_host"`
+	Label           string  `json:"label,omitempty"`
+	AvgPing         float64 `json:"avg_ping"`
+	SampleCount     int     `json:"sample_count"`
+	DeviceCount     int     `json:"device_count"`
+	FailDeviceCount int     `json:"fail_device_count,omitempty"`
 }
 
 // PingRankBody is POSTed to Astra /api/admin/config-order/ping-rank.

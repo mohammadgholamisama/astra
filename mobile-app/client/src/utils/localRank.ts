@@ -1,10 +1,12 @@
 import type { LocalPingResult, ParsedConfig, RankedConfig } from '../types';
+import { arrangeByCategorySlots } from './configCategory';
 
 type LiveMap = Map<string, LocalPingResult>;
 
 /**
- * Live ranking: updates as each config finishes.
- * Untested stay at the bottom; successful rise by lowest ping.
+ * Live ranking with category slots:
+ * up to 5 best مستقیم → 5 تانل → 5 گیمینگ → rest by ping.
+ * Untested / failed stay at the bottom.
  */
 export function rankLocally(
   configs: ParsedConfig[],
@@ -52,27 +54,17 @@ export function rankLocally(
     };
   });
 
-  rows.sort((a, b) => {
-    const aDone = !!a.measured;
-    const bDone = !!b.measured;
+  const ok = rows.filter((r) => r.measured && r.success_rate > 0);
+  const failed = rows.filter((r) => r.measured && r.success_rate <= 0);
+  const testing = rows.filter((r) => !r.measured && r.avg_ping === -2);
+  const pending = rows.filter((r) => !r.measured && r.avg_ping !== -2);
 
-    const tier = (x: RankedConfig, done: boolean) => {
-      if (done && x.success_rate > 0) return 0;
-      if (done) return 1;
-      if (x.avg_ping === -2) return 2;
-      return 3;
-    };
-    const ta = tier(a, aDone);
-    const tb = tier(b, bDone);
-    if (ta !== tb) return ta - tb;
+  const arrangedOk = arrangeByCategorySlots(
+    ok.map((r) => ({ ...r, label: r.remark, device_count: 1 })),
+  );
 
-    if (a.success_rate > 0 && b.success_rate > 0) {
-      return a.avg_ping - b.avg_ping;
-    }
-    return a.remark.localeCompare(b.remark, 'fa');
-  });
-
-  return rows.map((row, i) => ({ ...row, rank: i + 1 }));
+  const ordered = [...arrangedOk, ...failed, ...testing, ...pending];
+  return ordered.map((row, i) => ({ ...row, rank: i + 1 }));
 }
 
 export function configsAsPending(configs: ParsedConfig[]): RankedConfig[] {

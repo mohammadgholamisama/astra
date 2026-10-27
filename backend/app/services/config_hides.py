@@ -103,8 +103,12 @@ async def set_hidden(
     *,
     hidden: bool,
     match_host: str | None = "",
+    commit: bool = True,
 ) -> GroupConfigHide | None:
-    """Add or remove a GLOBAL hide rule (affects every subscription)."""
+    """Add or remove a GLOBAL hide rule (affects every subscription).
+
+    Pass ``commit=False`` when batching many updates (caller commits + refresh).
+    """
     host_n = normalize_host(host)
     port_n = int(port)
     match_n = normalize_match_host(match_host)
@@ -150,14 +154,16 @@ async def set_hidden(
             g = await db.get(Group, int(group_id))
             if g:
                 row.group_id = int(g.id)
-        await db.commit()
-        await refresh_cache(db)
+        if commit:
+            await db.commit()
+            await refresh_cache(db)
         return row
 
     for row in rows:
         await db.delete(row)
-    await db.commit()
-    await refresh_cache(db)
+    if commit:
+        await db.commit()
+        await refresh_cache(db)
     return None
 
 
