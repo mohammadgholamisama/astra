@@ -92,6 +92,7 @@ export function MainDashboard() {
     void runCycle(true);
   }, [runCycle]);
 
+  // Instant — cancel on press-in so it works even when JS is busy
   const onCancel = useCallback(() => {
     cancelCycle();
   }, [cancelCycle]);
@@ -139,9 +140,72 @@ export function MainDashboard() {
     [],
   );
 
+  // Only list chrome in FlatList header — controls stay OUTSIDE so they
+  // never remount while ranked[] updates during a test.
   const listHeader = useMemo(
     () => (
       <View>
+        {testing ? (
+          <View style={styles.progressCard}>
+            <View style={styles.progressTop}>
+              <Text style={styles.progressStatus} numberOfLines={1}>
+                {status}
+              </Text>
+              <Text style={styles.progressPct}>{toFaDigits(progressPct)}٪</Text>
+            </View>
+            <View style={styles.progressTrack}>
+              <View
+                style={[styles.progressFill, { width: `${progressPct}%` }]}
+              />
+            </View>
+            <Text style={styles.progressMeta}>
+              {toFaDigits(progressDone)} از {toFaDigits(progressTotal)}
+            </Text>
+          </View>
+        ) : status ? (
+          <Text style={styles.idleStatus}>{status}</Text>
+        ) : null}
+
+        {error ? (
+          <View style={styles.errorBox}>
+            <Text style={styles.errorText}>{error}</Text>
+          </View>
+        ) : null}
+
+        <View style={styles.listHeader}>
+          <Text style={styles.listStat}>
+            {toFaDigits(ranked.length)} کل
+            {aliveCount > 0 ? ` · ${toFaDigits(aliveCount)} فعال` : ''}
+          </Text>
+          <Text style={styles.listTitle}>رتبه‌بندی</Text>
+        </View>
+      </View>
+    ),
+    [
+      testing,
+      status,
+      progressPct,
+      progressDone,
+      progressTotal,
+      error,
+      ranked.length,
+      aliveCount,
+    ],
+  );
+
+  if (!hydrated) {
+    return (
+      <View style={[styles.root, styles.center]}>
+        <ActivityIndicator color={colors.accent} size="large" />
+        <Text style={styles.bootText}>در حال آماده‌سازی…</Text>
+      </View>
+    );
+  }
+
+  return (
+    <View style={[styles.root, { paddingTop: insets.top }]}>
+      {/* Sticky controls — outside FlatList so cancel always receives taps */}
+      <View style={styles.controls}>
         <AppHeader />
         <View style={styles.stack}>
           <SubLinkCard
@@ -170,79 +234,10 @@ export function MainDashboard() {
             onPress={onSync}
           />
         </View>
-
-        {testing ? (
-          <View style={styles.progressCard}>
-            <View style={styles.progressTop}>
-              <Text style={styles.progressStatus} numberOfLines={1}>
-                {status}
-              </Text>
-              <Text style={styles.progressPct}>{toFaDigits(progressPct)}٪</Text>
-            </View>
-            <View style={styles.progressTrack}>
-              <View style={[styles.progressFill, { width: `${progressPct}%` }]} />
-            </View>
-            <Text style={styles.progressMeta}>
-              {toFaDigits(progressDone)} از {toFaDigits(progressTotal)}
-            </Text>
-          </View>
-        ) : status ? (
-          <Text style={styles.idleStatus}>{status}</Text>
-        ) : null}
-
-        {error ? (
-          <View style={styles.errorBox}>
-            <Text style={styles.errorText}>{error}</Text>
-          </View>
-        ) : null}
-
-        <View style={styles.listHeader}>
-          <Text style={styles.listStat}>
-            {toFaDigits(ranked.length)} کل
-            {aliveCount > 0 ? ` · ${toFaDigits(aliveCount)} فعال` : ''}
-          </Text>
-          <Text style={styles.listTitle}>رتبه‌بندی</Text>
-        </View>
       </View>
-    ),
-    [
-      subUrl,
-      setSubUrl,
-      onLoadSub,
-      loadingSub,
-      configs.length,
-      backgroundEnabled,
-      setBackgroundEnabled,
-      testing,
-      remainingMs,
-      cycleIntervalMs,
-      onTest,
-      onCancel,
-      onCycleInterval,
-      syncingPanel,
-      onSync,
-      status,
-      progressPct,
-      progressDone,
-      progressTotal,
-      error,
-      ranked.length,
-      aliveCount,
-    ],
-  );
 
-  if (!hydrated) {
-    return (
-      <View style={[styles.root, styles.center]}>
-        <ActivityIndicator color={colors.accent} size="large" />
-        <Text style={styles.bootText}>در حال آماده‌سازی…</Text>
-      </View>
-    );
-  }
-
-  return (
-    <View style={[styles.root, { paddingTop: insets.top }]}>
       <FlatList
+        style={styles.list}
         data={ranked}
         keyExtractor={keyExtractor}
         renderItem={renderItem}
@@ -260,10 +255,10 @@ export function MainDashboard() {
           paddingBottom: insets.bottom + 28,
           paddingHorizontal: 14,
         }}
-        initialNumToRender={12}
-        maxToRenderPerBatch={8}
-        windowSize={7}
-        updateCellsBatchingPeriod={50}
+        initialNumToRender={10}
+        maxToRenderPerBatch={6}
+        windowSize={5}
+        updateCellsBatchingPeriod={80}
         removeClippedSubviews
         keyboardShouldPersistTaps="handled"
         showsVerticalScrollIndicator={false}
@@ -288,7 +283,14 @@ const styles = StyleSheet.create({
     textAlign: 'right',
     fontFamily: fonts.regular,
   },
+  controls: {
+    paddingHorizontal: 14,
+    paddingBottom: 4,
+    zIndex: 10,
+    elevation: 10,
+  },
   stack: { gap: 10, marginBottom: 4 },
+  list: { flex: 1 },
   progressCard: {
     marginTop: 10,
     marginBottom: 6,

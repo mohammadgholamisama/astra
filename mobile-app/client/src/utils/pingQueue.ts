@@ -1,4 +1,4 @@
-import { pingRealDelay, pingTcp } from '../native/XrayPing';
+import { cancelAllPings, pingRealDelay, pingTcp } from '../native/XrayPing';
 import type { LocalPingResult, ParsedConfig } from '../types';
 
 export interface PingQueueOptions {
@@ -22,7 +22,7 @@ function isAbort(e: unknown): boolean {
   );
 }
 
-/** Reject as soon as AbortSignal fires. */
+/** Reject as soon as AbortSignal fires — does not wait for native. */
 function raceAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
   if (signal.aborted) return Promise.reject(abortedError());
@@ -46,19 +46,31 @@ export async function runPingQueue(
   configs: ParsedConfig[],
   options: PingQueueOptions = {},
 ): Promise<LocalPingResult[]> {
-  const concurrency = Math.max(1, options.concurrency ?? 12);
-  const timeoutMs = options.timeoutMs ?? 1500;
-  const tcpTimeoutMs = options.tcpTimeoutMs ?? 250;
+  const concurrency = Math.max(1, options.concurrency ?? 5);
+  const timeoutMs = options.timeoutMs ?? 1200;
+  const tcpTimeoutMs = options.tcpTimeoutMs ?? 200;
   const tcpPrecheck = options.tcpPrecheck !== false;
   const total = configs.length;
   const results: LocalPingResult[] = new Array(total);
   let nextIndex = 0;
   let completed = 0;
+  let stopped = false;
+
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    cancelAllPings();
+  };
+
+  if (options.signal) {
+    if (options.signal.aborted) stop();
+    else options.signal.addEventListener('abort', stop, { once: true });
+  }
 
   async function measureOne(cfg: ParsedConfig): Promise<number> {
-    if (options.signal?.aborted) throw abortedError();
+    if (stopped || options.signal?.aborted) throw abortedError();
     options.onStart?.(cfg);
-    if (options.signal?.aborted) throw abortedError();
+    if (stopped || options.signal?.aborted) throw abortedError();
     if (tcpPrecheck) {
       const tcp = await raceAbort(
         pingTcp(cfg.address, cfg.port, tcpTimeoutMs),
@@ -66,26 +78,25 @@ export async function runPingQueue(
       );
       if (tcp < 0) return -1;
     }
-    if (options.signal?.aborted) throw abortedError();
+    if (stopped || options.signal?.aborted) throw abortedError();
     return raceAbort(pingRealDelay(cfg.raw, timeoutMs), options.signal);
   }
 
   async function worker(): Promise<void> {
     while (true) {
-      if (options.signal?.aborted) return;
+      if (stopped || options.signal?.aborted) return;
       const i = nextIndex++;
       if (i >= total) return;
-      // Stop scheduling more work once aborted (index already taken — OK)
-      if (options.signal?.aborted) return;
+      if (stopped || options.signal?.aborted) return;
       const cfg = configs[i]!;
       let pingMs = -1;
       try {
         pingMs = await measureOne(cfg);
       } catch (e) {
-        if (isAbort(e)) return;
+        if (isAbort(e) || stopped) return;
         pingMs = -1;
       }
-      if (options.signal?.aborted) return;
+      if (stopped || options.signal?.aborted) return;
       const latest: LocalPingResult = {
         configHash: cfg.configHash,
         pingMs,
@@ -103,7 +114,6 @@ export async function runPingQueue(
   );
   await Promise.all(workers);
 
-  // Always return whatever we have — caller decides abort vs complete
   return results.map((r, i) => {
     if (r) return r;
     return {

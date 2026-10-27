@@ -21,51 +21,47 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Real-delay ping via LibXray. Supports hard cancel so closing the app / tapping
- * «قطع تست» does not leave 16 Xray cores spinning (black screen / ANR on reopen).
+ * Real-delay ping via LibXray.
+ * Cancel is non-blocking on the RN bridge — resolve first, tear down pool off-thread.
  */
 class XrayPingModule(
   private val reactContext: ReactApplicationContext
 ) : ReactContextBaseJavaModule(reactContext) {
 
-  @Volatile private var measurePool: ExecutorService = Executors.newFixedThreadPool(12)
+  @Volatile private var measurePool: ExecutorService = Executors.newFixedThreadPool(POOL_SIZE)
   private val replyPool: ExecutorService = Executors.newCachedThreadPool()
   private val coreReady = AtomicBoolean(false)
   private val generation = AtomicInteger(0)
   private val inflight = ConcurrentHashMap.newKeySet<Future<*>>()
 
+  init {
+    holder = this
+  }
+
   override fun getName(): String = "XrayPing"
+
+  override fun invalidate() {
+    holder = null
+    hardCancelAsync()
+    super.invalidate()
+  }
 
   @ReactMethod
   fun isAvailable(promise: Promise) {
     promise.resolve(ensureCore())
   }
 
-  /** Abort every in-flight measure immediately and bump generation. */
+  /**
+   * Resolve immediately so JS cancel button never waits on pool teardown.
+   */
   @ReactMethod
   fun cancelAllPings(promise: Promise) {
+    generation.incrementAndGet()
     try {
-      generation.incrementAndGet()
-      val copy = inflight.toTypedArray()
-      inflight.clear()
-      for (f in copy) {
-        try {
-          f.cancel(true)
-        } catch (_: Throwable) {
-        }
-      }
-      // Drain stuck workers — LibXray may ignore interrupt, so replace the pool
-      val old = measurePool
-      measurePool = Executors.newFixedThreadPool(12)
-      try {
-        old.shutdownNow()
-      } catch (_: Throwable) {
-      }
       promise.resolve(true)
-    } catch (t: Throwable) {
-      Log.w(TAG, "cancelAllPings: ${t.message}")
-      promise.resolve(false)
+    } catch (_: Throwable) {
     }
+    hardCancelAsync()
   }
 
   @ReactMethod
@@ -81,8 +77,12 @@ class XrayPingModule(
 
   @ReactMethod
   fun pingRealDelay(shareLink: String, timeoutMs: Double, promise: Promise) {
-    val capMs = timeoutMs.toLong().coerceIn(700L, 5_000L)
+    val capMs = timeoutMs.toLong().coerceIn(700L, 4_000L)
     val myGen = generation.get()
+    if (myGen != generation.get()) {
+      promise.resolve(-1.0)
+      return
+    }
     val pool = measurePool
     val future: Future<Long> = try {
       pool.submit<Long> {
@@ -110,7 +110,7 @@ class XrayPingModule(
           -1L
         }
       }
-    } catch (t: Throwable) {
+    } catch (_: Throwable) {
       promise.resolve(-1.0)
       return
     }
@@ -121,7 +121,7 @@ class XrayPingModule(
           future.cancel(true)
           -1L
         } else {
-          future.get(capMs + 200L, TimeUnit.MILLISECONDS)
+          future.get(capMs + 150L, TimeUnit.MILLISECONDS)
         }
       } catch (_: TimeoutException) {
         future.cancel(true)
@@ -135,7 +135,6 @@ class XrayPingModule(
       try {
         promise.resolve(ms.toDouble())
       } catch (_: Throwable) {
-        // Bridge already torn down (activity destroyed)
       }
     }
   }
@@ -153,7 +152,7 @@ class XrayPingModule(
             tcpConnectMs(
               host.trim(),
               port.toInt().coerceIn(1, 65535),
-              timeoutMs.toInt().coerceIn(150, 3_000),
+              timeoutMs.toInt().coerceIn(150, 2_500),
             )
           }
         } catch (_: Throwable) {
@@ -169,14 +168,38 @@ class XrayPingModule(
       return
     }
     inflight.add(future)
-    // Remove when done — wrapped above resolves inside submit; clean up via reply
     replyPool.execute {
       try {
-        future.get(4, TimeUnit.SECONDS)
+        future.get(3, TimeUnit.SECONDS)
       } catch (_: Throwable) {
         future.cancel(true)
       } finally {
         inflight.remove(future)
+      }
+    }
+  }
+
+  private fun hardCancelAsync() {
+    replyPool.execute {
+      try {
+        val copy = inflight.toTypedArray()
+        inflight.clear()
+        for (f in copy) {
+          try {
+            f.cancel(true)
+          } catch (_: Throwable) {
+          }
+        }
+        val old = measurePool
+        measurePool = Executors.newFixedThreadPool(POOL_SIZE)
+        try {
+          old.shutdownNow()
+        } catch (_: Throwable) {
+        }
+        // Don't awaitTermination — LibXray may ignore interrupt; abandoning
+        // the old pool keeps the UI responsive and reopen clean.
+      } catch (t: Throwable) {
+        Log.w(TAG, "hardCancel: ${t.message}")
       }
     }
   }
@@ -235,6 +258,22 @@ class XrayPingModule(
 
   companion object {
     private const val TAG = "XrayPing"
+    private const val POOL_SIZE = 6
     const val PROBE_URL = "https://www.gstatic.com/generate_204"
+
+    @Volatile
+    private var holder: XrayPingModule? = null
+
+    /** Called from Activity lifecycle — no JS bridge required. */
+    @JvmStatic
+    fun cancelFromNative() {
+      try {
+        holder?.let {
+          it.generation.incrementAndGet()
+          it.hardCancelAsync()
+        }
+      } catch (_: Throwable) {
+      }
+    }
   }
 }

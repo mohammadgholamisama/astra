@@ -146,7 +146,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     cycleAbort?.abort();
     cycleAbort = null;
     cycleStarting = false;
-    void cancelAllPings();
+    cancelAllPings();
 
     try {
       const [saved, configs, ranked] = await Promise.all([
@@ -371,18 +371,19 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   cancelCycle: () => {
-    cycleAbort?.abort();
-    cycleAbort = null;
-    cycleStarting = false;
-    void cancelAllPings();
+    // Flip UI FIRST so the button feels instant even under load
     set({
       testing: false,
       testingHashes: [],
       syncingPanel: false,
       status: 'تست متوقف شد',
     });
+    cycleAbort?.abort();
+    cycleAbort = null;
+    cycleStarting = false;
+    cancelAllPings(); // sync fire-and-forget — never await
     const { configs, ranked } = get();
-    if (configs.length > 0 && ranked.length > 0) {
+    if (configs.length > 0) {
       setTimeout(() => {
         void saveSnapshot(configs, ranked, {
           lastBackgroundStatus: 'تست متوقف شد — آخرین ترتیب ذخیره شد',
@@ -408,7 +409,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     cycleStarting = true;
     cycleAbort?.abort();
-    void cancelAllPings();
+    cancelAllPings();
     const ac = new AbortController();
     cycleAbort = ac;
 
@@ -471,9 +472,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         rankTimer = null;
         lastRank = Date.now();
         if (ac.signal.aborted || !get().testing) return;
+        // Light updates only — keep cancel button responsive
         set({
           ranked: rankLocally(configs, live, inFlight),
-          testingHashes: [...inFlight].slice(0, 12),
+          testingHashes: [...inFlight].slice(0, 6),
           progressDone: latestDone,
           progressTotal: latestTotal,
           status: latestHint || `پینگ… ${latestDone}/${latestTotal}`,
@@ -481,13 +483,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       };
 
       const results = await runPingQueue(configs, {
-        concurrency: 12,
-        timeoutMs: 1400,
-        tcpTimeoutMs: 220,
+        concurrency: 5,
+        timeoutMs: 1200,
+        tcpTimeoutMs: 200,
         tcpPrecheck: true,
         signal: ac.signal,
         onStart: (cfg) => {
-          if (ac.signal.aborted) return;
+          if (ac.signal.aborted || !get().testing) return;
           inFlight.add(cfg.configHash);
         },
         onProgress: (done, total, latest) => {
@@ -502,7 +504,8 @@ export const useAppStore = create<AppState>((set, get) => ({
               : `${done}/${total} · قطع`;
 
           const now = Date.now();
-          if (now - lastLight >= 160) {
+          // Progress text only (cheap) — full list re-rank sparsely
+          if (now - lastLight >= 350) {
             lastLight = now;
             set({
               progressDone: done,
@@ -510,11 +513,11 @@ export const useAppStore = create<AppState>((set, get) => ({
               status: latestHint,
             });
           }
-          if (now - lastRank >= 600) {
+          if (now - lastRank >= 1800) {
             if (rankTimer) clearTimeout(rankTimer);
             flushRank();
           } else if (!rankTimer) {
-            rankTimer = setTimeout(flushRank, 600 - (now - lastRank));
+            rankTimer = setTimeout(flushRank, 1800 - (now - lastRank));
           }
         },
       });

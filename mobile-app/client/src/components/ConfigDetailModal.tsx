@@ -5,6 +5,7 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Check, Copy, X } from 'lucide-react-native';
@@ -37,6 +38,10 @@ export function ConfigDetailModal({
   onClose: () => void;
 }) {
   const [copied, setCopied] = useState(false);
+  const { height: winH } = useWindowDimensions();
+  const sheetMax = Math.round(winH * 0.9);
+  // Head (~62) + actions (~72) + padding — leave the rest for scroll
+  const scrollMax = Math.max(220, sheetMax - 150);
 
   const raw = parsed?.raw || ranked?.raw || '';
   const rows = useMemo(() => {
@@ -53,7 +58,10 @@ export function ConfigDetailModal({
       { label: 'نام', value: ranked?.remark || parsed?.remark || '—' },
       { label: 'رتبه', value: ranked ? toFaDigits(ranked.rank) : '—' },
       { label: 'پینگ', value: ping },
-      { label: 'پروتکل', value: (ranked?.protocol || parsed?.protocol || '').toUpperCase() },
+      {
+        label: 'پروتکل',
+        value: (ranked?.protocol || parsed?.protocol || '').toUpperCase(),
+      },
       { label: 'ترنسپورت', value: ranked?.transport || parsed?.transport || '' },
       { label: 'امنیت', value: ranked?.security || parsed?.security || '' },
       { label: 'آدرس', value: ranked?.host || parsed?.address || '' },
@@ -87,8 +95,13 @@ export function ConfigDetailModal({
       animationType="fade"
       onRequestClose={onClose}
     >
-      <Pressable style={styles.backdrop} onPress={onClose}>
-        <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
+      <View style={styles.backdrop}>
+        <Pressable
+          style={StyleSheet.absoluteFillObject}
+          onPress={onClose}
+          accessibilityLabel="بستن"
+        />
+        <View style={[styles.sheet, { maxHeight: sheetMax }]}>
           <View style={styles.head}>
             <Pressable onPress={onClose} hitSlop={10} style={styles.closeBtn}>
               <X size={18} color={colors.textSoft} strokeWidth={2.4} />
@@ -99,9 +112,12 @@ export function ConfigDetailModal({
           </View>
 
           <ScrollView
-            style={styles.scroll}
+            style={[styles.scroll, { maxHeight: scrollMax }]}
             contentContainerStyle={styles.scrollContent}
-            showsVerticalScrollIndicator={false}
+            showsVerticalScrollIndicator
+            bounces
+            nestedScrollEnabled
+            keyboardShouldPersistTaps="handled"
           >
             {rows.map((r) => (
               <Row key={r.label} label={r.label} value={r.value} />
@@ -133,8 +149,8 @@ export function ConfigDetailModal({
               </Text>
             </Pressable>
           </View>
-        </Pressable>
-      </Pressable>
+        </View>
+      </View>
     </Modal>
   );
 }
@@ -148,7 +164,7 @@ const styles = StyleSheet.create({
   },
   sheet: {
     direction: 'ltr',
-    maxHeight: '82%',
+    width: '100%',
     borderRadius: radii.xl,
     backgroundColor: colors.bgElevated,
     borderWidth: 1,
@@ -180,8 +196,15 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  scroll: { flexGrow: 0 },
-  scrollContent: { padding: 14, gap: 8, paddingBottom: 8 },
+  scroll: {
+    flexGrow: 0,
+    flexShrink: 1,
+  },
+  scrollContent: {
+    padding: 14,
+    gap: 8,
+    paddingBottom: 16,
+  },
   row: {
     flexDirection: 'row-reverse',
     alignItems: 'flex-start',

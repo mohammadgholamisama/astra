@@ -53,9 +53,9 @@ export default async function backgroundPingTask(): Promise<void> {
 
   const live = new Map<string, LocalPingResult>();
   const results = await runPingQueue(configs, {
-    concurrency: 16,
-    timeoutMs: 1500,
-    tcpTimeoutMs: 250,
+    concurrency: 5,
+    timeoutMs: 1200,
+    tcpTimeoutMs: 200,
     tcpPrecheck: true,
     onProgress: (_d, _t, latest) => {
       live.set(latest.configHash, latest);

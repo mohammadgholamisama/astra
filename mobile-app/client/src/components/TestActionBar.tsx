@@ -27,8 +27,9 @@ export function TestActionBar({
       <View style={styles.row}>
         {testing ? (
           <Pressable
+            onPressIn={onCancel}
             onPress={onCancel}
-            hitSlop={12}
+            hitSlop={16}
             accessibilityRole="button"
             accessibilityLabel="قطع تست"
             style={({ pressed }) => [

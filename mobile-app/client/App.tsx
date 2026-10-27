@@ -12,7 +12,6 @@ import { MainDashboard } from './src/screens/MainDashboard';
 import { ErrorBoundary } from './src/components/ErrorBoundary';
 import { useAppStore } from './src/store/appStore';
 import { saveSnapshot } from './src/store/persist';
-import { cancelAllPings } from './src/native/XrayPing';
 
 try {
   I18nManager.allowRTL(true);
@@ -27,31 +26,24 @@ function App(): React.JSX.Element {
     StatusBar.setBarStyle('light-content');
   }, []);
 
-  // Leaving the app mid-test: stop native cores + persist so reopen is clean
+  // Persist on leave — do NOT cancel the running test (that was cutting cycles short).
   useEffect(() => {
     const onChange = (next: AppStateStatus) => {
       const prev = appState.current;
       appState.current = next;
       const leaving =
-        (prev === 'active' && (next === 'inactive' || next === 'background')) ||
-        next === 'background';
+        prev === 'active' &&
+        (next === 'inactive' || next === 'background');
       if (!leaving) return;
 
-      const store = useAppStore.getState();
-      const wasTesting = store.testing;
-      if (wasTesting) {
-        store.cancelCycle();
-      } else {
-        void cancelAllPings();
-      }
-      const { configs, ranked, subUrl, backgroundEnabled } =
+      const { configs, ranked, subUrl, backgroundEnabled, testing } =
         useAppStore.getState();
       if (configs.length > 0) {
         void saveSnapshot(configs, ranked, {
           subUrl,
           backgroundEnabled,
-          lastBackgroundStatus: wasTesting
-            ? 'تست متوقف شد — اپ بسته شد'
+          lastBackgroundStatus: testing
+            ? 'تست در پس‌زمینه ادامه دارد…'
             : undefined,
         });
       }

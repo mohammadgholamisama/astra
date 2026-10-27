@@ -14,11 +14,16 @@ function normalize(ms: unknown): number {
   return ms < 0 ? -1 : Math.round(ms);
 }
 
-/** Hard-stop every native ping (pool drain). Safe to call often. */
-export async function cancelAllPings(): Promise<void> {
+/**
+ * Fire-and-forget hard stop. Never await — bridge must stay free for UI.
+ */
+export function cancelAllPings(): void {
   if (Platform.OS === 'android' && Native?.cancelAllPings) {
     try {
-      await Native.cancelAllPings();
+      const p = Native.cancelAllPings();
+      if (p && typeof (p as Promise<boolean>).then === 'function') {
+        void (p as Promise<boolean>).catch(() => undefined);
+      }
     } catch {
       /* ignore */
     }
