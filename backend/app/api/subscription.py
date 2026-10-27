@@ -51,7 +51,37 @@ def _is_cancel(exc: BaseException) -> bool:
 
 # Debounce background maintain so many clients don't stampede one user
 _bg_last: dict[int, float] = {}
-_BG_MIN_INTERVAL = 12.0
+_BG_MIN_INTERVAL = 8.0
+
+# Tiny in-process feed cache — VPN clients often refresh in bursts.
+_feed_cache: dict[tuple[int, bool], tuple[float, bytes]] = {}
+_FEED_CACHE_TTL = 8.0
+_FEED_CACHE_MAX = 400
+
+
+def _feed_cache_get(user_id: int, include_hidden: bool) -> bytes | None:
+    key = (int(user_id), bool(include_hidden))
+    hit = _feed_cache.get(key)
+    if not hit:
+        return None
+    ts, body = hit
+    if time.monotonic() - ts > _FEED_CACHE_TTL:
+        _feed_cache.pop(key, None)
+        return None
+    return body
+
+
+def _feed_cache_put(user_id: int, include_hidden: bool, body: bytes) -> None:
+    if len(_feed_cache) >= _FEED_CACHE_MAX:
+        # Drop oldest ~10%
+        for k, _ in sorted(_feed_cache.items(), key=lambda kv: kv[1][0])[
+            : max(1, _FEED_CACHE_MAX // 10)
+        ]:
+            _feed_cache.pop(k, None)
+    _feed_cache[(int(user_id), bool(include_hidden))] = (
+        time.monotonic(),
+        body,
+    )
 
 
 def _account_has_ready_shares(account) -> bool:
@@ -197,7 +227,7 @@ async def _bg_sub_maintain(user_id: int) -> None:
 async def _bg_sub_maintain_deferred(user_id: int) -> None:
     # Let the HTTP request finish + release its DB session first so concurrent
     # SQLite writers don't leave the request session in PendingRollback (500).
-    await asyncio.sleep(0.75)
+    await asyncio.sleep(0.25)
     await _bg_sub_maintain(user_id)
 
 
@@ -316,40 +346,53 @@ def _feed_response(body: bytes, headers: dict[str, str]) -> Response:
     )
 
 
+async def _collect_feed_links(
+    user,
+    *,
+    include_hidden: bool = False,
+    db: AsyncSession | None = None,
+) -> list[str]:
+    """Assemble ordered/filtered share links from cached account data only."""
+    return await collect_links(
+        user,
+        include_notices=False,
+        include_hidden=include_hidden,
+        db=db,
+        live_rebuild=False,
+    )
+
+
 async def _ensure_share_links(
     db: AsyncSession,
     token: str,
     user,
     *,
-    timeout: float = 12.0,
+    timeout: float = 2.5,
     force: bool = False,
     include_hidden: bool = False,
 ):
-    """Hydrate missing share links in parallel (one wave, per-panel deadlines).
+    """Serve cached share links immediately; only briefly hydrate when empty.
 
-    Never raises — tunnel / slow remotes must still get a 200 with whatever
-    share links are already cached.
+    VPN clients timeout on long remotes — never block the HTTP path for a full
+    multi-panel hydrate when we already have something to return. Background
+    maintain fills gaps after the response.
     """
-    if not force and await _user_sub_links_complete(db, user):
+    # Fast path: any ready shares → serve now (even if some panels are incomplete).
+    if not force and _user_has_share_links(user):
         try:
-            links = await collect_links(
-                user,
-                include_notices=False,
-                include_hidden=include_hidden,
-                db=db,
+            links = await _collect_feed_links(
+                user, include_hidden=include_hidden, db=db
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("sub collect-complete user=%s: %s", user.username, exc)
+            logger.warning("sub collect-cached user=%s: %s", user.username, exc)
             links = []
         return user, links
 
-    # Already have some share links → keep hydrate short so tunnel clients
-    # don't hit nginx 502/504 ("Internal Server Error") on slow remotes.
-    if _user_has_share_links(user):
-        timeout = min(timeout, 6.0)
-
+    # Cold start only: very short hydrate so first open isn't empty forever.
     try:
-        n = await asyncio.wait_for(hydrate_share_links(db, user), timeout=timeout)
+        n = await asyncio.wait_for(
+            hydrate_share_links(db, user), timeout=max(1.5, float(timeout))
+        )
         if n:
             await db.commit()
             logger.info("sub hydrated user=%s accounts=%s", user.username, n)
@@ -366,11 +409,8 @@ async def _ensure_share_links(
             pass
     links: list[str] = []
     try:
-        links = await collect_links(
-            user,
-            include_notices=False,
-            include_hidden=include_hidden,
-            db=db,
+        links = await _collect_feed_links(
+            user, include_hidden=include_hidden, db=db
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("sub collect user=%s: %s", getattr(user, "username", "?"), exc)
@@ -380,11 +420,8 @@ async def _ensure_share_links(
             pass
         try:
             user = await load_user_by_token(db, token) or user
-            links = await collect_links(
-                user,
-                include_notices=False,
-                include_hidden=include_hidden,
-                db=db,
+            links = await _collect_feed_links(
+                user, include_hidden=include_hidden, db=db
             )
         except Exception as exc2:  # noqa: BLE001
             logger.warning("sub collect retry user=%s: %s", getattr(user, "username", "?"), exc2)
@@ -477,15 +514,10 @@ async def _render_info_page(db: AsyncSession, token: str, user) -> HTMLResponse:
         # Same policy as the feed: complete cached links, hydrate gaps, refresh in BG.
         # Do NOT run request-time refresh_usage here — partial panel responses used to
         # shrink stored links and make HTML/feed counts diverge.
-        try:
-            complete = await _user_sub_links_complete(db, user)
-        except Exception:  # noqa: BLE001
-            complete = False
-        if complete:
-            user = await load_user_by_token(db, token) or user
-        else:
+        # Cache-first like the feed — never block HTML on full multi-panel hydrate.
+        if not _user_has_share_links(user):
             user, _links = await _ensure_share_links(
-                db, token, user, timeout=8.0, force=True
+                db, token, user, timeout=2.5, force=False
             )
         try:
             _schedule_bg_maintain(int(user.id))
@@ -493,7 +525,9 @@ async def _render_info_page(db: AsyncSession, token: str, user) -> HTMLResponse:
             pass
 
         try:
-            configs = await collect_links_detailed(user, include_notices=True, db=db)
+            configs = await collect_links_detailed(
+                user, include_notices=True, db=db, live_rebuild=False
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("sub detailed user=%s: %s", user.username, exc)
             configs = []
@@ -582,40 +616,36 @@ async def get_subscription(
         # AstraPing probe → include hidden; normal clients keep them out.
         include_hidden = _wants_probe(request)
 
-        # Complete membership → serve immediately.
-        # Incomplete → short hydrate, then serve whatever is cached.
-        try:
-            complete = await _user_sub_links_complete(db, user)
-        except Exception:  # noqa: BLE001
-            complete = False
+        headers = _sub_headers(user)
 
-        if complete:
+        if user.status not in (UserStatus.active, UserStatus.on_hold):
+            return _feed_response(b"", headers)
+
+        cached = _feed_cache_get(int(user.id), include_hidden)
+        if cached is not None:
+            _schedule_bg_maintain(int(user.id))
+            return _feed_response(cached, headers)
+
+        # Always serve cached shares ASAP. Incomplete panels hydrate in BG.
+        # Only cold users (zero share links) get a tiny request-time hydrate.
+        if _user_has_share_links(user):
             try:
-                links = await collect_links(
-                    user,
-                    include_notices=False,
-                    include_hidden=include_hidden,
-                    db=db,
+                links = await _collect_feed_links(
+                    user, include_hidden=include_hidden, db=db
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("sub collect user=%s: %s", user.username, exc)
                 links = []
-            _schedule_bg_maintain(int(user.id))
         else:
             user, links = await _ensure_share_links(
                 db,
                 token,
                 user,
-                timeout=8.0,
-                force=True,
+                timeout=2.5,
+                force=False,
                 include_hidden=include_hidden,
             )
-            _schedule_bg_maintain(int(user.id))
-
-        headers = _sub_headers(user)
-
-        if user.status not in (UserStatus.active, UserStatus.on_hold):
-            return _feed_response(b"", headers)
+        _schedule_bg_maintain(int(user.id))
 
         body = _encode_feed(links)
         if not body:
@@ -624,6 +654,8 @@ async def get_subscription(
                 user.username,
                 token[:8],
             )
+        else:
+            _feed_cache_put(int(user.id), include_hidden, body)
 
         return _feed_response(body, headers)
     except BaseException as exc:  # noqa: BLE001

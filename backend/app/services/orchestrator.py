@@ -2893,12 +2893,14 @@ async def collect_links(
     include_notices: bool = False,
     include_hidden: bool = False,
     db: AsyncSession | None = None,
+    live_rebuild: bool = True,
 ) -> list[str]:
     rows = await collect_links_detailed(
         user,
         include_notices=include_notices,
         include_hidden=include_hidden,
         db=db,
+        live_rebuild=live_rebuild,
     )
     return [row["link"] for row in rows if row.get("link")]
 
@@ -2909,6 +2911,7 @@ async def collect_links_detailed(
     include_notices: bool = True,
     include_hidden: bool = False,
     db: AsyncSession | None = None,
+    live_rebuild: bool = True,
 ) -> list[dict]:
     """All unique share links across panels.
 
@@ -2922,6 +2925,8 @@ async def collect_links_detailed(
     protocol split for Marzban, remote_group_ids partition for PasarGuard.
 
     ``include_hidden=True`` keeps globally-hidden endpoints (config-order admin).
+    ``live_rebuild=False`` (subscription hot path): use cached account.links +
+    in-memory group graph — no Astra live rewrite / no extra claims SQL.
     """
     from app.adapters.http_utils import is_share_link
     from app.services.link_remark import (
@@ -2947,10 +2952,12 @@ async def collect_links_detailed(
             expire_ts = int(time.time()) + hold_dur
     groups = list(getattr(user, "groups", None) or user.__dict__.get("groups") or [])
 
-    if db is not None:
-        claims = await resolve_group_panel_claims(db, user)
+    # Prefer already-loaded group→panel graph (no extra SQL) on the hot sub path.
+    loaded_claims = _claims_from_loaded_groups(user)
+    if loaded_claims or not live_rebuild or db is None:
+        claims = loaded_claims
     else:
-        claims = _claims_from_loaded_groups(user)
+        claims = await resolve_group_panel_claims(db, user)
 
     tag_by_gid = {str(c["group_id"]): _normalize_config_tag(c.get("tag")) for c in claims}
 
@@ -2997,12 +3004,13 @@ async def collect_links_detailed(
         and _account_in_membership(a)
     ]
 
-    # Astra: always rebuild share links from current public_host/port (domain change).
-    astra_links_cache: dict[int, dict[str, list[str]]] = {}
-    if db is not None:
+    # Astra live rewrite is for domain/port changes — skip on subscription GET.
+    astra_mutated = False
+    if live_rebuild and db is not None:
         from app.models.panel import PanelType
         from app.services import astra_node as astra_node_svc
 
+        astra_links_cache: dict[int, dict[str, list[str]]] = {}
         for acc in active_accounts:
             panel = acc.__dict__.get("panel") or getattr(acc, "panel", None)
             if panel is None or getattr(panel, "type", None) != PanelType.astra:
@@ -3023,6 +3031,7 @@ async def collect_links_detailed(
             if list(acc.links or []) != fresh:
                 acc.links = fresh
                 acc.links_by_group = None
+                astra_mutated = True
 
     # Per-group accounts already own one group's links; legacy merged rows still partition
     need_partition = [
@@ -3129,7 +3138,7 @@ async def collect_links_detailed(
                     }
                 )
 
-    if db is not None:
+    if astra_mutated and db is not None:
         try:
             await db.flush()
         except Exception:  # noqa: BLE001
