@@ -21,7 +21,6 @@ from app.services.orchestrator import (
     hydrate_share_links,
     refresh_usage,
     sync_modify_user,
-    usage_breakdown_for_user,
 )
 from app.services.site_settings import (
     ensure_loaded,
@@ -507,68 +506,77 @@ def _fallback_sub_html(username: str = "") -> str:
     )
 
 
-async def _render_info_page(db: AsyncSession, token: str, user) -> HTMLResponse:
-    """HTML info page — never 500; tunnel clients get a soft fallback page."""
+async def _render_info_page_body(db: AsyncSession, token: str, user) -> HTMLResponse:
+    """Build the browser info page from cached data only (no remote hydrate)."""
+    await ensure_loaded(db)
+    # Never block HTML on multi-panel hydrate — BG maintain fills gaps.
     try:
-        await ensure_loaded(db)
-        # Same policy as the feed: complete cached links, hydrate gaps, refresh in BG.
-        # Do NOT run request-time refresh_usage here — partial panel responses used to
-        # shrink stored links and make HTML/feed counts diverge.
-        # Cache-first like the feed — never block HTML on full multi-panel hydrate.
-        if not _user_has_share_links(user):
-            user, _links = await _ensure_share_links(
-                db, token, user, timeout=2.5, force=False
-            )
+        _schedule_bg_maintain(int(user.id))
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        configs = await collect_links_detailed(
+            user, include_notices=True, db=db, live_rebuild=False
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("sub detailed user=%s: %s", user.username, exc)
+        configs = []
+    # Skip usage_breakdown SQL on hot HTML path — page ignores panels_usage anyway.
+    panels_usage: list = []
+    try:
+        device_limit = await device_limit_for_user(db, user)
+    except Exception:  # noqa: BLE001
+        device_limit = 0
+    status = user.status.value if hasattr(user.status, "value") else str(user.status)
+    show_name = (getattr(user, "display_name", None) or "").strip() or user.username
+    html = render_subscription_page(
+        panel_name=get_brand_name(),
+        username=show_name,
+        status=status,
+        used=int(user.used_traffic or 0),
+        limit=int(user.data_limit or 0),
+        expire=user.expire,
+        sub_url=subscription_url(user),
+        configs=configs,
+        panels_usage=panels_usage,
+        device_limit=device_limit,
+        public_links=get_public_links(),
+    )
+    return HTMLResponse(
+        html,
+        headers={
+            "cache-control": "no-store",
+            "content-disposition": "inline",
+        },
+    )
+
+
+async def _render_info_page(db: AsyncSession, token: str, user) -> HTMLResponse:
+    """HTML info page — hard wall-clock cap so Iran nginx never 504s the browser."""
+    name = getattr(user, "username", "") or ""
+    try:
+        # Edge proxy_read is often 60–120s, but flaky tunnels need a fast answer.
+        return await asyncio.wait_for(
+            _render_info_page_body(db, token, user),
+            timeout=3.5,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("sub html deadline user=%s — fallback page", name)
         try:
             _schedule_bg_maintain(int(user.id))
         except Exception:  # noqa: BLE001
             pass
-
-        try:
-            configs = await collect_links_detailed(
-                user, include_notices=True, db=db, live_rebuild=False
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("sub detailed user=%s: %s", user.username, exc)
-            configs = []
-        try:
-            panels_usage = await usage_breakdown_for_user(db, user)
-        except Exception:  # noqa: BLE001
-            panels_usage = []
-        try:
-            device_limit = await device_limit_for_user(db, user)
-        except Exception:  # noqa: BLE001
-            device_limit = 0
-        status = user.status.value if hasattr(user.status, "value") else str(user.status)
-        show_name = (getattr(user, "display_name", None) or "").strip() or user.username
-        html = render_subscription_page(
-            panel_name=get_brand_name(),
-            username=show_name,
-            status=status,
-            used=int(user.used_traffic or 0),
-            limit=int(user.data_limit or 0),
-            expire=user.expire,
-            sub_url=subscription_url(user),
-            configs=configs,
-            panels_usage=panels_usage,
-            device_limit=device_limit,
-            public_links=get_public_links(),
-        )
         return HTMLResponse(
-            html,
-            headers={
-                "cache-control": "no-store",
-                "content-disposition": "inline",
-            },
+            _fallback_sub_html(name),
+            status_code=200,
+            headers={"cache-control": "no-store"},
         )
     except BaseException as exc:  # noqa: BLE001
         if _is_cancel(exc):
             raise
-        logger.exception(
-            "sub html failed user=%s", getattr(user, "username", "?")
-        )
+        logger.exception("sub html failed user=%s", name)
         await _safe_rollback(db)
-        name = getattr(user, "username", "") or ""
         return HTMLResponse(
             _fallback_sub_html(name),
             status_code=200,

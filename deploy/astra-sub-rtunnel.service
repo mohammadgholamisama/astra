@@ -1,0 +1,16 @@
+[Unit]
+Description=Astra sub reverse tunnel to Iranian edge (R 18081 -> local 2086)
+After=network-online.target astra.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+# Keep a remote shell session; more reliable than -N across flaky Iran paths.
+ExecStart=/usr/bin/ssh -i /root/.ssh/astra_sub_rtunnel -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ConnectTimeout=25 -o TCPKeepAlive=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/root/.ssh/known_hosts -o BatchMode=yes -R 127.0.0.1:18081:127.0.0.1:2086 root@5.202.8.221 sleep infinity
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
