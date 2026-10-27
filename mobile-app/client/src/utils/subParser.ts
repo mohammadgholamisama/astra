@@ -307,18 +307,32 @@ function yieldUi(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+/** Ask Astra for the full probe feed (includes globally-hidden endpoints). */
+function withProbeQuery(url: string): string {
+  const raw = url.trim();
+  try {
+    const u = new URL(raw);
+    if (!u.searchParams.has('probe')) u.searchParams.set('probe', '1');
+    return u.toString();
+  } catch {
+    if (/[?&]probe=/i.test(raw)) return raw;
+    return raw.includes('?') ? `${raw}&probe=1` : `${raw}?probe=1`;
+  }
+}
+
 async function fetchOnce(url: string, timeoutMs: number, signal?: AbortSignal): Promise<string> {
   const controller = new AbortController();
   const onAbort = () => controller.abort();
   signal?.addEventListener('abort', onAbort);
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url.trim(), {
+    const res = await fetch(withProbeQuery(url), {
       signal: controller.signal,
       headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 AstraPing/1.1',
-        Accept: 'text/plain,text/html,application/octet-stream,*/*',
+        // Probe UA — server includes hidden configs for AstraPing only
+        'User-Agent': 'AstraPing/1.2.7',
+        Accept: 'text/plain,application/octet-stream,*/*',
+        'X-Astra-Probe': '1',
         'Cache-Control': 'no-cache',
       },
     });

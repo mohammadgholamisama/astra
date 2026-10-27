@@ -61,11 +61,6 @@ export function MainDashboard() {
     return () => clearInterval(id);
   }, [tick]);
 
-  const progressPct = useMemo(() => {
-    if (!progressTotal) return 0;
-    return Math.round((progressDone / progressTotal) * 100);
-  }, [progressDone, progressTotal]);
-
   const aliveCount = useMemo(
     () => ranked.reduce((n, r) => (r.avg_ping > 0 ? n + 1 : n), 0),
     [ranked],
@@ -145,24 +140,7 @@ export function MainDashboard() {
   const listHeader = useMemo(
     () => (
       <View>
-        {testing ? (
-          <View style={styles.progressCard}>
-            <View style={styles.progressTop}>
-              <Text style={styles.progressStatus} numberOfLines={1}>
-                {status}
-              </Text>
-              <Text style={styles.progressPct}>{toFaDigits(progressPct)}٪</Text>
-            </View>
-            <View style={styles.progressTrack}>
-              <View
-                style={[styles.progressFill, { width: `${progressPct}%` }]}
-              />
-            </View>
-            <Text style={styles.progressMeta}>
-              {toFaDigits(progressDone)} از {toFaDigits(progressTotal)}
-            </Text>
-          </View>
-        ) : status ? (
+        {!testing && status ? (
           <Text style={styles.idleStatus}>{status}</Text>
         ) : null}
 
@@ -181,16 +159,7 @@ export function MainDashboard() {
         </View>
       </View>
     ),
-    [
-      testing,
-      status,
-      progressPct,
-      progressDone,
-      progressTotal,
-      error,
-      ranked.length,
-      aliveCount,
-    ],
+    [testing, status, error, ranked.length, aliveCount],
   );
 
   if (!hydrated) {
@@ -224,6 +193,9 @@ export function MainDashboard() {
             disabled={false}
             remainingMs={remainingMs}
             cycleIntervalMs={cycleIntervalMs}
+            progressDone={progressDone}
+            progressTotal={progressTotal}
+            progressStatus={status}
             onTest={onTest}
             onCancel={onCancel}
             onCycleInterval={onCycleInterval}
@@ -291,43 +263,6 @@ const styles = StyleSheet.create({
   },
   stack: { gap: 10, marginBottom: 4 },
   list: { flex: 1 },
-  progressCard: {
-    marginTop: 10,
-    marginBottom: 6,
-    borderRadius: radii.lg,
-    backgroundColor: colors.panel,
-    borderWidth: 1,
-    borderColor: colors.line,
-    padding: 12,
-  },
-  progressTop: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 8,
-    gap: 8,
-  },
-  progressStatus: {
-    flex: 1,
-    textAlign: 'right',
-    color: colors.textSoft,
-    fontSize: 12,
-    fontFamily: fonts.regular,
-  },
-  progressPct: { color: colors.mint, fontFamily: fonts.extraBold, fontSize: 14 },
-  progressTrack: {
-    height: 6,
-    borderRadius: 99,
-    backgroundColor: colors.bg,
-    overflow: 'hidden',
-  },
-  progressFill: { height: '100%', borderRadius: 99, backgroundColor: colors.mint },
-  progressMeta: {
-    marginTop: 6,
-    textAlign: 'right',
-    color: colors.textMute,
-    fontSize: 11,
-  },
   idleStatus: {
     marginTop: 8,
     marginBottom: 2,

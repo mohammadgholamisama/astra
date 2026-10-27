@@ -249,6 +249,22 @@ def _sub_headers(user) -> dict[str, str]:
     return headers
 
 
+def _wants_probe(request: Request) -> bool:
+    """AstraPing / panel probe: include globally-hidden endpoints in the feed.
+
+    Normal user clients never send this — dead configs stay hidden for them.
+    """
+    for key in ("probe", "include_hidden", "all"):
+        q = (request.query_params.get(key) or "").lower()
+        if q in ("1", "true", "yes", "all"):
+            return True
+    h = (request.headers.get("x-astra-probe") or "").lower()
+    if h in ("1", "true", "yes"):
+        return True
+    ua = (request.headers.get("user-agent") or "").lower()
+    return "astraping" in ua
+
+
 def _wants_html_page(request: Request) -> bool:
     """
     HTML only for real browser *navigation* (Sec-Fetch). Default = Base64 feed.
@@ -307,6 +323,7 @@ async def _ensure_share_links(
     *,
     timeout: float = 12.0,
     force: bool = False,
+    include_hidden: bool = False,
 ):
     """Hydrate missing share links in parallel (one wave, per-panel deadlines).
 
@@ -315,7 +332,12 @@ async def _ensure_share_links(
     """
     if not force and await _user_sub_links_complete(db, user):
         try:
-            links = await collect_links(user, include_notices=False, db=db)
+            links = await collect_links(
+                user,
+                include_notices=False,
+                include_hidden=include_hidden,
+                db=db,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("sub collect-complete user=%s: %s", user.username, exc)
             links = []
@@ -344,7 +366,12 @@ async def _ensure_share_links(
             pass
     links: list[str] = []
     try:
-        links = await collect_links(user, include_notices=False, db=db)
+        links = await collect_links(
+            user,
+            include_notices=False,
+            include_hidden=include_hidden,
+            db=db,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("sub collect user=%s: %s", getattr(user, "username", "?"), exc)
         try:
@@ -353,7 +380,12 @@ async def _ensure_share_links(
             pass
         try:
             user = await load_user_by_token(db, token) or user
-            links = await collect_links(user, include_notices=False, db=db)
+            links = await collect_links(
+                user,
+                include_notices=False,
+                include_hidden=include_hidden,
+                db=db,
+            )
         except Exception as exc2:  # noqa: BLE001
             logger.warning("sub collect retry user=%s: %s", getattr(user, "username", "?"), exc2)
             links = []
@@ -547,6 +579,9 @@ async def get_subscription(
 
         await ensure_loaded(db)
 
+        # AstraPing probe → include hidden; normal clients keep them out.
+        include_hidden = _wants_probe(request)
+
         # Complete membership → serve immediately.
         # Incomplete → short hydrate, then serve whatever is cached.
         try:
@@ -556,14 +591,24 @@ async def get_subscription(
 
         if complete:
             try:
-                links = await collect_links(user, include_notices=False, db=db)
+                links = await collect_links(
+                    user,
+                    include_notices=False,
+                    include_hidden=include_hidden,
+                    db=db,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("sub collect user=%s: %s", user.username, exc)
                 links = []
             _schedule_bg_maintain(int(user.id))
         else:
             user, links = await _ensure_share_links(
-                db, token, user, timeout=8.0, force=True
+                db,
+                token,
+                user,
+                timeout=8.0,
+                force=True,
+                include_hidden=include_hidden,
             )
             _schedule_bg_maintain(int(user.id))
 

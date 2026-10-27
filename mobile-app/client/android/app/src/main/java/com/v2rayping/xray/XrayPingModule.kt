@@ -28,7 +28,7 @@ class XrayPingModule(
   private val reactContext: ReactApplicationContext
 ) : ReactContextBaseJavaModule(reactContext) {
 
-  @Volatile private var measurePool: ExecutorService = Executors.newFixedThreadPool(POOL_SIZE)
+  @Volatile private var measurePool: ExecutorService = newMeasurePool()
   private val replyPool: ExecutorService = Executors.newCachedThreadPool()
   private val coreReady = AtomicBoolean(false)
   private val generation = AtomicInteger(0)
@@ -191,7 +191,7 @@ class XrayPingModule(
           }
         }
         val old = measurePool
-        measurePool = Executors.newFixedThreadPool(POOL_SIZE)
+        measurePool = newMeasurePool()
         try {
           old.shutdownNow()
         } catch (_: Throwable) {
@@ -203,6 +203,15 @@ class XrayPingModule(
       }
     }
   }
+
+  /**
+   * Cached pool: hung JNI measureOutboundDelay threads must not starve the
+   * fixed queue (classic stuck-at-98% when the last slots never free).
+   */
+  private fun newMeasurePool(): ExecutorService =
+    Executors.newCachedThreadPool { r ->
+      Thread(r, "xray-ping").apply { isDaemon = true }
+    }
 
   private fun ensureCore(): Boolean {
     if (coreReady.get()) return true
@@ -258,7 +267,6 @@ class XrayPingModule(
 
   companion object {
     private const val TAG = "XrayPing"
-    private const val POOL_SIZE = 6
     const val PROBE_URL = "https://www.gstatic.com/generate_204"
 
     @Volatile

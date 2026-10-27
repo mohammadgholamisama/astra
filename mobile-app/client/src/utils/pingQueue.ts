@@ -42,6 +42,35 @@ function raceAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   });
 }
 
+/**
+ * Hard wall-clock cap so a hung native LibXray call cannot freeze the queue
+ * at ~98%. Resolves -1 on timeout (not reject) so workers keep advancing.
+ */
+function raceMs(promise: Promise<number>, ms: number): Promise<number> {
+  return new Promise((resolve) => {
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      resolve(-1);
+    }, Math.max(200, ms));
+    promise.then(
+      (v) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(typeof v === 'number' && !Number.isNaN(v) ? v : -1);
+      },
+      () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(-1);
+      },
+    );
+  });
+}
+
 export async function runPingQueue(
   configs: ParsedConfig[],
   options: PingQueueOptions = {},
@@ -73,13 +102,18 @@ export async function runPingQueue(
     if (stopped || options.signal?.aborted) throw abortedError();
     if (tcpPrecheck) {
       const tcp = await raceAbort(
-        pingTcp(cfg.address, cfg.port, tcpTimeoutMs),
+        raceMs(pingTcp(cfg.address, cfg.port, tcpTimeoutMs), tcpTimeoutMs + 250),
         options.signal,
       );
       if (tcp < 0) return -1;
     }
     if (stopped || options.signal?.aborted) throw abortedError();
-    return raceAbort(pingRealDelay(cfg.raw, timeoutMs), options.signal);
+    // Native may hang in JNI past its own Future timeout when the pool is
+    // saturated — JS wall clock always wins so the bar reaches 100%.
+    return raceAbort(
+      raceMs(pingRealDelay(cfg.raw, timeoutMs), timeoutMs + 500),
+      options.signal,
+    );
   }
 
   async function worker(): Promise<void> {
@@ -93,10 +127,41 @@ export async function runPingQueue(
       try {
         pingMs = await measureOne(cfg);
       } catch (e) {
-        if (isAbort(e) || stopped) return;
+        if (isAbort(e) || stopped) {
+          // Still record a slot so progress never freezes mid-cancel
+          if (!results[i]) {
+            results[i] = {
+              configHash: cfg.configHash,
+              pingMs: -1,
+              measuredAt: Date.now(),
+            };
+            completed += 1;
+            try {
+              options.onProgress?.(completed, total, results[i]!);
+            } catch {
+              /* ignore */
+            }
+          }
+          return;
+        }
         pingMs = -1;
       }
-      if (stopped || options.signal?.aborted) return;
+      if (stopped || options.signal?.aborted) {
+        if (!results[i]) {
+          results[i] = {
+            configHash: cfg.configHash,
+            pingMs: -1,
+            measuredAt: Date.now(),
+          };
+          completed += 1;
+          try {
+            options.onProgress?.(completed, total, results[i]!);
+          } catch {
+            /* ignore */
+          }
+        }
+        return;
+      }
       const latest: LocalPingResult = {
         configHash: cfg.configHash,
         pingMs,

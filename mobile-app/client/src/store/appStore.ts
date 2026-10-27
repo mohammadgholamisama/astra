@@ -504,8 +504,9 @@ export const useAppStore = create<AppState>((set, get) => ({
               : `${done}/${total} · قطع`;
 
           const now = Date.now();
-          // Progress text only (cheap) — full list re-rank sparsely
-          if (now - lastLight >= 350) {
+          // Always refresh near the end so the bar never freezes at ~98%
+          const nearEnd = total > 0 && done >= Math.max(1, total - 4);
+          if (nearEnd || now - lastLight >= 250) {
             lastLight = now;
             set({
               progressDone: done,

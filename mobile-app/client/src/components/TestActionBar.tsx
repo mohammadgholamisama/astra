@@ -10,6 +10,9 @@ export function TestActionBar({
   disabled,
   remainingMs,
   cycleIntervalMs,
+  progressDone = 0,
+  progressTotal = 0,
+  progressStatus = '',
   onTest,
   onCancel,
   onCycleInterval,
@@ -18,10 +21,18 @@ export function TestActionBar({
   disabled: boolean;
   remainingMs: number;
   cycleIntervalMs: number;
+  progressDone?: number;
+  progressTotal?: number;
+  progressStatus?: string;
   onTest: () => void;
   onCancel: () => void;
   onCycleInterval: (ms: number) => void;
 }) {
+  const pct =
+    progressTotal > 0
+      ? Math.min(100, Math.round((progressDone / progressTotal) * 100))
+      : 0;
+
   return (
     <View style={styles.wrap}>
       <View style={styles.row}>
@@ -81,6 +92,23 @@ export function TestActionBar({
           </Text>
         </View>
       </View>
+
+      {testing ? (
+        <View style={styles.progressCard}>
+          <View style={styles.progressTop}>
+            <Text style={styles.progressStatus} numberOfLines={1}>
+              {progressStatus || 'پینگ…'}
+            </Text>
+            <Text style={styles.progressPct}>{toFaDigits(pct)}٪</Text>
+          </View>
+          <View style={styles.progressTrack}>
+            <View style={[styles.progressFill, { width: `${pct}%` }]} />
+          </View>
+          <Text style={styles.progressMeta}>
+            {toFaDigits(progressDone)} از {toFaDigits(progressTotal)}
+          </Text>
+        </View>
+      ) : null}
 
       <View style={styles.intervalBlock}>
         <Text style={styles.intervalTitle}>بازهٔ چرخه (دقیقه)</Text>
@@ -206,6 +234,43 @@ const styles = StyleSheet.create({
     color: colors.accent,
     fontSize: 26,
     fontFamily: fonts.extraBold,
+    fontVariant: ['tabular-nums'],
+  },
+  progressCard: {
+    borderRadius: radii.lg,
+    backgroundColor: colors.panel,
+    borderWidth: 1,
+    borderColor: colors.line,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    gap: 8,
+  },
+  progressTop: {
+    flexDirection: 'row-reverse',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  progressStatus: {
+    flex: 1,
+    textAlign: 'right',
+    color: colors.textSoft,
+    fontSize: 12,
+    fontFamily: fonts.medium,
+  },
+  progressPct: { color: colors.mint, fontFamily: fonts.extraBold, fontSize: 14 },
+  progressTrack: {
+    height: 8,
+    borderRadius: 99,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    overflow: 'hidden',
+  },
+  progressFill: { height: '100%', borderRadius: 99, backgroundColor: colors.mint },
+  progressMeta: {
+    textAlign: 'right',
+    color: colors.textMute,
+    fontSize: 11,
+    fontFamily: fonts.medium,
     fontVariant: ['tabular-nums'],
   },
   intervalBlock: {
