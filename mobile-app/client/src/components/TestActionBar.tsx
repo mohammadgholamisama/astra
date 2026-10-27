@@ -24,6 +24,7 @@ export function TestActionBar({
   const testing = useAppStore((s) => s.testing);
   const remainingMs = useAppStore((s) => s.remainingMs);
   const cycleIntervalMs = useAppStore((s) => s.cycleIntervalMs);
+  const backgroundEnabled = useAppStore((s) => s.backgroundEnabled);
   const progressDone = useAppStore((s) => s.progressDone);
   const progressTotal = useAppStore((s) => s.progressTotal);
   const progressStatus = useAppStore((s) => s.status);
@@ -115,11 +116,26 @@ export function TestActionBar({
 
         <View style={styles.timer}>
           <View style={styles.timerTop}>
-            <Text style={styles.timerLabel}>چرخه بعدی</Text>
-            <Gauge size={13} color={colors.accent} strokeWidth={2.2} />
+            <Text style={styles.timerLabel}>
+              {backgroundEnabled ? 'چرخه بعدی' : 'چرخه (خاموش)'}
+            </Text>
+            <Gauge
+              size={13}
+              color={backgroundEnabled ? colors.accent : colors.textMute}
+              strokeWidth={2.2}
+            />
           </View>
-          <Text style={styles.timerValue}>
-            {testing ? '—' : formatCountdown(remainingMs)}
+          <Text
+            style={[
+              styles.timerValue,
+              !backgroundEnabled && styles.timerValueMute,
+            ]}
+          >
+            {testing
+              ? '—'
+              : backgroundEnabled
+                ? formatCountdown(remainingMs)
+                : 'دستی'}
           </Text>
         </View>
       </View>
@@ -279,6 +295,10 @@ const styles = StyleSheet.create({
     fontSize: 26,
     fontFamily: fonts.extraBold,
     fontVariant: ['tabular-nums'],
+  },
+  timerValueMute: {
+    color: colors.textMute,
+    fontSize: 20,
   },
   progressCard: {
     borderRadius: radii.lg,

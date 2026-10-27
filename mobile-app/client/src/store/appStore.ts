@@ -42,6 +42,8 @@ interface AppState {
   hydrated: boolean;
   backgroundEnabled: boolean;
   syncingPanel: boolean;
+  /** Short result line under «اعمال ترتیب» */
+  panelSyncHint: string;
   permissionsReady: boolean;
 
   hydrate: () => Promise<void>;
@@ -69,10 +71,23 @@ async function armTimer(
   get: () => AppState,
 ) {
   const ms = intervalOf(get);
+  // Auto-cycle only while background monitor is on
+  if (!get().backgroundEnabled) {
+    set({ nextRunAt: null, remainingMs: ms });
+    await saveSettings({ nextRunAt: undefined, cycleIntervalMs: ms });
+    return null;
+  }
   const nextRunAt = Date.now() + ms;
   set({ nextRunAt, remainingMs: ms });
   await saveSettings({ nextRunAt, cycleIntervalMs: ms });
   return nextRunAt;
+}
+
+function clearPanelSyncBusy(
+  set: (p: Partial<AppState>) => void,
+  patch: Partial<AppState> = {},
+) {
+  set({ syncingPanel: false, ...patch });
 }
 
 /** Upload this device's pings, then reorder panel from multi-device 15m window. */
@@ -83,46 +98,68 @@ async function uploadThenSyncPanel(
   get: () => AppState,
   baseStatus: string,
 ): Promise<void> {
-  const sent = await uploadCyclePings(DEFAULT_OPERATOR, configs, results);
-  if (!get().testing && get().status.startsWith('تمام') && sent) {
-    set({ status: `${baseStatus} · ارسال شد` });
+  // Don't stomp a manual "اعمال ترتیب" already in flight
+  if (get().syncingPanel) {
+    void uploadCyclePings(DEFAULT_OPERATOR, configs, results);
+    return;
   }
 
   set({
     syncingPanel: true,
-    status: sent
-      ? 'میانگین ۱۵د · اعمال ترتیب پنل…'
-      : 'اعمال ترتیب پنل از پنجرهٔ سرور…',
+    panelSyncHint: 'ارسال پینگ و اعمال ترتیب…',
   });
 
-  // Brief yield so Redis ingest is visible to RankedFingerprints
-  await new Promise<void>((r) => setTimeout(r, 500));
-  const res = await pushPanelOrderNow();
+  try {
+    const sent = await uploadCyclePings(DEFAULT_OPERATOR, configs, results);
+    if (get().testing) {
+      clearPanelSyncBusy(set);
+      return;
+    }
+    if (sent && get().status.startsWith('تمام')) {
+      set({ status: `${baseStatus} · ارسال شد` });
+    }
 
-  if (get().testing) {
-    set({ syncingPanel: false });
-    return;
-  }
+    set({
+      status: sent
+        ? 'میانگین ۱۵د · اعمال ترتیب پنل…'
+        : 'اعمال ترتیب پنل از پنجرهٔ سرور…',
+      panelSyncHint: 'اعمال روی پنل…',
+    });
 
-  if (!res.ok) {
-    set({
-      syncingPanel: false,
-      status: `${baseStatus} · پنل: ${res.error || 'ناموفق'}`,
+    // Brief yield so Redis ingest is visible to RankedFingerprints
+    await new Promise<void>((r) => setTimeout(r, 400));
+    const res = await pushPanelOrderNow();
+
+    if (get().testing) {
+      clearPanelSyncBusy(set, { panelSyncHint: '' });
+      return;
+    }
+
+    if (!res.ok) {
+      clearPanelSyncBusy(set, {
+        panelSyncHint: res.error || 'اعمال ناموفق',
+        status: `${baseStatus} · پنل: ${res.error || 'ناموفق'}`,
+      });
+      return;
+    }
+    if (res.count === 0) {
+      clearPanelSyncBusy(set, {
+        panelSyncHint: 'دامنهٔ منطبق نبود / میانگین ناکافی',
+        status: `${baseStatus} · هنوز میانگین ۱۵د کافی نیست`,
+      });
+      return;
+    }
+    const msHint = res.ms != null ? ` · ${Math.round(res.ms)}ms` : '';
+    clearPanelSyncBusy(set, {
+      panelSyncHint: `اعمال شد · ${res.count} دامنه`,
+      status: `${baseStatus} · پنل ${res.count} دامنه (میانگین ۱۵د)${msHint}`,
     });
-    return;
-  }
-  if (res.count === 0) {
-    set({
-      syncingPanel: false,
-      status: `${baseStatus} · هنوز میانگین ۱۵د کافی نیست`,
+  } catch (e) {
+    clearPanelSyncBusy(set, {
+      panelSyncHint: e instanceof Error ? e.message : 'خطا',
+      status: `${baseStatus} · خطا در اعمال پنل`,
     });
-    return;
   }
-  const msHint = res.ms != null ? ` · ${Math.round(res.ms)}ms` : '';
-  set({
-    syncingPanel: false,
-    status: `${baseStatus} · پنل ${res.count} دامنه (میانگین ۱۵د)${msHint}`,
-  });
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -141,6 +178,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   hydrated: false,
   backgroundEnabled: false,
   syncingPanel: false,
+  panelSyncHint: '',
   permissionsReady: false,
 
   hydrate: async () => {
@@ -183,6 +221,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         testing: false,
         testingHashes: [],
         syncingPanel: false,
+        panelSyncHint: '',
         error: null,
         hydrated: true,
         permissionsReady: true,
@@ -216,11 +255,14 @@ export const useAppStore = create<AppState>((set, get) => ({
               await saveSettings({ backgroundEnabled: false });
             }
 
-            // Timer already due while app was closed → run now
-            if (overdue && !get().testing) {
+            // Auto-cycle only when background monitor is on
+            if (wantBg && overdue && !get().testing) {
               void get().runCycle(false);
             } else if (wantBg && !nextRunAt && hasCache && !get().testing) {
               await armTimer(set, get);
+            } else if (!wantBg) {
+              set({ nextRunAt: null, remainingMs: cycleIntervalMs });
+              await saveSettings({ nextRunAt: undefined });
             }
           } catch {
             /* keep UI up */
@@ -256,12 +298,14 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
 
     if (!get().testing) {
-      await armTimer(set, get);
+      await armTimer(set, get); // no-ops timer when background is off
     }
 
     if (prev !== cycleIntervalMs) {
       set({
-        status: `چرخه هر ${cycleMinutesLabel(cycleIntervalMs)} دقیقه تنظیم شد`,
+        status: get().backgroundEnabled
+          ? `چرخه هر ${cycleMinutesLabel(cycleIntervalMs)} دقیقه تنظیم شد`
+          : `بازه ${cycleMinutesLabel(cycleIntervalMs)}د — برای چرخش خودکار پایش را روشن کن`,
       });
     }
   },
@@ -317,11 +361,17 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   tick: () => {
-    const { nextRunAt, testing } = get();
+    const { nextRunAt, testing, backgroundEnabled } = get();
+    // No auto-cycle while background monitor is off — manual test only
+    if (!backgroundEnabled) {
+      if (nextRunAt != null) {
+        set({ nextRunAt: null, remainingMs: intervalOf(get) });
+      }
+      return;
+    }
     if (!nextRunAt || testing) return;
     const remaining = Math.max(0, nextRunAt - Date.now());
     set({ remainingMs: remaining });
-    // Fire whether or not background service is on — service skips when UI is active
     if (remaining === 0) {
       void get().runCycle(false);
     }
@@ -610,6 +660,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (items.length === 0) {
       set({
         error: null,
+        panelSyncHint: 'اول تست بگیر',
         status: 'اول تست بگیر — فقط پینگ‌های موفق روی پنل اعمال می‌شوند',
       });
       return;
@@ -618,26 +669,14 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({
       syncingPanel: true,
       error: null,
+      panelSyncHint: `اعمال · ${items.length} دامنه…`,
       status: `اعمال فوری · ${items.length} دامنه…`,
     });
     await new Promise<void>((r) => setTimeout(r, 0));
 
-    const { configs, ranked } = get();
-    void uploadCyclePings(
-      DEFAULT_OPERATOR,
-      configs,
-      ranked
-        .filter((r) => r.measured && r.avg_ping > 0)
-        .map((r) => ({
-          configHash: r.config_hash,
-          pingMs: r.avg_ping,
-          measuredAt: Date.now(),
-        })),
-    );
-
-    let res = await pushPanelOrderNow(items);
-    if (res.ok && res.count === 0 && res.source !== 'client') {
-      set({ status: 'همگام‌سازی از میانگین ۱۵دقیقه…' });
+    try {
+      const { configs, ranked } = get();
+      // Await upload so panel sees fresh samples before reorder
       await uploadCyclePings(
         DEFAULT_OPERATOR,
         configs,
@@ -649,30 +688,55 @@ export const useAppStore = create<AppState>((set, get) => ({
             measuredAt: Date.now(),
           })),
       );
-      await new Promise<void>((r) => setTimeout(r, 400));
-      res = await pushPanelOrderNow();
-    }
 
-    if (!res.ok) {
-      set({
-        syncingPanel: false,
-        error: res.error || 'همگام‌سازی پنل ناموفق',
+      let res = await pushPanelOrderNow(items);
+      if (res.ok && res.count === 0 && res.source !== 'client') {
+        set({
+          status: 'همگام‌سازی از میانگین ۱۵دقیقه…',
+          panelSyncHint: 'میانگین ۱۵د…',
+        });
+        await uploadCyclePings(
+          DEFAULT_OPERATOR,
+          configs,
+          ranked
+            .filter((r) => r.measured && r.avg_ping > 0)
+            .map((r) => ({
+              configHash: r.config_hash,
+              pingMs: r.avg_ping,
+              measuredAt: Date.now(),
+            })),
+        );
+        await new Promise<void>((r) => setTimeout(r, 400));
+        res = await pushPanelOrderNow();
+      }
+
+      if (!res.ok) {
+        clearPanelSyncBusy(set, {
+          error: res.error || 'همگام‌سازی پنل ناموفق',
+          panelSyncHint: res.error || 'ناموفق — دوباره بزن',
+          status: 'خطا در اعمال ترتیب',
+        });
+        return;
+      }
+      if (res.count === 0) {
+        clearPanelSyncBusy(set, {
+          panelSyncHint: 'دامنهٔ منطبق نبود',
+          status: 'دامنهٔ منطبق در پنل نبود — هاست/پورت/SNI را چک کن',
+        });
+        return;
+      }
+      const msHint = res.ms != null ? ` · ${Math.round(res.ms)}ms` : '';
+      clearPanelSyncBusy(set, {
+        panelSyncHint: `اعمال شد · ${res.count} دامنه`,
+        status: `ترتیب پنل اعمال شد · ${res.count} دامنه${msHint}`,
+      });
+    } catch (e) {
+      clearPanelSyncBusy(set, {
+        error: e instanceof Error ? e.message : 'خطا در اعمال ترتیب',
+        panelSyncHint: 'خطا — دوباره بزن',
         status: 'خطا در اعمال ترتیب',
       });
-      return;
     }
-    if (res.count === 0) {
-      set({
-        syncingPanel: false,
-        status: 'دامنهٔ منطبق در پنل نبود — هاست/پورت/SNI را چک کن',
-      });
-      return;
-    }
-    const msHint = res.ms != null ? ` · ${Math.round(res.ms)}ms` : '';
-    set({
-      syncingPanel: false,
-      status: `ترتیب پنل اعمال شد · ${res.count} دامنه${msHint}`,
-    });
   },
 }));
 

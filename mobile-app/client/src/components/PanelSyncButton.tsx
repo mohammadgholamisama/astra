@@ -1,33 +1,73 @@
-import React from 'react';
+import React, { useRef } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
-import { ArrowUpDown } from 'lucide-react-native';
+import { ArrowUpDown, CheckCircle2, AlertCircle } from 'lucide-react-native';
 import { colors, fonts, radii } from '../theme';
+import { useAppStore } from '../store/appStore';
 
 export function PanelSyncButton({
-  busy,
   disabled,
   onPress,
 }: {
-  busy: boolean;
   disabled?: boolean;
   onPress: () => void;
 }) {
+  const busy = useAppStore((s) => s.syncingPanel);
+  const hint = useAppStore((s) => s.panelSyncHint);
+  const lock = useRef(false);
+
+  const okHint = hint.startsWith('اعمال شد');
+  const errHint =
+    !!hint &&
+    !busy &&
+    !okHint &&
+    (hint.includes('ناموفق') ||
+      hint.includes('خطا') ||
+      hint.includes('منطبق') ||
+      hint.includes('اول تست'));
+
+  const handlePress = () => {
+    if (busy || disabled || lock.current) return;
+    lock.current = true;
+    onPress();
+    setTimeout(() => {
+      lock.current = false;
+    }, 1200);
+  };
+
   return (
     <Pressable
       disabled={busy || disabled}
-      onPress={onPress}
+      onPress={handlePress}
       style={[styles.btn, (busy || disabled) && styles.btnDisabled]}
     >
-      {/* Parent app is RTL: first child = RIGHT side */}
       <View style={styles.row}>
         <View style={styles.copy}>
-          <Text style={styles.title}>اعمال ترتیب روی پنل</Text>
-          <Text style={styles.hint}>
-            میانگین همین صفحه · هاست/پورت/دامنه · فقط موفق‌ها جابه‌جا می‌شوند
+          <Text style={styles.title}>
+            {busy ? 'در حال اعمال روی پنل…' : 'اعمال ترتیب روی پنل'}
+          </Text>
+          <Text
+            style={[
+              styles.hint,
+              okHint && styles.hintOk,
+              errHint && styles.hintErr,
+            ]}
+          >
+            {busy
+              ? hint || 'صبر کن — اسپینر تا پایان درخواست می‌چرخد'
+              : hint ||
+                'میانگین ۱۵د · هاست/پورت/دامنه · فقط موفق‌ها جابه‌جا می‌شوند'}
           </Text>
         </View>
         {busy ? (
           <ActivityIndicator color={colors.accent} />
+        ) : okHint ? (
+          <View style={[styles.iconWrap, styles.iconOk]}>
+            <CheckCircle2 size={18} color={colors.mint} strokeWidth={2.3} />
+          </View>
+        ) : errHint ? (
+          <View style={[styles.iconWrap, styles.iconErr]}>
+            <AlertCircle size={18} color={colors.rose} strokeWidth={2.3} />
+          </View>
         ) : (
           <View style={styles.iconWrap}>
             <ArrowUpDown size={18} color={colors.accent} strokeWidth={2.3} />
@@ -63,6 +103,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  iconOk: { backgroundColor: 'rgba(42,212,197,0.18)' },
+  iconErr: { backgroundColor: 'rgba(251,113,133,0.14)' },
   copy: { flex: 1, alignItems: 'flex-start' },
   title: {
     color: colors.text,
@@ -80,4 +122,6 @@ const styles = StyleSheet.create({
     textAlign: 'right',
     width: '100%',
   },
+  hintOk: { color: colors.mint },
+  hintErr: { color: colors.rose },
 });

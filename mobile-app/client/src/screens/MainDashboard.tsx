@@ -51,7 +51,6 @@ export function MainDashboard() {
   const setCycleInterval = useAppStore((s) => s.setCycleInterval);
   const backgroundEnabled = useAppStore((s) => s.backgroundEnabled);
   const setBackgroundEnabled = useAppStore((s) => s.setBackgroundEnabled);
-  const syncingPanel = useAppStore((s) => s.syncingPanel);
   const syncPanelOrder = useAppStore((s) => s.syncPanelOrder);
 
   useEffect(() => {
@@ -159,11 +158,7 @@ export function MainDashboard() {
             onCancel={onCancel}
             onCycleInterval={onCycleInterval}
           />
-          <PanelSyncButton
-            busy={syncingPanel}
-            disabled={testing}
-            onPress={onSync}
-          />
+          <PanelSyncButton disabled={testing} onPress={onSync} />
         </View>
 
         <IdleStatusLine />
@@ -195,7 +190,6 @@ export function MainDashboard() {
       onTest,
       onCancel,
       onCycleInterval,
-      syncingPanel,
       onSync,
       error,
       ranked.length,
