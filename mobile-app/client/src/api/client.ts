@@ -64,6 +64,10 @@ export function buildPingSamples(
       config_hash: c.configHash,
       operator,
       ping_ms: r?.pingMs ?? -1,
+      download_kbps:
+        r?.downloadKbps != null && r.downloadKbps > 0 ? r.downloadKbps : undefined,
+      upload_kbps:
+        r?.uploadKbps != null && r.uploadKbps > 0 ? r.uploadKbps : undefined,
       remark: c.remark,
       protocol: c.protocol,
       transport: c.transport,
@@ -102,6 +106,8 @@ export type FingerprintRankPayload = {
   match_host: string;
   label?: string;
   avg_ping: number;
+  download_kbps?: number;
+  upload_kbps?: number;
   sample_count?: number;
   device_count?: number;
 };

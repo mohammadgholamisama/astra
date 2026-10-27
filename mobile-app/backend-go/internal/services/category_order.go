@@ -55,6 +55,15 @@ func arrangeFingerprintSlots(items []models.FingerprintRank) []models.Fingerprin
 		if da != db {
 			return da > db
 		}
+		// Prefer download/upload when present on either side
+		if a.DownloadKbps > 0 || b.DownloadKbps > 0 || a.UploadKbps > 0 || b.UploadKbps > 0 {
+			if a.DownloadKbps != b.DownloadKbps {
+				return a.DownloadKbps > b.DownloadKbps
+			}
+			if a.UploadKbps != b.UploadKbps {
+				return a.UploadKbps > b.UploadKbps
+			}
+		}
 		if a.AvgPing != b.AvgPing {
 			return a.AvgPing < b.AvgPing
 		}

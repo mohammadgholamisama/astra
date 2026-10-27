@@ -31,6 +31,10 @@ export interface LocalPingResult {
   configHash: string;
   pingMs: number;
   measuredAt: number;
+  /** kbps; −1 = not measured / fail */
+  downloadKbps?: number;
+  /** kbps; −1 = not measured / fail */
+  uploadKbps?: number;
 }
 
 export interface OperatorPing {
@@ -53,6 +57,8 @@ export interface RankedConfig {
   match_host: string;
   success_rate: number;
   avg_ping: number;
+  download_kbps?: number;
+  upload_kbps?: number;
   /** True after a ping attempt finished (success or fail). */
   measured?: boolean;
   raw?: string;
@@ -74,6 +80,8 @@ export interface PingSamplePayload {
   config_hash: string;
   operator: Operator;
   ping_ms: number;
+  download_kbps?: number;
+  upload_kbps?: number;
   remark?: string;
   protocol?: string;
   transport?: string;

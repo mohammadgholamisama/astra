@@ -92,9 +92,10 @@ export async function runPingQueue(
   configs: ParsedConfig[],
   options: PingQueueOptions = {},
 ): Promise<LocalPingResult[]> {
-  const concurrency = Math.max(1, options.concurrency ?? 3);
-  const timeoutMs = options.timeoutMs ?? 4500;
-  const tcpTimeoutMs = options.tcpTimeoutMs ?? 900;
+  // Fast + accurate defaults: parallel delay, soft TCP, one retry on miss
+  const concurrency = Math.max(1, options.concurrency ?? 5);
+  const timeoutMs = options.timeoutMs ?? 2200;
+  const tcpTimeoutMs = options.tcpTimeoutMs ?? 600;
   const tcpMode = resolveTcpMode(options.tcpPrecheck);
   const retries = Math.max(0, options.retries ?? 1);
   const total = configs.length;

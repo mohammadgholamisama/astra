@@ -4,9 +4,8 @@ import { arrangeByCategorySlots } from './configCategory';
 type LiveMap = Map<string, LocalPingResult>;
 
 /**
- * Live ranking with category slots:
- * up to 5 best مستقیم → 5 تانل → 5 گیمینگ → rest by ping.
- * Untested / failed stay at the bottom.
+ * Live ranking with category slots.
+ * When download/upload present → prefer speed; else ping.
  */
 export function rankLocally(
   configs: ParsedConfig[],
@@ -30,6 +29,14 @@ export function rankLocally(
     const ping = measured ? r!.pingMs : -1;
     const ok = measured && ping > 0;
     const testing = !measured && testingSet.has(c.configHash);
+    const downloadKbps =
+      measured && r!.downloadKbps != null && r!.downloadKbps > 0
+        ? r!.downloadKbps
+        : undefined;
+    const uploadKbps =
+      measured && r!.uploadKbps != null && r!.uploadKbps > 0
+        ? r!.uploadKbps
+        : undefined;
 
     return {
       rank: 0,
@@ -43,6 +50,8 @@ export function rankLocally(
       match_host: c.matchHost,
       success_rate: ok ? 1 : 0,
       avg_ping: measured ? (ok ? ping : -1) : testing ? -2 : -1,
+      download_kbps: downloadKbps,
+      upload_kbps: uploadKbps,
       measured,
       raw: c.raw,
       uuid: c.uuid,
@@ -60,7 +69,13 @@ export function rankLocally(
   const pending = rows.filter((r) => !r.measured && r.avg_ping !== -2);
 
   const arrangedOk = arrangeByCategorySlots(
-    ok.map((r) => ({ ...r, label: r.remark, device_count: 1 })),
+    ok.map((r) => ({
+      ...r,
+      label: r.remark,
+      device_count: 1,
+      download_kbps: r.download_kbps ?? 0,
+      upload_kbps: r.upload_kbps ?? 0,
+    })),
   );
 
   const ordered = [...arrangedOk, ...failed, ...testing, ...pending];

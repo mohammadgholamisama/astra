@@ -46,6 +46,8 @@ class PingRankItemIn(BaseModel):
     match_host: str = ""
     label: str | None = None
     avg_ping: float = -1
+    download_kbps: float = 0
+    upload_kbps: float = 0
     sample_count: int = 0
     device_count: int = 0
     # Devices that reported a failed/timeout ping in the window (for auto-hide)

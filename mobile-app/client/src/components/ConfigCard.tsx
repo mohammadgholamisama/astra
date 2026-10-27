@@ -16,6 +16,12 @@ function pingColor(ms: number, testing: boolean, fail: boolean, wait: boolean): 
   return colors.rose;
 }
 
+function formatKbps(kbps?: number): string | null {
+  if (kbps == null || !(kbps > 0)) return null;
+  if (kbps >= 1000) return `${toFaDigits((kbps / 1000).toFixed(1))}M`;
+  return `${toFaDigits(Math.round(kbps))}k`;
+}
+
 function ConfigCardInner({
   item,
   highlight,
@@ -32,6 +38,10 @@ function ConfigCardInner({
   const wait = !testing && !measured;
   const color = pingColor(avg, testing, fail, wait);
   const avgLabel = testing ? '…' : fail ? 'قطع' : wait ? '—' : formatMs(avg);
+  const dl = formatKbps(item.download_kbps);
+  const ul = formatKbps(item.upload_kbps);
+  const speedLabel =
+    dl || ul ? `${dl ? `${dl}↓` : ''}${dl && ul ? ' ' : ''}${ul ? `${ul}↑` : ''}` : null;
 
   return (
     <Pressable
@@ -48,7 +58,14 @@ function ConfigCardInner({
           {item.protocol ? ` · ${item.protocol}` : ''}
         </Text>
       </View>
-      <Text style={[styles.avg, { color }]}>{avgLabel}</Text>
+      <View style={styles.metrics}>
+        {speedLabel ? (
+          <Text style={styles.speed} numberOfLines={1}>
+            {speedLabel}
+          </Text>
+        ) : null}
+        <Text style={[styles.avg, { color }]}>{avgLabel}</Text>
+      </View>
     </Pressable>
   );
 }
@@ -62,6 +79,8 @@ function propsEqual(
     a.item.config_hash === b.item.config_hash &&
     a.item.rank === b.item.rank &&
     a.item.avg_ping === b.item.avg_ping &&
+    a.item.download_kbps === b.item.download_kbps &&
+    a.item.upload_kbps === b.item.upload_kbps &&
     a.item.measured === b.item.measured &&
     a.item.remark === b.item.remark
   );
@@ -78,42 +97,44 @@ const styles = StyleSheet.create({
     marginBottom: 6,
     paddingHorizontal: 10,
     borderRadius: radii.lg,
-    borderWidth: StyleSheet.hairlineWidth,
+    backgroundColor: colors.bgElevated,
+    borderWidth: 1,
     borderColor: colors.line,
-    backgroundColor: colors.panel,
-    gap: 8,
   },
   cardActive: {
-    borderColor: 'rgba(42,212,197,0.5)',
-    backgroundColor: '#101a28',
+    borderColor: 'rgba(42,212,197,0.45)',
   },
   rank: {
     width: 28,
     textAlign: 'center',
-    color: colors.accent,
-    fontSize: 15,
-    fontFamily: fonts.extraBold,
+    color: colors.textMute,
+    fontFamily: fonts.bold,
+    fontSize: 13,
   },
-  body: { flex: 1, alignItems: 'flex-end' },
+  body: { flex: 1, paddingHorizontal: 6 },
   title: {
-    width: '100%',
     textAlign: 'right',
     color: colors.text,
-    fontSize: 13,
     fontFamily: fonts.bold,
+    fontSize: 13,
   },
   host: {
     marginTop: 2,
-    width: '100%',
     textAlign: 'right',
     color: colors.textMute,
     fontSize: 11,
     fontFamily: fonts.regular,
   },
+  metrics: { alignItems: 'flex-end', minWidth: 72 },
+  speed: {
+    color: colors.mint,
+    fontSize: 10,
+    fontFamily: fonts.medium,
+    marginBottom: 2,
+  },
   avg: {
-    minWidth: 52,
-    textAlign: 'left',
-    fontSize: 15,
     fontFamily: fonts.extraBold,
+    fontSize: 14,
+    fontVariant: ['tabular-nums'],
   },
 });

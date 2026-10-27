@@ -546,6 +546,8 @@ async def apply_ping_rank(
     current = list(workspace.items)
 
     score: dict[tuple[str, int, str], float] = {}
+    downloads: dict[tuple[str, int, str], float] = {}
+    uploads: dict[tuple[str, int, str], float] = {}
     devices: dict[tuple[str, int, str], int] = {}
     fails: dict[tuple[str, int, str], int] = {}
     labels: dict[tuple[str, int, str], str] = {}
@@ -557,6 +559,8 @@ async def apply_ping_rank(
             port = int(raw.get("port") or 0)
             match = str(raw.get("match_host") or "")
             avg = float(raw.get("avg_ping") if raw.get("avg_ping") is not None else -1)
+            dl = float(raw.get("download_kbps") or 0)
+            ul = float(raw.get("upload_kbps") or 0)
             dcount = int(raw.get("device_count") or 0)
             fcount = int(raw.get("fail_device_count") or 0)
             samples = int(raw.get("sample_count") or 0)
@@ -576,6 +580,10 @@ async def apply_ping_rank(
                 devices[key] = max(dcount, 1)
             elif dcount > devices.get(key, 0):
                 devices[key] = dcount
+            if dl > 0 and dl > downloads.get(key, 0):
+                downloads[key] = dl
+            if ul > 0 and ul > uploads.get(key, 0):
+                uploads[key] = ul
             # success always clears hide candidate
             tested_fail.discard(key)
         else:
@@ -657,6 +665,12 @@ async def apply_ping_rank(
         or "",
         device_of=lambda it: devices.get(
             _fp_key(it.host, int(it.port), it.match_host or ""), 1
+        ),
+        download_of=lambda it: downloads.get(
+            _fp_key(it.host, int(it.port), it.match_host or ""), 0
+        ),
+        upload_of=lambda it: uploads.get(
+            _fp_key(it.host, int(it.port), it.match_host or ""), 0
         ),
     )
     ordered = list(arranged) + unscored_rows

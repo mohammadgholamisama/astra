@@ -76,6 +76,8 @@ func (s *PanelSyncService) SyncPingRanks(ctx context.Context, ranks []models.Fin
 			MatchHost:       match,
 			Label:           label,
 			AvgPing:         r.AvgPing,
+			DownloadKbps:    r.DownloadKbps,
+			UploadKbps:      r.UploadKbps,
 			SampleCount:     sampleN,
 			DeviceCount:     devN,
 			FailDeviceCount: r.FailDeviceCount,
@@ -85,9 +87,27 @@ func (s *PanelSyncService) SyncPingRanks(ctx context.Context, ranks []models.Fin
 			best[key] = cand
 			continue
 		}
-		// Prefer a successful reading over a failure
-		if cand.AvgPing > 0 && (prev.AvgPing <= 0 || cand.AvgPing < prev.AvgPing) {
+		// Prefer successful ping; among successes keep better ping and merge speeds
+		if cand.AvgPing > 0 && prev.AvgPing <= 0 {
 			best[key] = cand
+		} else if cand.AvgPing > 0 && prev.AvgPing > 0 {
+			merged := prev
+			if cand.AvgPing < prev.AvgPing {
+				merged.AvgPing = cand.AvgPing
+			}
+			if cand.DownloadKbps > merged.DownloadKbps {
+				merged.DownloadKbps = cand.DownloadKbps
+			}
+			if cand.UploadKbps > merged.UploadKbps {
+				merged.UploadKbps = cand.UploadKbps
+			}
+			if cand.DeviceCount > merged.DeviceCount {
+				merged.DeviceCount = cand.DeviceCount
+			}
+			if cand.Label != "" && merged.Label == "" {
+				merged.Label = cand.Label
+			}
+			best[key] = merged
 		} else if cand.AvgPing <= 0 && prev.AvgPing <= 0 {
 			if cand.FailDeviceCount > prev.FailDeviceCount {
 				best[key] = cand

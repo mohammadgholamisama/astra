@@ -12,17 +12,7 @@ import java.net.URLDecoder
 object XrayConfigBuilder {
 
   fun fromShareLink(link: String): String? {
-    val raw = link.trim()
-    if (raw.isEmpty()) return null
-    val lower = raw.lowercase()
-    val outbound = when {
-      lower.startsWith("vless://") -> parseVless(raw)
-      lower.startsWith("vmess://") -> parseVmess(raw)
-      lower.startsWith("trojan://") -> parseTrojan(raw)
-      lower.startsWith("ss://") -> parseShadowsocks(raw)
-      else -> null
-    } ?: return null
-
+    val outbound = outboundFromShareLink(link) ?: return null
     return JSONObject()
       .put("log", JSONObject().put("loglevel", "warning"))
       .put(
@@ -32,6 +22,45 @@ object XrayConfigBuilder {
           .put(JSONObject().put("protocol", "freedom").put("tag", "direct")),
       )
       .toString()
+  }
+
+  /** Full config with local SOCKS inbound for download/upload speed tests. */
+  fun fromShareLinkWithSocks(link: String, socksPort: Int): String? {
+    val outbound = outboundFromShareLink(link) ?: return null
+    val port = socksPort.coerceIn(1025, 65535)
+    val inbound =
+      JSONObject()
+        .put("tag", "socks-in")
+        .put("listen", "127.0.0.1")
+        .put("port", port)
+        .put("protocol", "socks")
+        .put(
+          "settings",
+          JSONObject().put("udp", false).put("auth", "noauth"),
+        )
+    return JSONObject()
+      .put("log", JSONObject().put("loglevel", "warning"))
+      .put("inbounds", JSONArray().put(inbound))
+      .put(
+        "outbounds",
+        JSONArray()
+          .put(outbound)
+          .put(JSONObject().put("protocol", "freedom").put("tag", "direct")),
+      )
+      .toString()
+  }
+
+  private fun outboundFromShareLink(link: String): JSONObject? {
+    val raw = link.trim()
+    if (raw.isEmpty()) return null
+    val lower = raw.lowercase()
+    return when {
+      lower.startsWith("vless://") -> parseVless(raw)
+      lower.startsWith("vmess://") -> parseVmess(raw)
+      lower.startsWith("trojan://") -> parseTrojan(raw)
+      lower.startsWith("ss://") -> parseShadowsocks(raw)
+      else -> null
+    }
   }
 
   private fun parseVless(link: String): JSONObject? {

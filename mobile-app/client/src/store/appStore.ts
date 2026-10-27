@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { loadConfigsFromSubUrl } from '../utils/subParser';
 import { runPingQueue } from '../utils/pingQueue';
+import { runSpeedQueue } from '../utils/speedQueue';
 import { configsAsPending, rankLocally } from '../utils/localRank';
 import {
   ensureBackgroundPermissions,
@@ -41,6 +42,8 @@ interface AppState {
   error: string | null;
   hydrated: boolean;
   backgroundEnabled: boolean;
+  /** After ping: also measure download/upload and rank by speed. */
+  speedRankEnabled: boolean;
   syncingPanel: boolean;
   /** Short result line under «اعمال ترتیب» */
   panelSyncHint: string;
@@ -50,6 +53,7 @@ interface AppState {
   setSubUrl: (url: string) => void;
   setCycleInterval: (ms: number) => Promise<void>;
   setBackgroundEnabled: (on: boolean) => Promise<void>;
+  setSpeedRankEnabled: (on: boolean) => Promise<void>;
   tick: () => void;
   loadSub: () => Promise<void>;
   runCycle: (manual?: boolean) => Promise<void>;
@@ -177,6 +181,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   error: null,
   hydrated: false,
   backgroundEnabled: false,
+  speedRankEnabled: false,
   syncingPanel: false,
   panelSyncHint: '',
   permissionsReady: false,
@@ -226,6 +231,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         hydrated: true,
         permissionsReady: true,
         backgroundEnabled: saved.backgroundEnabled === true,
+        speedRankEnabled: saved.speedRankEnabled === true,
       });
 
       void saveSettings({
@@ -308,6 +314,16 @@ export const useAppStore = create<AppState>((set, get) => ({
           : `بازه ${cycleMinutesLabel(cycleIntervalMs)}د — برای چرخش خودکار پایش را روشن کن`,
       });
     }
+  },
+
+  setSpeedRankEnabled: async (on) => {
+    set({
+      speedRankEnabled: on,
+      status: on
+        ? 'رتبه با سرعت: اول پینگ، بعد دانلود/آپلود روی وصل‌ها'
+        : 'رتبه فقط با پینگ',
+    });
+    await saveSettings({ speedRankEnabled: on });
   },
 
   setBackgroundEnabled: async (on) => {
@@ -538,10 +554,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         });
       };
 
-      const results = await runPingQueue(configs, {
-        concurrency: 3,
-        timeoutMs: 4500,
-        tcpTimeoutMs: 900,
+      let results = await runPingQueue(configs, {
+        concurrency: 5,
+        timeoutMs: 2200,
+        tcpTimeoutMs: 600,
         tcpPrecheck: 'soft',
         retries: 1,
         signal: ac.signal,
@@ -561,7 +577,6 @@ export const useAppStore = create<AppState>((set, get) => ({
               : `${done}/${total} · قطع`;
 
           const now = Date.now();
-          // Always refresh near the end so the bar never freezes at ~98%
           const nearEnd = total > 0 && done >= Math.max(1, total - 4);
           if (nearEnd || now - lastLight >= 250) {
             lastLight = now;
@@ -602,9 +617,76 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
 
       results.forEach((r) => live.set(r.configHash, r));
+
+      // Optional: speed burst only on alive configs, then re-rank
+      if (get().speedRankEnabled && !ac.signal.aborted && get().testing) {
+        const aliveN = results.filter((r) => r.pingMs > 0).length;
+        set({
+          status: `سرعت · ${aliveN} وصل…`,
+          progressDone: 0,
+          progressTotal: Math.max(1, aliveN),
+          testingHashes: [],
+        });
+        lastLight = 0;
+        lastRank = 0;
+        results = await runSpeedQueue(configs, results, {
+          concurrency: 2,
+          downloadBudgetMs: 1600,
+          uploadBudgetMs: 1400,
+          signal: ac.signal,
+          onProgress: (done, total, latest) => {
+            if (ac.signal.aborted || !get().testing) return;
+            live.set(latest.configHash, latest);
+            const dl =
+              latest.downloadKbps && latest.downloadKbps > 0
+                ? `${Math.round(latest.downloadKbps)}↓`
+                : '—';
+            const ul =
+              latest.uploadKbps && latest.uploadKbps > 0
+                ? `${Math.round(latest.uploadKbps)}↑`
+                : '—';
+            const hint = `${done}/${total} · ${dl} ${ul} kbps`;
+            const now = Date.now();
+            if (done >= total - 1 || now - lastLight >= 200) {
+              lastLight = now;
+              set({
+                progressDone: done,
+                progressTotal: total,
+                status: hint,
+              });
+            }
+            if (now - lastRank >= 1600) {
+              lastRank = now;
+              set({ ranked: rankLocally(configs, live) });
+            }
+          },
+        });
+        results.forEach((r) => live.set(r.configHash, r));
+      }
+
+      if (ac.signal.aborted || !get().testing) {
+        setTimeout(() => {
+          try {
+            const ranked = rankLocally(configs, live);
+            set({ ranked, testingHashes: [], testing: false });
+            void saveSnapshot(configs, ranked, {
+              lastBackgroundStatus: 'تست متوقف شد — آخرین ترتیب ذخیره شد',
+            });
+          } catch {
+            /* ignore */
+          }
+        }, 50);
+        return;
+      }
+
       const ranked = rankLocally(configs, live);
       const ok = results.filter((r) => r.pingMs > 0).length;
-      const baseStatus = `تمام · ${ok}/${configs.length} موفق`;
+      const withSpeed = results.filter(
+        (r) => (r.downloadKbps ?? 0) > 0 || (r.uploadKbps ?? 0) > 0,
+      ).length;
+      const baseStatus = get().speedRankEnabled
+        ? `تمام · ${ok} پینگ · ${withSpeed} سرعت`
+        : `تمام · ${ok}/${configs.length} موفق`;
       set({
         testing: false,
         testingHashes: [],
@@ -615,9 +697,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       });
       void armTimer(set, get);
       void saveSnapshot(configs, ranked, {
-        lastBackgroundStatus: `آخرین تست · ${ok}/${configs.length} موفق`,
+        lastBackgroundStatus: baseStatus,
         operator: DEFAULT_OPERATOR,
         cycleIntervalMs: intervalOf(get),
+        speedRankEnabled: get().speedRankEnabled,
       });
 
       // Upload → multi-device 15m avg → reorder panel (auto)

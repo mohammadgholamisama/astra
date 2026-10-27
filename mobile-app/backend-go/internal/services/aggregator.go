@@ -44,9 +44,11 @@ type configMeta struct {
 }
 
 type pingRecord struct {
-	PingMs    int64  `json:"ping_ms"`
-	UpdatedAt int64  `json:"updated_at"`
-	DeviceID  string `json:"device_id,omitempty"`
+	PingMs       int64   `json:"ping_ms"`
+	DownloadKbps float64 `json:"download_kbps,omitempty"`
+	UploadKbps   float64 `json:"upload_kbps,omitempty"`
+	UpdatedAt    int64   `json:"updated_at"`
+	DeviceID     string  `json:"device_id,omitempty"`
 }
 
 func cleanHost(h string) string {
@@ -120,9 +122,11 @@ func (a *Aggregator) IngestBatch(ctx context.Context, req models.PingBatchReques
 		}
 
 		rec := pingRecord{
-			PingMs:    s.PingMs,
-			UpdatedAt: s.MeasuredAt,
-			DeviceID:  dev,
+			PingMs:       s.PingMs,
+			DownloadKbps: s.DownloadKbps,
+			UploadKbps:   s.UploadKbps,
+			UpdatedAt:    s.MeasuredAt,
+			DeviceID:     dev,
 		}
 		recBytes, err := json.Marshal(rec)
 		if err != nil {
@@ -341,8 +345,10 @@ func (a *Aggregator) RankedFingerprints(ctx context.Context) ([]models.Fingerpri
 			continue
 		}
 
-		// deviceID → best positive ping; also track devices that only failed
+		// deviceID → best positive ping / speed; also track devices that only failed
 		bestByDevice := map[string]float64{}
+		bestDlByDevice := map[string]float64{}
+		bestUlByDevice := map[string]float64{}
 		failedDevices := map[string]struct{}{}
 		var label string
 		var sampleN int
@@ -388,6 +394,16 @@ func (a *Aggregator) RankedFingerprints(ctx context.Context) ([]models.Fingerpri
 					if prev, ok := bestByDevice[id]; !ok || ms < prev {
 						bestByDevice[id] = ms
 					}
+					if rec.DownloadKbps > 0 {
+						if prev, ok := bestDlByDevice[id]; !ok || rec.DownloadKbps > prev {
+							bestDlByDevice[id] = rec.DownloadKbps
+						}
+					}
+					if rec.UploadKbps > 0 {
+						if prev, ok := bestUlByDevice[id]; !ok || rec.UploadKbps > prev {
+							bestUlByDevice[id] = rec.UploadKbps
+						}
+					}
 				}
 			}
 		}
@@ -400,12 +416,30 @@ func (a *Aggregator) RankedFingerprints(ctx context.Context) ([]models.Fingerpri
 			}
 			avg = math.Round((sum/float64(len(bestByDevice)))*10) / 10
 		}
+		avgDl := 0.0
+		if len(bestDlByDevice) > 0 {
+			var sum float64
+			for _, v := range bestDlByDevice {
+				sum += v
+			}
+			avgDl = math.Round((sum/float64(len(bestDlByDevice)))*10) / 10
+		}
+		avgUl := 0.0
+		if len(bestUlByDevice) > 0 {
+			var sum float64
+			for _, v := range bestUlByDevice {
+				sum += v
+			}
+			avgUl = math.Round((sum/float64(len(bestUlByDevice)))*10) / 10
+		}
 		out = append(out, models.FingerprintRank{
 			Host:            host,
 			Port:            port,
 			MatchHost:       match,
 			Label:           label,
 			AvgPing:         avg,
+			DownloadKbps:    avgDl,
+			UploadKbps:      avgUl,
 			SampleCount:     sampleN,
 			DeviceCount:     len(bestByDevice),
 			FailDeviceCount: len(failedDevices),

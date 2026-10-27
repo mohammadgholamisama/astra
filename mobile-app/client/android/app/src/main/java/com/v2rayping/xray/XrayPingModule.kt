@@ -1,6 +1,7 @@
 package com.v2rayping.xray
 
 import android.util.Log
+import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
@@ -137,6 +138,74 @@ class XrayPingModule(
       }
       try {
         promise.resolve(ms.toDouble())
+      } catch (_: Throwable) {
+      }
+    }
+  }
+
+  /**
+   * Short download+upload burst through the share-link outbound (SOCKS).
+   * Resolves { download_kbps, upload_kbps } (−1 on fail).
+   */
+  @ReactMethod
+  fun measureSpeed(
+    shareLink: String,
+    downloadBudgetMs: Double,
+    uploadBudgetMs: Double,
+    promise: Promise,
+  ) {
+    val myGen = generation.get()
+    val dl = downloadBudgetMs.toLong().coerceIn(800L, 5_000L)
+    val ul = uploadBudgetMs.toLong().coerceIn(800L, 5_000L)
+    val pool = measurePool
+    val future: Future<Pair<Double, Double>> =
+      try {
+        pool.submit<Pair<Double, Double>> {
+          try {
+            if (generation.get() != myGen || !ensureCore()) {
+              -1.0 to -1.0
+            } else {
+              val res =
+                XraySpeedHelper.measure(
+                  shareLink.trim(),
+                  dl,
+                  ul,
+                ) { generation.get() != myGen }
+              res.downloadKbps to res.uploadKbps
+            }
+          } catch (t: Throwable) {
+            Log.w(TAG, "measureSpeed: ${t.message}")
+            -1.0 to -1.0
+          }
+        }
+      } catch (_: Throwable) {
+        val map = Arguments.createMap()
+        map.putDouble("download_kbps", -1.0)
+        map.putDouble("upload_kbps", -1.0)
+        promise.resolve(map)
+        return
+      }
+    inflight.add(future)
+    replyPool.execute {
+      val pair =
+        try {
+          if (generation.get() != myGen) {
+            future.cancel(true)
+            -1.0 to -1.0
+          } else {
+            future.get(dl + ul + 4_000L, TimeUnit.MILLISECONDS)
+          }
+        } catch (_: Throwable) {
+          future.cancel(true)
+          -1.0 to -1.0
+        } finally {
+          inflight.remove(future)
+        }
+      try {
+        val map = Arguments.createMap()
+        map.putDouble("download_kbps", pair.first)
+        map.putDouble("upload_kbps", pair.second)
+        promise.resolve(map)
       } catch (_: Throwable) {
       }
     }

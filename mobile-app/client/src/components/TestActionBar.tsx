@@ -25,6 +25,8 @@ export function TestActionBar({
   const remainingMs = useAppStore((s) => s.remainingMs);
   const cycleIntervalMs = useAppStore((s) => s.cycleIntervalMs);
   const backgroundEnabled = useAppStore((s) => s.backgroundEnabled);
+  const speedRankEnabled = useAppStore((s) => s.speedRankEnabled);
+  const setSpeedRankEnabled = useAppStore((s) => s.setSpeedRankEnabled);
   const progressDone = useAppStore((s) => s.progressDone);
   const progressTotal = useAppStore((s) => s.progressTotal);
   const progressStatus = useAppStore((s) => s.status);
@@ -156,6 +158,31 @@ export function TestActionBar({
           </Text>
         </View>
       ) : null}
+
+      <Pressable
+        disabled={testing}
+        onPress={() => void setSpeedRankEnabled(!speedRankEnabled)}
+        style={({ pressed }) => [
+          styles.speedToggle,
+          speedRankEnabled && styles.speedToggleOn,
+          testing && styles.chipDisabled,
+          pressed && !testing && styles.chipPressed,
+        ]}
+        accessibilityRole="switch"
+        accessibilityState={{ checked: speedRankEnabled }}
+        accessibilityLabel="رتبه‌بندی با سرعت دانلود و آپلود"
+      >
+        <Text
+          style={[
+            styles.speedToggleText,
+            speedRankEnabled && styles.speedToggleTextOn,
+          ]}
+        >
+          {speedRankEnabled
+            ? 'رتبه با سرعت · روشن (پینگ → دانلود/آپلود)'
+            : 'رتبه با سرعت · خاموش (فقط پینگ)'}
+        </Text>
+      </Pressable>
 
       <View style={styles.intervalBlock}>
         <Text style={styles.intervalTitle}>بازهٔ چرخه (دقیقه)</Text>
@@ -299,6 +326,28 @@ const styles = StyleSheet.create({
   timerValueMute: {
     color: colors.textMute,
     fontSize: 20,
+  },
+  speedToggle: {
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.lineStrong,
+    backgroundColor: colors.panel,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+  },
+  speedToggleOn: {
+    borderColor: 'rgba(42,212,197,0.55)',
+    backgroundColor: colors.accentDim,
+  },
+  speedToggleText: {
+    textAlign: 'right',
+    color: colors.textSoft,
+    fontSize: 12,
+    fontFamily: fonts.medium,
+  },
+  speedToggleTextOn: {
+    color: colors.accent,
+    fontFamily: fonts.bold,
   },
   progressCard: {
     borderRadius: radii.lg,

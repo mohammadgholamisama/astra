@@ -52,10 +52,10 @@ export default async function backgroundPingTask(): Promise<void> {
   if (configs.length === 0) return;
 
   const live = new Map<string, LocalPingResult>();
-  const results = await runPingQueue(configs, {
-    concurrency: 3,
-    timeoutMs: 4500,
-    tcpTimeoutMs: 900,
+  let results = await runPingQueue(configs, {
+    concurrency: 5,
+    timeoutMs: 2200,
+    tcpTimeoutMs: 600,
     tcpPrecheck: 'soft',
     retries: 1,
     onProgress: (_d, _t, latest) => {
@@ -63,6 +63,20 @@ export default async function backgroundPingTask(): Promise<void> {
     },
   });
   results.forEach((r) => live.set(r.configHash, r));
+
+  if (saved.speedRankEnabled) {
+    const { runSpeedQueue } = await import('../utils/speedQueue');
+    results = await runSpeedQueue(configs, results, {
+      concurrency: 2,
+      downloadBudgetMs: 1600,
+      uploadBudgetMs: 1400,
+      onProgress: (_d, _t, latest) => {
+        live.set(latest.configHash, latest);
+      },
+    });
+    results.forEach((r) => live.set(r.configHash, r));
+  }
+
   const ranked: RankedConfig[] = rankLocally(configs, live);
   const now = Date.now();
   const ok = results.filter((r) => r.pingMs > 0).length;

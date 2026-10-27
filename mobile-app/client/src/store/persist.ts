@@ -12,6 +12,8 @@ export type SavedSettings = {
   /** Auto-test interval in ms (2m / 5m / 10m / 15m / 30m). */
   cycleIntervalMs?: number;
   backgroundEnabled?: boolean;
+  /** Ping first, then download/upload speed on alive configs. */
+  speedRankEnabled?: boolean;
   lastBackgroundStatus?: string;
   permissionsAsked?: boolean;
 };

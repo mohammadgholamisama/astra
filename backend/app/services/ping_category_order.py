@@ -1,4 +1,4 @@
-"""Category-aware ping order: 5 مستقیم → 5 تانل → 5 گیمینگ → rest by quality."""
+"""Category-aware ping/speed order: 5 مستقیم → 5 تانل → 5 گیمینگ → rest."""
 
 from __future__ import annotations
 
@@ -31,10 +31,12 @@ def arrange_by_category_slots(
     avg_of,
     label_of,
     device_of=None,
+    download_of=None,
+    upload_of=None,
 ) -> list[T]:
     """Sort successful items into category slots then leftover by quality.
 
-    ``avg_of`` / ``label_of`` / ``device_of`` are callables: item → value.
+    Quality: more devices → higher download → higher upload → lower ping.
     """
     ok: list[T] = []
     rest: list[T] = []
@@ -48,7 +50,15 @@ def arrange_by_category_slots(
         else:
             rest.append(it)
 
-    def quality_key(it: T) -> tuple[int, float]:
+    def _num(call, it: T, default: float = 0.0) -> float:
+        if call is None:
+            return default
+        try:
+            return float(call(it) or 0)
+        except (TypeError, ValueError):
+            return default
+
+    def quality_key(it: T) -> tuple:
         try:
             avg = float(avg_of(it))
         except (TypeError, ValueError):
@@ -59,8 +69,10 @@ def arrange_by_category_slots(
                 dev = int(device_of(it) or 1)
             except (TypeError, ValueError):
                 dev = 1
-        # Higher device count first → negate for ascending sort key
-        return (-dev, avg)
+        dl = _num(download_of, it)
+        ul = _num(upload_of, it)
+        # Ascending sort: negate devices/speeds so higher wins
+        return (-dev, -dl, -ul, avg)
 
     buckets: dict[str, list[T]] = {
         "direct": [],
@@ -91,4 +103,6 @@ def arrange_rank_dicts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         avg_of=lambda d: d.get("avg_ping", -1),
         label_of=lambda d: d.get("label") or "",
         device_of=lambda d: d.get("device_count") or 1,
+        download_of=lambda d: d.get("download_kbps") or 0,
+        upload_of=lambda d: d.get("upload_kbps") or 0,
     )
