@@ -7551,6 +7551,13 @@ html[dir="rtl"] .configs-switch input:checked + .configs-switch-track::after,
   background: var(--card-solid);
   box-shadow: 0 1px 0 color-mix(in srgb, var(--line) 55%, transparent);
 }
+.config-order-unhide-all {
+  margin-inline-start: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
 .config-order-search {
   display: inline-flex;
   align-items: center;

@@ -262,6 +262,39 @@ export default function ConfigOrderPage() {
     onSettled: () => setPendingKey(null),
   });
 
+  const unhideAll = useMutation({
+    mutationFn: () =>
+      api<{ ok: boolean; cleared: number }>(
+        "/api/admin/config-visibility/unhide-all",
+        { method: "POST" }
+      ),
+    onSuccess: (res) => {
+      setItems((prev) => prev.map((it) => ({ ...it, hidden: false })));
+      qc.setQueryData<Workspace>(["config-order"], (old) =>
+        old
+          ? {
+              ...old,
+              items: (old.items || []).map((it) => ({ ...it, hidden: false })),
+            }
+          : old
+      );
+      setFilter("all");
+      const n = res?.cleared ?? 0;
+      pushToast(
+        "ok",
+        n > 0
+          ? `${toFaDigits(n)} کانفیگ دوباره در همه ساب‌ها نمایش داده می‌شود`
+          : "موردی برای نمایش نبود"
+      );
+    },
+    onError: (e) => {
+      pushToast(
+        "err",
+        e instanceof ApiError ? e.message : "نمایش همه ناموفق بود"
+      );
+    },
+  });
+
   const setFlag = useMutation({
     mutationFn: async (args: {
       row: OrderItem;
@@ -329,6 +362,7 @@ export default function ConfigOrderPage() {
     save.isPending ||
     buildSamples.isPending ||
     toggleHide.isPending ||
+    unhideAll.isPending ||
     setFlag.isPending;
 
   function applyOrder(next: OrderItem[], { persist = true }: { persist?: boolean } = {}) {
@@ -582,6 +616,35 @@ export default function ConfigOrderPage() {
               </button>
             ))}
           </div>
+          {filter === "hidden" && hiddenCount > 0 ? (
+            <button
+              type="button"
+              className="btn ghost sm config-order-unhide-all"
+              disabled={busy}
+              title="همه کانفیگ‌های مخفی را دوباره در ساب نشان بده"
+              onClick={() => {
+                if (
+                  !window.confirm(
+                    `${toFaDigits(hiddenCount)} کانفیگ مخفی دوباره در همه ساب‌ها نمایش داده شود؟`
+                  )
+                ) {
+                  return;
+                }
+                unhideAll.mutate();
+              }}
+            >
+              {unhideAll.isPending ? (
+                <Loader2 size={14} className="configs-spin" />
+              ) : (
+                <Eye size={14} />
+              )}
+              <span>
+                {unhideAll.isPending
+                  ? "در حال نمایش…"
+                  : `نمایش همه (${toFaDigits(hiddenCount)})`}
+              </span>
+            </button>
+          ) : null}
         </div>
       ) : null}
 

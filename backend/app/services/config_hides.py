@@ -95,6 +95,18 @@ async def list_hides(db: AsyncSession, group_id: int | None = None) -> list[Grou
     return list(result.scalars().all())
 
 
+async def clear_all_hides(db: AsyncSession) -> int:
+    """Remove every global hide rule so all endpoints show in subscriptions again."""
+    result = await db.execute(select(GroupConfigHide))
+    rows = list(result.scalars().all())
+    n = len(rows)
+    if n:
+        await db.execute(delete(GroupConfigHide))
+        await db.commit()
+    await refresh_cache(db)
+    return n
+
+
 async def set_hidden(
     db: AsyncSession,
     group_id: int | None,

@@ -186,6 +186,26 @@ async def set_config_visibility_global(
         ) from exc
 
 
+@router.post("/api/admin/config-visibility/unhide-all")
+async def unhide_all_configs(
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """Clear every global hide rule — all configs show in every subscription again."""
+    try:
+        cleared = await hide_svc.clear_all_hides(db)
+        return {"ok": True, "cleared": int(cleared)}
+    except Exception as exc:  # noqa: BLE001
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"خطا در نمایش همه کانفیگ‌ها: {exc}",
+        ) from exc
+
+
 @router.get(
     "/api/group/{group_id}/config-visibility",
     response_model=ConfigVisibilityOut,
