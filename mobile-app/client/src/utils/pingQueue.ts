@@ -3,9 +3,17 @@ import type { LocalPingResult, ParsedConfig } from '../types';
 
 export interface PingQueueOptions {
   concurrency?: number;
+  /** How long to wait for LibXray real-delay (ms). */
   timeoutMs?: number;
-  tcpPrecheck?: boolean;
+  /**
+   * soft (default): TCP fail still runs real-delay.
+   * hard: TCP fail → قطع without real-delay.
+   * off: skip TCP entirely.
+   */
+  tcpPrecheck?: 'soft' | 'hard' | 'off' | boolean;
   tcpTimeoutMs?: number;
+  /** Extra real-delay attempts after a miss (default 1). */
+  retries?: number;
   onStart?: (config: ParsedConfig) => void;
   onProgress?: (done: number, total: number, latest: LocalPingResult) => void;
   signal?: AbortSignal;
@@ -20,6 +28,15 @@ function isAbort(e: unknown): boolean {
     (e instanceof DOMException && e.name === 'AbortError') ||
     (e instanceof Error && /abort/i.test(e.message))
   );
+}
+
+function resolveTcpMode(
+  v: PingQueueOptions['tcpPrecheck'],
+): 'soft' | 'hard' | 'off' {
+  if (v === false || v === 'off') return 'off';
+  if (v === 'hard' || v === true) return v === true ? 'soft' : 'hard';
+  if (v === 'soft') return 'soft';
+  return 'soft';
 }
 
 /** Reject as soon as AbortSignal fires — does not wait for native. */
@@ -43,8 +60,8 @@ function raceAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
 }
 
 /**
- * Hard wall-clock cap so a hung native LibXray call cannot freeze the queue
- * at ~98%. Resolves -1 on timeout (not reject) so workers keep advancing.
+ * Hard wall-clock cap so a hung native LibXray call cannot freeze the queue.
+ * Resolves -1 on timeout (not reject) so workers keep advancing.
  */
 function raceMs(promise: Promise<number>, ms: number): Promise<number> {
   return new Promise((resolve) => {
@@ -53,7 +70,7 @@ function raceMs(promise: Promise<number>, ms: number): Promise<number> {
       if (done) return;
       done = true;
       resolve(-1);
-    }, Math.max(200, ms));
+    }, Math.max(400, ms));
     promise.then(
       (v) => {
         if (done) return;
@@ -75,10 +92,11 @@ export async function runPingQueue(
   configs: ParsedConfig[],
   options: PingQueueOptions = {},
 ): Promise<LocalPingResult[]> {
-  const concurrency = Math.max(1, options.concurrency ?? 5);
-  const timeoutMs = options.timeoutMs ?? 1200;
-  const tcpTimeoutMs = options.tcpTimeoutMs ?? 200;
-  const tcpPrecheck = options.tcpPrecheck !== false;
+  const concurrency = Math.max(1, options.concurrency ?? 3);
+  const timeoutMs = options.timeoutMs ?? 4500;
+  const tcpTimeoutMs = options.tcpTimeoutMs ?? 900;
+  const tcpMode = resolveTcpMode(options.tcpPrecheck);
+  const retries = Math.max(0, options.retries ?? 1);
   const total = configs.length;
   const results: LocalPingResult[] = new Array(total);
   let nextIndex = 0;
@@ -96,24 +114,41 @@ export async function runPingQueue(
     else options.signal.addEventListener('abort', stop, { once: true });
   }
 
+  async function realDelayOnce(cfg: ParsedConfig): Promise<number> {
+    // Wall clock a bit above native wait so we prefer native result when possible
+    return raceAbort(
+      raceMs(pingRealDelay(cfg.raw, timeoutMs), timeoutMs + 1200),
+      options.signal,
+    );
+  }
+
   async function measureOne(cfg: ParsedConfig): Promise<number> {
     if (stopped || options.signal?.aborted) throw abortedError();
     options.onStart?.(cfg);
     if (stopped || options.signal?.aborted) throw abortedError();
-    if (tcpPrecheck) {
+
+    if (tcpMode !== 'off') {
       const tcp = await raceAbort(
-        raceMs(pingTcp(cfg.address, cfg.port, tcpTimeoutMs), tcpTimeoutMs + 250),
+        raceMs(pingTcp(cfg.address, cfg.port, tcpTimeoutMs), tcpTimeoutMs + 400),
         options.signal,
       );
-      if (tcp < 0) return -1;
+      // Hard mode only: TCP unreachable → skip real-delay
+      if (tcpMode === 'hard' && tcp < 0) return -1;
+      // soft: continue to real-delay even if TCP timed out
     }
+
     if (stopped || options.signal?.aborted) throw abortedError();
-    // Native may hang in JNI past its own Future timeout when the pool is
-    // saturated — JS wall clock always wins so the bar reaches 100%.
-    return raceAbort(
-      raceMs(pingRealDelay(cfg.raw, timeoutMs), timeoutMs + 500),
-      options.signal,
-    );
+
+    let best = await realDelayOnce(cfg);
+    for (let attempt = 0; attempt < retries && best <= 0; attempt++) {
+      if (stopped || options.signal?.aborted) throw abortedError();
+      // Short pause so LibXray can tear down the failed outbound
+      await new Promise<void>((r) => setTimeout(r, 120));
+      if (stopped || options.signal?.aborted) throw abortedError();
+      const again = await realDelayOnce(cfg);
+      if (again > 0) best = again;
+    }
+    return best;
   }
 
   async function worker(): Promise<void> {
@@ -128,7 +163,6 @@ export async function runPingQueue(
         pingMs = await measureOne(cfg);
       } catch (e) {
         if (isAbort(e) || stopped) {
-          // Still record a slot so progress never freezes mid-cancel
           if (!results[i]) {
             results[i] = {
               configHash: cfg.configHash,

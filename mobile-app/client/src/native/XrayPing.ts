@@ -51,7 +51,7 @@ export async function pingTcp(
  */
 export async function pingRealDelay(
   shareLink: string,
-  timeoutMs = 8000,
+  timeoutMs = 4500,
 ): Promise<number> {
   if (Platform.OS === 'android' && Native?.pingRealDelay) {
     try {

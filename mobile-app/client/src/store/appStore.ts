@@ -539,10 +539,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       };
 
       const results = await runPingQueue(configs, {
-        concurrency: 5,
-        timeoutMs: 1200,
-        tcpTimeoutMs: 200,
-        tcpPrecheck: true,
+        concurrency: 3,
+        timeoutMs: 4500,
+        tcpTimeoutMs: 900,
+        tcpPrecheck: 'soft',
+        retries: 1,
         signal: ac.signal,
         onStart: (cfg) => {
           if (ac.signal.aborted || !get().testing) return;

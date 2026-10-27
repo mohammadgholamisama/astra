@@ -77,7 +77,9 @@ class XrayPingModule(
 
   @ReactMethod
   fun pingRealDelay(shareLink: String, timeoutMs: Double, promise: Promise) {
-    val capMs = timeoutMs.toLong().coerceIn(700L, 4_000L)
+    // waitMs = how long we wait for LibXray; accept any positive delay up to ACCEPT_MAX
+    // (old code discarded valid pings when delay > waitMs → false «قطع»)
+    val waitMs = timeoutMs.toLong().coerceIn(1_500L, 12_000L)
     val myGen = generation.get()
     if (myGen != generation.get()) {
       promise.resolve(-1.0)
@@ -100,7 +102,7 @@ class XrayPingModule(
               when {
                 generation.get() != myGen -> -1L
                 delay <= 0L -> -1L
-                delay > capMs -> -1L
+                delay > ACCEPT_MAX_MS -> -1L
                 else -> delay
               }
             }
@@ -121,7 +123,8 @@ class XrayPingModule(
           future.cancel(true)
           -1L
         } else {
-          future.get(capMs + 150L, TimeUnit.MILLISECONDS)
+          // Extra slack so a slow-but-valid measure can still return
+          future.get(waitMs + 800L, TimeUnit.MILLISECONDS)
         }
       } catch (_: TimeoutException) {
         future.cancel(true)
@@ -267,6 +270,8 @@ class XrayPingModule(
 
   companion object {
     private const val TAG = "XrayPing"
+    /** Accept real measured delays up to this (ms); wait timeout is separate. */
+    private const val ACCEPT_MAX_MS = 15_000L
     const val PROBE_URL = "https://www.gstatic.com/generate_204"
 
     @Volatile
