@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -91,18 +92,17 @@ func (a *API) GetRanked(c *fiber.Ctx) error {
 }
 
 type panelSyncBody struct {
-	// Ignored for ordering — server always ranks from the 1h Redis window.
-	// Kept so older app builds that POST live items still work.
+	// Live page ranks from the app (already ordered). Merged with the 1h
+	// Redis window so multi-device history still counts — never used to hide.
 	Items []models.FingerprintRank `json:"items"`
 }
 
 func (a *API) SyncPanelNow(c *fiber.Ctx) error {
 	var body panelSyncBody
 	_ = c.BodyParser(&body)
-	_ = body // older apps may still POST live items; ordering always uses the 1h window
 
 	a.cancelScheduledSync()
-	count, err := a.syncWindowToPanel()
+	count, source, err := a.syncRanksToPanel(body.Items)
 	if err != nil {
 		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": err.Error()})
 	}
@@ -110,14 +110,14 @@ func (a *API) SyncPanelNow(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{
 			"ok":      true,
 			"count":   0,
-			"source":  "window",
-			"message": "no successful samples in ranking window",
+			"source":  source,
+			"message": "no successful samples to apply",
 		})
 	}
 	return c.JSON(fiber.Map{
 		"ok":     true,
 		"count":  count,
-		"source": "window",
+		"source": source,
 	})
 }
 
@@ -157,7 +157,7 @@ func (a *API) cancelScheduledSync() {
 }
 
 func (a *API) syncOnce() {
-	n, err := a.syncWindowToPanel()
+	n, _, err := a.syncRanksToPanel(nil)
 	if err != nil {
 		log.Printf("[panel-sync] %v", err)
 		return
@@ -169,34 +169,104 @@ func (a *API) syncOnce() {
 	log.Printf("[panel-sync] ok — reordered %d fingerprints in Astra (1h window)", n)
 }
 
-func (a *API) syncWindowToPanel() (int, error) {
+func rankOK(r models.FingerprintRank) bool {
+	pktOK := r.HasPacketLoss && r.PacketLossPct >= 0 && r.PacketLossPct < 100
+	return r.AvgPing > 0 || r.DownloadKbps > 0 || r.UploadKbps > 0 || pktOK
+}
+
+func mergeRank(prev, cand models.FingerprintRank) models.FingerprintRank {
+	out := prev
+	if cand.AvgPing > 0 && (prev.AvgPing <= 0 || cand.AvgPing < prev.AvgPing) {
+		out.AvgPing = cand.AvgPing
+	}
+	if cand.DownloadKbps > out.DownloadKbps {
+		out.DownloadKbps = cand.DownloadKbps
+	}
+	if cand.UploadKbps > out.UploadKbps {
+		out.UploadKbps = cand.UploadKbps
+	}
+	if cand.HasPacketLoss {
+		if !out.HasPacketLoss || cand.PacketLossPct < out.PacketLossPct {
+			out.HasPacketLoss = true
+			out.PacketLossPct = cand.PacketLossPct
+		}
+	}
+	if cand.DeviceCount > out.DeviceCount {
+		out.DeviceCount = cand.DeviceCount
+	}
+	if cand.SampleCount > out.SampleCount {
+		out.SampleCount = cand.SampleCount
+	}
+	if cand.Label != "" {
+		out.Label = cand.Label
+	}
+	// Never forward failures for hide
+	out.FailDeviceCount = 0
+	return out
+}
+
+// syncRanksToPanel merges optional live app ranks with the 1h window, then
+// reorders Astra. Successes only — never auto-hide.
+func (a *API) syncRanksToPanel(live []models.FingerprintRank) (int, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	ranks, err := a.Agg.RankedFingerprints(ctx)
+	window, err := a.Agg.RankedFingerprints(ctx)
 	if err != nil {
-		return 0, err
+		return 0, "window", err
 	}
 
-	filtered := make([]models.FingerprintRank, 0, len(ranks))
-	for _, r := range ranks {
-		if strings.TrimSpace(r.Host) == "" || r.Port < 1 {
-			continue
+	best := map[string]models.FingerprintRank{}
+	put := func(r models.FingerprintRank) {
+		host := strings.TrimSpace(strings.ToLower(r.Host))
+		if host == "" || r.Port < 1 || r.Port > 65535 {
+			return
 		}
-		pktOK := r.HasPacketLoss && r.PacketLossPct >= 0 && r.PacketLossPct < 100
-		ok := r.AvgPing > 0 || r.DownloadKbps > 0 || r.UploadKbps > 0 || pktOK
-		if !ok {
-			continue
+		if !rankOK(r) {
+			return
 		}
+		match := strings.TrimSpace(strings.ToLower(r.MatchHost))
+		key := host + "|" + strconv.Itoa(r.Port) + "|" + match
+		cand := r
+		cand.Host = host
+		cand.MatchHost = match
+		cand.FailDeviceCount = 0
+		if cand.DeviceCount < 1 {
+			cand.DeviceCount = 1
+		}
+		if cand.SampleCount < 1 {
+			cand.SampleCount = 1
+		}
+		if prev, ok := best[key]; ok {
+			best[key] = mergeRank(prev, cand)
+		} else {
+			best[key] = cand
+		}
+	}
+
+	for _, r := range window {
+		put(r)
+	}
+	for _, r := range live {
+		put(r)
+	}
+
+	source := "window"
+	if len(live) > 0 {
+		source = "live+window"
+	}
+	if len(best) == 0 {
+		return 0, source, nil
+	}
+
+	filtered := make([]models.FingerprintRank, 0, len(best))
+	for _, r := range best {
 		filtered = append(filtered, r)
 	}
-	if len(filtered) == 0 {
-		return 0, nil
-	}
 	if err := a.Panel.SyncPingRanks(ctx, filtered); err != nil {
-		return 0, err
+		return 0, source, err
 	}
-	return len(filtered), nil
+	return len(filtered), source, nil
 }
 
 // WSUpgrade gates non-websocket requests.

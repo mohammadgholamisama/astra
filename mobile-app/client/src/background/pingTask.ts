@@ -223,7 +223,7 @@ export default async function backgroundPingTask(): Promise<void> {
   await uploadCyclePings(operator, configs, results);
   await new Promise<void>((r) => setTimeout(r, 300));
   const items = buildFingerprintRanksFromPage(ranked);
-  // Live successes only — never empty hub-window sync (avoids auto-hide)
+  // Live successes → hub merges 1h window → panel reorder (never hide)
   const sync =
     items.length > 0
       ? await pushPanelOrderNow(items)

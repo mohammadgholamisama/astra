@@ -147,14 +147,11 @@ async function uploadThenSyncPanel(
     });
 
     await new Promise<void>((r) => setTimeout(r, 200));
-    // Live items only — empty → skip panel push (never hub 15m hide path)
+    // Live successes → hub merges with 1h window → panel reorder (never hide)
     let res =
       items.length > 0
         ? await pushPanelOrderNow(items)
         : { ok: true, count: 0 as number, source: 'client' as const };
-
-    // Do NOT fall back to hub 15m window — that path can auto-hide fingerprints.
-    // Live page order must only reorder/unhide what this test ranked.
 
     if (get().testing) {
       clearPanelSyncBusy(set, { panelSyncHint: '' });
@@ -977,7 +974,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
       await uploadCyclePings(DEFAULT_OPERATOR, configs, toUpload());
 
-      // Live items only — never hub 15m window (that can auto-hide)
+      // Live successes → hub merges 1h window → panel order only (no hide)
       const res = await pushPanelOrderNow(items);
 
       if (!res.ok) {
