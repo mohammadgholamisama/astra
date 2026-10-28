@@ -720,21 +720,6 @@ export default function ConfigOrderPage() {
                     {it.protocol ? (
                       <span className="badge muted">{it.protocol}</span>
                     ) : null}
-                    {it.avg_ping != null && Number.isFinite(it.avg_ping) ? (
-                      <span
-                        className="badge ok"
-                        title={
-                          it.device_count
-                            ? `میانگین از ${toFaDigits(it.device_count)} دستگاه`
-                            : "میانگین پینگ چند دستگاه"
-                        }
-                      >
-                        ⌀ {toFaDigits(Math.round(it.avg_ping))} ms
-                        {it.device_count
-                          ? ` · ${toFaDigits(it.device_count)} دستگاه`
-                          : ""}
-                      </span>
-                    ) : null}
                     {it.hidden ? (
                       <span className="badge warn">مخفی از ساب</span>
                     ) : (

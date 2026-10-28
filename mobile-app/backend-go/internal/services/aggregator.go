@@ -15,7 +15,7 @@ import (
 
 const (
 	metaKeyPrefix = "cfg:meta:"
-	// Latest sample per device/operator/hash — TTL = window (default 15m)
+	// Best sample per device/operator/hash within the ranking window (default 1h)
 	devPingKeyPrefix = "cfg:devping:"
 	indexSetKey      = "cfg:index"
 	fpIndexKey       = "cfg:fpindex"
@@ -44,11 +44,13 @@ type configMeta struct {
 }
 
 type pingRecord struct {
-	PingMs       int64   `json:"ping_ms"`
-	DownloadKbps float64 `json:"download_kbps,omitempty"`
-	UploadKbps   float64 `json:"upload_kbps,omitempty"`
-	UpdatedAt    int64   `json:"updated_at"`
-	DeviceID     string  `json:"device_id,omitempty"`
+	PingMs        int64   `json:"ping_ms"`
+	DownloadKbps  float64 `json:"download_kbps,omitempty"`
+	UploadKbps    float64 `json:"upload_kbps,omitempty"`
+	PacketLossPct float64 `json:"packet_loss_pct,omitempty"`
+	HasPacketLoss bool    `json:"has_packet_loss,omitempty"`
+	UpdatedAt     int64   `json:"updated_at"`
+	DeviceID      string  `json:"device_id,omitempty"`
 }
 
 func cleanHost(h string) string {
@@ -65,7 +67,66 @@ func fingerprint(host string, port int, match string) string {
 	return fmt.Sprintf("%s|%d|%s", cleanHost(host), port, cleanHost(match))
 }
 
-// IngestBatch stores the latest ping per device (within TTL window).
+func recordSuccess(r pingRecord) bool {
+	pktOK := r.HasPacketLoss && r.PacketLossPct >= 0 && r.PacketLossPct < 100
+	return r.PingMs > 0 || r.DownloadKbps > 0 || r.UploadKbps > 0 || pktOK
+}
+
+// mergePingRecord keeps the better metrics in the ranking window.
+// A worse/failed new test must not wipe a good earlier sample from the same device.
+func mergePingRecord(prev, next pingRecord) pingRecord {
+	out := next
+	if prev.UpdatedAt == 0 && prev.PingMs == 0 && prev.DownloadKbps == 0 &&
+		prev.UploadKbps == 0 && !prev.HasPacketLoss {
+		return next
+	}
+	out.UpdatedAt = next.UpdatedAt
+	if next.DeviceID != "" {
+		out.DeviceID = next.DeviceID
+	} else {
+		out.DeviceID = prev.DeviceID
+	}
+
+	// Ping: lowest positive wins
+	out.PingMs = prev.PingMs
+	if next.PingMs > 0 && (prev.PingMs <= 0 || next.PingMs < prev.PingMs) {
+		out.PingMs = next.PingMs
+	}
+
+	out.DownloadKbps = prev.DownloadKbps
+	if next.DownloadKbps > prev.DownloadKbps {
+		out.DownloadKbps = next.DownloadKbps
+	}
+	out.UploadKbps = prev.UploadKbps
+	if next.UploadKbps > prev.UploadKbps {
+		out.UploadKbps = next.UploadKbps
+	}
+
+	out.HasPacketLoss = prev.HasPacketLoss
+	out.PacketLossPct = prev.PacketLossPct
+	if next.HasPacketLoss {
+		if !prev.HasPacketLoss || next.PacketLossPct < prev.PacketLossPct {
+			out.HasPacketLoss = true
+			out.PacketLossPct = next.PacketLossPct
+		}
+	}
+	return out
+}
+
+type pendingSample struct {
+	hash     string
+	op       models.Operator
+	dev      string
+	host     string
+	port     int
+	match    string
+	meta     configMeta
+	rec      pingRecord
+	pingKey  string
+	devsKey  string
+}
+
+// IngestBatch stores samples and merges with any prior result in the TTL window.
 func (a *Aggregator) IngestBatch(ctx context.Context, req models.PingBatchRequest) (int, error) {
 	if !req.Operator.Valid() {
 		return 0, fmt.Errorf("invalid operator: %s", req.Operator)
@@ -80,8 +141,8 @@ func (a *Aggregator) IngestBatch(ctx context.Context, req models.PingBatchReques
 		deviceID = "anonymous"
 	}
 
-	pipe := a.rdb.Pipeline()
-	accepted := 0
+	pending := make([]pendingSample, 0, len(req.Samples))
+	pingKeys := make([]string, 0, len(req.Samples))
 
 	for i := range req.Samples {
 		s := &req.Samples[i]
@@ -106,48 +167,96 @@ func (a *Aggregator) IngestBatch(ctx context.Context, req models.PingBatchReques
 
 		host := cleanHost(s.Host)
 		match := cleanHost(s.MatchHost)
-		meta := configMeta{
-			ConfigHash: hash,
-			Remark:     strings.TrimSpace(s.Remark),
-			Protocol:   strings.ToLower(strings.TrimSpace(s.Protocol)),
-			Transport:  strings.ToLower(strings.TrimSpace(s.Transport)),
-			Security:   strings.ToLower(strings.TrimSpace(s.Security)),
-			Host:       host,
-			Port:       s.Port,
-			MatchHost:  match,
+		hasPacket := s.HasPacketLoss
+		loss := s.PacketLossPct
+		if hasPacket {
+			if loss < 0 {
+				loss = 0
+			}
+			if loss > 100 {
+				loss = 100
+			}
+		} else {
+			loss = 0
 		}
-		metaBytes, err := json.Marshal(meta)
-		if err != nil {
-			continue
-		}
-
 		rec := pingRecord{
-			PingMs:       s.PingMs,
-			DownloadKbps: s.DownloadKbps,
-			UploadKbps:   s.UploadKbps,
-			UpdatedAt:    s.MeasuredAt,
-			DeviceID:     dev,
+			PingMs:        s.PingMs,
+			DownloadKbps:  s.DownloadKbps,
+			UploadKbps:    s.UploadKbps,
+			PacketLossPct: loss,
+			HasPacketLoss: hasPacket,
+			UpdatedAt:     s.MeasuredAt,
+			DeviceID:      dev,
 		}
-		recBytes, err := json.Marshal(rec)
+		pk := devPingKey(hash, op, dev)
+		pending = append(pending, pendingSample{
+			hash:    hash,
+			op:      op,
+			dev:     dev,
+			host:    host,
+			port:    s.Port,
+			match:   match,
+			meta: configMeta{
+				ConfigHash: hash,
+				Remark:     strings.TrimSpace(s.Remark),
+				Protocol:   strings.ToLower(strings.TrimSpace(s.Protocol)),
+				Transport:  strings.ToLower(strings.TrimSpace(s.Transport)),
+				Security:   strings.ToLower(strings.TrimSpace(s.Security)),
+				Host:       host,
+				Port:       s.Port,
+				MatchHost:  match,
+			},
+			rec:     rec,
+			pingKey: pk,
+			devsKey: devIndexKey(hash, op),
+		})
+		pingKeys = append(pingKeys, pk)
+	}
+
+	if len(pending) == 0 {
+		return 0, fmt.Errorf("no valid samples")
+	}
+
+	prevRaw, err := a.rdb.MGet(ctx, pingKeys...).Result()
+	if err != nil && err != redis.Nil {
+		return 0, fmt.Errorf("redis mget: %w", err)
+	}
+
+	pipe := a.rdb.Pipeline()
+	accepted := 0
+	for i := range pending {
+		p := &pending[i]
+		if i < len(prevRaw) && prevRaw[i] != nil {
+			if raw, ok := prevRaw[i].(string); ok && raw != "" {
+				var prev pingRecord
+				if json.Unmarshal([]byte(raw), &prev) == nil {
+					p.rec = mergePingRecord(prev, p.rec)
+				}
+			}
+		}
+		metaBytes, err := json.Marshal(p.meta)
+		if err != nil {
+			continue
+		}
+		recBytes, err := json.Marshal(p.rec)
 		if err != nil {
 			continue
 		}
 
-		devsKey := devIndexKey(hash, op)
-		pipe.Set(ctx, metaKey(hash), metaBytes, a.ttl)
-		pipe.Set(ctx, devPingKey(hash, op, dev), recBytes, a.ttl)
-		pipe.SAdd(ctx, devsKey, dev)
-		pipe.Expire(ctx, devsKey, a.ttl)
-		pipe.SAdd(ctx, indexSetKey, hash)
-		pipe.SAdd(ctx, activeOpsKey, string(op))
+		pipe.Set(ctx, metaKey(p.hash), metaBytes, a.ttl)
+		pipe.Set(ctx, p.pingKey, recBytes, a.ttl)
+		pipe.SAdd(ctx, p.devsKey, p.dev)
+		pipe.Expire(ctx, p.devsKey, a.ttl)
+		pipe.SAdd(ctx, indexSetKey, p.hash)
+		pipe.SAdd(ctx, activeOpsKey, string(p.op))
 		pipe.Expire(ctx, indexSetKey, a.ttl*2)
 		pipe.Expire(ctx, activeOpsKey, a.ttl*2)
 
-		if host != "" && s.Port >= 1 && s.Port <= 65535 {
-			fp := fingerprint(host, s.Port, match)
+		if p.host != "" && p.port >= 1 && p.port <= 65535 {
+			fp := fingerprint(p.host, p.port, p.match)
 			pipe.SAdd(ctx, fpIndexKey, fp)
 			pipe.Expire(ctx, fpIndexKey, a.ttl*2)
-			pipe.SAdd(ctx, fpHashesKey(fp), hash)
+			pipe.SAdd(ctx, fpHashesKey(fp), p.hash)
 			pipe.Expire(ctx, fpHashesKey(fp), a.ttl*2)
 		}
 		accepted++
@@ -345,10 +454,11 @@ func (a *Aggregator) RankedFingerprints(ctx context.Context) ([]models.Fingerpri
 			continue
 		}
 
-		// deviceID → best positive ping / speed; also track devices that only failed
+		// deviceID → best positive ping / speed / lowest packet loss
 		bestByDevice := map[string]float64{}
 		bestDlByDevice := map[string]float64{}
 		bestUlByDevice := map[string]float64{}
+		bestLossByDevice := map[string]float64{}
 		failedDevices := map[string]struct{}{}
 		var label string
 		var sampleN int
@@ -383,16 +493,21 @@ func (a *Aggregator) RankedFingerprints(ctx context.Context) ([]models.Fingerpri
 					if id == "" {
 						id = dev
 					}
-					if rec.PingMs <= 0 {
+					if !recordSuccess(rec) {
 						if _, ok := bestByDevice[id]; !ok {
 							failedDevices[id] = struct{}{}
 						}
 						continue
 					}
 					delete(failedDevices, id)
-					ms := float64(rec.PingMs)
-					if prev, ok := bestByDevice[id]; !ok || ms < prev {
-						bestByDevice[id] = ms
+					if rec.PingMs > 0 {
+						ms := float64(rec.PingMs)
+						if prev, ok := bestByDevice[id]; !ok || ms < prev {
+							bestByDevice[id] = ms
+						}
+					} else if _, ok := bestByDevice[id]; !ok {
+						// Speed/packet-only success — count device without ping
+						bestByDevice[id] = 0
 					}
 					if rec.DownloadKbps > 0 {
 						if prev, ok := bestDlByDevice[id]; !ok || rec.DownloadKbps > prev {
@@ -404,17 +519,30 @@ func (a *Aggregator) RankedFingerprints(ctx context.Context) ([]models.Fingerpri
 							bestUlByDevice[id] = rec.UploadKbps
 						}
 					}
+					if rec.HasPacketLoss && rec.PacketLossPct >= 0 && rec.PacketLossPct <= 100 {
+						if prev, ok := bestLossByDevice[id]; !ok || rec.PacketLossPct < prev {
+							bestLossByDevice[id] = rec.PacketLossPct
+						}
+					}
 				}
 			}
 		}
 
 		avg := -1.0
+		pingDevices := 0
 		if len(bestByDevice) > 0 {
 			var sum float64
 			for _, ms := range bestByDevice {
-				sum += ms
+				if ms > 0 {
+					sum += ms
+					pingDevices++
+				}
 			}
-			avg = math.Round((sum/float64(len(bestByDevice)))*10) / 10
+			if pingDevices > 0 {
+				avg = math.Round((sum/float64(pingDevices))*10) / 10
+			} else {
+				avg = 0
+			}
 		}
 		avgDl := 0.0
 		if len(bestDlByDevice) > 0 {
@@ -432,6 +560,16 @@ func (a *Aggregator) RankedFingerprints(ctx context.Context) ([]models.Fingerpri
 			}
 			avgUl = math.Round((sum/float64(len(bestUlByDevice)))*10) / 10
 		}
+		avgLoss := 0.0
+		hasLoss := false
+		if len(bestLossByDevice) > 0 {
+			var sum float64
+			for _, v := range bestLossByDevice {
+				sum += v
+			}
+			avgLoss = math.Round((sum/float64(len(bestLossByDevice)))*10) / 10
+			hasLoss = true
+		}
 		out = append(out, models.FingerprintRank{
 			Host:            host,
 			Port:            port,
@@ -440,6 +578,8 @@ func (a *Aggregator) RankedFingerprints(ctx context.Context) ([]models.Fingerpri
 			AvgPing:         avg,
 			DownloadKbps:    avgDl,
 			UploadKbps:      avgUl,
+			PacketLossPct:   avgLoss,
+			HasPacketLoss:   hasLoss,
 			SampleCount:     sampleN,
 			DeviceCount:     len(bestByDevice),
 			FailDeviceCount: len(failedDevices),

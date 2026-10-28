@@ -33,8 +33,8 @@ func NewPanelSyncService(cfg *config.Config) *PanelSyncService {
 	}
 }
 
-// SyncPingRanks reorders Astra config-order by avg ping (host/port/domain).
-// Only positive averages are sent — failures never move panel ranks.
+// SyncPingRanks pushes successful fingerprint ranks to Astra config-order.
+// Quality order (packet → speed → ping) is applied before POST; failures omitted.
 func (s *PanelSyncService) SyncPingRanks(ctx context.Context, ranks []models.FingerprintRank) error {
 	if !s.enabled {
 		return nil
@@ -55,7 +55,6 @@ func (s *PanelSyncService) SyncPingRanks(ctx context.Context, ranks []models.Fin
 		if host == "" || r.Port < 1 || r.Port > 65535 {
 			continue
 		}
-		// Keep failures too (avg<=0) so Astra can auto-hide dead fingerprints
 		match := strings.TrimSpace(strings.ToLower(r.MatchHost))
 		key := fmt.Sprintf("%s|%d|%s", host, r.Port, match)
 		label := strings.TrimSpace(r.Label)
@@ -78,41 +77,48 @@ func (s *PanelSyncService) SyncPingRanks(ctx context.Context, ranks []models.Fin
 			AvgPing:         r.AvgPing,
 			DownloadKbps:    r.DownloadKbps,
 			UploadKbps:      r.UploadKbps,
+			PacketLossPct:   r.PacketLossPct,
+			HasPacketLoss:   r.HasPacketLoss,
 			SampleCount:     sampleN,
 			DeviceCount:     devN,
 			FailDeviceCount: r.FailDeviceCount,
+		}
+		candPacketOK := cand.HasPacketLoss && cand.PacketLossPct >= 0 && cand.PacketLossPct < 100
+		candOK := cand.AvgPing > 0 || cand.DownloadKbps > 0 || cand.UploadKbps > 0 || candPacketOK
+		if !candOK {
+			continue
 		}
 		prev, ok := best[key]
 		if !ok {
 			best[key] = cand
 			continue
 		}
-		// Prefer successful ping; among successes keep better ping and merge speeds
-		if cand.AvgPing > 0 && prev.AvgPing <= 0 {
-			best[key] = cand
-		} else if cand.AvgPing > 0 && prev.AvgPing > 0 {
-			merged := prev
-			if cand.AvgPing < prev.AvgPing {
-				merged.AvgPing = cand.AvgPing
-			}
-			if cand.DownloadKbps > merged.DownloadKbps {
-				merged.DownloadKbps = cand.DownloadKbps
-			}
-			if cand.UploadKbps > merged.UploadKbps {
-				merged.UploadKbps = cand.UploadKbps
-			}
-			if cand.DeviceCount > merged.DeviceCount {
-				merged.DeviceCount = cand.DeviceCount
-			}
-			if cand.Label != "" && merged.Label == "" {
-				merged.Label = cand.Label
-			}
-			best[key] = merged
-		} else if cand.AvgPing <= 0 && prev.AvgPing <= 0 {
-			if cand.FailDeviceCount > prev.FailDeviceCount {
-				best[key] = cand
+		merged := prev
+		if cand.AvgPing > 0 && (prev.AvgPing <= 0 || cand.AvgPing < prev.AvgPing) {
+			merged.AvgPing = cand.AvgPing
+		}
+		if cand.DownloadKbps > merged.DownloadKbps {
+			merged.DownloadKbps = cand.DownloadKbps
+		}
+		if cand.UploadKbps > merged.UploadKbps {
+			merged.UploadKbps = cand.UploadKbps
+		}
+		if cand.HasPacketLoss {
+			if !merged.HasPacketLoss || cand.PacketLossPct < merged.PacketLossPct {
+				merged.HasPacketLoss = true
+				merged.PacketLossPct = cand.PacketLossPct
 			}
 		}
+		if cand.DeviceCount > merged.DeviceCount {
+			merged.DeviceCount = cand.DeviceCount
+		}
+		if cand.SampleCount > merged.SampleCount {
+			merged.SampleCount = cand.SampleCount
+		}
+		if cand.Label != "" && merged.Label == "" {
+			merged.Label = cand.Label
+		}
+		best[key] = merged
 	}
 	if len(best) == 0 {
 		return fmt.Errorf("no fingerprint ranks to sync")

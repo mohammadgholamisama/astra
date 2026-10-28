@@ -7,10 +7,10 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 User=root
-# Keep a remote shell session; more reliable than -N across flaky Iran paths.
-ExecStart=/usr/bin/ssh -i /root/.ssh/astra_sub_rtunnel -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ConnectTimeout=25 -o TCPKeepAlive=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/root/.ssh/known_hosts -o BatchMode=yes -R 127.0.0.1:18081:127.0.0.1:2086 root@5.202.8.221 sleep infinity
+ExecStart=/usr/local/bin/astra-sub-rtunnel-run
 Restart=always
-RestartSec=5
+RestartSec=3
+TimeoutStartSec=40
 
 [Install]
 WantedBy=multi-user.target

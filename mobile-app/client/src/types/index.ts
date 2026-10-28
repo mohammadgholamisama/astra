@@ -35,6 +35,8 @@ export interface LocalPingResult {
   downloadKbps?: number;
   /** kbps; −1 = not measured / fail */
   uploadKbps?: number;
+  /** 0–100; −1 = not measured / fail */
+  packetLossPct?: number;
 }
 
 export interface OperatorPing {
@@ -59,6 +61,8 @@ export interface RankedConfig {
   avg_ping: number;
   download_kbps?: number;
   upload_kbps?: number;
+  /** 0–100; −1 = fail / unset */
+  packet_loss_pct?: number;
   /** True after a ping attempt finished (success or fail). */
   measured?: boolean;
   raw?: string;
@@ -82,6 +86,8 @@ export interface PingSamplePayload {
   ping_ms: number;
   download_kbps?: number;
   upload_kbps?: number;
+  packet_loss_pct?: number;
+  has_packet_loss?: boolean;
   remark?: string;
   protocol?: string;
   transport?: string;

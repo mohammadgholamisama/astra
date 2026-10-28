@@ -183,6 +183,10 @@ async def lifespan(_app: FastAPI):
         await refresh_config_locations(db)
         await refresh_config_hides(db)
         await refresh_config_orders(db)
+        # Undo mass hides from older ping-rank bug (once per install)
+        from app.services.config_hides import clear_stale_ping_auto_hides_once
+
+        await clear_stale_ping_auto_hides_once(db)
     usage_task = asyncio.create_task(_usage_sync_loop(), name="astra-usage-sync")
     heal_task = asyncio.create_task(
         _heal_failed_panels_loop(), name="astra-heal-panels"

@@ -242,6 +242,8 @@ export interface User {
   subscription_url: string;
   links: string[];
   group_ids: number[];
+  /** Bound sales category — auto-syncs when category groups change */
+  source_category_id?: number | null;
   panel_accounts: PanelAccount[];
   created_at?: string;
 }

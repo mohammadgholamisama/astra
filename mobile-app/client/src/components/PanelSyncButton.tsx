@@ -22,7 +22,6 @@ export function PanelSyncButton({
     !okHint &&
     (hint.includes('ناموفق') ||
       hint.includes('خطا') ||
-      hint.includes('منطبق') ||
       hint.includes('اول تست'));
 
   const handlePress = () => {
@@ -55,7 +54,7 @@ export function PanelSyncButton({
             {busy
               ? hint || 'صبر کن — اسپینر تا پایان درخواست می‌چرخد'
               : hint ||
-                'میانگین ۱۵د · هاست/پورت/دامنه · فقط موفق‌ها جابه‌جا می‌شوند'}
+                'ترتیب همین تست · هاست/پورت/دامنه · موفق‌ها اعمال می‌شوند'}
           </Text>
         </View>
         {busy ? (

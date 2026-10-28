@@ -39,22 +39,24 @@ func (o Operator) LabelFA() string {
 	}
 }
 
-// PingSample is one real-delay (+ optional speed) measurement from a phone.
+// PingSample is one real-delay (+ optional speed / packet-loss) measurement from a phone.
 type PingSample struct {
-	ConfigHash   string   `json:"config_hash"`
-	Operator     Operator `json:"operator"`
-	PingMs       int64    `json:"ping_ms"` // -1 = timeout / unreachable
-	DownloadKbps float64  `json:"download_kbps,omitempty"`
-	UploadKbps   float64  `json:"upload_kbps,omitempty"`
-	Remark       string   `json:"remark,omitempty"`
-	Protocol     string   `json:"protocol,omitempty"`
-	Transport    string   `json:"transport,omitempty"`
-	Security     string   `json:"security,omitempty"`
-	Host         string   `json:"host,omitempty"`
-	Port         int      `json:"port,omitempty"`
-	MatchHost    string   `json:"match_host,omitempty"` // SNI / peer used by Astra order API
-	DeviceID     string   `json:"device_id,omitempty"`
-	MeasuredAt   int64    `json:"measured_at,omitempty"` // unix ms; server fills if 0
+	ConfigHash    string   `json:"config_hash"`
+	Operator      Operator `json:"operator"`
+	PingMs        int64    `json:"ping_ms"` // -1 = timeout / unreachable
+	DownloadKbps  float64  `json:"download_kbps,omitempty"`
+	UploadKbps    float64  `json:"upload_kbps,omitempty"`
+	PacketLossPct float64  `json:"packet_loss_pct,omitempty"` // 0..100
+	HasPacketLoss bool     `json:"has_packet_loss,omitempty"` // true when packet was measured (incl. 0%)
+	Remark        string   `json:"remark,omitempty"`
+	Protocol      string   `json:"protocol,omitempty"`
+	Transport     string   `json:"transport,omitempty"`
+	Security      string   `json:"security,omitempty"`
+	Host          string   `json:"host,omitempty"`
+	Port          int      `json:"port,omitempty"`
+	MatchHost     string   `json:"match_host,omitempty"` // SNI / peer used by Astra order API
+	DeviceID      string   `json:"device_id,omitempty"`
+	MeasuredAt    int64    `json:"measured_at,omitempty"` // unix ms; server fills if 0
 }
 
 // PingBatchRequest is posted by the mobile app after a test cycle.
@@ -100,6 +102,8 @@ type FingerprintRank struct {
 	AvgPing         float64 `json:"avg_ping"`
 	DownloadKbps    float64 `json:"download_kbps,omitempty"`
 	UploadKbps      float64 `json:"upload_kbps,omitempty"`
+	PacketLossPct   float64 `json:"packet_loss_pct,omitempty"` // 0..100 avg; 0 may mean unset
+	HasPacketLoss   bool    `json:"has_packet_loss,omitempty"`
 	SampleCount     int     `json:"sample_count"`
 	DeviceCount     int     `json:"device_count"`
 	FailDeviceCount int     `json:"fail_device_count,omitempty"`

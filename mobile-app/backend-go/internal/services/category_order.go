@@ -31,17 +31,36 @@ func detectCategory(label string) string {
 	return "other"
 }
 
+func lossSortKey(it models.FingerprintRank) float64 {
+	if !it.HasPacketLoss {
+		return 101
+	}
+	if it.PacketLossPct < 0 {
+		return 101
+	}
+	return it.PacketLossPct
+}
+
 // arrangeFingerprintSlots: 5 مستقیم → 5 تانل → 5 گیمینگ → rest by quality.
-// Failures (avg<=0) stay after successful items.
+// Success = positive ping OR speed OR packet loss < 100%.
+// Quality: devices → packet loss ↑ → download ↓ → upload ↓ → ping ↑
 func arrangeFingerprintSlots(items []models.FingerprintRank) []models.FingerprintRank {
 	ok := make([]models.FingerprintRank, 0, len(items))
 	rest := make([]models.FingerprintRank, 0)
 	for _, it := range items {
-		if it.AvgPing > 0 {
+		packetOk := it.HasPacketLoss && it.PacketLossPct >= 0 && it.PacketLossPct < 100
+		if it.AvgPing > 0 || it.DownloadKbps > 0 || it.UploadKbps > 0 || packetOk {
 			ok = append(ok, it)
 		} else {
 			rest = append(rest, it)
 		}
+	}
+
+	pingKey := func(p float64) float64 {
+		if p > 0 {
+			return p
+		}
+		return 1e18
 	}
 
 	quality := func(a, b models.FingerprintRank) bool {
@@ -55,17 +74,19 @@ func arrangeFingerprintSlots(items []models.FingerprintRank) []models.Fingerprin
 		if da != db {
 			return da > db
 		}
-		// Prefer download/upload when present on either side
-		if a.DownloadKbps > 0 || b.DownloadKbps > 0 || a.UploadKbps > 0 || b.UploadKbps > 0 {
-			if a.DownloadKbps != b.DownloadKbps {
-				return a.DownloadKbps > b.DownloadKbps
-			}
-			if a.UploadKbps != b.UploadKbps {
-				return a.UploadKbps > b.UploadKbps
-			}
+		la, lb := lossSortKey(a), lossSortKey(b)
+		if la != lb {
+			return la < lb
 		}
-		if a.AvgPing != b.AvgPing {
-			return a.AvgPing < b.AvgPing
+		if a.DownloadKbps != b.DownloadKbps {
+			return a.DownloadKbps > b.DownloadKbps
+		}
+		if a.UploadKbps != b.UploadKbps {
+			return a.UploadKbps > b.UploadKbps
+		}
+		pa, pb := pingKey(a.AvgPing), pingKey(b.AvgPing)
+		if pa != pb {
+			return pa < pb
 		}
 		if a.Host != b.Host {
 			return a.Host < b.Host

@@ -6,15 +6,15 @@ import org.json.JSONObject
 import java.net.URLDecoder
 
 /**
- * Builds a minimal Xray JSON config from a share link for Libv2ray.measureOutboundDelay.
- * Supports vless (incl. Reality), vmess, trojan, ss.
+ * Builds Xray JSON for Libv2ray.measureOutboundDelay — aligned with v2rayNG
+ * getV2rayConfig4Speedtest outbound shape (minimal: outbounds + freedom).
  */
 object XrayConfigBuilder {
 
   fun fromShareLink(link: String): String? {
     val outbound = outboundFromShareLink(link) ?: return null
     return JSONObject()
-      .put("log", JSONObject().put("loglevel", "warning"))
+      .put("log", JSONObject().put("loglevel", "error"))
       .put(
         "outbounds",
         JSONArray()
@@ -24,7 +24,6 @@ object XrayConfigBuilder {
       .toString()
   }
 
-  /** Full config with local SOCKS inbound for download/upload speed tests. */
   fun fromShareLinkWithSocks(link: String, socksPort: Int): String? {
     val outbound = outboundFromShareLink(link) ?: return null
     val port = socksPort.coerceIn(1025, 65535)
@@ -39,7 +38,7 @@ object XrayConfigBuilder {
           JSONObject().put("udp", false).put("auth", "noauth"),
         )
     return JSONObject()
-      .put("log", JSONObject().put("loglevel", "warning"))
+      .put("log", JSONObject().put("loglevel", "error"))
       .put("inbounds", JSONArray().put(inbound))
       .put(
         "outbounds",
@@ -63,12 +62,27 @@ object XrayConfigBuilder {
     }
   }
 
+  private fun normalizeNetwork(raw: String): String {
+    return when (raw.lowercase()) {
+      "raw", "tcp" -> "tcp"
+      "h2", "http" -> "h2"
+      "httpupgrade" -> "httpupgrade"
+      "xhttp", "splithttp" -> "xhttp"
+      "ws", "websocket" -> "ws"
+      "grpc" -> "grpc"
+      "kcp", "mkcp" -> "kcp"
+      "quic" -> "quic"
+      else -> raw.lowercase().ifBlank { "tcp" }
+    }
+  }
+
   private fun parseVless(link: String): JSONObject? {
     val noHash = link.substringBefore('#')
     val body = noHash.removePrefix("vless://").removePrefix("VLESS://")
     val at = body.lastIndexOf('@')
     if (at < 0) return null
-    val uuid = body.substring(0, at)
+    val uuid = decode(body.substring(0, at)).trim()
+    if (uuid.isEmpty()) return null
     val hostPart = body.substring(at + 1)
     val qIdx = hostPart.indexOf('?')
     val main = if (qIdx >= 0) hostPart.substring(0, qIdx) else hostPart
@@ -78,95 +92,74 @@ object XrayConfigBuilder {
     val address = main.substring(0, colon).trim('[', ']')
     val port = main.substring(colon + 1).toIntOrNull() ?: return null
 
-    val network = (query["type"] ?: query["net"] ?: "tcp").lowercase()
+    val network = normalizeNetwork(query["type"] ?: query["net"] ?: "tcp")
     var security = (query["security"] ?: query["tls"] ?: "none").lowercase()
-    if (query.containsKey("pbk") || query.containsKey("sid")) security = "reality"
-    val sni = query["sni"] ?: query["host"] ?: address
+    if (security == "xtls") security = "reality"
+    if (!query["pbk"].isNullOrBlank() || !query["sid"].isNullOrBlank()) {
+      security = "reality"
+    }
+    val sni = query["sni"] ?: query["peer"] ?: address
+    val headerHost = query["host"] ?: sni
     val flow = query["flow"] ?: ""
+    val alpn = query["alpn"]
+    val fp = query["fp"] ?: if (security == "reality" || security == "tls") "chrome" else ""
 
     val stream = JSONObject().put("network", network).put("security", security)
     when (security) {
       "reality" -> {
-        stream.put(
-          "realitySettings",
+        val pbk = query["pbk"] ?: return null
+        if (pbk.isBlank()) return null
+        val reality =
           JSONObject()
             .put("serverName", sni)
-            .put("fingerprint", query["fp"] ?: "chrome")
-            .put("publicKey", query["pbk"] ?: "")
+            .put("fingerprint", fp.ifBlank { "chrome" })
+            .put("publicKey", pbk)
             .put("shortId", query["sid"] ?: "")
-            .put("spiderX", query["spx"] ?: "/")
-            .put("show", false),
-        )
+            .put("spiderX", query["spx"] ?: "")
+            .put("show", false)
+        stream.put("realitySettings", reality)
       }
       "tls" -> {
-        stream.put(
-          "tlsSettings",
+        val tls =
           JSONObject()
             .put("serverName", sni)
-            .put("allowInsecure", query["allowInsecure"] == "1")
-            .put("fingerprint", query["fp"] ?: ""),
-        )
+            .put(
+              "allowInsecure",
+              query["allowInsecure"] == "1" ||
+                query["insecure"] == "1" ||
+                query["allowInsecure"] == "true",
+            )
+        if (fp.isNotBlank()) tls.put("fingerprint", fp)
+        putAlpn(tls, alpn)
+        stream.put("tlsSettings", tls)
       }
     }
-    when (network) {
-      "ws" -> stream.put(
-        "wsSettings",
-        JSONObject()
-          .put("path", query["path"] ?: "/")
-          .put("headers", JSONObject().put("Host", query["host"] ?: sni)),
-      )
-      "grpc" -> stream.put(
-        "grpcSettings",
-        JSONObject().put("serviceName", query["serviceName"] ?: query["path"] ?: ""),
-      )
-      "tcp" -> {
-        if ((query["headerType"] ?: "") == "http") {
-          stream.put(
-            "tcpSettings",
-            JSONObject().put(
-              "header",
-              JSONObject()
-                .put("type", "http")
-                .put(
-                  "request",
-                  JSONObject().put(
-                    "headers",
-                    JSONObject().put("Host", JSONArray().put(query["host"] ?: sni)),
-                  ),
-                ),
-            ),
-          )
-        }
-      }
-      "httpupgrade", "xhttp", "splithttp" -> {
-        stream.put(
-          "httpupgradeSettings",
-          JSONObject()
-            .put("path", query["path"] ?: "/")
-            .put("host", query["host"] ?: sni),
-        )
-      }
-    }
+    applyTransport(stream, network, query, headerHost, sni)
 
-    val user = JSONObject()
-      .put("id", uuid)
-      .put("encryption", "none")
-      .put("flow", flow)
+    val user =
+      JSONObject()
+        .put("id", uuid)
+        .put("encryption", query["encryption"] ?: "none")
+    if (flow.isNotBlank()) user.put("flow", flow)
+
+    val settings =
+      JSONObject().put(
+        "vnext",
+        JSONArray().put(
+          JSONObject()
+            .put("address", address)
+            .put("port", port)
+            .put("users", JSONArray().put(user)),
+        ),
+      )
+    val pe = query["packetEncoding"]
+    if (!pe.isNullOrBlank() && pe != "none") {
+      settings.put("packetEncoding", pe)
+    }
 
     return JSONObject()
       .put("protocol", "vless")
-      .put(
-        "settings",
-        JSONObject().put(
-          "vnext",
-          JSONArray().put(
-            JSONObject()
-              .put("address", address)
-              .put("port", port)
-              .put("users", JSONArray().put(user)),
-          ),
-        ),
-      )
+      .put("settings", settings)
       .put("streamSettings", stream)
       .put("tag", "proxy")
   }
@@ -183,29 +176,36 @@ object XrayConfigBuilder {
     val port = json.optInt("port", 0)
     val id = json.optString("id")
     if (address.isEmpty() || port <= 0 || id.isEmpty()) return null
-    val network = json.optString("net", "tcp").ifEmpty { "tcp" }
+    val network = normalizeNetwork(json.optString("net", "tcp").ifEmpty { "tcp" })
     val tls = json.optString("tls")
     val security = when {
-      tls == "tls" || tls == "1" -> "tls"
+      tls.equals("tls", true) || tls == "1" -> "tls"
+      tls.equals("reality", true) -> "reality"
       else -> "none"
     }
-    val sni = json.optString("sni").ifEmpty { json.optString("host") }
+    val sni = json.optString("sni").ifEmpty { json.optString("host") }.ifEmpty { address }
     val path = json.optString("path")
-    val host = json.optString("host")
+    val host = json.optString("host").ifEmpty { sni }
+    val fp = json.optString("fp").ifEmpty { if (security == "tls") "chrome" else "" }
 
     val stream = JSONObject().put("network", network).put("security", security)
     if (security == "tls") {
-      stream.put(
-        "tlsSettings",
-        JSONObject().put("serverName", sni).put("allowInsecure", false),
-      )
+      val tlsObj =
+        JSONObject()
+          .put("serverName", sni)
+          .put("allowInsecure", false)
+      if (fp.isNotBlank()) tlsObj.put("fingerprint", fp)
+      stream.put("tlsSettings", tlsObj)
     }
-    if (network == "ws") {
-      stream.put(
-        "wsSettings",
-        JSONObject().put("path", path).put("headers", JSONObject().put("Host", host)),
+    val q =
+      mapOf(
+        "path" to path,
+        "host" to host,
+        "type" to network,
+        "headerType" to json.optString("type"),
+        "serviceName" to json.optString("path"),
       )
-    }
+    applyTransport(stream, network, q, host, sni)
 
     return JSONObject()
       .put("protocol", "vmess")
@@ -223,7 +223,7 @@ object XrayConfigBuilder {
                   JSONObject()
                     .put("id", id)
                     .put("alterId", json.optInt("aid", 0))
-                    .put("security", "auto"),
+                    .put("security", json.optString("scy").ifEmpty { "auto" }),
                 ),
               ),
           ),
@@ -238,7 +238,7 @@ object XrayConfigBuilder {
     val body = noHash.removePrefix("trojan://").removePrefix("TROJAN://")
     val at = body.lastIndexOf('@')
     if (at < 0) return null
-    val password = body.substring(0, at)
+    val password = decode(body.substring(0, at))
     val hostPart = body.substring(at + 1)
     val qIdx = hostPart.indexOf('?')
     val main = if (qIdx >= 0) hostPart.substring(0, qIdx) else hostPart
@@ -247,24 +247,26 @@ object XrayConfigBuilder {
     if (colon < 0) return null
     val address = main.substring(0, colon).trim('[', ']')
     val port = main.substring(colon + 1).toIntOrNull() ?: return null
-    val network = (query["type"] ?: "tcp").lowercase()
+    val network = normalizeNetwork(query["type"] ?: "tcp")
     val sni = query["sni"] ?: query["peer"] ?: address
+    val headerHost = query["host"] ?: sni
+    val fp = query["fp"] ?: "chrome"
 
-    val stream = JSONObject()
-      .put("network", network)
-      .put("security", "tls")
-      .put(
-        "tlsSettings",
-        JSONObject().put("serverName", sni).put("allowInsecure", false),
-      )
-    if (network == "ws") {
-      stream.put(
-        "wsSettings",
-        JSONObject()
-          .put("path", query["path"] ?: "/")
-          .put("headers", JSONObject().put("Host", query["host"] ?: sni)),
-      )
-    }
+    val stream =
+      JSONObject()
+        .put("network", network)
+        .put("security", "tls")
+    val tls =
+      JSONObject()
+        .put("serverName", sni)
+        .put(
+          "allowInsecure",
+          query["allowInsecure"] == "1" || query["insecure"] == "1",
+        )
+        .put("fingerprint", fp)
+    putAlpn(tls, query["alpn"])
+    stream.put("tlsSettings", tls)
+    applyTransport(stream, network, query, headerHost, sni)
 
     return JSONObject()
       .put("protocol", "trojan")
@@ -286,6 +288,14 @@ object XrayConfigBuilder {
 
   private fun parseShadowsocks(link: String): JSONObject? {
     var raw = link.removePrefix("ss://").removePrefix("SS://").substringBefore('#')
+    val query: Map<String, String>
+    if (raw.contains('?')) {
+      val qi = raw.indexOf('?')
+      query = parseQuery(raw.substring(qi + 1))
+      raw = raw.substring(0, qi)
+    } else {
+      query = emptyMap()
+    }
     if (!raw.contains('@')) {
       raw = try {
         String(Base64.decode(padB64(raw), Base64.DEFAULT))
@@ -296,7 +306,7 @@ object XrayConfigBuilder {
     val at = raw.lastIndexOf('@')
     if (at < 0) return null
     val userInfo = raw.substring(0, at)
-    val hostPort = raw.substring(at + 1).substringBefore('?')
+    val hostPort = raw.substring(at + 1).substringBefore('/')
     val colon = hostPort.lastIndexOf(':')
     if (colon < 0) return null
     val address = hostPort.substring(0, colon).trim('[', ']')
@@ -318,22 +328,145 @@ object XrayConfigBuilder {
       password = p.getOrElse(1) { "" }
     }
 
-    return JSONObject()
-      .put("protocol", "shadowsocks")
-      .put(
-        "settings",
-        JSONObject().put(
-          "servers",
-          JSONArray().put(
-            JSONObject()
-              .put("address", address)
-              .put("port", port)
-              .put("method", method)
-              .put("password", password),
+    val outbound =
+      JSONObject()
+        .put("protocol", "shadowsocks")
+        .put(
+          "settings",
+          JSONObject().put(
+            "servers",
+            JSONArray().put(
+              JSONObject()
+                .put("address", address)
+                .put("port", port)
+                .put("method", method)
+                .put("password", password),
+            ),
           ),
-        ),
-      )
-      .put("tag", "proxy")
+        )
+        .put("tag", "proxy")
+
+    val network = normalizeNetwork(query["type"] ?: query["net"] ?: "")
+    if (network.isNotBlank() && network != "tcp") {
+      val security = (query["security"] ?: "none").lowercase()
+      val sni = query["sni"] ?: query["host"] ?: address
+      val stream = JSONObject().put("network", network).put("security", security)
+      if (security == "tls") {
+        stream.put(
+          "tlsSettings",
+          JSONObject()
+            .put("serverName", sni)
+            .put("allowInsecure", query["allowInsecure"] == "1"),
+        )
+      }
+      applyTransport(stream, network, query, query["host"] ?: sni, sni)
+      outbound.put("streamSettings", stream)
+    }
+    return outbound
+  }
+
+  private fun applyTransport(
+    stream: JSONObject,
+    network: String,
+    query: Map<String, String>,
+    headerHost: String,
+    sni: String,
+  ) {
+    when (network) {
+      "ws" ->
+        stream.put(
+          "wsSettings",
+          JSONObject()
+            .put("path", query["path"] ?: "/")
+            .put("headers", JSONObject().put("Host", headerHost)),
+        )
+      "grpc" ->
+        stream.put(
+          "grpcSettings",
+          JSONObject()
+            .put("serviceName", query["serviceName"] ?: query["path"] ?: "")
+            .put("multiMode", query["mode"] == "multi"),
+        )
+      "tcp" -> {
+        if ((query["headerType"] ?: query["type"] ?: "") == "http") {
+          stream.put(
+            "tcpSettings",
+            JSONObject().put(
+              "header",
+              JSONObject()
+                .put("type", "http")
+                .put(
+                  "request",
+                  JSONObject().put(
+                    "headers",
+                    JSONObject().put("Host", JSONArray().put(headerHost)),
+                  ),
+                ),
+            ),
+          )
+        }
+      }
+      "httpupgrade" ->
+        stream.put(
+          "httpupgradeSettings",
+          JSONObject()
+            .put("path", query["path"] ?: "/")
+            .put("host", headerHost),
+        )
+      "xhttp" ->
+        stream.put(
+          "xhttpSettings",
+          JSONObject()
+            .put("path", query["path"] ?: "/")
+            .put("host", headerHost)
+            .put("mode", query["mode"] ?: "auto"),
+        )
+      "h2" ->
+        stream.put(
+          "httpSettings",
+          JSONObject()
+            .put("path", query["path"] ?: "/")
+            .put("host", JSONArray().put(headerHost)),
+        )
+      "kcp" ->
+        stream.put(
+          "kcpSettings",
+          JSONObject()
+            .put("mtu", 1350)
+            .put("tti", 50)
+            .put("uplinkCapacity", 12)
+            .put("downlinkCapacity", 100)
+            .put("congestion", false)
+            .put("readBufferSize", 2)
+            .put("writeBufferSize", 2)
+            .put(
+              "header",
+              JSONObject().put("type", query["headerType"] ?: "none"),
+            )
+            .put("seed", query["seed"] ?: query["path"] ?: ""),
+        )
+      "quic" ->
+        stream.put(
+          "quicSettings",
+          JSONObject()
+            .put("security", query["quicSecurity"] ?: "none")
+            .put("key", query["key"] ?: "")
+            .put(
+              "header",
+              JSONObject().put("type", query["headerType"] ?: "none"),
+            ),
+        )
+    }
+  }
+
+  private fun putAlpn(target: JSONObject, alpn: String?) {
+    if (alpn.isNullOrBlank()) return
+    val arr = JSONArray()
+    for (p in alpn.split(',')) {
+      val t = p.trim()
+      if (t.isNotEmpty()) arr.put(t)
+    }
+    if (arr.length() > 0) target.put("alpn", arr)
   }
 
   private fun parseQuery(qs: String): Map<String, String> {

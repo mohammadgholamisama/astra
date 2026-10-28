@@ -185,6 +185,30 @@ async def clear_all_hides(db: AsyncSession, *, commit: bool = True) -> int:
     return n
 
 
+async def clear_stale_ping_auto_hides_once(db: AsyncSession) -> int:
+    """One-shot: wipe hides left by older ping-rank auto-hide bug.
+
+    Flag: ``data/cleared_ping_auto_hide_v1``. Manual hides after the flag
+    exists are preserved. Ping/tests must never call set_hidden(True).
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[3]
+    data_dir = root / "data"
+    flag = data_dir / "cleared_ping_auto_hide_v1"
+    if flag.exists():
+        return 0
+    try:
+        n = await clear_all_hides(db, commit=True)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        flag.write_text(f"cleared={n}\n", encoding="utf-8")
+        logger.info("cleared_ping_auto_hide_v1: removed %s hide rules", n)
+        return n
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cleared_ping_auto_hide_v1 failed: %s", exc)
+        return 0
+
+
 async def set_hidden_bulk(
     db: AsyncSession,
     items: list[tuple[str, int, str, bool]],

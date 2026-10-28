@@ -307,7 +307,14 @@ export default function UsersPage() {
   const [groupSearch, setGroupSearch] = useState("");
   /** Filter/focus in create modal: all | uncategorized | category id */
   const [createCatTab, setCreateCatTab] = useState<number | "all" | "none">("all");
+  /** When set, user tracks this category (subs sync on category changes) */
+  const [createBoundCategoryId, setCreateBoundCategoryId] = useState<number | null>(
+    null
+  );
   const [editCatTab, setEditCatTab] = useState<number | "all" | "none">("all");
+  const [editBoundCategoryId, setEditBoundCategoryId] = useState<number | null>(
+    null
+  );
   const [bulkPrefix, setBulkPrefix] = useState("");
   const [bulkCount, setBulkCount] = useState("5");
   const [bulkDisplayName, setBulkDisplayName] = useState("");
@@ -317,6 +324,9 @@ export default function UsersPage() {
   const [bulkGroupIds, setBulkGroupIds] = useState<number[]>([]);
   const [bulkGroupSearch, setBulkGroupSearch] = useState("");
   const [bulkCatTab, setBulkCatTab] = useState<number | "all" | "none">("all");
+  const [bulkBoundCategoryId, setBulkBoundCategoryId] = useState<number | null>(
+    null
+  );
   const [bulkResult, setBulkResult] = useState<{
     created: User[];
     failed: { username: string; message: string }[];
@@ -505,6 +515,7 @@ export default function UsersPage() {
           status: hold ? "on_hold" : "active",
           on_hold_expire_duration: hold ? Math.floor(dayN * 86400) : 0,
           group_ids: groupIds,
+          category_id: createBoundCategoryId,
         }),
       });
     },
@@ -519,6 +530,7 @@ export default function UsersPage() {
       setGroupIds([]);
       setGroupSearch("");
       setCreateCatTab("all");
+      setCreateBoundCategoryId(null);
       setActionMsg({ type: "ok", text: "کاربر ساخته شد" });
     },
   });
@@ -567,6 +579,7 @@ export default function UsersPage() {
           status: hold ? "on_hold" : "active",
           on_hold_expire_duration: hold ? Math.floor(dayN * 86400) : 0,
           group_ids: bulkGroupIds,
+          category_id: bulkBoundCategoryId,
         }),
       });
     },
@@ -581,6 +594,7 @@ export default function UsersPage() {
       setBulkGroupIds([]);
       setBulkGroupSearch("");
       setBulkCatTab("all");
+      setBulkBoundCategoryId(null);
       setBulkResult(res);
     },
   });
@@ -620,12 +634,14 @@ export default function UsersPage() {
     setBulkGroupIds([]);
     setBulkGroupSearch("");
     setBulkCatTab("all");
+    setBulkBoundCategoryId(null);
   }
 
   function toggleBulkGroup(id: number) {
     setBulkGroupIds((cur) =>
       cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]
     );
+    setBulkBoundCategoryId(null);
   }
 
   function onBulkSubmit(e: FormEvent) {
@@ -838,6 +854,12 @@ export default function UsersPage() {
       if (groupsChanged) {
         body.group_ids = editGroupIds;
       }
+      const prevCat = editUser.source_category_id ?? null;
+      if (editBoundCategoryId != null) {
+        body.category_id = editBoundCategoryId;
+      } else if (prevCat != null && groupsChanged) {
+        body.clear_category = true;
+      }
       return api<User>(`/api/user/${encodeURIComponent(editUser.username)}`, {
         method: "PUT",
         body: JSON.stringify(body),
@@ -853,6 +875,7 @@ export default function UsersPage() {
       if (removed) parts.push(`${toFaDigits(removed)} گروه حذف از پنل و ساب`);
       patchUserInCache(updated);
       setEditUser(null);
+      setEditBoundCategoryId(null);
       setActionMsg({
         type: "ok",
         text: parts.length
@@ -881,6 +904,7 @@ export default function UsersPage() {
     setEditGroupIds(ids);
     setEditGroupSearch("");
     setEditCatTab("all");
+    setEditBoundCategoryId(u.source_category_id ?? null);
   }
 
   function toggleEditGroup(id: number) {
@@ -891,6 +915,7 @@ export default function UsersPage() {
       }
       return [...cur, id];
     });
+    setEditBoundCategoryId(null);
   }
 
   useEffect(() => {
@@ -981,6 +1006,8 @@ export default function UsersPage() {
     setGroupIds((cur) =>
       cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]
     );
+    // Manual tweak → stop tracking category auto-sync
+    setCreateBoundCategoryId(null);
   }
 
   const users = data?.users || [];
@@ -1082,18 +1109,23 @@ export default function UsersPage() {
         ? uncategorizedActive.map((g) => g.id)
         : (groupsInCategory.get(categoryId) || []).map((g) => g.id);
     if (!ids.length) return;
+    // Named category → bind user to auto-sync; «بدون دسته» is a one-shot pick
+    const bindId = categoryId != null ? categoryId : null;
     if (mode === "edit") {
-      setEditGroupIds((cur) => [...new Set([...cur, ...ids])]);
+      setEditGroupIds(ids);
       setEditCatTab(categoryId == null ? "none" : categoryId);
+      setEditBoundCategoryId(bindId);
       return;
     }
     if (mode === "bulk") {
-      setBulkGroupIds((cur) => [...new Set([...cur, ...ids])]);
+      setBulkGroupIds(ids);
       setBulkCatTab(categoryId == null ? "none" : categoryId);
+      setBulkBoundCategoryId(bindId);
       return;
     }
-    setGroupIds((cur) => [...new Set([...cur, ...ids])]);
+    setGroupIds(ids);
     setCreateCatTab(categoryId == null ? "none" : categoryId);
+    setCreateBoundCategoryId(bindId);
   }
 
   const editAddedCount = useMemo(() => {
@@ -1145,10 +1177,12 @@ export default function UsersPage() {
   function selectAllFilteredGroups() {
     const ids = filteredCreateGroups.map((g) => g.id);
     setGroupIds((cur) => [...new Set([...cur, ...ids])]);
+    setCreateBoundCategoryId(null);
   }
 
   function clearCreateGroups() {
     setGroupIds([]);
+    setCreateBoundCategoryId(null);
   }
 
   const panelTypeLabel: Record<string, string> = {
@@ -1958,8 +1992,9 @@ export default function UsersPage() {
                 )}
                 {createCatTab !== "all" && (
                   <p className="field-hint user-create-cat-hint">
-                    گروه‌های این دسته به‌صورت پیش‌فرض انتخاب شدند — می‌توانید هر کدام را
-                    حذف کنید
+                    {createBoundCategoryId != null
+                      ? "متصل به این دسته — با کم/زیاد شدن گروه در دسته، ساب کاربر هم به‌روز می‌شود"
+                      : "گروه‌های این دسته انتخاب شدند — با تغییر دستی، همگام‌سازی دسته قطع می‌شود"}
                   </p>
                 )}
 

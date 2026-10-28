@@ -9,11 +9,18 @@ export function formatMs(ms: number): string {
   return `${toFaDigits(Math.round(ms))}ms`;
 }
 
+/** Exact countdown — `M:SS` or `H:MM:SS` when ≥ ۱ ساعت. */
 export function formatCountdown(ms: number): string {
   const total = Math.max(0, Math.ceil(ms / 1000));
-  const m = Math.floor(total / 60);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
   const s = total % 60;
-  return `${toFaDigits(m)}:${toFaDigits(String(s).padStart(2, '0'))}`;
+  const ss = toFaDigits(String(s).padStart(2, '0'));
+  if (h > 0) {
+    const mm = toFaDigits(String(m).padStart(2, '0'));
+    return `${toFaDigits(h)}:${mm}:${ss}`;
+  }
+  return `${toFaDigits(m)}:${ss}`;
 }
 
 export function pingTone(ms: number): string {

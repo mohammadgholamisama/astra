@@ -12,6 +12,7 @@ import com.facebook.react.defaults.DefaultReactNativeHost
 import com.facebook.react.soloader.OpenSourceMergedSoMapping
 import com.facebook.soloader.SoLoader
 import com.v2rayping.bg.BackgroundMonitorPackage
+import com.v2rayping.net.NetworkGuardPackage
 import com.v2rayping.xray.XrayPingPackage
 
 class MainApplication : Application(), ReactApplication {
@@ -22,6 +23,7 @@ class MainApplication : Application(), ReactApplication {
             PackageList(this).packages.apply {
               add(XrayPingPackage())
               add(BackgroundMonitorPackage())
+              add(NetworkGuardPackage())
             }
 
         override fun getJSMainModuleName(): String = "index"

@@ -48,9 +48,11 @@ class PingRankItemIn(BaseModel):
     avg_ping: float = -1
     download_kbps: float = 0
     upload_kbps: float = 0
+    packet_loss_pct: float = -1
+    has_packet_loss: bool = False
     sample_count: int = 0
     device_count: int = 0
-    # Devices that reported a failed/timeout ping in the window (for auto-hide)
+    # Legacy field — ignored by apply_ping_rank (tests never auto-hide)
     fail_device_count: int = 0
 
 

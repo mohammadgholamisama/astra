@@ -527,20 +527,24 @@ async def apply_ping_rank(
     db: AsyncSession,
     ranked: list[dict[str, Any]],
 ) -> ConfigOrderWorkspaceOut:
-    """Reorder config-order + auto hide/unhide from multi-device pings.
+    """Reorder config-order from multi-device pings — NEVER auto-hide.
+
+    App / hub ping tests only change sort order. Subscription visibility is
+    manual (config-order hide toggles) — failed ping must not remove from sub.
+
+    One-shot: clear leftover auto-hides from older hub builds that wrongly
+    hid dead pings (flag file under data/).
 
     Order rules:
-    - Up to 5 best مستقیم, then 5 تانل, then 5 گیمینگ (by device_count then ping)
+    - Up to 5 best مستقیم, then 5 تانل, then 5 گیمینگ
     - Remaining successful fingerprints by quality
     - Untested / unmatched keep relative order after scored ones
-
-    Sub visibility:
-    - All reporting devices failed → hide from every user subscription
-    - Any device succeeded → unhide (re-enter sub)
-    - Priority for ranking: more successful devices first
     """
-    from app.services.config_hides import set_hidden
+    from app.services.config_hides import clear_stale_ping_auto_hides_once
     from app.services.ping_category_order import arrange_by_category_slots
+
+    # Never call set_hidden(True) here. One-shot undo of old auto-hide damage.
+    await clear_stale_ping_auto_hides_once(db)
 
     workspace = await list_workspace(db)
     current = list(workspace.items)
@@ -548,10 +552,30 @@ async def apply_ping_rank(
     score: dict[tuple[str, int, str], float] = {}
     downloads: dict[tuple[str, int, str], float] = {}
     uploads: dict[tuple[str, int, str], float] = {}
+    packet_loss: dict[tuple[str, int, str], float] = {}
     devices: dict[tuple[str, int, str], int] = {}
-    fails: dict[tuple[str, int, str], int] = {}
     labels: dict[tuple[str, int, str], str] = {}
-    tested_fail: set[tuple[str, int, str]] = set()
+    # host:port → best exact key (fallback when match_host differs app↔panel)
+    by_host_port: dict[tuple[str, int], tuple[str, int, str]] = {}
+
+    def _remember_hp(key: tuple[str, int, str]) -> None:
+        hp = (key[0], key[1])
+        prev = by_host_port.get(hp)
+        if prev is None:
+            by_host_port[hp] = key
+            return
+        # Prefer non-empty match; else keep first
+        if not prev[2] and key[2]:
+            by_host_port[hp] = key
+
+    def _resolve_key(host: str, port: int, match: str) -> tuple[str, int, str] | None:
+        exact = _fp_key(host, port, match or "")
+        if exact in score:
+            return exact
+        empty = _fp_key(host, port, "")
+        if empty in score:
+            return empty
+        return by_host_port.get((host, port))
 
     for raw in ranked:
         try:
@@ -561,9 +585,16 @@ async def apply_ping_rank(
             avg = float(raw.get("avg_ping") if raw.get("avg_ping") is not None else -1)
             dl = float(raw.get("download_kbps") or 0)
             ul = float(raw.get("upload_kbps") or 0)
+            has_pkt = bool(raw.get("has_packet_loss"))
+            try:
+                pkt = float(raw.get("packet_loss_pct")) if raw.get("packet_loss_pct") is not None else -1.0
+            except (TypeError, ValueError):
+                pkt = -1.0
+            if has_pkt and pkt < 0:
+                pkt = 0.0
+            if not has_pkt and pkt >= 0:
+                has_pkt = True
             dcount = int(raw.get("device_count") or 0)
-            fcount = int(raw.get("fail_device_count") or 0)
-            samples = int(raw.get("sample_count") or 0)
         except (TypeError, ValueError):
             continue
         norm = try_normalize_endpoint(host, port, match)
@@ -574,111 +605,93 @@ async def apply_ping_rank(
         if label and key not in labels:
             labels[key] = label
 
+        speed_ok = dl > 0 or ul > 0
+        packet_ok = has_pkt and 0 <= pkt < 100
+        # Failures are ignored for ordering — never scored, never hidden
+        if not (avg > 0 or speed_ok or packet_ok):
+            continue
+
         if avg > 0:
             if key not in score or avg < score[key]:
                 score[key] = avg
                 devices[key] = max(dcount, 1)
             elif dcount > devices.get(key, 0):
                 devices[key] = dcount
-            if dl > 0 and dl > downloads.get(key, 0):
-                downloads[key] = dl
-            if ul > 0 and ul > uploads.get(key, 0):
-                uploads[key] = ul
-            # success always clears hide candidate
-            tested_fail.discard(key)
         else:
-            # Tested but no positive device → candidate for hide
-            if samples > 0 or fcount > 0 or dcount == 0:
-                if key not in score:
-                    tested_fail.add(key)
-                    fails[key] = max(fcount, fails.get(key, 0), 1)
-
-    # Auto hide / unhide for subscription feeds
-    hide_n = 0
-    show_n = 0
-    for it in current:
-        key = _fp_key(it.host, int(it.port), it.match_host or "")
-        try:
-            if key in score:
-                await set_hidden(
-                    db,
-                    None,
-                    it.host,
-                    int(it.port),
-                    hidden=False,
-                    match_host=it.match_host or "",
-                    commit=False,
-                )
-                show_n += 1
-            elif key in tested_fail:
-                await set_hidden(
-                    db,
-                    None,
-                    it.host,
-                    int(it.port),
-                    hidden=True,
-                    match_host=it.match_host or "",
-                    commit=False,
-                )
-                hide_n += 1
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("apply_ping_rank hide/unhide %s: %s", key, exc)
+            # Speed/packet-only success (no ping) — keep in score for ordering
+            if key not in score:
+                score[key] = 0.0
+            devices[key] = max(devices.get(key, 0), max(dcount, 1))
+        if dl > 0 and dl > downloads.get(key, 0):
+            downloads[key] = dl
+        if ul > 0 and ul > uploads.get(key, 0):
+            uploads[key] = ul
+        if has_pkt and 0 <= pkt <= 100:
+            prev_pkt = packet_loss.get(key)
+            if prev_pkt is None or pkt < prev_pkt:
+                packet_loss[key] = pkt
+        # Also index empty-match alias so panel rows without SNI still hit
+        empty_key = _fp_key(key[0], key[1], "")
+        if empty_key not in score:
+            score[empty_key] = score[key]
+            devices[empty_key] = devices.get(key, 1)
+            if key in downloads:
+                downloads[empty_key] = downloads[key]
+            if key in uploads:
+                uploads[empty_key] = uploads[key]
+            if key in packet_loss:
+                packet_loss[empty_key] = packet_loss[key]
+        _remember_hp(key)
 
     if not score:
-        await db.commit()
-        from app.services.config_hides import refresh_cache as refresh_hides
-
-        await refresh_hides(db)
-        logger.info(
-            "apply_ping_rank no scores — hide=%s show=%s",
-            hide_n,
-            show_n,
-        )
+        logger.info("apply_ping_rank no scores — order unchanged (no auto-hide)")
         return await list_workspace(db)
 
     scored_items: list[ConfigOrderItemOut] = []
     unscored_rows: list[ConfigOrderItemOut] = []
+    item_score_key: dict[int, tuple[str, int, str]] = {}
     for it in current:
-        key = _fp_key(it.host, int(it.port), it.match_host or "")
-        if key in score:
+        resolved = _resolve_key(it.host, int(it.port), it.match_host or "")
+        if resolved is not None and resolved in score:
             scored_items.append(it)
+            item_score_key[id(it)] = resolved
         else:
             unscored_rows.append(it)
 
     if not scored_items:
-        await db.commit()
-        from app.services.config_hides import refresh_cache as refresh_hides
-
-        await refresh_hides(db)
         logger.info(
-            "apply_ping_rank skip order — %s scores, 0 panel matches hide=%s",
+            "apply_ping_rank skip order — %s scores, 0 panel matches",
             len(score),
-            hide_n,
         )
         return await list_workspace(db)
 
+    def _sk(it: ConfigOrderItemOut) -> tuple[str, int, str]:
+        return item_score_key.get(id(it)) or _fp_key(
+            it.host, int(it.port), it.match_host or ""
+        )
+
     arranged = arrange_by_category_slots(
         scored_items,
-        avg_of=lambda it: score[_fp_key(it.host, int(it.port), it.match_host or "")],
+        avg_of=lambda it: score.get(_sk(it), 1e18),
         label_of=lambda it: it.label
+        or labels.get(_sk(it), "")
         or labels.get(_fp_key(it.host, int(it.port), it.match_host or ""), "")
         or "",
-        device_of=lambda it: devices.get(
-            _fp_key(it.host, int(it.port), it.match_host or ""), 1
-        ),
-        download_of=lambda it: downloads.get(
-            _fp_key(it.host, int(it.port), it.match_host or ""), 0
-        ),
-        upload_of=lambda it: uploads.get(
-            _fp_key(it.host, int(it.port), it.match_host or ""), 0
-        ),
+        device_of=lambda it: devices.get(_sk(it), 1),
+        download_of=lambda it: downloads.get(_sk(it), 0),
+        upload_of=lambda it: uploads.get(_sk(it), 0),
+        packet_of=lambda it: packet_loss.get(_sk(it), 101.0),
     )
     ordered = list(arranged) + unscored_rows
 
     payload: list[ConfigOrderItemIn] = []
     for it in ordered:
-        key = _fp_key(it.host, int(it.port), it.match_host or "")
-        label = it.label or labels.get(key)
+        key = _sk(it) if id(it) in item_score_key else _fp_key(
+            it.host, int(it.port), it.match_host or ""
+        )
+        label = it.label or labels.get(key) or labels.get(
+            _fp_key(it.host, int(it.port), it.match_host or ""), None
+        )
         payload.append(
             ConfigOrderItemIn(
                 host=it.host,
@@ -689,11 +702,9 @@ async def apply_ping_rank(
         )
 
     logger.info(
-        "apply_ping_rank scored=%s unscored=%s hide=%s show=%s total=%s",
+        "apply_ping_rank scored=%s unscored=%s total=%s (order only, no hide)",
         len(arranged),
         len(unscored_rows),
-        hide_n,
-        show_n,
         len(payload),
     )
     await save_order(db, payload)
@@ -714,9 +725,6 @@ async def apply_ping_rank(
             row.device_count = int(devices.get(key) or 1)
     await db.commit()
     await refresh_cache(db)
-    from app.services.config_hides import refresh_cache as refresh_hides
-
-    await refresh_hides(db)
     return await list_workspace(db)
 
 

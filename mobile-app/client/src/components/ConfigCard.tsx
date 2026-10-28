@@ -4,7 +4,7 @@ import type { RankedConfig } from '../types';
 import { formatMs, toFaDigits } from '../utils/format';
 import { colors, fonts, radii } from '../theme';
 
-const ROW_H = 64;
+const ROW_H = 72;
 
 function pingColor(ms: number, testing: boolean, fail: boolean, wait: boolean): string {
   if (testing) return colors.accent;
@@ -16,10 +16,18 @@ function pingColor(ms: number, testing: boolean, fail: boolean, wait: boolean): 
   return colors.rose;
 }
 
-function formatKbps(kbps?: number): string | null {
-  if (kbps == null || !(kbps > 0)) return null;
+/** kbps → label; null = not tested yet; ≤0 after test → — */
+function formatKbpsPart(kbps?: number): string | null {
+  if (kbps == null) return null;
+  if (!(kbps > 0)) return '—';
   if (kbps >= 1000) return `${toFaDigits((kbps / 1000).toFixed(1))}M`;
   return `${toFaDigits(Math.round(kbps))}k`;
+}
+
+function formatLossPart(pct?: number): string | null {
+  if (pct == null) return null;
+  if (pct < 0) return '—';
+  return `${toFaDigits(pct % 1 === 0 ? String(pct) : pct.toFixed(1))}٪`;
 }
 
 function ConfigCardInner({
@@ -34,14 +42,32 @@ function ConfigCardInner({
   const avg = item.avg_ping;
   const testing = avg === -2 || !!highlight;
   const measured = !!item.measured;
+  // avg === 0 → ping skipped (speed/packet-only mode)
+  const pingSkipped = measured && avg === 0;
   const fail = measured && avg < 0;
   const wait = !testing && !measured;
-  const color = pingColor(avg, testing, fail, wait);
-  const avgLabel = testing ? '…' : fail ? 'قطع' : wait ? '—' : formatMs(avg);
-  const dl = formatKbps(item.download_kbps);
-  const ul = formatKbps(item.upload_kbps);
-  const speedLabel =
-    dl || ul ? `${dl ? `${dl}↓` : ''}${dl && ul ? ' ' : ''}${ul ? `${ul}↑` : ''}` : null;
+  const color = pingSkipped
+    ? colors.textMute
+    : pingColor(avg, testing, fail, wait);
+  const avgLabel = testing
+    ? '…'
+    : pingSkipped
+      ? '—'
+      : fail
+        ? 'قطع'
+        : wait
+          ? '—'
+          : formatMs(avg);
+
+  const lossAttempted = item.packet_loss_pct != null;
+  const lossPart = formatLossPart(item.packet_loss_pct);
+  const lossLabel = lossAttempted ? `پکت ${lossPart ?? '—'}` : null;
+
+  const speedAttempted =
+    item.download_kbps != null || item.upload_kbps != null;
+  const dlPart = formatKbpsPart(item.download_kbps) ?? '—';
+  const ulPart = formatKbpsPart(item.upload_kbps) ?? '—';
+  const speedLabel = speedAttempted ? `دان ${dlPart} · آپ ${ulPart}` : null;
 
   return (
     <Pressable
@@ -59,12 +85,17 @@ function ConfigCardInner({
         </Text>
       </View>
       <View style={styles.metrics}>
+        <Text style={[styles.avg, { color }]}>{avgLabel}</Text>
+        {lossLabel ? (
+          <Text style={styles.loss} numberOfLines={1}>
+            {lossLabel}
+          </Text>
+        ) : null}
         {speedLabel ? (
           <Text style={styles.speed} numberOfLines={1}>
             {speedLabel}
           </Text>
         ) : null}
-        <Text style={[styles.avg, { color }]}>{avgLabel}</Text>
       </View>
     </Pressable>
   );
@@ -81,6 +112,7 @@ function propsEqual(
     a.item.avg_ping === b.item.avg_ping &&
     a.item.download_kbps === b.item.download_kbps &&
     a.item.upload_kbps === b.item.upload_kbps &&
+    a.item.packet_loss_pct === b.item.packet_loss_pct &&
     a.item.measured === b.item.measured &&
     a.item.remark === b.item.remark
   );
@@ -125,16 +157,22 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontFamily: fonts.regular,
   },
-  metrics: { alignItems: 'flex-end', minWidth: 72 },
-  speed: {
-    color: colors.mint,
-    fontSize: 10,
-    fontFamily: fonts.medium,
-    marginBottom: 2,
-  },
+  metrics: { alignItems: 'flex-end', minWidth: 88 },
   avg: {
     fontFamily: fonts.extraBold,
     fontSize: 14,
     fontVariant: ['tabular-nums'],
+  },
+  loss: {
+    marginTop: 1,
+    color: colors.amber,
+    fontSize: 10,
+    fontFamily: fonts.medium,
+  },
+  speed: {
+    marginTop: 1,
+    color: colors.mint,
+    fontSize: 10,
+    fontFamily: fonts.medium,
   },
 });

@@ -1,5 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { Operator, ParsedConfig, RankedConfig } from '../types';
+import type { TestFlags } from '../utils/testFlags';
+import type { TestMode } from '../utils/testMode';
 
 const SETTINGS_KEY = 'v2ray_ping_settings_v1';
 const CONFIGS_KEY = 'v2ray_ping_configs_v1';
@@ -9,10 +11,14 @@ export type SavedSettings = {
   operator?: Operator;
   subUrl?: string;
   nextRunAt?: number;
-  /** Auto-test interval in ms (2m / 5m / 10m / 15m / 30m). */
+  /** Auto-test interval in ms (2m…30m / 1h…6h). */
   cycleIntervalMs?: number;
   backgroundEnabled?: boolean;
-  /** Ping first, then download/upload speed on alive configs. */
+  /** Multi-select: ping / speed / packet */
+  testFlags?: TestFlags;
+  /** @deprecated migrated → testFlags */
+  testMode?: TestMode;
+  /** @deprecated migrated → testFlags */
   speedRankEnabled?: boolean;
   lastBackgroundStatus?: string;
   permissionsAsked?: boolean;

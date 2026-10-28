@@ -127,5 +127,6 @@ def to_user_response(user: User, *, include_links: bool = True) -> UserResponse:
         proxies=proxies,
         # Preserve membership order (selection order → subscription order)
         group_ids=[int(g.id) for g in groups],
+        source_category_id=getattr(user, "source_category_id", None),
         panel_accounts=panel_accounts,
     )

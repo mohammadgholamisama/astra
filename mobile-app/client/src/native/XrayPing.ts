@@ -8,6 +8,11 @@ type NativeXrayPing = {
     downloadBudgetMs: number,
     uploadBudgetMs: number,
   ) => Promise<{ download_kbps?: number; upload_kbps?: number }>;
+  measurePacketLoss?: (
+    shareLink: string,
+    probes: number,
+    perProbeTimeoutMs: number,
+  ) => Promise<{ loss_pct?: number; sent?: number; ok?: number }>;
   isAvailable: () => Promise<boolean>;
   cancelAllPings?: () => Promise<boolean>;
 };
@@ -61,7 +66,7 @@ export async function pingTcp(
  */
 export async function pingRealDelay(
   shareLink: string,
-  timeoutMs = 2200,
+  timeoutMs = 12_000,
 ): Promise<number> {
   if (Platform.OS === 'android' && Native?.pingRealDelay) {
     try {
@@ -95,6 +100,35 @@ export async function measureSpeed(
     }
   }
   return { downloadKbps: -1, uploadKbps: -1 };
+}
+
+/** Packet loss % (0–100) via N short HTTP probes through the config. */
+export async function measurePacketLoss(
+  shareLink: string,
+  probes = 10,
+  perProbeTimeoutMs = 1500,
+): Promise<{ lossPct: number; sent: number; ok: number }> {
+  if (Platform.OS === 'android' && Native?.measurePacketLoss) {
+    try {
+      const r = await Native.measurePacketLoss(
+        shareLink,
+        probes,
+        perProbeTimeoutMs,
+      );
+      const loss =
+        typeof r?.loss_pct === 'number' && Number.isFinite(r.loss_pct)
+          ? r.loss_pct
+          : -1;
+      return {
+        lossPct: loss < 0 ? -1 : Math.min(100, Math.max(0, Math.round(loss * 10) / 10)),
+        sent: Number(r?.sent) || 0,
+        ok: Number(r?.ok) || 0,
+      };
+    } catch {
+      return { lossPct: -1, sent: 0, ok: 0 };
+    }
+  }
+  return { lossPct: -1, sent: 0, ok: 0 };
 }
 
 export async function isXrayNativeAvailable(): Promise<boolean> {

@@ -15,6 +15,7 @@ import androidx.core.app.NotificationCompat
 import com.facebook.react.HeadlessJsTaskService
 import com.v2rayping.MainActivity
 import com.v2rayping.R
+import com.v2rayping.net.NetworkGuardModule
 
 /**
  * Sticky foreground service — every [intervalMs] starts Headless JS Real Delay cycle.
@@ -45,10 +46,9 @@ class PingMonitorService : Service() {
         intervalMs = intent?.getLongExtra(EXTRA_INTERVAL, DEFAULT_INTERVAL) ?: DEFAULT_INTERVAL
         if (intervalMs < 60_000L) intervalMs = DEFAULT_INTERVAL
         createChannel()
-        val mins = (intervalMs / 60_000L).coerceAtLeast(1)
         startForeground(
           NOTIF_ID,
-          buildNotification("پایش خودکار هر $mins دقیقه — حتی با اپ بسته‌شده"),
+          buildNotification("پایش خودکار هر ${formatIntervalFa(intervalMs)} — حتی با اپ بسته‌شده"),
         )
         handler.removeCallbacks(tickRunnable)
         // Don't fire immediately — manual «تست الان» covers that; timer owns background cycles
@@ -64,6 +64,10 @@ class PingMonitorService : Service() {
   }
 
   private fun fireHeadless() {
+    // Never start a background test while system VPN is up
+    if (NetworkGuardModule.checkVpnActive(applicationContext)) {
+      return
+    }
     try {
       HeadlessJsTaskService.acquireWakeLockNow(applicationContext)
       startService(Intent(applicationContext, PingHeadlessService::class.java))
@@ -115,6 +119,15 @@ class PingMonitorService : Service() {
 
     fun stop(context: Context) {
       context.startService(Intent(context, PingMonitorService::class.java).setAction(ACTION_STOP))
+    }
+
+    fun formatIntervalFa(ms: Long): String {
+      val mins = (ms / 60_000L).coerceAtLeast(1)
+      return when {
+        mins % 60L == 0L && mins >= 60L -> "${mins / 60L} ساعت"
+        mins > 60L -> "${mins / 60L}س و ${mins % 60L}د"
+        else -> "$mins دقیقه"
+      }
     }
   }
 }

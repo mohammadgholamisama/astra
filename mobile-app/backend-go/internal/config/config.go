@@ -33,7 +33,7 @@ func Load() (*Config, error) {
 		RedisAddr:       getenv("REDIS_ADDR", "127.0.0.1:6379"),
 		RedisPassword:   os.Getenv("REDIS_PASSWORD"),
 		RedisDB:         getenvInt("REDIS_DB", 0),
-		PingTTL:         time.Duration(getenvInt("PING_TTL_SECONDS", 900)) * time.Second,
+		PingTTL:         time.Duration(getenvInt("PING_TTL_SECONDS", 3600)) * time.Second,
 		RateLimitMax:    getenvInt("RATE_LIMIT_MAX", 120),
 		RateLimitWindow: time.Duration(getenvInt("RATE_LIMIT_WINDOW_SECONDS", 60)) * time.Second,
 		PanelSyncEnabled: getenvBool("PANEL_SYNC_ENABLED", true),
@@ -46,8 +46,9 @@ func Load() (*Config, error) {
 	if cfg.APIKey == "" {
 		return nil, fmt.Errorf("API_KEY is required")
 	}
-	if cfg.PingTTL < time.Minute {
-		cfg.PingTTL = 15 * time.Minute
+	// Ranking window: last hour of app samples (override via PING_TTL_SECONDS).
+	if cfg.PingTTL < 5*time.Minute {
+		cfg.PingTTL = time.Hour
 	}
 	return cfg, nil
 }

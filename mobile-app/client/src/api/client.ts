@@ -68,6 +68,12 @@ export function buildPingSamples(
         r?.downloadKbps != null && r.downloadKbps > 0 ? r.downloadKbps : undefined,
       upload_kbps:
         r?.uploadKbps != null && r.uploadKbps > 0 ? r.uploadKbps : undefined,
+      packet_loss_pct:
+        r?.packetLossPct != null && r.packetLossPct >= 0
+          ? r.packetLossPct
+          : undefined,
+      has_packet_loss:
+        r?.packetLossPct != null && r.packetLossPct >= 0 ? true : undefined,
       remark: c.remark,
       protocol: c.protocol,
       transport: c.transport,
@@ -108,6 +114,8 @@ export type FingerprintRankPayload = {
   avg_ping: number;
   download_kbps?: number;
   upload_kbps?: number;
+  packet_loss_pct?: number;
+  has_packet_loss?: boolean;
   sample_count?: number;
   device_count?: number;
 };

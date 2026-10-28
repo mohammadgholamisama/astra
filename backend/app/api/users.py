@@ -76,6 +76,23 @@ def _username_exists_error(username: str) -> HTTPException:
     )
 
 
+async def _resolve_source_category(
+    db: AsyncSession, category_id: int | None
+) -> int | None:
+    """Validate category exists; return id or None."""
+    if category_id is None:
+        return None
+    from app.models.group import GroupCategory
+
+    cat = await db.get(GroupCategory, int(category_id))
+    if not cat:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "CATEGORY_NOT_FOUND", "message": "دسته پیدا نشد"},
+        )
+    return int(cat.id)
+
+
 async def _attach_groups(db: AsyncSession, user: User, group_ids: list[int]) -> None:
     """Replace user↔groups in the given order (order = subscription config order)."""
     # Preserve selection order; drop dupes while keeping first occurrence
@@ -172,6 +189,7 @@ async def create_user(
     status, expire, hold_dur = _normalize_on_hold(
         body.status, body.expire, body.on_hold_expire_duration
     )
+    source_cat = await _resolve_source_category(db, body.category_id)
     user = User(
         username=body.username,
         display_name=display,
@@ -187,6 +205,7 @@ async def create_user(
             "inbounds": body.inbounds or {},
         },
         sub_token=generate_sub_token(),
+        source_category_id=source_cat,
         created_at=datetime.now(timezone.utc),
     )
     db.add(user)
@@ -392,6 +411,7 @@ async def create_users_bulk(
     status, expire, hold_dur = _normalize_on_hold(
         body.status, body.expire, body.on_hold_expire_duration
     )
+    source_cat = await _resolve_source_category(db, body.category_id)
     now = datetime.now(timezone.utc)
     created_names: list[str] = []
     # Snapshot panel targets once — (panel_id, config, group_id) for fast reload
@@ -418,6 +438,7 @@ async def create_users_bulk(
                     "inbounds": body.inbounds or {},
                 },
                 sub_token=generate_sub_token(),
+                source_category_id=source_cat,
                 created_at=now,
             )
             db.add(user)
@@ -626,6 +647,11 @@ async def modify_user(
             ps.update(body.proxy_settings)
         user.proxy_settings = ps
     groups_changed = False
+    if body.clear_category:
+        user.source_category_id = None
+    elif body.category_id is not None:
+        user.source_category_id = await _resolve_source_category(db, body.category_id)
+
     if body.group_ids is not None:
         if not body.group_ids:
             raise HTTPException(
@@ -663,6 +689,10 @@ async def modify_user(
         groups_changed = old_order != wanted
 
         if groups_changed:
+            # Manual group edit without category_id → stop tracking category
+            if body.category_id is None and not body.clear_category:
+                user.source_category_id = None
+
             # 1) Remove remotes for dropped groups BEFORE rewriting membership
             if removed:
                 results = await orchestrator.sync_delete_user_group_accounts(

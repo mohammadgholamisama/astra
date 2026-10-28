@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofiber/contrib/websocket"
@@ -13,10 +14,15 @@ import (
 	"github.com/mohammadgholamisama/v2ray-ping-hub/internal/ws"
 )
 
+const panelSyncDebounce = 2 * time.Second
+
 type API struct {
 	Agg   *services.Aggregator
 	Panel *services.PanelSyncService
 	Hub   *ws.Hub
+
+	syncMu    sync.Mutex
+	syncTimer *time.Timer
 }
 
 func (a *API) Health(c *fiber.Ctx) error {
@@ -66,7 +72,9 @@ func (a *API) PostPings(c *fiber.Ctx) error {
 
 	a.Hub.BroadcastRanked(list)
 
-	// Panel reorder runs on the PingTTL scheduler (default 15m) — not on every live upload.
+	// Compare new samples with the 1h window, then reorder Astra (debounced).
+	a.schedulePanelSync(panelSyncDebounce)
+
 	return c.JSON(fiber.Map{
 		"ok":       true,
 		"accepted": n,
@@ -83,69 +91,46 @@ func (a *API) GetRanked(c *fiber.Ctx) error {
 }
 
 type panelSyncBody struct {
-	// Optional: push exact page averages (host/port/match_host) from the app.
-	// When empty, falls back to multi-device 15m Redis window.
+	// Ignored for ordering — server always ranks from the 1h Redis window.
+	// Kept so older app builds that POST live items still work.
 	Items []models.FingerprintRank `json:"items"`
 }
 
 func (a *API) SyncPanelNow(c *fiber.Ctx) error {
 	var body panelSyncBody
 	_ = c.BodyParser(&body)
+	_ = body // older apps may still POST live items; ordering always uses the 1h window
 
-	ranks := body.Items
-	source := "client"
-	if len(ranks) == 0 {
-		source = "window"
-		var err error
-		ranks, err = a.Agg.RankedFingerprints(c.Context())
-		if err != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
-		}
+	a.cancelScheduledSync()
+	count, err := a.syncWindowToPanel()
+	if err != nil {
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": err.Error()})
 	}
-
-	// Include failures so Astra can hide dead fingerprints from user subs.
-	// Successful ones reorder; all-fail ones auto-hide until any device recovers.
-	filtered := make([]models.FingerprintRank, 0, len(ranks))
-	okN := 0
-	for _, r := range ranks {
-		if strings.TrimSpace(r.Host) == "" || r.Port < 1 {
-			continue
-		}
-		if r.AvgPing > 0 {
-			okN++
-			filtered = append(filtered, r)
-			continue
-		}
-		// Only forward failures that were actually sampled
-		if r.SampleCount > 0 || r.FailDeviceCount > 0 {
-			filtered = append(filtered, r)
-		}
-	}
-	if len(filtered) == 0 {
+	if count == 0 {
 		return c.JSON(fiber.Map{
 			"ok":      true,
 			"count":   0,
-			"source":  source,
-			"message": "no ping samples to apply",
+			"source":  "window",
+			"message": "no successful samples in ranking window",
 		})
-	}
-
-	if err := a.Panel.SyncPingRanks(c.Context(), filtered); err != nil {
-		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": err.Error()})
 	}
 	return c.JSON(fiber.Map{
 		"ok":     true,
-		"count":  okN,
-		"source": source,
+		"count":  count,
+		"source": "window",
 	})
 }
 
-// RunPanelSyncLoop aggregates the last window and reorders Astra every interval.
+// RunPanelSyncLoop is a backup ticker; primary reorder runs on each /pings upload.
 func (a *API) RunPanelSyncLoop(interval time.Duration) {
 	if interval < time.Minute {
+		interval = 10 * time.Minute
+	}
+	// Backup more often than the full window so stale order recovers without a new test.
+	if interval > 15*time.Minute {
 		interval = 15 * time.Minute
 	}
-	log.Printf("[panel-sync] scheduler every %s (first sync after one window)", interval)
+	log.Printf("[panel-sync] backup every %s; primary sync on each /pings (1h compare)", interval)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for range ticker.C {
@@ -153,23 +138,65 @@ func (a *API) RunPanelSyncLoop(interval time.Duration) {
 	}
 }
 
+func (a *API) schedulePanelSync(delay time.Duration) {
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+	if a.syncTimer != nil {
+		a.syncTimer.Stop()
+	}
+	a.syncTimer = time.AfterFunc(delay, a.syncOnce)
+}
+
+func (a *API) cancelScheduledSync() {
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+	if a.syncTimer != nil {
+		a.syncTimer.Stop()
+		a.syncTimer = nil
+	}
+}
+
 func (a *API) syncOnce() {
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
-	ranks, err := a.Agg.RankedFingerprints(ctx)
+	n, err := a.syncWindowToPanel()
 	if err != nil {
-		log.Printf("[panel-sync] rank: %v", err)
-		return
-	}
-	if len(ranks) == 0 {
-		log.Printf("[panel-sync] skip — no fingerprints in window")
-		return
-	}
-	if err := a.Panel.SyncPingRanks(ctx, ranks); err != nil {
 		log.Printf("[panel-sync] %v", err)
 		return
 	}
-	log.Printf("[panel-sync] ok — reordered %d fingerprints in Astra", len(ranks))
+	if n == 0 {
+		log.Printf("[panel-sync] skip — no successful fingerprints in window")
+		return
+	}
+	log.Printf("[panel-sync] ok — reordered %d fingerprints in Astra (1h window)", n)
+}
+
+func (a *API) syncWindowToPanel() (int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	ranks, err := a.Agg.RankedFingerprints(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	filtered := make([]models.FingerprintRank, 0, len(ranks))
+	for _, r := range ranks {
+		if strings.TrimSpace(r.Host) == "" || r.Port < 1 {
+			continue
+		}
+		pktOK := r.HasPacketLoss && r.PacketLossPct >= 0 && r.PacketLossPct < 100
+		ok := r.AvgPing > 0 || r.DownloadKbps > 0 || r.UploadKbps > 0 || pktOK
+		if !ok {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	if len(filtered) == 0 {
+		return 0, nil
+	}
+	if err := a.Panel.SyncPingRanks(ctx, filtered); err != nil {
+		return 0, err
+	}
+	return len(filtered), nil
 }
 
 // WSUpgrade gates non-websocket requests.

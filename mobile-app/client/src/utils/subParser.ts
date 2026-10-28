@@ -272,11 +272,20 @@ function parseUriStyle(link: string, protocol: Protocol): Omit<ParsedConfig, 'co
 
     const uuid = protocol === 'ss' ? userInfo : userInfo.split(':')[0] ?? userInfo;
     const path = (query.path || query.spx || '').trim();
-    const sni = (query.sni || query.peer || query.host || '').trim();
+    // Display SNI: prefer real sni/peer; Host header may differ (ws)
+    const sni = (query.sni || query.peer || query.host || query.authority || '').trim();
     const transport = (query.type || query.net || 'tcp').toLowerCase();
     let security = (query.security || query.tls || '').toLowerCase();
     if (!security && (query.sni || query.fp)) security = 'tls';
     if (query.pbk || query.sid) security = 'reality';
+    // Must match Astra extract_link_match_host order: host → sni → peer → authority
+    const matchHost = (
+      query.host ||
+      query.sni ||
+      query.peer ||
+      query.authority ||
+      ''
+    ).trim();
 
     return {
       raw: link,
@@ -289,8 +298,7 @@ function parseUriStyle(link: string, protocol: Protocol): Omit<ParsedConfig, 'co
       uuid,
       path,
       sni,
-      // Align with Astra extract_link_match_host: query host/sni/peer only
-      matchHost: sni,
+      matchHost,
     };
   } catch {
     return null;

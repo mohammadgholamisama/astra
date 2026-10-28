@@ -1,5 +1,7 @@
 package com.v2rayping.xray
 
+import android.provider.Settings
+import android.util.Base64
 import android.util.Log
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
@@ -22,8 +24,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Real-delay ping via LibXray.
- * Cancel is non-blocking on the RN bridge — resolve first, tear down pool off-thread.
+ * Real-delay ping via LibXray — same path as v2rayNG / v2box:
+ * share-link → outbound JSON → Libv2ray.measureOutboundDelay (≈12s, 2 HTTP tries).
  */
 class XrayPingModule(
   private val reactContext: ReactApplicationContext
@@ -52,9 +54,6 @@ class XrayPingModule(
     promise.resolve(ensureCore())
   }
 
-  /**
-   * Resolve immediately so JS cancel button never waits on pool teardown.
-   */
   @ReactMethod
   fun cancelAllPings(promise: Promise) {
     generation.incrementAndGet()
@@ -78,9 +77,8 @@ class XrayPingModule(
 
   @ReactMethod
   fun pingRealDelay(shareLink: String, timeoutMs: Double, promise: Promise) {
-    // waitMs = how long we wait for LibXray; accept any positive delay up to ACCEPT_MAX
-    // (old code discarded valid pings when delay > waitMs → false «قطع»)
-    val waitMs = timeoutMs.toLong().coerceIn(1_500L, 12_000L)
+    // LibXray measureInstDelay uses 12s HTTP client + 2 attempts — do not cut earlier
+    val waitMs = timeoutMs.toLong().coerceIn(8_000L, 20_000L)
     val myGen = generation.get()
     if (myGen != generation.get()) {
       promise.resolve(-1.0)
@@ -96,16 +94,11 @@ class XrayPingModule(
           } else {
             val configJson = XrayConfigBuilder.fromShareLink(shareLink.trim())
             if (configJson.isNullOrBlank()) {
+              Log.w(TAG, "ping: unsupported / bad share link")
               -1L
             } else {
               if (generation.get() != myGen) return@submit -1L
-              val delay = Libv2ray.measureOutboundDelay(configJson, PROBE_URL)
-              when {
-                generation.get() != myGen -> -1L
-                delay <= 0L -> -1L
-                delay > ACCEPT_MAX_MS -> -1L
-                else -> delay
-              }
+              measureLikeV2ray(configJson)
             }
           }
         } catch (t: Throwable) {
@@ -124,8 +117,8 @@ class XrayPingModule(
           future.cancel(true)
           -1L
         } else {
-          // Extra slack so a slow-but-valid measure can still return
-          future.get(waitMs + 800L, TimeUnit.MILLISECONDS)
+          // Slack past LibXray's own 12s so we don't cancel a valid late result
+          future.get(waitMs + 2_000L, TimeUnit.MILLISECONDS)
         }
       } catch (_: TimeoutException) {
         future.cancel(true)
@@ -144,9 +137,92 @@ class XrayPingModule(
   }
 
   /**
-   * Short download+upload burst through the share-link outbound (SOCKS).
-   * Resolves { download_kbps, upload_kbps } (−1 on fail).
+   * Same URLs v2rayNG / v2box try — gstatic first (Iran-friendly), then google.
    */
+  private fun measureLikeV2ray(configJson: String): Long {
+    for (url in PROBE_URLS) {
+      if (generation.get() < 0) return -1L // unreachable guard
+      try {
+        val delay = Libv2ray.measureOutboundDelay(configJson, url)
+        if (delay > 0L && delay <= ACCEPT_MAX_MS) return delay
+      } catch (t: Throwable) {
+        Log.w(TAG, "probe $url: ${t.message}")
+      }
+    }
+    return -1L
+  }
+
+  /**
+   * Packet-loss % through share-link SOCKS (N short HTTP probes).
+   * Resolves { loss_pct, sent, ok } (−1 loss = fail).
+   */
+  @ReactMethod
+  fun measurePacketLoss(
+    shareLink: String,
+    probes: Double,
+    perProbeTimeoutMs: Double,
+    promise: Promise,
+  ) {
+    val myGen = generation.get()
+    val n = probes.toInt().coerceIn(5, 30)
+    val per = perProbeTimeoutMs.toLong().coerceIn(600L, 4_000L)
+    val pool = measurePool
+    val future: Future<Triple<Double, Int, Int>> =
+      try {
+        pool.submit<Triple<Double, Int, Int>> {
+          try {
+            if (generation.get() != myGen || !ensureCore()) {
+              Triple(-1.0, 0, 0)
+            } else {
+              val res =
+                XrayPacketHelper.measure(
+                  shareLink.trim(),
+                  n,
+                  per,
+                ) { generation.get() != myGen }
+              Triple(res.lossPct, res.sent, res.ok)
+            }
+          } catch (t: Throwable) {
+            Log.w(TAG, "measurePacketLoss: ${t.message}")
+            Triple(-1.0, 0, 0)
+          }
+        }
+      } catch (_: Throwable) {
+        val map = Arguments.createMap()
+        map.putDouble("loss_pct", -1.0)
+        map.putInt("sent", 0)
+        map.putInt("ok", 0)
+        promise.resolve(map)
+        return
+      }
+    inflight.add(future)
+    replyPool.execute {
+      val triple =
+        try {
+          if (generation.get() != myGen) {
+            future.cancel(true)
+            Triple(-1.0, 0, 0)
+          } else {
+            val budget = (n * (per + 80L) + 4_000L).coerceAtMost(90_000L)
+            future.get(budget, TimeUnit.MILLISECONDS)
+          }
+        } catch (_: Throwable) {
+          future.cancel(true)
+          Triple(-1.0, 0, 0)
+        } finally {
+          inflight.remove(future)
+        }
+      try {
+        val map = Arguments.createMap()
+        map.putDouble("loss_pct", triple.first)
+        map.putInt("sent", triple.second)
+        map.putInt("ok", triple.third)
+        promise.resolve(map)
+      } catch (_: Throwable) {
+      }
+    }
+  }
+
   @ReactMethod
   fun measureSpeed(
     shareLink: String,
@@ -268,18 +344,12 @@ class XrayPingModule(
           old.shutdownNow()
         } catch (_: Throwable) {
         }
-        // Don't awaitTermination — LibXray may ignore interrupt; abandoning
-        // the old pool keeps the UI responsive and reopen clean.
       } catch (t: Throwable) {
         Log.w(TAG, "hardCancel: ${t.message}")
       }
     }
   }
 
-  /**
-   * Cached pool: hung JNI measureOutboundDelay threads must not starve the
-   * fixed queue (classic stuck-at-98% when the last slots never free).
-   */
   private fun newMeasurePool(): ExecutorService =
     Executors.newCachedThreadPool { r ->
       Thread(r, "xray-ping").apply { isDaemon = true }
@@ -292,7 +362,9 @@ class XrayPingModule(
       return try {
         Seq.setContext(reactContext.applicationContext)
         val assetsDir = prepareGeoAssets()
-        Libv2ray.initCoreEnv(assetsDir.absolutePath, "")
+        // Required for VLESS xudp / packetEncoding — same as v2rayNG
+        val deviceId = deviceIdForXudp()
+        Libv2ray.initCoreEnv(assetsDir.absolutePath, deviceId)
         coreReady.set(true)
         Log.i(TAG, "Libv2ray ready · ${Libv2ray.checkVersionX()}")
         true
@@ -300,6 +372,22 @@ class XrayPingModule(
         Log.e(TAG, "initCoreEnv failed", t)
         false
       }
+    }
+  }
+
+  /** Mirrors v2rayNG Utils.getDeviceIdForXUDPBaseKey() */
+  private fun deviceIdForXudp(): String {
+    return try {
+      val androidId =
+        Settings.Secure.getString(
+          reactContext.contentResolver,
+          Settings.Secure.ANDROID_ID,
+        ) ?: "v2rayping"
+      val bytes = androidId.toByteArray(Charsets.UTF_8).copyOf(32)
+      Base64.encodeToString(bytes, Base64.NO_PADDING or Base64.URL_SAFE)
+    } catch (t: Throwable) {
+      Log.w(TAG, "xudp device id: ${t.message}")
+      ""
     }
   }
 
@@ -339,14 +427,18 @@ class XrayPingModule(
 
   companion object {
     private const val TAG = "XrayPing"
-    /** Accept real measured delays up to this (ms); wait timeout is separate. */
-    private const val ACCEPT_MAX_MS = 15_000L
-    const val PROBE_URL = "https://www.gstatic.com/generate_204"
+    private const val ACCEPT_MAX_MS = 20_000L
+    /** Prefer gstatic (often reachable), then google — same family as v2rayNG defaults. */
+    private val PROBE_URLS =
+      listOf(
+        "https://www.gstatic.com/generate_204",
+        "https://www.google.com/generate_204",
+        "https://cp.cloudflare.com/",
+      )
 
     @Volatile
     private var holder: XrayPingModule? = null
 
-    /** Called from Activity lifecycle — no JS bridge required. */
     @JvmStatic
     fun cancelFromNative() {
       try {

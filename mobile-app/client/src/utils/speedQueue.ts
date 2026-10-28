@@ -6,6 +6,11 @@ export interface SpeedQueueOptions {
   concurrency?: number;
   downloadBudgetMs?: number;
   uploadBudgetMs?: number;
+  /**
+   * alive = only ping>0 (after ping pass)
+   * all = every config from first to last (speed-only mode)
+   */
+  scope?: 'alive' | 'all';
   onProgress?: (done: number, total: number, latest: LocalPingResult) => void;
   signal?: AbortSignal;
 }
@@ -21,9 +26,23 @@ function isAbort(e: unknown): boolean {
   );
 }
 
+async function measureWithRetry(
+  raw: string,
+  dlBudget: number,
+  ulBudget: number,
+  signal?: AbortSignal,
+): Promise<{ downloadKbps: number; uploadKbps: number }> {
+  let last = await measureSpeed(raw, dlBudget, ulBudget);
+  if (signal?.aborted) throw abortedError();
+  if (!(last.downloadKbps > 0)) {
+    last = await measureSpeed(raw, dlBudget, ulBudget);
+  }
+  return last;
+}
+
 /**
- * Run short download+upload bursts only for configs that already have ping > 0.
- * Merges speed fields into a copy of the ping results map.
+ * Short download+upload bursts.
+ * Always writes downloadKbps/uploadKbps on targeted rows (−1 if failed).
  */
 export async function runSpeedQueue(
   configs: ParsedConfig[],
@@ -31,17 +50,31 @@ export async function runSpeedQueue(
   options: SpeedQueueOptions = {},
 ): Promise<LocalPingResult[]> {
   const byHash = new Map(pingResults.map((r) => [r.configHash, { ...r }]));
-  const alive = configs.filter((c) => {
+  const scope = options.scope ?? 'alive';
+
+  const targets = configs.filter((c) => {
+    if (scope === 'all') return true;
     const r = byHash.get(c.configHash);
     return !!r && r.pingMs > 0;
   });
 
-  if (alive.length === 0) return pingResults.map((r) => ({ ...r }));
+  // Ensure a result stub for every target (speed-only: pingMs=0 = skipped)
+  for (const c of targets) {
+    if (!byHash.has(c.configHash)) {
+      byHash.set(c.configHash, {
+        configHash: c.configHash,
+        pingMs: 0,
+        measuredAt: Date.now(),
+      });
+    }
+  }
+
+  if (targets.length === 0) return pingResults.map((r) => ({ ...r }));
 
   const concurrency = Math.max(1, Math.min(options.concurrency ?? 2, 3));
   const dlBudget = options.downloadBudgetMs ?? 1600;
   const ulBudget = options.uploadBudgetMs ?? 1400;
-  const total = alive.length;
+  const total = targets.length;
   let nextIndex = 0;
   let completed = 0;
   let stopped = false;
@@ -61,21 +94,36 @@ export async function runSpeedQueue(
       if (stopped || options.signal?.aborted) return;
       const i = nextIndex++;
       if (i >= total) return;
-      const cfg = alive[i]!;
+      const cfg = targets[i]!;
       const prev = byHash.get(cfg.configHash)!;
       let downloadKbps = -1;
       let uploadKbps = -1;
       try {
         if (stopped || options.signal?.aborted) throw abortedError();
-        const speed = await measureSpeed(cfg.raw, dlBudget, ulBudget);
-        downloadKbps = speed.downloadKbps;
-        uploadKbps = speed.uploadKbps;
+        const speed = await measureWithRetry(
+          cfg.raw,
+          dlBudget,
+          ulBudget,
+          options.signal,
+        );
+        downloadKbps =
+          speed.downloadKbps != null && Number.isFinite(speed.downloadKbps)
+            ? speed.downloadKbps
+            : -1;
+        uploadKbps =
+          speed.uploadKbps != null && Number.isFinite(speed.uploadKbps)
+            ? speed.uploadKbps
+            : -1;
       } catch (e) {
         if (isAbort(e) || stopped) return;
+        downloadKbps = -1;
+        uploadKbps = -1;
       }
       if (stopped || options.signal?.aborted) return;
       const latest: LocalPingResult = {
         ...prev,
+        // Keep existing ping; speed-only stubs stay at 0
+        pingMs: prev.pingMs > 0 ? prev.pingMs : scope === 'all' ? 0 : prev.pingMs,
         downloadKbps,
         uploadKbps,
         measuredAt: Date.now(),

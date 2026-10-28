@@ -16,6 +16,8 @@ class UserCreate(BaseModel):
     on_hold_expire_duration: int = 0
     note: str | None = None
     group_ids: list[int] = Field(default_factory=list)
+    # Bind user to a sales category so later category membership changes sync
+    category_id: int | None = None
     proxies: dict[str, Any] = Field(default_factory=dict)
     proxy_settings: dict[str, Any] = Field(default_factory=dict)
     inbounds: dict[str, Any] = Field(default_factory=dict)
@@ -31,6 +33,9 @@ class UserModify(BaseModel):
     on_hold_expire_duration: int | None = None
     note: str | None = None
     group_ids: list[int] | None = None
+    # Set to bind/rebind; null + clear_category clears tracking
+    category_id: int | None = None
+    clear_category: bool = False
     proxies: dict[str, Any] | None = None
     proxy_settings: dict[str, Any] | None = None
     data_limit_reset_strategy: str | None = None
@@ -71,6 +76,7 @@ class UserResponse(ORMModel):
     subscription_url: str = ""
     proxies: dict[str, Any] = Field(default_factory=dict)
     group_ids: list[int] = Field(default_factory=list)
+    source_category_id: int | None = None
     panel_accounts: list[PanelAccountOut] = Field(default_factory=list)
 
 
@@ -111,6 +117,7 @@ class UserBulkCreate(BaseModel):
     on_hold_expire_duration: int = 0
     note: str | None = None
     group_ids: list[int] = Field(default_factory=list)
+    category_id: int | None = None
     proxies: dict[str, Any] = Field(default_factory=dict)
     proxy_settings: dict[str, Any] = Field(default_factory=dict)
     inbounds: dict[str, Any] = Field(default_factory=dict)

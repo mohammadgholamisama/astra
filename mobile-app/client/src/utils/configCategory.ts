@@ -17,6 +17,7 @@ type Rankable = {
   device_count?: number;
   download_kbps?: number;
   upload_kbps?: number;
+  packet_loss_pct?: number;
   label?: string;
   remark?: string;
 };
@@ -25,16 +26,32 @@ function hasSpeed(it: Rankable): boolean {
   return (it.download_kbps ?? 0) > 0 || (it.upload_kbps ?? 0) > 0;
 }
 
+function hasPacket(it: Rankable): boolean {
+  return it.packet_loss_pct != null && it.packet_loss_pct >= 0;
+}
+
+function lossKey(it: Rankable): number {
+  const v = it.packet_loss_pct;
+  if (v == null || v < 0) return 101;
+  return v;
+}
+
 /**
- * Quality: more devices → higher download → higher upload → lower ping.
- * When no speed samples exist on either side, ping-only.
+ * Quality: more devices → lower packet loss → higher download → higher upload → lower ping.
  */
 function quality(a: Rankable, b: Rankable): number {
   const da = a.device_count ?? 1;
   const db = b.device_count ?? 1;
   if (da !== db) return db - da;
 
-  const speedAware = hasSpeed(a) || hasSpeed(b);
+  const packetAware = hasPacket(a) || hasPacket(b);
+  if (packetAware) {
+    const la = lossKey(a);
+    const lb = lossKey(b);
+    if (la !== lb) return la - lb;
+  }
+
+  const speedAware = hasSpeed(a) || hasSpeed(b) || packetAware;
   if (speedAware) {
     const dlA = a.download_kbps ?? 0;
     const dlB = b.download_kbps ?? 0;
@@ -56,8 +73,15 @@ export function arrangeByCategorySlots<T extends Rankable>(items: T[]): T[] {
   const ok: T[] = [];
   const rest: T[] = [];
   for (const it of items) {
-    if (it.avg_ping > 0) ok.push(it);
-    else rest.push(it);
+    if (
+      it.avg_ping > 0 ||
+      hasSpeed(it) ||
+      (hasPacket(it) && (it.packet_loss_pct as number) < 100)
+    ) {
+      ok.push(it);
+    } else {
+      rest.push(it);
+    }
   }
 
   const buckets: Record<ConfigCategory, T[]> = {

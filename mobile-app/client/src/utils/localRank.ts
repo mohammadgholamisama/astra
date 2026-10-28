@@ -1,11 +1,22 @@
 import type { LocalPingResult, ParsedConfig, RankedConfig } from '../types';
-import { arrangeByCategorySlots } from './configCategory';
 
 type LiveMap = Map<string, LocalPingResult>;
 
+function positiveKbps(v: number | undefined): number {
+  return v != null && v > 0 ? v : 0;
+}
+
+/** Sort key: lower is better. Missing / fail → worst. */
+function lossSortKey(v: number | undefined): number {
+  if (v == null || v < 0) return 101;
+  return v;
+}
+
 /**
- * Live ranking with category slots.
- * When download/upload present → prefer speed; else ping.
+ * In-app list order.
+ * Alive = ping>0 OR download/upload>0 OR packet loss measured with <100%.
+ * Rank priority: packet loss ↑ → download ↓ → upload ↓ → ping ↑
+ * Buckets: alive → testing → pending → failed
  */
 export function rankLocally(
   configs: ParsedConfig[],
@@ -23,20 +34,40 @@ export function rankLocally(
         ? new Set([testingHashes])
         : new Set<string>();
 
+  let anySpeed = false;
+  let anyPacket = false;
   const rows: RankedConfig[] = configs.map((c) => {
     const r = byHash.get(c.configHash);
     const measured = !!r;
     const ping = measured ? r!.pingMs : -1;
-    const ok = measured && ping > 0;
-    const testing = !measured && testingSet.has(c.configHash);
     const downloadKbps =
-      measured && r!.downloadKbps != null && r!.downloadKbps > 0
-        ? r!.downloadKbps
-        : undefined;
+      measured && r!.downloadKbps != null ? r!.downloadKbps : undefined;
     const uploadKbps =
-      measured && r!.uploadKbps != null && r!.uploadKbps > 0
-        ? r!.uploadKbps
-        : undefined;
+      measured && r!.uploadKbps != null ? r!.uploadKbps : undefined;
+    const packetLossPct =
+      measured && r!.packetLossPct != null ? r!.packetLossPct : undefined;
+    if (downloadKbps != null || uploadKbps != null) anySpeed = true;
+    if (packetLossPct != null) anyPacket = true;
+
+    const pingOk = measured && ping > 0;
+    const speedOk =
+      positiveKbps(downloadKbps) > 0 || positiveKbps(uploadKbps) > 0;
+    const packetOk =
+      packetLossPct != null && packetLossPct >= 0 && packetLossPct < 100;
+    const ok = pingOk || speedOk || packetOk;
+    const testing = !measured && testingSet.has(c.configHash);
+    // ping === 0 → skipped (speed/packet-only); keep 0 for UI "—"
+    const avgPing = measured
+      ? pingOk
+        ? ping
+        : ping === 0
+          ? 0
+          : speedOk || packetOk
+            ? 0
+            : -1
+      : testing
+        ? -2
+        : -1;
 
     return {
       rank: 0,
@@ -49,9 +80,10 @@ export function rankLocally(
       port: c.port,
       match_host: c.matchHost,
       success_rate: ok ? 1 : 0,
-      avg_ping: measured ? (ok ? ping : -1) : testing ? -2 : -1,
+      avg_ping: avgPing,
       download_kbps: downloadKbps,
       upload_kbps: uploadKbps,
+      packet_loss_pct: packetLossPct,
       measured,
       raw: c.raw,
       uuid: c.uuid,
@@ -68,17 +100,27 @@ export function rankLocally(
   const testing = rows.filter((r) => !r.measured && r.avg_ping === -2);
   const pending = rows.filter((r) => !r.measured && r.avg_ping !== -2);
 
-  const arrangedOk = arrangeByCategorySlots(
-    ok.map((r) => ({
-      ...r,
-      label: r.remark,
-      device_count: 1,
-      download_kbps: r.download_kbps ?? 0,
-      upload_kbps: r.upload_kbps ?? 0,
-    })),
-  );
+  ok.sort((a, b) => {
+    if (anyPacket) {
+      const lossA = lossSortKey(a.packet_loss_pct);
+      const lossB = lossSortKey(b.packet_loss_pct);
+      if (lossA !== lossB) return lossA - lossB;
+    }
+    if (anySpeed || anyPacket) {
+      const dlA = positiveKbps(a.download_kbps);
+      const dlB = positiveKbps(b.download_kbps);
+      if (dlA !== dlB) return dlB - dlA;
+      const ulA = positiveKbps(a.upload_kbps);
+      const ulB = positiveKbps(b.upload_kbps);
+      if (ulA !== ulB) return ulB - ulA;
+    }
+    const pingA = a.avg_ping > 0 ? a.avg_ping : Number.POSITIVE_INFINITY;
+    const pingB = b.avg_ping > 0 ? b.avg_ping : Number.POSITIVE_INFINITY;
+    if (pingA !== pingB) return pingA - pingB;
+    return a.remark.localeCompare(b.remark, 'fa');
+  });
 
-  const ordered = [...arrangedOk, ...failed, ...testing, ...pending];
+  const ordered = [...ok, ...testing, ...pending, ...failed];
   return ordered.map((row, i) => ({ ...row, rank: i + 1 }));
 }
 

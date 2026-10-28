@@ -60,6 +60,14 @@ class User(Base):
     sub_token: Mapped[str] = mapped_column(String(64), unique=True, index=True, default=generate_sub_token)
     data_limit_reset_strategy: Mapped[str] = mapped_column(String(32), default="no_reset")
     proxy_settings: Mapped[dict] = mapped_column(JSONType, default=dict)
+    # When set, user tracks this sales category: group membership auto-syncs
+    # when groups are added/removed/moved in the category (sub updates safely).
+    source_category_id: Mapped[int | None] = mapped_column(
+        ForeignKey("group_categories.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        default=None,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

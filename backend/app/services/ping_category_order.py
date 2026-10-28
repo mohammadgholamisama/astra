@@ -33,23 +33,13 @@ def arrange_by_category_slots(
     device_of=None,
     download_of=None,
     upload_of=None,
+    packet_of=None,
 ) -> list[T]:
     """Sort successful items into category slots then leftover by quality.
 
-    Quality: more devices → higher download → higher upload → lower ping.
+    Success = positive ping OR speed OR packet loss < 100%.
+    Quality: more devices → lower packet loss → higher download → higher upload → lower ping.
     """
-    ok: list[T] = []
-    rest: list[T] = []
-    for it in items:
-        try:
-            avg = float(avg_of(it))
-        except (TypeError, ValueError):
-            avg = -1.0
-        if avg > 0:
-            ok.append(it)
-        else:
-            rest.append(it)
-
     def _num(call, it: T, default: float = 0.0) -> float:
         if call is None:
             return default
@@ -58,11 +48,39 @@ def arrange_by_category_slots(
         except (TypeError, ValueError):
             return default
 
+    def _loss(it: T) -> float:
+        if packet_of is None:
+            return 101.0
+        try:
+            v = float(packet_of(it))
+        except (TypeError, ValueError):
+            return 101.0
+        if v < 0:
+            return 101.0
+        return v
+
+    ok: list[T] = []
+    rest: list[T] = []
+    for it in items:
+        try:
+            avg = float(avg_of(it))
+        except (TypeError, ValueError):
+            avg = -1.0
+        dl = _num(download_of, it)
+        ul = _num(upload_of, it)
+        loss = _loss(it)
+        if avg > 0 or dl > 0 or ul > 0 or (0 <= loss < 100):
+            ok.append(it)
+        else:
+            rest.append(it)
+
     def quality_key(it: T) -> tuple:
         try:
             avg = float(avg_of(it))
         except (TypeError, ValueError):
-            avg = 1e18
+            avg = -1.0
+        # Missing ping sorts after real pings when speeds tie
+        avg_sort = avg if avg > 0 else 1e18
         dev = 1
         if device_of is not None:
             try:
@@ -71,8 +89,9 @@ def arrange_by_category_slots(
                 dev = 1
         dl = _num(download_of, it)
         ul = _num(upload_of, it)
-        # Ascending sort: negate devices/speeds so higher wins
-        return (-dev, -dl, -ul, avg)
+        loss = _loss(it)
+        # Ascending sort: negate devices/speeds so higher wins; loss lower wins
+        return (-dev, loss, -dl, -ul, avg_sort)
 
     buckets: dict[str, list[T]] = {
         "direct": [],
@@ -98,6 +117,17 @@ def arrange_by_category_slots(
 
 
 def arrange_rank_dicts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _packet(d: dict[str, Any]) -> float:
+        if d.get("has_packet_loss") or (
+            d.get("packet_loss_pct") is not None
+            and float(d.get("packet_loss_pct") or -1) >= 0
+        ):
+            try:
+                return float(d.get("packet_loss_pct") or 0)
+            except (TypeError, ValueError):
+                return 101.0
+        return 101.0
+
     return arrange_by_category_slots(
         items,
         avg_of=lambda d: d.get("avg_ping", -1),
@@ -105,4 +135,5 @@ def arrange_rank_dicts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         device_of=lambda d: d.get("device_count") or 1,
         download_of=lambda d: d.get("download_kbps") or 0,
         upload_of=lambda d: d.get("upload_kbps") or 0,
+        packet_of=_packet,
     )

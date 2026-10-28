@@ -3,7 +3,18 @@ import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { Gauge, X, Zap } from 'lucide-react-native';
 import { colors, fonts, radii } from '../theme';
 import { formatCountdown, toFaDigits } from '../utils/format';
-import { CYCLE_OPTIONS } from '../utils/cycleInterval';
+import {
+  CYCLE_HOUR_OPTIONS,
+  CYCLE_MINUTE_OPTIONS,
+  cycleIntervalLabel,
+  cycleOptionOf,
+} from '../utils/cycleInterval';
+import {
+  TEST_FLAG_OPTIONS,
+  testFlagsButtonHint,
+  testFlagsHint,
+  type TestFlags,
+} from '../utils/testFlags';
 import { useAppStore } from '../store/appStore';
 
 /**
@@ -25,8 +36,8 @@ export function TestActionBar({
   const remainingMs = useAppStore((s) => s.remainingMs);
   const cycleIntervalMs = useAppStore((s) => s.cycleIntervalMs);
   const backgroundEnabled = useAppStore((s) => s.backgroundEnabled);
-  const speedRankEnabled = useAppStore((s) => s.speedRankEnabled);
-  const setSpeedRankEnabled = useAppStore((s) => s.setSpeedRankEnabled);
+  const testFlags = useAppStore((s) => s.testFlags);
+  const toggleTestFlag = useAppStore((s) => s.toggleTestFlag);
   const progressDone = useAppStore((s) => s.progressDone);
   const progressTotal = useAppStore((s) => s.progressTotal);
   const progressStatus = useAppStore((s) => s.status);
@@ -57,13 +68,16 @@ export function TestActionBar({
     }, 900);
   };
 
+  const modeHint = testFlagsHint(testFlags);
+  const testBtnHint = testFlagsButtonHint(testFlags);
+
   return (
     <View style={styles.wrap}>
       <View style={styles.row}>
         {/* Both stay mounted — swapping mid-press caused multi-tap bugs */}
         <View style={styles.btnSlot}>
           <Pressable
-            onPressIn={handleCancel}
+            onPress={handleCancel}
             hitSlop={12}
             accessibilityRole="button"
             accessibilityLabel="قطع تست"
@@ -103,7 +117,7 @@ export function TestActionBar({
           >
             <View style={styles.btnCopy}>
               <Text style={styles.btnTitle}>تست الان</Text>
-              <Text style={styles.btnHint}>پینگ واقعی · سریع</Text>
+              <Text style={styles.btnHint}>{testBtnHint}</Text>
             </View>
             <View style={styles.btnIcon}>
               <Zap
@@ -146,7 +160,7 @@ export function TestActionBar({
         <View style={styles.progressCard}>
           <View style={styles.progressTop}>
             <Text style={styles.progressStatus} numberOfLines={1}>
-              {progressStatus || 'پینگ…'}
+              {progressStatus || 'تست…'}
             </Text>
             <Text style={styles.progressPct}>{toFaDigits(pct)}٪</Text>
           </View>
@@ -159,35 +173,55 @@ export function TestActionBar({
         </View>
       ) : null}
 
-      <Pressable
-        disabled={testing}
-        onPress={() => void setSpeedRankEnabled(!speedRankEnabled)}
-        style={({ pressed }) => [
-          styles.speedToggle,
-          speedRankEnabled && styles.speedToggleOn,
-          testing && styles.chipDisabled,
-          pressed && !testing && styles.chipPressed,
-        ]}
-        accessibilityRole="switch"
-        accessibilityState={{ checked: speedRankEnabled }}
-        accessibilityLabel="رتبه‌بندی با سرعت دانلود و آپلود"
-      >
-        <Text
-          style={[
-            styles.speedToggleText,
-            speedRankEnabled && styles.speedToggleTextOn,
-          ]}
-        >
-          {speedRankEnabled
-            ? 'رتبه با سرعت · روشن (پینگ → دانلود/آپلود)'
-            : 'رتبه با سرعت · خاموش (فقط پینگ)'}
+      <View style={styles.modeBlock}>
+        <Text style={styles.modeTitle}>تست‌ها (چندتایی)</Text>
+        <View style={styles.modeSeg}>
+          {TEST_FLAG_OPTIONS.map((opt) => {
+            const active = testFlags[opt.id as keyof TestFlags];
+            return (
+              <Pressable
+                key={opt.id}
+                disabled={testing}
+                onPress={() => void toggleTestFlag(opt.id as keyof TestFlags)}
+                style={({ pressed }) => [
+                  styles.modeChip,
+                  active && styles.modeChipActive,
+                  testing && styles.chipDisabled,
+                  pressed && !testing && styles.chipPressed,
+                ]}
+                accessibilityRole="button"
+                accessibilityState={{ selected: active }}
+                accessibilityLabel={opt.title}
+              >
+                <Text
+                  style={[
+                    styles.modeChipText,
+                    active && styles.modeChipTextActive,
+                  ]}
+                  numberOfLines={1}
+                >
+                  {opt.title}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+        <Text style={styles.modeHint} numberOfLines={2}>
+          {modeHint}
         </Text>
-      </Pressable>
+      </View>
 
       <View style={styles.intervalBlock}>
-        <Text style={styles.intervalTitle}>بازهٔ چرخه (دقیقه)</Text>
+        <View style={styles.intervalHead}>
+          <Text style={styles.intervalTitle}>بازهٔ چرخه خودکار</Text>
+          <Text style={styles.intervalSelected} numberOfLines={1}>
+            هر {toFaDigits(cycleIntervalLabel(cycleIntervalMs))}
+          </Text>
+        </View>
+
+        <Text style={styles.intervalGroupLabel}>دقیقه</Text>
         <View style={styles.chips}>
-          {CYCLE_OPTIONS.map((opt) => {
+          {CYCLE_MINUTE_OPTIONS.map((opt) => {
             const active = opt.ms === cycleIntervalMs;
             return (
               <Pressable
@@ -202,17 +236,61 @@ export function TestActionBar({
                 ]}
                 accessibilityRole="button"
                 accessibilityState={{ selected: active }}
-                accessibilityLabel={`چرخه ${opt.minutes} دقیقه`}
+                accessibilityLabel={opt.title}
               >
                 <Text
                   style={[styles.chipText, active && styles.chipTextActive]}
                 >
-                  {toFaDigits(opt.label)}
+                  {toFaDigits(opt.short)}
                 </Text>
               </Pressable>
             );
           })}
         </View>
+
+        <Text style={styles.intervalGroupLabel}>ساعت</Text>
+        <View style={styles.chips}>
+          {CYCLE_HOUR_OPTIONS.map((opt) => {
+            const active = opt.ms === cycleIntervalMs;
+            return (
+              <Pressable
+                key={opt.ms}
+                disabled={testing}
+                onPress={() => onCycleInterval(opt.ms)}
+                style={({ pressed }) => [
+                  styles.chip,
+                  styles.chipWide,
+                  active && styles.chipActive,
+                  testing && styles.chipDisabled,
+                  pressed && !testing && styles.chipPressed,
+                ]}
+                accessibilityRole="button"
+                accessibilityState={{ selected: active }}
+                accessibilityLabel={opt.title}
+              >
+                <Text
+                  style={[styles.chipText, active && styles.chipTextActive]}
+                >
+                  {toFaDigits(opt.short)}
+                </Text>
+                <Text
+                  style={[
+                    styles.chipSub,
+                    active && styles.chipSubActive,
+                  ]}
+                >
+                  {toFaDigits(opt.title)}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+
+        <Text style={styles.intervalHint} numberOfLines={2}>
+          {backgroundEnabled
+            ? `تایمر دقیق: بعدی ${formatCountdown(remainingMs)} · الان ${toFaDigits(cycleOptionOf(cycleIntervalMs).title)}`
+            : 'پایش پس‌زمینه را روشن کن تا چرخه با این بازه اجرا شود'}
+        </Text>
       </View>
     </View>
   );
@@ -319,35 +397,59 @@ const styles = StyleSheet.create({
     textAlign: 'right',
     alignSelf: 'stretch',
     color: colors.accent,
-    fontSize: 26,
+    fontSize: 22,
     fontFamily: fonts.extraBold,
     fontVariant: ['tabular-nums'],
+    letterSpacing: -0.3,
   },
   timerValueMute: {
     color: colors.textMute,
-    fontSize: 20,
+    fontSize: 18,
   },
-  speedToggle: {
+  modeBlock: {
+    gap: 8,
+  },
+  modeTitle: {
+    textAlign: 'right',
+    color: colors.textMute,
+    fontSize: 11,
+    fontFamily: fonts.medium,
+  },
+  modeSeg: {
+    flexDirection: 'row-reverse',
+    gap: 6,
+  },
+  modeChip: {
+    flex: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 6,
     borderRadius: radii.md,
     borderWidth: 1,
     borderColor: colors.lineStrong,
     backgroundColor: colors.panel,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  speedToggleOn: {
+  modeChipActive: {
     borderColor: 'rgba(42,212,197,0.55)',
     backgroundColor: colors.accentDim,
   },
-  speedToggleText: {
-    textAlign: 'right',
+  modeChipText: {
     color: colors.textSoft,
     fontSize: 12,
-    fontFamily: fonts.medium,
-  },
-  speedToggleTextOn: {
-    color: colors.accent,
     fontFamily: fonts.bold,
+    textAlign: 'center',
+  },
+  modeChipTextActive: {
+    color: colors.accent,
+    fontFamily: fonts.extraBold,
+  },
+  modeHint: {
+    textAlign: 'right',
+    color: colors.textMute,
+    fontSize: 11,
+    fontFamily: fonts.medium,
+    lineHeight: 16,
   },
   progressCard: {
     borderRadius: radii.lg,
@@ -388,28 +490,67 @@ const styles = StyleSheet.create({
   },
   intervalBlock: {
     gap: 8,
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.panel,
+    padding: 10,
+  },
+  intervalHead: {
+    flexDirection: 'row-reverse',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
   },
   intervalTitle: {
     textAlign: 'right',
+    color: colors.textSoft,
+    fontSize: 12,
+    fontFamily: fonts.bold,
+  },
+  intervalSelected: {
+    flexShrink: 1,
+    textAlign: 'left',
+    color: colors.accent,
+    fontSize: 12,
+    fontFamily: fonts.extraBold,
+  },
+  intervalGroupLabel: {
+    textAlign: 'right',
     color: colors.textMute,
-    fontSize: 11,
+    fontSize: 10,
     fontFamily: fonts.medium,
+    marginTop: 2,
+  },
+  intervalHint: {
+    textAlign: 'right',
+    color: colors.textMute,
+    fontSize: 10,
+    fontFamily: fonts.medium,
+    lineHeight: 15,
+    marginTop: 2,
   },
   chips: {
     flexDirection: 'row-reverse',
     flexWrap: 'wrap',
-    gap: 8,
+    gap: 6,
     justifyContent: 'flex-start',
   },
   chip: {
-    minWidth: 44,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
+    minWidth: 46,
+    paddingVertical: 9,
+    paddingHorizontal: 10,
     borderRadius: radii.md,
     borderWidth: 1,
     borderColor: colors.lineStrong,
-    backgroundColor: colors.panel,
+    backgroundColor: colors.bgElevated,
     alignItems: 'center',
+    justifyContent: 'center',
+  },
+  chipWide: {
+    minWidth: 64,
+    paddingVertical: 8,
+    gap: 2,
   },
   chipActive: {
     borderColor: 'rgba(42,212,197,0.55)',
@@ -419,12 +560,20 @@ const styles = StyleSheet.create({
   chipPressed: { opacity: 0.85 },
   chipText: {
     color: colors.textSoft,
-    fontSize: 14,
+    fontSize: 13,
     fontFamily: fonts.bold,
     fontVariant: ['tabular-nums'],
   },
   chipTextActive: {
     color: colors.accent,
     fontFamily: fonts.extraBold,
+  },
+  chipSub: {
+    color: colors.textMute,
+    fontSize: 9,
+    fontFamily: fonts.medium,
+  },
+  chipSubActive: {
+    color: 'rgba(42,212,197,0.85)',
   },
 });

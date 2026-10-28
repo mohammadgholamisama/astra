@@ -97,6 +97,36 @@ async def _bg_resync_group_users(
         logger.exception("bg group %s resync failed", group_id)
 
 
+async def _bg_resync_category_users(
+    *category_ids: int | None,
+    removed_group_ids: list[int] | None = None,
+) -> None:
+    """Sync users bound to sales categories after membership change."""
+    from app.core.database import AsyncSessionLocal
+    from app.services.orchestrator import resync_users_for_category
+
+    seen: set[int] = set()
+    for raw in category_ids:
+        if raw is None:
+            continue
+        try:
+            cid = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if cid in seen:
+            continue
+        seen.add(cid)
+        try:
+            async with AsyncSessionLocal() as db:
+                n = await resync_users_for_category(
+                    db, cid, removed_group_ids=removed_group_ids
+                )
+                await db.commit()
+                logger.info("bg category %s resync ok changed_users=%s", cid, n)
+        except Exception:  # noqa: BLE001
+            logger.exception("bg category %s resync failed", cid)
+
+
 async def _bg_recount_group_users(group_id: int) -> None:
     """Coefficient-only save: recount Astra usage, freeze remotes that flipped."""
     from sqlalchemy.orm import selectinload
@@ -382,6 +412,11 @@ async def create_group(
     if body.panels:
         await _set_panels(db, group, body.panels)
     await db.commit()
+    if category_id is not None:
+        asyncio.create_task(
+            _bg_resync_category_users(category_id),
+            name=f"astra-cat-resync-{category_id}",
+        )
     group = await _load_group(db, group.id)
     return _to_out(group)  # type: ignore[arg-type]
 
@@ -422,8 +457,15 @@ async def move_group(
     group = await _load_group(db, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
-    group.category_id = await _ensure_category(db, body.category_id)
+    old_cat = getattr(group, "category_id", None)
+    new_cat = await _ensure_category(db, body.category_id)
+    group.category_id = new_cat
     await db.commit()
+    if old_cat != new_cat:
+        asyncio.create_task(
+            _bg_resync_category_users(old_cat, new_cat),
+            name=f"astra-cat-move-{group_id}",
+        )
     group = await _load_group(db, group_id)
     return _to_out(group)  # type: ignore[arg-type]
 
@@ -448,10 +490,17 @@ async def update_group(
         group.config_tag = _normalize_config_tag(body.config_tag)
     if body.notices is not None:
         group.notices = normalize_notices(body.notices)
+    old_cat = getattr(group, "category_id", None)
+    cat_changed = False
     if body.clear_category:
+        if old_cat is not None:
+            cat_changed = True
         group.category_id = None
     elif body.category_id is not None:
-        group.category_id = await _ensure_category(db, body.category_id)
+        new_cat = await _ensure_category(db, body.category_id)
+        if new_cat != old_cat:
+            cat_changed = True
+        group.category_id = new_cat
     need_full_resync = False
     need_local_recount = False
     removed_panel_ids: list[int] = []
@@ -467,6 +516,9 @@ async def update_group(
         await _set_panels(db, group, body.panels)
         need_local_recount = old_fp != new_fp
         need_full_resync = old_remote_fp != new_remote_fp or bool(removed_panel_ids)
+    # Disable/enable also affects category-bound membership (enabled-only)
+    if body.is_disabled is not None and old_cat is not None:
+        cat_changed = True
     await db.commit()
     # Never block PUT /api/group on remote I/O or a full user recount.
     if need_full_resync:
@@ -478,6 +530,12 @@ async def update_group(
         asyncio.create_task(
             _bg_recount_group_users(group_id),
             name=f"astra-group-recount-{group_id}",
+        )
+    if cat_changed:
+        new_cat = getattr(group, "category_id", None)
+        asyncio.create_task(
+            _bg_resync_category_users(old_cat, new_cat),
+            name=f"astra-cat-resync-g{group_id}",
         )
     group = await _load_group(db, group_id)
     return _to_out(group)  # type: ignore[arg-type]
@@ -493,6 +551,7 @@ async def delete_group(
     group = await db.get(Group, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
+    old_cat = getattr(group, "category_id", None)
 
     # Explicit child cleanup (avoids async lazy-load / FK 500s)
     await db.execute(delete(GroupConfigItem).where(GroupConfigItem.group_id == group_id))
@@ -517,4 +576,11 @@ async def delete_group(
     except Exception as exc:  # noqa: BLE001
         await db.rollback()
         raise HTTPException(status_code=400, detail=f"حذف گروه ناموفق: {exc}") from exc
+    if old_cat is not None:
+        asyncio.create_task(
+            _bg_resync_category_users(
+                old_cat, removed_group_ids=[int(group_id)]
+            ),
+            name=f"astra-cat-resync-del-{group_id}",
+        )
     return {"detail": "Group deleted"}

@@ -56,8 +56,8 @@ object XraySpeedHelper {
     try {
       if (isCancelled()) return Result(-1.0, -1.0)
       controller.startLoop(configJson, port)
-      // Brief settle for SOCKS listen
-      Thread.sleep(180)
+      // Settle so SOCKS accept is ready (short settle caused empty speeds)
+      Thread.sleep(280)
       if (isCancelled() || !controller.isRunning) {
         return Result(-1.0, -1.0)
       }
@@ -124,7 +124,8 @@ object XraySpeedHelper {
       } catch (_: Throwable) {
       }
       val elapsedMs = max(1L, (System.nanoTime() - started) / 1_000_000L)
-      if (total < 16_384L) return -1.0
+      // Lower floor so slow-but-alive links still get a number on the card
+      if (total < 4_096L) return -1.0
       // kibps = (bytes * 8) / ms
       (total.toDouble() * 8.0) / elapsedMs.toDouble()
     } catch (t: Throwable) {
@@ -183,7 +184,7 @@ object XraySpeedHelper {
         }
       }
       val elapsedMs = max(1L, (System.nanoTime() - started) / 1_000_000L)
-      if (total < 16_384L) return -1.0
+      if (total < 4_096L) return -1.0
       (total.toDouble() * 8.0) / elapsedMs.toDouble()
     } catch (t: Throwable) {
       Log.w(TAG, "upload burst: ${t.message}")

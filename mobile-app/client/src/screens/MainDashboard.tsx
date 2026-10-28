@@ -63,7 +63,20 @@ export function MainDashboard() {
   }, [tick]);
 
   const aliveCount = useMemo(
-    () => ranked.reduce((n, r) => (r.avg_ping > 0 ? n + 1 : n), 0),
+    () =>
+      ranked.reduce((n, r) => {
+        if (r.success_rate > 0) return n + 1;
+        if (r.avg_ping > 0) return n + 1;
+        if ((r.download_kbps ?? 0) > 0 || (r.upload_kbps ?? 0) > 0) return n + 1;
+        if (
+          r.packet_loss_pct != null &&
+          r.packet_loss_pct >= 0 &&
+          r.packet_loss_pct < 100
+        ) {
+          return n + 1;
+        }
+        return n;
+      }, 0),
     [ranked],
   );
 
@@ -211,6 +224,7 @@ export function MainDashboard() {
       <FlatList
         style={styles.list}
         data={ranked}
+        extraData={ranked}
         keyExtractor={keyExtractor}
         renderItem={renderItem}
         getItemLayout={getItemLayout}

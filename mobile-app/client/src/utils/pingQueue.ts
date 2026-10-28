@@ -1,18 +1,11 @@
-import { cancelAllPings, pingRealDelay, pingTcp } from '../native/XrayPing';
+import { cancelAllPings, pingRealDelay } from '../native/XrayPing';
 import type { LocalPingResult, ParsedConfig } from '../types';
 
 export interface PingQueueOptions {
   concurrency?: number;
-  /** How long to wait for LibXray real-delay (ms). */
+  /** Wall budget passed to native (LibXray itself uses ~12s + 2 HTTP tries). */
   timeoutMs?: number;
-  /**
-   * soft (default): TCP fail still runs real-delay.
-   * hard: TCP fail → قطع without real-delay.
-   * off: skip TCP entirely.
-   */
-  tcpPrecheck?: 'soft' | 'hard' | 'off' | boolean;
-  tcpTimeoutMs?: number;
-  /** Extra real-delay attempts after a miss (default 1). */
+  /** Extra full measure after a miss (native already retries HTTP twice). */
   retries?: number;
   onStart?: (config: ParsedConfig) => void;
   onProgress?: (done: number, total: number, latest: LocalPingResult) => void;
@@ -30,39 +23,7 @@ function isAbort(e: unknown): boolean {
   );
 }
 
-function resolveTcpMode(
-  v: PingQueueOptions['tcpPrecheck'],
-): 'soft' | 'hard' | 'off' {
-  if (v === false || v === 'off') return 'off';
-  if (v === 'hard' || v === true) return v === true ? 'soft' : 'hard';
-  if (v === 'soft') return 'soft';
-  return 'soft';
-}
-
-/** Reject as soon as AbortSignal fires — does not wait for native. */
-function raceAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
-  if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(abortedError());
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(abortedError());
-    signal.addEventListener('abort', onAbort, { once: true });
-    promise.then(
-      (v) => {
-        signal.removeEventListener('abort', onAbort);
-        resolve(v);
-      },
-      (e) => {
-        signal.removeEventListener('abort', onAbort);
-        reject(e);
-      },
-    );
-  });
-}
-
-/**
- * Hard wall-clock cap so a hung native LibXray call cannot freeze the queue.
- * Resolves -1 on timeout (not reject) so workers keep advancing.
- */
+/** Cap hung native calls without rejecting the worker. */
 function raceMs(promise: Promise<number>, ms: number): Promise<number> {
   return new Promise((resolve) => {
     let done = false;
@@ -88,15 +49,38 @@ function raceMs(promise: Promise<number>, ms: number): Promise<number> {
   });
 }
 
+function raceAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortedError());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortedError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (v) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(v);
+      },
+      (e) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(e);
+      },
+    );
+  });
+}
+
+/**
+ * v2rayNG / v2box style queue:
+ * Libv2ray.measureOutboundDelay on each share link (no TCP pre-fail gate).
+ * Native does 12s × 2 HTTP attempts — JS must not cut that short.
+ */
 export async function runPingQueue(
   configs: ParsedConfig[],
   options: PingQueueOptions = {},
 ): Promise<LocalPingResult[]> {
-  // Fast + accurate defaults: parallel delay, soft TCP, one retry on miss
-  const concurrency = Math.max(1, options.concurrency ?? 5);
-  const timeoutMs = options.timeoutMs ?? 2200;
-  const tcpTimeoutMs = options.tcpTimeoutMs ?? 600;
-  const tcpMode = resolveTcpMode(options.tcpPrecheck);
+  // v2rayNG runs several workers; too many cores thrash phones
+  const concurrency = Math.max(1, Math.min(options.concurrency ?? 5, 8));
+  // Match LibXray measureInstDelay (12s client) + small slack
+  const timeoutMs = options.timeoutMs ?? 12_000;
   const retries = Math.max(0, options.retries ?? 1);
   const total = configs.length;
   const results: LocalPingResult[] = new Array(total);
@@ -115,10 +99,10 @@ export async function runPingQueue(
     else options.signal.addEventListener('abort', stop, { once: true });
   }
 
-  async function realDelayOnce(cfg: ParsedConfig): Promise<number> {
-    // Wall clock a bit above native wait so we prefer native result when possible
+  async function realDelayOnce(raw: string): Promise<number> {
+    // Native wait ≥12s; JS race must stay above that or we invent «قطع»
     return raceAbort(
-      raceMs(pingRealDelay(cfg.raw, timeoutMs), timeoutMs + 1200),
+      raceMs(pingRealDelay(raw, timeoutMs), timeoutMs + 3_000),
       options.signal,
     );
   }
@@ -128,25 +112,12 @@ export async function runPingQueue(
     options.onStart?.(cfg);
     if (stopped || options.signal?.aborted) throw abortedError();
 
-    if (tcpMode !== 'off') {
-      const tcp = await raceAbort(
-        raceMs(pingTcp(cfg.address, cfg.port, tcpTimeoutMs), tcpTimeoutMs + 400),
-        options.signal,
-      );
-      // Hard mode only: TCP unreachable → skip real-delay
-      if (tcpMode === 'hard' && tcp < 0) return -1;
-      // soft: continue to real-delay even if TCP timed out
-    }
-
-    if (stopped || options.signal?.aborted) throw abortedError();
-
-    let best = await realDelayOnce(cfg);
+    let best = await realDelayOnce(cfg.raw);
     for (let attempt = 0; attempt < retries && best <= 0; attempt++) {
       if (stopped || options.signal?.aborted) throw abortedError();
-      // Short pause so LibXray can tear down the failed outbound
-      await new Promise<void>((r) => setTimeout(r, 120));
+      await new Promise<void>((r) => setTimeout(r, 150));
       if (stopped || options.signal?.aborted) throw abortedError();
-      const again = await realDelayOnce(cfg);
+      const again = await realDelayOnce(cfg.raw);
       if (again > 0) best = again;
     }
     return best;
@@ -157,7 +128,6 @@ export async function runPingQueue(
       if (stopped || options.signal?.aborted) return;
       const i = nextIndex++;
       if (i >= total) return;
-      if (stopped || options.signal?.aborted) return;
       const cfg = configs[i]!;
       let pingMs = -1;
       try {
@@ -208,11 +178,12 @@ export async function runPingQueue(
     }
   }
 
-  const workers = Array.from(
-    { length: Math.min(concurrency, Math.max(total, 1)) },
-    () => worker(),
+  await Promise.all(
+    Array.from(
+      { length: Math.min(concurrency, Math.max(total, 1)) },
+      () => worker(),
+    ),
   );
-  await Promise.all(workers);
 
   return results.map((r, i) => {
     if (r) return r;

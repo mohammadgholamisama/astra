@@ -4534,6 +4534,200 @@ async def recount_group_usage_local(db: AsyncSession, group_id: int) -> list[int
     return flipped
 
 
+async def category_group_ids(db: AsyncSession, category_id: int) -> list[int]:
+    """Enabled sales groups currently in a category (stable id order)."""
+    from app.models.group import Group
+
+    rows = await db.execute(
+        select(Group.id)
+        .where(
+            Group.category_id == int(category_id),
+            Group.is_disabled.is_(False),
+        )
+        .order_by(Group.id.asc())
+    )
+    return [int(r[0]) for r in rows.all() if r[0] is not None]
+
+
+async def apply_user_group_membership(
+    db: AsyncSession,
+    user: User,
+    wanted_group_ids: list[int],
+) -> bool:
+    """Replace user groups + remotes to match ``wanted_group_ids``.
+
+    Same safety as admin edit: delete remotes for removed groups first, then
+    rewrite membership, provision new panels, hydrate links. Does NOT reset
+    used_traffic / coeff anchors — only membership changes.
+    Returns True if membership actually changed.
+    """
+    from sqlalchemy import delete as sa_delete
+
+    ordered: list[int] = []
+    seen: set[int] = set()
+    for raw in wanted_group_ids:
+        try:
+            gid = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if gid in seen:
+            continue
+        seen.add(gid)
+        ordered.append(gid)
+    if not ordered:
+        return False
+
+    ug = await db.execute(
+        select(UserGroup.group_id)
+        .where(UserGroup.user_id == user.id)
+        .order_by(UserGroup.sort_order.asc(), UserGroup.id.asc())
+    )
+    old_order = [int(row[0]) for row in ug.all() if row[0] is not None]
+    if old_order == ordered:
+        return False
+
+    old_set = set(old_order)
+    wanted_set = set(ordered)
+    removed = sorted(old_set - wanted_set)
+
+    if removed:
+        results = await sync_delete_user_group_accounts(db, user, removed)
+        failed = [r for r in results if not r.get("ok")]
+        if failed:
+            # Soft: keep going for category bulk sync — log and skip hard fail
+            logger.warning(
+                "category membership delete remotes partial user=%s failed=%s",
+                getattr(user, "username", "?"),
+                len(failed),
+            )
+
+    await db.execute(sa_delete(UserGroup).where(UserGroup.user_id == user.id))
+    for i, gid in enumerate(ordered):
+        db.add(UserGroup(user_id=user.id, group_id=gid, sort_order=i))
+    await db.flush()
+
+    panels = await resolve_panels_for_groups(db, ordered)
+    if panels:
+        await provision_user_on_panels(db, user, panels)
+        try:
+            await hydrate_share_links(db, user)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "hydrate after category sync user=%s failed",
+                getattr(user, "username", "?"),
+                exc_info=True,
+            )
+    return True
+
+
+async def resync_users_for_category(
+    db: AsyncSession,
+    category_id: int,
+    *,
+    removed_group_ids: list[int] | None = None,
+) -> int:
+    """Sync every user bound to ``category_id`` to current category groups.
+
+    Used when groups are added/removed/moved in a sales category. Preserves
+    volume + coefficient anchors; only membership / remotes change.
+
+    ``removed_group_ids``: force remote cleanup (e.g. group deleted from Astra
+    after UserGroup rows were already dropped).
+    """
+    from app.models.group import GroupCategory
+    from app.models.user import User as UserModel
+
+    cid = int(category_id)
+    cat = await db.get(GroupCategory, cid)
+    if cat is None:
+        return 0
+
+    desired = await category_group_ids(db, cid)
+    force_removed = sorted(
+        {int(g) for g in (removed_group_ids or []) if g is not None}
+    )
+
+    result = await db.execute(
+        select(UserModel)
+        .where(UserModel.source_category_id == cid)
+        .options(
+            selectinload(UserModel.panel_accounts).selectinload(PanelAccount.panel)
+        )
+    )
+    users = [
+        u
+        for u in result.scalars().unique().all()
+        if not str(u.username or "").startswith("ag")
+        and "نمونه کانفیگ" not in (u.note or "")
+    ]
+    if not users:
+        return 0
+
+    if not desired and not force_removed:
+        logger.info("category %s resync skipped — no enabled groups", cid)
+        return 0
+
+    ok = 0
+    touched_gids: set[int] = set(desired)
+    for user in users:
+        try:
+            changed = False
+            if force_removed:
+                await sync_delete_user_group_accounts(db, user, force_removed)
+                changed = True
+            if desired:
+                if await apply_user_group_membership(db, user, desired):
+                    changed = True
+            if changed:
+                ok += 1
+                ug = await db.execute(
+                    select(UserGroup.group_id).where(UserGroup.user_id == user.id)
+                )
+                for (gid,) in ug.all():
+                    if gid is not None:
+                        touched_gids.add(int(gid))
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "category %s resync user=%s failed",
+                cid,
+                getattr(user, "username", "?"),
+            )
+
+    # Recount coeffs on affected groups (local only — no traffic inflation)
+    for gid in sorted(touched_gids):
+        try:
+            await recount_group_usage_local(db, gid)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "category %s recount group=%s failed", cid, gid, exc_info=True
+            )
+
+    # Push remotes for users that changed (caps / enable state)
+    if ok:
+        ids = [int(u.id) for u in users]
+        result2 = await db.execute(
+            select(UserModel)
+            .where(UserModel.id.in_(ids))
+            .options(
+                selectinload(UserModel.panel_accounts).selectinload(PanelAccount.panel)
+            )
+        )
+        fresh = list(result2.scalars().unique().all())
+        if fresh:
+            await refresh_users_usage_batch(
+                db, fresh, force=True, concurrency=8, push_remotes=True
+            )
+    await db.flush()
+    logger.info(
+        "category %s membership resync: changed=%s/%s groups=%s",
+        cid,
+        ok,
+        len(users),
+        desired,
+    )
+    return ok
+
+
 async def resync_users_for_group(
     db: AsyncSession,
     group_id: int,
