@@ -100,6 +100,7 @@ async def _bg_resync_group_users(
 async def _bg_resync_category_users(
     *category_ids: int | None,
     removed_group_ids: list[int] | None = None,
+    added_group_ids: list[int] | None = None,
 ) -> None:
     """Sync users bound to sales categories after membership change."""
     from app.core.database import AsyncSessionLocal
@@ -119,7 +120,10 @@ async def _bg_resync_category_users(
         try:
             async with AsyncSessionLocal() as db:
                 n = await resync_users_for_category(
-                    db, cid, removed_group_ids=removed_group_ids
+                    db,
+                    cid,
+                    removed_group_ids=removed_group_ids,
+                    added_group_ids=added_group_ids,
                 )
                 await db.commit()
                 logger.info("bg category %s resync ok changed_users=%s", cid, n)
@@ -386,6 +390,28 @@ async def delete_group_category(
     }
 
 
+@router.post("/api/group-categories/{category_id}/resync-users")
+async def resync_category_users(
+    category_id: int,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """Force-sync all category-bound users to current groups (subs update)."""
+    cat = await db.get(GroupCategory, category_id)
+    if not cat:
+        raise HTTPException(status_code=404, detail="دسته پیدا نشد")
+    # Run in background — can take a while with many remotes
+    asyncio.create_task(
+        _bg_resync_category_users(category_id),
+        name=f"astra-cat-manual-resync-{category_id}",
+    )
+    return {
+        "ok": True,
+        "detail": "همگام‌سازی کاربران این دسته شروع شد",
+        "category_id": int(category_id),
+    }
+
+
 # ── Groups ──────────────────────────────────────────────────────────────────
 
 
@@ -414,7 +440,9 @@ async def create_group(
     await db.commit()
     if category_id is not None:
         asyncio.create_task(
-            _bg_resync_category_users(category_id),
+            _bg_resync_category_users(
+                category_id, added_group_ids=[int(group.id)]
+            ),
             name=f"astra-cat-resync-{category_id}",
         )
     group = await _load_group(db, group.id)
@@ -462,10 +490,22 @@ async def move_group(
     group.category_id = new_cat
     await db.commit()
     if old_cat != new_cat:
-        asyncio.create_task(
-            _bg_resync_category_users(old_cat, new_cat),
-            name=f"astra-cat-move-{group_id}",
-        )
+        # Leaving old category → drop this group from those users' membership
+        if old_cat is not None:
+            asyncio.create_task(
+                _bg_resync_category_users(
+                    old_cat, removed_group_ids=[int(group_id)]
+                ),
+                name=f"astra-cat-leave-{group_id}",
+            )
+        # Entering new category → add this group for category-bound users
+        if new_cat is not None:
+            asyncio.create_task(
+                _bg_resync_category_users(
+                    new_cat, added_group_ids=[int(group_id)]
+                ),
+                name=f"astra-cat-join-{group_id}",
+            )
     group = await _load_group(db, group_id)
     return _to_out(group)  # type: ignore[arg-type]
 
@@ -533,10 +573,26 @@ async def update_group(
         )
     if cat_changed:
         new_cat = getattr(group, "category_id", None)
-        asyncio.create_task(
-            _bg_resync_category_users(old_cat, new_cat),
-            name=f"astra-cat-resync-g{group_id}",
-        )
+        if old_cat is not None and old_cat != new_cat:
+            asyncio.create_task(
+                _bg_resync_category_users(
+                    old_cat, removed_group_ids=[int(group_id)]
+                ),
+                name=f"astra-cat-leave-g{group_id}",
+            )
+        if new_cat is not None and new_cat != old_cat:
+            asyncio.create_task(
+                _bg_resync_category_users(
+                    new_cat, added_group_ids=[int(group_id)]
+                ),
+                name=f"astra-cat-join-g{group_id}",
+            )
+        elif new_cat is not None and body.is_disabled is not None:
+            # enable/disable inside same category — refresh membership
+            asyncio.create_task(
+                _bg_resync_category_users(new_cat),
+                name=f"astra-cat-toggle-g{group_id}",
+            )
     group = await _load_group(db, group_id)
     return _to_out(group)  # type: ignore[arg-type]
 

@@ -6,6 +6,7 @@ import {
   Layers,
   Pencil,
   Plus,
+  RefreshCw,
   Trash2,
   X,
 } from "lucide-react";
@@ -501,6 +502,20 @@ export default function GroupsPage() {
     },
   });
 
+  const resyncCat = useMutation({
+    mutationFn: (id: number) =>
+      api<{ ok: boolean; detail: string }>(
+        `/api/group-categories/${id}/resync-users`,
+        { method: "POST" }
+      ),
+    onSuccess: (res) => {
+      window.alert(res.detail || "همگام‌سازی شروع شد");
+    },
+    onError: (e: unknown) => {
+      window.alert(e instanceof Error ? e.message : "همگام‌سازی ناموفق بود");
+    },
+  });
+
   function togglePanel(panel: Panel) {
     setPicks((prev) => {
       if (prev.some((p) => p.panel_id === panel.id)) {
@@ -764,6 +779,18 @@ export default function GroupsPage() {
           >
             <Pencil size={14} />
             ویرایش دسته
+          </button>
+        )}
+        {activeCat && (
+          <button
+            type="button"
+            className="groups-cat-manage"
+            title="افزودن گروه‌های جدید دسته به ساب کاربران متصل به این دسته"
+            disabled={resyncCat.isPending}
+            onClick={() => resyncCat.mutate(activeCat.id)}
+          >
+            <RefreshCw size={14} className={resyncCat.isPending ? "configs-spin" : undefined} />
+            {resyncCat.isPending ? "همگام‌سازی…" : "همگام‌سازی ساب کاربران"}
           </button>
         )}
       </div>

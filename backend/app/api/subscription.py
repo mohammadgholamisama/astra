@@ -83,6 +83,16 @@ def _feed_cache_put(user_id: int, include_hidden: bool, body: bytes) -> None:
     )
 
 
+def invalidate_user_feed_cache(*user_ids: int) -> None:
+    """Drop cached sub bodies after membership / remote changes."""
+    if not user_ids:
+        return
+    want = {int(u) for u in user_ids if u is not None}
+    for key in list(_feed_cache.keys()):
+        if key[0] in want:
+            _feed_cache.pop(key, None)
+
+
 def _account_has_ready_shares(account) -> bool:
     """True when account can contribute stable share links to the feed."""
     from app.adapters.http_utils import is_share_link, is_subscription_ref

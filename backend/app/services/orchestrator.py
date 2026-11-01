@@ -5,7 +5,7 @@ import secrets
 import time
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -4620,11 +4620,54 @@ async def apply_user_group_membership(
     return True
 
 
+async def _users_with_exact_groups(
+    db: AsyncSession, group_ids: list[int]
+) -> list[User]:
+    """Users whose membership is exactly ``group_ids`` (order ignored)."""
+    from app.models.user import User as UserModel
+
+    want = sorted({int(g) for g in group_ids if g is not None})
+    if not want:
+        return []
+    # Candidates that have every wanted group
+    q = (
+        select(UserGroup.user_id)
+        .where(UserGroup.group_id.in_(want))
+        .group_by(UserGroup.user_id)
+        .having(func.count(UserGroup.group_id) == len(want))
+    )
+    cand_ids = [int(r[0]) for r in (await db.execute(q)).all() if r[0] is not None]
+    if not cand_ids:
+        return []
+    # Exclude anyone who also has a group outside ``want``
+    extra = await db.execute(
+        select(UserGroup.user_id)
+        .where(
+            UserGroup.user_id.in_(cand_ids),
+            UserGroup.group_id.notin_(want),
+        )
+        .distinct()
+    )
+    skip = {int(r[0]) for r in extra.all() if r[0] is not None}
+    keep = [i for i in cand_ids if i not in skip]
+    if not keep:
+        return []
+    result = await db.execute(
+        select(UserModel)
+        .where(UserModel.id.in_(keep))
+        .options(
+            selectinload(UserModel.panel_accounts).selectinload(PanelAccount.panel)
+        )
+    )
+    return list(result.scalars().unique().all())
+
+
 async def resync_users_for_category(
     db: AsyncSession,
     category_id: int,
     *,
     removed_group_ids: list[int] | None = None,
+    added_group_ids: list[int] | None = None,
 ) -> int:
     """Sync every user bound to ``category_id`` to current category groups.
 
@@ -4633,7 +4676,10 @@ async def resync_users_for_category(
 
     ``removed_group_ids``: force remote cleanup (e.g. group deleted from Astra
     after UserGroup rows were already dropped).
+    ``added_group_ids``: also pick up unbound users who previously matched the
+    category exactly (before these groups were added) and bind them.
     """
+    from app.api.subscription import invalidate_user_feed_cache
     from app.models.group import GroupCategory
     from app.models.user import User as UserModel
 
@@ -4646,6 +4692,7 @@ async def resync_users_for_category(
     force_removed = sorted(
         {int(g) for g in (removed_group_ids or []) if g is not None}
     )
+    added = sorted({int(g) for g in (added_group_ids or []) if g is not None})
 
     result = await db.execute(
         select(UserModel)
@@ -4654,13 +4701,39 @@ async def resync_users_for_category(
             selectinload(UserModel.panel_accounts).selectinload(PanelAccount.panel)
         )
     )
-    users = [
-        u
-        for u in result.scalars().unique().all()
-        if not str(u.username or "").startswith("ag")
-        and "نمونه کانفیگ" not in (u.note or "")
-    ]
+    users_by_id: dict[int, User] = {}
+    for u in result.scalars().unique().all():
+        if str(u.username or "").startswith("ag"):
+            continue
+        if "نمونه کانفیگ" in (u.note or ""):
+            continue
+        users_by_id[int(u.id)] = u
+
+    # Fallback: users created from this category before source_category_id existed
+    # (or after a manual tweak cleared the bind) but still have exact prior membership.
+    if added and desired:
+        prev = sorted(set(desired) - set(added))
+        if prev:
+            for u in await _users_with_exact_groups(db, prev):
+                if str(u.username or "").startswith("ag"):
+                    continue
+                if "نمونه کانفیگ" in (u.note or ""):
+                    continue
+                if int(u.id) in users_by_id:
+                    continue
+                # Bind so future category edits keep syncing
+                if getattr(u, "source_category_id", None) is None:
+                    u.source_category_id = cid
+                users_by_id[int(u.id)] = u
+
+    users = list(users_by_id.values())
     if not users:
+        logger.info(
+            "category %s resync — no bound users (desired=%s added=%s)",
+            cid,
+            desired,
+            added,
+        )
         return 0
 
     if not desired and not force_removed:
@@ -4669,6 +4742,7 @@ async def resync_users_for_category(
 
     ok = 0
     touched_gids: set[int] = set(desired)
+    touched_uids: list[int] = []
     for user in users:
         try:
             changed = False
@@ -4678,8 +4752,24 @@ async def resync_users_for_category(
             if desired:
                 if await apply_user_group_membership(db, user, desired):
                     changed = True
+                else:
+                    # Membership already matches — still heal missing remotes
+                    # (e.g. prior provision failed / panel added later).
+                    panels = await resolve_panels_for_groups(db, desired)
+                    if panels:
+                        await provision_user_on_panels(db, user, panels)
+                        try:
+                            await hydrate_share_links(db, user)
+                        except Exception:  # noqa: BLE001
+                            logger.warning(
+                                "hydrate after category heal user=%s failed",
+                                getattr(user, "username", "?"),
+                                exc_info=True,
+                            )
+                        changed = True
             if changed:
                 ok += 1
+                touched_uids.append(int(user.id))
                 ug = await db.execute(
                     select(UserGroup.group_id).where(UserGroup.user_id == user.id)
                 )
@@ -4692,6 +4782,9 @@ async def resync_users_for_category(
                 cid,
                 getattr(user, "username", "?"),
             )
+
+    if touched_uids:
+        invalidate_user_feed_cache(*touched_uids)
 
     # Recount coeffs on affected groups (local only — no traffic inflation)
     for gid in sorted(touched_gids):
@@ -4719,11 +4812,12 @@ async def resync_users_for_category(
             )
     await db.flush()
     logger.info(
-        "category %s membership resync: changed=%s/%s groups=%s",
+        "category %s membership resync: changed=%s/%s groups=%s added=%s",
         cid,
         ok,
         len(users),
         desired,
+        added,
     )
     return ok
 
