@@ -540,8 +540,14 @@ async def _render_info_page_body(db: AsyncSession, token: str, user) -> HTMLResp
         device_limit = 0
     status = user.status.value if hasattr(user.status, "value") else str(user.status)
     show_name = (getattr(user, "display_name", None) or "").strip() or user.username
+    # Without first promo, hide brand on the public sub page (privacy / no-ad users).
+    page_brand = (
+        get_brand_name()
+        if bool(getattr(user, "include_promo_first", True))
+        else "sub links"
+    )
     html = render_subscription_page(
-        panel_name=get_brand_name(),
+        panel_name=page_brand,
         username=show_name,
         status=status,
         used=int(user.used_traffic or 0),
