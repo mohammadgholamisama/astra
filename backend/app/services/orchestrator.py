@@ -1694,7 +1694,7 @@ async def _delete_panel_accounts_remote(
 
         # Inactive Astra panels: still try delete so remotes don't keep junk
         last_err = "حذف از پنل ناموفق بود"
-        for attempt in range(2):
+        for attempt in range(3):
             adapter = get_adapter(panel)
             try:
                 async with sem:
@@ -1702,7 +1702,7 @@ async def _delete_panel_accounts_remote(
                         adapter.delete_user(
                             uname, account.remote_id or account.remote_username
                         ),
-                        timeout=16,
+                        timeout=20,
                     )
             except Exception as e:  # noqa: BLE001
                 last_err = _exc_msg(e)
@@ -1717,8 +1717,8 @@ async def _delete_panel_accounts_remote(
                 return {**base, "ok": True, "error": None}
             if res is not None:
                 last_err = res.error or last_err
-            if attempt == 0:
-                await asyncio.sleep(0.35)
+            if attempt < 2:
+                await asyncio.sleep(0.35 + attempt * 0.25)
 
         return {**base, "ok": False, "error": last_err}
 
@@ -1755,6 +1755,8 @@ async def deprovision_all_accounts_on_panel(db: AsyncSession, panel_id: int) -> 
     """Delete every remote account on this panel, then mark local rows deleted.
 
     Used before removing a panel from Astra so remotes are not left with live configs.
+    Covers Marzban / Sanaei / PasarGuard / Rebecca / Astra node — works even when
+    the Astra panel row is already inactive.
     """
     pid = int(panel_id)
     result = await db.execute(
@@ -1771,6 +1773,25 @@ async def deprovision_all_accounts_on_panel(db: AsyncSession, panel_id: int) -> 
     accounts = list(result.scalars().unique().all())
     if not accounts:
         return {"accounts": 0, "ok": 0, "fail": 0}
+
+    # Drop share links first so subs update even if remote delete is slow
+    touched_uids: list[int] = []
+    seen_u: set[int] = set()
+    for a in accounts:
+        a.links = []
+        a.links_by_group = {}
+        uid = int(a.user_id)
+        if uid not in seen_u:
+            seen_u.add(uid)
+            touched_uids.append(uid)
+    await db.flush()
+    try:
+        from app.api.subscription import invalidate_user_feed_cache
+
+        if touched_uids:
+            invalidate_user_feed_cache(*touched_uids)
+    except Exception:  # noqa: BLE001
+        pass
 
     by_user: dict[int, list[PanelAccount]] = {}
     users: dict[int, User] = {}
@@ -1801,8 +1822,16 @@ async def deprovision_all_accounts_on_panel(db: AsyncSession, panel_id: int) -> 
             a.status = PanelAccountStatus.deleted
             a.links = []
             a.links_by_group = {}
+            a.error_message = None
 
     await db.flush()
+    try:
+        from app.api.subscription import invalidate_user_feed_cache
+
+        if touched_uids:
+            invalidate_user_feed_cache(*touched_uids)
+    except Exception:  # noqa: BLE001
+        pass
     logger.info(
         "deprovision-panel panel=%s accounts=%s ok=%s fail=%s",
         pid,
@@ -2433,6 +2462,248 @@ async def drop_inactive_panel_errors(db: AsyncSession, panel_id: int) -> int:
             "drop inactive-panel errors panel=%s count=%s", panel_id, len(rows)
         )
     return len(rows)
+
+
+async def clear_panel_account_share_links(
+    db: AsyncSession, panel_id: int
+) -> list[int]:
+    """Wipe share links for every non-deleted account on this panel.
+
+    Subscription feeds stop emitting those configs immediately (inactive panel
+    is already filtered, but empty links keep hydrate/order paths clean).
+    Returns touched user ids for feed-cache invalidation.
+    """
+    pid = int(panel_id)
+    result = await db.execute(
+        select(PanelAccount).where(
+            PanelAccount.panel_id == pid,
+            PanelAccount.status != PanelAccountStatus.deleted,
+        )
+    )
+    rows = list(result.scalars().all())
+    touched: list[int] = []
+    seen: set[int] = set()
+    for a in rows:
+        a.links = []
+        a.links_by_group = {}
+        uid = int(a.user_id)
+        if uid not in seen:
+            seen.add(uid)
+            touched.append(uid)
+    if rows:
+        await db.flush()
+        logger.info(
+            "clear panel share-links panel=%s accounts=%s users=%s",
+            pid,
+            len(rows),
+            len(touched),
+        )
+    return touched
+
+
+async def freeze_all_accounts_on_panel(panel_id: int) -> dict:
+    """Disable every remote user on this panel (Marzban/Sanaei/Pasar/Rebecca/Astra).
+
+    Used after an Astra panel is turned OFF. Local PanelAccount rows stay
+    (status unchanged, links already cleared) so heal can re-enable later.
+    Runs in its own DB session — safe as a background task.
+    """
+    from app.core.database import AsyncSessionLocal
+
+    pid = int(panel_id)
+    stats = {"accounts": 0, "ok": 0, "fail": 0, "skipped": 0}
+    t0 = time.monotonic()
+    try:
+        async with AsyncSessionLocal() as db:
+            panel = await db.get(Panel, pid)
+            if panel is None:
+                return stats
+            # Panel may already be inactive — that is expected.
+
+            gp = await db.execute(
+                select(GroupPanel).where(GroupPanel.panel_id == pid)
+            )
+            claim_cfg: dict[int, dict] = {}
+            any_cfg: dict = {}
+            for link in gp.scalars().all():
+                cfg = dict(link.config or {})
+                claim_cfg[int(link.group_id)] = cfg
+                if cfg and not any_cfg:
+                    any_cfg = cfg
+
+            result = await db.execute(
+                select(PanelAccount)
+                .where(
+                    PanelAccount.panel_id == pid,
+                    PanelAccount.status != PanelAccountStatus.deleted,
+                )
+                .options(
+                    selectinload(PanelAccount.panel),
+                    selectinload(PanelAccount.user),
+                )
+            )
+            accounts = list(result.scalars().unique().all())
+            stats["accounts"] = len(accounts)
+            if not accounts:
+                return stats
+
+            # Ensure links stay empty even if caller skipped clear
+            for a in accounts:
+                a.links = []
+                a.links_by_group = {}
+            await db.commit()
+
+            sem = _remote_sem()
+
+            async def _freeze_remote(account: PanelAccount) -> str:
+                """Return ok | fail | skipped."""
+                p = account.panel
+                user = account.user
+                if p is None or user is None:
+                    return "fail"
+                uname = (account.remote_username or user.username or "").strip()
+                if not uname:
+                    return "skipped"  # never provisioned
+
+                gid = int(getattr(account, "group_id", 0) or 0)
+                cfg = dict(claim_cfg.get(gid) or any_cfg or {})
+                rid = (account.remote_id or "").strip()
+                if rid:
+                    cfg["_remote_id"] = rid
+
+                payload = build_user_payload(
+                    user,
+                    uuid=account.uuid,
+                    panel_config=cfg,
+                    used_raw_on_panel=int(account.used_traffic or 0),
+                    remote_username=uname,
+                )
+                # Force remote freeze regardless of Astra user status
+                payload.status = "disabled"
+                used_r = max(0, int(account.used_traffic or 0))
+                if int(user.data_limit or 0) > 0:
+                    payload.data_limit = max(1, used_r) if used_r > 0 else 1
+
+                last_err: str | None = None
+                for attempt in range(3):
+                    adapter = get_adapter(p)
+                    try:
+                        async with sem:
+                            res = await asyncio.wait_for(
+                                adapter.modify_user(payload),
+                                timeout=18.0,
+                            )
+                        if res.success or _is_not_found_err(res.error):
+                            return "ok"
+                        last_err = res.error
+                    except Exception as exc:  # noqa: BLE001
+                        last_err = _exc_msg(exc)
+                    finally:
+                        try:
+                            await adapter.close()  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    if attempt < 2:
+                        await asyncio.sleep(0.3 + attempt * 0.2)
+
+                logger.warning(
+                    "freeze-panel panel=%s account=%s user=%s fail=%s",
+                    pid,
+                    account.id,
+                    uname,
+                    last_err,
+                )
+                return "fail"
+
+            # Astra node clients: upsert on shared session (avoids SQLite lock)
+            astra_accounts: list[PanelAccount] = []
+            remote_jobs: list[PanelAccount] = []
+            for a in accounts:
+                p = a.panel
+                if p is not None and p.type == PanelType.astra:
+                    astra_accounts.append(a)
+                else:
+                    remote_jobs.append(a)
+
+            if astra_accounts:
+                from app.services import astra_node as astra_node_svc
+
+                panel_row = await db.get(Panel, pid)
+                if panel_row is not None:
+                    for account in astra_accounts:
+                        user = account.user
+                        uname = (
+                            (
+                                account.remote_username
+                                or (user.username if user else "")
+                                or ""
+                            ).strip()
+                        )
+                        if not uname or user is None:
+                            stats["skipped"] += 1
+                            continue
+                        try:
+                            await astra_node_svc.upsert_client(
+                                db,
+                                panel_row,
+                                email=uname,
+                                uuid=account.uuid,
+                                data_limit=max(1, int(account.used_traffic or 0)) or 1,
+                                expire=0,
+                                enable=False,
+                                limit_ip=0,
+                                rebuild=False,
+                                sync_nginx=False,
+                            )
+                            stats["ok"] += 1
+                        except Exception:  # noqa: BLE001
+                            stats["fail"] += 1
+                            logger.exception(
+                                "freeze-panel astra account=%s failed", account.id
+                            )
+                    try:
+                        await astra_node_svc.rebuild_xray_config(db, panel_row)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("freeze-panel astra rebuild panel=%s", pid)
+                    await db.commit()
+
+            if remote_jobs:
+                outcomes = await asyncio.gather(
+                    *[_freeze_remote(a) for a in remote_jobs],
+                    return_exceptions=True,
+                )
+                for o in outcomes:
+                    if o == "ok":
+                        stats["ok"] += 1
+                    elif o == "skipped":
+                        stats["skipped"] += 1
+                    else:
+                        stats["fail"] += 1
+                        if not isinstance(o, str):
+                            logger.warning("freeze-panel gather err: %s", o)
+
+            try:
+                from app.api.subscription import invalidate_user_feed_cache
+
+                uids = sorted({int(a.user_id) for a in accounts})
+                if uids:
+                    invalidate_user_feed_cache(*uids)
+            except Exception:  # noqa: BLE001
+                pass
+
+            logger.info(
+                "freeze-panel panel=%s accounts=%s ok=%s fail=%s skipped=%s dt=%.2fs",
+                pid,
+                stats["accounts"],
+                stats["ok"],
+                stats["fail"],
+                stats["skipped"],
+                time.monotonic() - t0,
+            )
+    except Exception:  # noqa: BLE001
+        stats["fail"] += 1
+        logger.exception("freeze-panel panel=%s fatal", pid)
+    return stats
 
 
 async def heal_failed_panel_accounts_batch(

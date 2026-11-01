@@ -380,15 +380,18 @@ async def update_panel(
             v = v.strip() or None
         setattr(panel, k, v)
 
+    turning_off = was_active and not bool(panel.is_active)
+    turning_on = (not was_active) and bool(panel.is_active)
+
     if only_active:
         # Toggle on/off must not require a live probe (panel may be temporarily down)
-        if was_active and not bool(panel.is_active):
-            from app.services.orchestrator import drop_inactive_panel_errors
-
-            await drop_inactive_panel_errors(db, panel.id)
+        if turning_off:
+            await _prepare_panel_turn_off(db, panel.id)
         await db.commit()
         await db.refresh(panel)
-        if (not was_active) and bool(panel.is_active):
+        if turning_off:
+            _schedule_panel_freeze(panel.id)
+        if turning_on:
             asyncio.create_task(
                 _bg_heal_panel(panel.id),
                 name=f"astra-panel-heal-{panel.id}",
@@ -431,9 +434,14 @@ async def update_panel(
         await _probe_panel(panel)
         panel.last_ok_at = datetime.now(timezone.utc)
 
+    if turning_off:
+        await _prepare_panel_turn_off(db, panel.id)
+
     await db.commit()
     await db.refresh(panel)
-    if (not was_active) and bool(panel.is_active):
+    if turning_off:
+        _schedule_panel_freeze(panel.id)
+    if turning_on:
         asyncio.create_task(
             _bg_heal_panel(panel.id),
             name=f"astra-panel-heal-{panel.id}",
@@ -452,26 +460,63 @@ async def set_panel_active(
     """
     Turn panel on/off without probing remotes.
 
-    Off → excluded from groups provision + all old/new subscriptions immediately.
-    On  → background heal provisions missing accounts on linked groups.
+    Off → drop from subs immediately, then disable remotes on Marzban/Sanaei/
+          PasarGuard/Rebecca/Astra in the background.
+    On  → background heal re-enables / provisions accounts on linked groups.
     """
     panel = await db.get(Panel, panel_id)
     if not panel:
         raise HTTPException(status_code=404, detail="Panel not found")
     was_active = bool(panel.is_active)
     panel.is_active = bool(body.is_active)
-    if was_active and not bool(panel.is_active):
-        from app.services.orchestrator import drop_inactive_panel_errors
-
-        await drop_inactive_panel_errors(db, panel.id)
+    turning_off = was_active and not bool(panel.is_active)
+    turning_on = (not was_active) and bool(panel.is_active)
+    if turning_off:
+        await _prepare_panel_turn_off(db, panel.id)
     await db.commit()
     await db.refresh(panel)
-    if (not was_active) and bool(panel.is_active):
+    if turning_off:
+        _schedule_panel_freeze(panel.id)
+    if turning_on:
         asyncio.create_task(
             _bg_heal_panel(panel.id),
             name=f"astra-panel-heal-{panel.id}",
         )
     return _to_out(panel)
+
+
+async def _prepare_panel_turn_off(db: AsyncSession, panel_id: int) -> None:
+    """Local cleanup before remotes are frozen in the background."""
+    from app.api.subscription import invalidate_user_feed_cache
+    from app.services.orchestrator import (
+        clear_panel_account_share_links,
+        drop_inactive_panel_errors,
+    )
+
+    await drop_inactive_panel_errors(db, panel_id)
+    uids = await clear_panel_account_share_links(db, panel_id)
+    if uids:
+        try:
+            invalidate_user_feed_cache(*uids)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _schedule_panel_freeze(panel_id: int) -> None:
+    asyncio.create_task(
+        _bg_freeze_panel(panel_id),
+        name=f"astra-panel-freeze-{panel_id}",
+    )
+
+
+async def _bg_freeze_panel(panel_id: int) -> None:
+    from app.services.orchestrator import freeze_all_accounts_on_panel
+
+    try:
+        stats = await freeze_all_accounts_on_panel(panel_id)
+        logger.info("bg freeze panel=%s stats=%s", panel_id, stats)
+    except Exception:  # noqa: BLE001
+        logger.exception("bg freeze panel=%s failed", panel_id)
 
 
 async def _bg_heal_panel(panel_id: int) -> None:
@@ -493,7 +538,8 @@ async def delete_panel(
     """Remove panel from Astra AFTER deleting its configs on the remote panel.
 
     Every PanelAccount on this panel is deleted upstream (Marzban / PasarGuard /
-    Sanaei / Rebecca) so old and new subs lose those configs and remotes stay clean.
+    Sanaei / Rebecca / Astra node) so old and new subs lose those configs and
+    remotes stay clean — even if the panel was already turned off.
     """
     from sqlalchemy import delete as sa_delete
 
