@@ -3207,7 +3207,7 @@ async def collect_links_detailed(
         notice_rows_from_groups,
     )
     from app.services.site_settings import (
-        get_promo_config_texts,
+        get_promo_config_texts_for_user,
         get_status_line_template,
         get_status_panel_label,
     )
@@ -3242,7 +3242,9 @@ async def collect_links_detailed(
             panel_label=get_status_panel_label(),
         )
     ]
-    for promo_text in get_promo_config_texts():
+    for promo_text in get_promo_config_texts_for_user(
+        include_first=bool(getattr(user, "include_promo_first", True))
+    ):
         promo = build_promo_row(promo_text)
         if promo:
             head.append(promo)

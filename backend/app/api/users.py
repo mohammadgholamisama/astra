@@ -197,6 +197,7 @@ async def create_user(
         data_limit=body.data_limit or 0,
         expire=expire,
         on_hold_expire_duration=hold_dur,
+        include_promo_first=bool(body.include_promo_first),
         note=body.note,
         data_limit_reset_strategy=body.data_limit_reset_strategy,
         proxy_settings={
@@ -430,6 +431,7 @@ async def create_users_bulk(
                 data_limit=body.data_limit or 0,
                 expire=expire,
                 on_hold_expire_duration=hold_dur,
+                include_promo_first=bool(body.include_promo_first),
                 note=body.note,
                 data_limit_reset_strategy=body.data_limit_reset_strategy,
                 proxy_settings={
@@ -635,6 +637,8 @@ async def modify_user(
         user.status = st
         user.expire = exp
         user.on_hold_expire_duration = hold_dur
+    if body.include_promo_first is not None:
+        user.include_promo_first = bool(body.include_promo_first)
     if body.note is not None:
         user.note = body.note
     if body.data_limit_reset_strategy is not None:
@@ -768,6 +772,13 @@ async def modify_user(
             ),
             name=f"astra-sync-remotes-{username}",
         )
+    if body.include_promo_first is not None:
+        try:
+            from app.api.subscription import invalidate_user_feed_cache
+
+            invalidate_user_feed_cache(int(user.id))
+        except Exception:  # noqa: BLE001
+            pass
     user = await load_user(db, username)
     return to_user_response(user)  # type: ignore[arg-type]
 

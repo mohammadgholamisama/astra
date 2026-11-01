@@ -338,13 +338,25 @@ def get_promo_config_text_2() -> str:
 
 def get_promo_config_texts() -> list[str]:
     """Non-empty promo remarks in order (max 2) when master switch is on."""
+    return get_promo_config_texts_for_user(include_first=True)
+
+
+def get_promo_config_texts_for_user(*, include_first: bool = True) -> list[str]:
+    """Promo texts for a subscription feed.
+
+    ``include_first=False`` skips settings «تبلیغ اول» (slot 1) but still
+    includes «تبلیغ دوم» when set. Master switch still gates both.
+    """
     if not get_promo_config_enabled():
         return []
     out: list[str] = []
-    for raw in (get_promo_config_text(), get_promo_config_text_2()):
-        text = (raw or "").strip()
-        if text:
-            out.append(text)
+    if include_first:
+        t1 = (get_promo_config_text() or "").strip()
+        if t1:
+            out.append(t1)
+    t2 = (get_promo_config_text_2() or "").strip()
+    if t2:
+        out.append(t2)
     return out
 
 

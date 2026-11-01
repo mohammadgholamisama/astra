@@ -14,6 +14,7 @@ class UserCreate(BaseModel):
     data_limit: int = 0
     expire: int | None = 0
     on_hold_expire_duration: int = 0
+    include_promo_first: bool = True
     note: str | None = None
     group_ids: list[int] = Field(default_factory=list)
     # Bind user to a sales category so later category membership changes sync
@@ -31,6 +32,7 @@ class UserModify(BaseModel):
     data_limit: int | None = None
     expire: int | None = None
     on_hold_expire_duration: int | None = None
+    include_promo_first: bool | None = None
     note: str | None = None
     group_ids: list[int] | None = None
     # Set to bind/rebind; null + clear_category clears tracking
@@ -69,6 +71,7 @@ class UserResponse(ORMModel):
     data_limit: int = 0
     expire: int | None = None
     on_hold_expire_duration: int = 0
+    include_promo_first: bool = True
     data_limit_reset_strategy: str = "no_reset"
     note: str | None = None
     created_at: datetime | None = None
@@ -115,6 +118,7 @@ class UserBulkCreate(BaseModel):
     data_limit: int = 0
     expire: int | None = 0
     on_hold_expire_duration: int = 0
+    include_promo_first: bool = True
     note: str | None = None
     group_ids: list[int] = Field(default_factory=list)
     category_id: int | None = None

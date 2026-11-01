@@ -303,6 +303,7 @@ export default function UsersPage() {
   const [dataGb, setDataGb] = useState("50");
   const [days, setDays] = useState("30");
   const [startOnFirstUse, setStartOnFirstUse] = useState(false);
+  const [includePromoFirst, setIncludePromoFirst] = useState(true);
   const [groupIds, setGroupIds] = useState<number[]>([]);
   const [groupSearch, setGroupSearch] = useState("");
   /** Filter/focus in create modal: all | uncategorized | category id */
@@ -321,6 +322,7 @@ export default function UsersPage() {
   const [bulkDataGb, setBulkDataGb] = useState("50");
   const [bulkDays, setBulkDays] = useState("30");
   const [bulkStartOnFirstUse, setBulkStartOnFirstUse] = useState(false);
+  const [bulkIncludePromoFirst, setBulkIncludePromoFirst] = useState(true);
   const [bulkGroupIds, setBulkGroupIds] = useState<number[]>([]);
   const [bulkGroupSearch, setBulkGroupSearch] = useState("");
   const [bulkCatTab, setBulkCatTab] = useState<number | "all" | "none">("all");
@@ -514,6 +516,7 @@ export default function UsersPage() {
           expire,
           status: hold ? "on_hold" : "active",
           on_hold_expire_duration: hold ? Math.floor(dayN * 86400) : 0,
+          include_promo_first: includePromoFirst,
           group_ids: groupIds,
           category_id: createBoundCategoryId,
         }),
@@ -527,6 +530,7 @@ export default function UsersPage() {
       setDataGb("50");
       setDays("30");
       setStartOnFirstUse(false);
+      setIncludePromoFirst(true);
       setGroupIds([]);
       setGroupSearch("");
       setCreateCatTab("all");
@@ -578,6 +582,7 @@ export default function UsersPage() {
           expire,
           status: hold ? "on_hold" : "active",
           on_hold_expire_duration: hold ? Math.floor(dayN * 86400) : 0,
+          include_promo_first: bulkIncludePromoFirst,
           group_ids: bulkGroupIds,
           category_id: bulkBoundCategoryId,
         }),
@@ -591,6 +596,8 @@ export default function UsersPage() {
       setBulkDisplayName("");
       setBulkDataGb("50");
       setBulkDays("30");
+      setBulkStartOnFirstUse(false);
+      setBulkIncludePromoFirst(true);
       setBulkGroupIds([]);
       setBulkGroupSearch("");
       setBulkCatTab("all");
@@ -2159,6 +2166,25 @@ export default function UsersPage() {
               {startOnFirstUse && Number(days) <= 0 && (
                 <p className="error">برای این گزینه باید روز اعتبار بیشتر از صفر باشد</p>
               )}
+              <button
+                type="button"
+                className={`settings-switch user-hold-switch${includePromoFirst ? " on" : ""}`}
+                role="switch"
+                aria-checked={includePromoFirst}
+                onClick={() => setIncludePromoFirst((v) => !v)}
+              >
+                <span className="settings-switch-track" aria-hidden>
+                  <span className="settings-switch-knob" />
+                </span>
+                <span className="user-hold-switch-copy">
+                  <strong>تبلیغ اول</strong>
+                  <small>
+                    {includePromoFirst
+                      ? "کانفیگ تبلیغ اول تنظیمات در ساب این کاربر نمایش داده می‌شود"
+                      : "تبلیغ اول برای این کاربر در ساب نمی‌آید"}
+                  </small>
+                </span>
+              </button>
               {createErrorText && <p className="error">{createErrorText}</p>}
               <footer className="modal-foot">
                 <button type="button" className="btn ghost" onClick={() => setOpen(false)}>
@@ -2464,6 +2490,26 @@ export default function UsersPage() {
               {bulkStartOnFirstUse && Number(bulkDays) <= 0 && (
                 <p className="error">برای این گزینه باید روز اعتبار بیشتر از صفر باشد</p>
               )}
+              <button
+                type="button"
+                className={`settings-switch user-hold-switch${bulkIncludePromoFirst ? " on" : ""}`}
+                role="switch"
+                aria-checked={bulkIncludePromoFirst}
+                disabled={bulkCreate.isPending}
+                onClick={() => setBulkIncludePromoFirst((v) => !v)}
+              >
+                <span className="settings-switch-track" aria-hidden>
+                  <span className="settings-switch-knob" />
+                </span>
+                <span className="user-hold-switch-copy">
+                  <strong>تبلیغ اول</strong>
+                  <small>
+                    {bulkIncludePromoFirst
+                      ? "کانفیگ تبلیغ اول تنظیمات در ساب این کاربران نمایش داده می‌شود"
+                      : "تبلیغ اول برای این کاربران در ساب نمی‌آید"}
+                  </small>
+                </span>
+              </button>
 
               {bulkErrorText && <p className="error">{bulkErrorText}</p>}
               <footer className="modal-foot">

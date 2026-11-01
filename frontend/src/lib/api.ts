@@ -238,6 +238,8 @@ export interface User {
   data_limit: number;
   expire: number | null;
   on_hold_expire_duration?: number;
+  /** When false, subscription omits settings «تبلیغ اول» */
+  include_promo_first?: boolean;
   note: string | null;
   subscription_url: string;
   links: string[];
