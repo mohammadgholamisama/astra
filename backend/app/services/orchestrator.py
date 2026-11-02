@@ -1357,6 +1357,34 @@ async def _provision_account_now(account_id: int) -> bool:
                                 links = shares
                         except Exception:  # noqa: BLE001
                             pass
+                    if not any(is_share_link(x) for x in links):
+                        adapter2 = get_adapter(panel)
+                        try:
+                            extra = await asyncio.wait_for(
+                                adapter2.get_usage(  # type: ignore[call-arg]
+                                    payload.username,
+                                    acc.remote_id or payload.username,
+                                    expand_links=True,
+                                ),
+                                timeout=8.0,
+                            )
+                            if extra.success:
+                                shares = [
+                                    str(x).strip()
+                                    for x in (extra.links or [])
+                                    if x and is_share_link(str(x))
+                                ]
+                                if shares:
+                                    links = shares
+                        except TypeError:
+                            pass
+                        except Exception:  # noqa: BLE001
+                            pass
+                        finally:
+                            try:
+                                await adapter2.close()  # type: ignore[attr-defined]
+                            except Exception:
+                                pass
                     acc.status = PanelAccountStatus.active
                     acc.remote_username = (
                         res.remote_username or payload.username or user.username
@@ -3940,10 +3968,12 @@ async def collect_links_detailed(
 
     # Prefer already-loaded group→panel graph (no extra SQL) on the hot sub path.
     loaded_claims = _claims_from_loaded_groups(user)
-    if loaded_claims or not live_rebuild or db is None:
+    if loaded_claims:
         claims = loaded_claims
-    else:
+    elif db is not None:
         claims = await resolve_group_panel_claims(db, user)
+    else:
+        claims = loaded_claims
 
     tag_by_gid = {str(c["group_id"]): _normalize_config_tag(c.get("tag")) for c in claims}
 
@@ -3987,9 +4017,14 @@ async def collect_links_detailed(
     active_accounts = [
         a
         for a in (user.panel_accounts or [])
-        if a.status in (PanelAccountStatus.active, PanelAccountStatus.error)
+        if a.status
+        in (
+            PanelAccountStatus.active,
+            PanelAccountStatus.error,
+            PanelAccountStatus.pending,
+        )
         and _panel_is_active(a.__dict__.get("panel") or getattr(a, "panel", None))
-        and _account_in_membership(a)
+        and (not claim_keys or _account_in_membership(a))
     ]
 
     # Astra live rewrite is for domain/port changes — skip on subscription GET.
@@ -4273,10 +4308,10 @@ async def hydrate_share_links(db: AsyncSession, user: User) -> int:
 
                     adapter = get_adapter(panel)
                     try:
-                        coro = adapter.get_usage(uname, rid, expand_links=False)  # type: ignore[call-arg]
+                        coro = adapter.get_usage(uname, rid, expand_links=True)  # type: ignore[call-arg]
                     except TypeError:
                         coro = adapter.get_usage(uname, rid)
-                    res = await asyncio.wait_for(coro, timeout=8.0)
+                    res = await asyncio.wait_for(coro, timeout=10.0)
                     if not res or not res.success:
                         return None
 

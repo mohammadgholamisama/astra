@@ -394,10 +394,10 @@ async def _ensure_share_links(
             links = []
         return user, links
 
-    # Cold start only: very short hydrate so first open isn't empty forever.
+    # New user / sub-URL-only accounts: expand to vless/vmess on this request.
     try:
         n = await asyncio.wait_for(
-            hydrate_share_links(db, user), timeout=max(1.5, float(timeout))
+            hydrate_share_links(db, user), timeout=max(8.0, float(timeout))
         )
         if n:
             await db.commit()
@@ -662,18 +662,26 @@ async def get_subscription(
                 db,
                 token,
                 user,
-                timeout=2.5,
+                timeout=10.0,
                 force=False,
                 include_hidden=include_hidden,
             )
         _schedule_bg_maintain(int(user.id))
 
         body = _encode_feed(links)
-        if not body:
+        from app.adapters.http_utils import is_share_link as _isl
+
+        real_n = sum(
+            1
+            for x in links
+            if _isl(x) and "127.0.0.1" not in (x or "")
+        )
+        if not body or real_n <= 0:
             logger.warning(
-                "sub returning empty body user=%s token=%s…",
+                "sub returning empty body user=%s token=%s… real=%s",
                 user.username,
                 token[:8],
+                real_n,
             )
         else:
             _feed_cache_put(int(user.id), include_hidden, body)
