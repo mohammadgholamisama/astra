@@ -5697,18 +5697,17 @@ async def apply_user_group_membership(
         db.add(UserGroup(user_id=user.id, group_id=gid, sort_order=i))
     await db.flush()
 
-    if ordered:
-        panels = await resolve_panels_for_groups(db, ordered)
+    added = [g for g in ordered if g not in old_set]
+    if added:
+        panels = await resolve_panels_for_groups(db, added)
         if panels:
-            await provision_user_on_panels(db, user, panels)
-            try:
-                await hydrate_share_links(db, user)
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "hydrate after category sync user=%s failed",
-                    getattr(user, "username", "?"),
-                    exc_info=True,
-                )
+            await provision_users_now(db, [user], panels)
+    try:
+        from app.api.subscription import invalidate_user_feed_cache
+
+        invalidate_user_feed_cache(int(user.id))
+    except Exception:  # noqa: BLE001
+        pass
     return True
 
 
@@ -5970,15 +5969,7 @@ async def resync_users_for_category(
                 # (e.g. prior provision failed / panel added later).
                 panels = await resolve_panels_for_groups(db, desired)
                 if panels:
-                    await provision_user_on_panels(db, user, panels)
-                    try:
-                        await hydrate_share_links(db, user)
-                    except Exception:  # noqa: BLE001
-                        logger.warning(
-                            "hydrate after category heal user=%s failed",
-                            getattr(user, "username", "?"),
-                            exc_info=True,
-                        )
+                    await provision_users_now(db, [user], panels)
                     changed = True
             elif force_removed:
                 # desired=[] and membership already empty — still scrub remotes

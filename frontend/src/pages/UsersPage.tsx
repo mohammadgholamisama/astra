@@ -646,10 +646,11 @@ export default function UsersPage() {
   }
 
   function toggleBulkGroup(id: number) {
-    setBulkGroupIds((cur) =>
-      cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]
-    );
-    setBulkBoundCategoryId(null);
+    setBulkGroupIds((cur) => {
+      const next = cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id];
+      setBulkBoundCategoryId((bind) => keepBindIfInsideCategory(next, bind));
+      return next;
+    });
   }
 
   function onBulkSubmit(e: FormEvent) {
@@ -917,13 +918,11 @@ export default function UsersPage() {
 
   function toggleEditGroup(id: number) {
     setEditGroupIds((cur) => {
-      if (cur.includes(id)) {
-        if (cur.length <= 1) return cur; // keep at least one
-        return cur.filter((x) => x !== id);
-      }
-      return [...cur, id];
+      if (cur.includes(id) && cur.length <= 1) return cur;
+      const next = cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id];
+      setEditBoundCategoryId((bind) => keepBindIfInsideCategory(next, bind));
+      return next;
     });
-    setEditBoundCategoryId(null);
   }
 
   useEffect(() => {
@@ -1010,12 +1009,24 @@ export default function UsersPage() {
     create.mutate();
   }
 
-  function toggleCreateGroup(id: number) {
-    setGroupIds((cur) =>
-      cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]
+  function keepBindIfInsideCategory(
+    nextIds: number[],
+    currentBind: number | null
+  ): number | null {
+    if (currentBind == null) return null;
+    const catIds = new Set(
+      (groupsInCategory.get(currentBind) || []).map((g) => g.id)
     );
-    // Manual tweak → stop tracking category auto-sync
-    setCreateBoundCategoryId(null);
+    if (nextIds.some((id) => !catIds.has(id))) return null;
+    return currentBind;
+  }
+
+  function toggleCreateGroup(id: number) {
+    setGroupIds((cur) => {
+      const next = cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id];
+      setCreateBoundCategoryId((bind) => keepBindIfInsideCategory(next, bind));
+      return next;
+    });
   }
 
   const users = data?.users || [];
@@ -1184,8 +1195,17 @@ export default function UsersPage() {
 
   function selectAllFilteredGroups() {
     const ids = filteredCreateGroups.map((g) => g.id);
-    setGroupIds((cur) => [...new Set([...cur, ...ids])]);
-    setCreateBoundCategoryId(null);
+    setGroupIds((cur) => {
+      const next = [...new Set([...cur, ...ids])];
+      if (typeof createCatTab === "number") {
+        setCreateBoundCategoryId(
+          keepBindIfInsideCategory(next, createCatTab) ?? createBoundCategoryId
+        );
+      } else {
+        setCreateBoundCategoryId((bind) => keepBindIfInsideCategory(next, bind));
+      }
+      return next;
+    });
   }
 
   function clearCreateGroups() {
@@ -1998,13 +2018,18 @@ export default function UsersPage() {
                     )}
                   </div>
                 )}
-                {createCatTab !== "all" && (
+                {createBoundCategoryId != null ? (
                   <p className="field-hint user-create-cat-hint">
-                    {createBoundCategoryId != null
-                      ? "متصل به این دسته — با کم/زیاد شدن گروه در دسته، ساب کاربر هم به‌روز می‌شود"
-                      : "گروه‌های این دسته انتخاب شدند — با تغییر دستی، همگام‌سازی دسته قطع می‌شود"}
+                    متصل به دسته — همه گروه‌های این دسته تیک خوردند. می‌توانید یکی را
+                    بردارید. بعداً با افزودن یا حذف گروه در همین دسته، کانفیگ برای این
+                    کاربر هم ساخته یا از پنل و ساب حذف می‌شود.
                   </p>
-                )}
+                ) : createCatTab !== "all" ? (
+                  <p className="field-hint user-create-cat-hint">
+                    روی نام دسته بزنید تا همه گروه‌هایش انتخاب شوند و کاربر به آن دسته
+                    وصل شود.
+                  </p>
+                ) : null}
 
                 <div className="user-create-groups-search">
                   <Search size={16} aria-hidden />
@@ -2301,12 +2326,25 @@ export default function UsersPage() {
                       className="btn ghost sm"
                       disabled={!filteredBulkGroups.length || bulkCreate.isPending}
                       onClick={() =>
-                        setBulkGroupIds((cur) => [
-                          ...new Set([
-                            ...cur,
-                            ...filteredBulkGroups.map((g) => g.id),
-                          ]),
-                        ])
+                        setBulkGroupIds((cur) => {
+                          const next = [
+                            ...new Set([
+                              ...cur,
+                              ...filteredBulkGroups.map((g) => g.id),
+                            ]),
+                          ];
+                          if (typeof bulkCatTab === "number") {
+                            setBulkBoundCategoryId(
+                              keepBindIfInsideCategory(next, bulkCatTab) ??
+                                bulkBoundCategoryId
+                            );
+                          } else {
+                            setBulkBoundCategoryId((bind) =>
+                              keepBindIfInsideCategory(next, bind)
+                            );
+                          }
+                          return next;
+                        })
                       }
                     >
                       انتخاب همه
@@ -2315,7 +2353,10 @@ export default function UsersPage() {
                       type="button"
                       className="btn ghost sm"
                       disabled={!bulkGroupIds.length || bulkCreate.isPending}
-                      onClick={() => setBulkGroupIds([])}
+                      onClick={() => {
+                        setBulkGroupIds([]);
+                        setBulkBoundCategoryId(null);
+                      }}
                     >
                       پاک کردن
                     </button>
@@ -2371,6 +2412,17 @@ export default function UsersPage() {
                     )}
                   </div>
                 )}
+                {bulkBoundCategoryId != null ? (
+                  <p className="field-hint user-create-cat-hint">
+                    متصل به دسته — همه گروه‌ها تیک خوردند. می‌توانید یکی را بردارید.
+                    بعداً با اد/ریمو گروه در این دسته، کانفیگ این کاربران هم ساخته یا
+                    از پنل و ساب حذف می‌شود.
+                  </p>
+                ) : bulkCatTab !== "all" ? (
+                  <p className="field-hint user-create-cat-hint">
+                    روی نام دسته بزنید تا همه گروه‌هایش انتخاب شوند.
+                  </p>
+                ) : null}
 
                 <div className="user-create-groups-search">
                   <Search size={16} aria-hidden />
