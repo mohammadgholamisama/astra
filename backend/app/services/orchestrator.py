@@ -1130,50 +1130,62 @@ async def _finish_leftover_provision(
     leftover: list[tuple[int, asyncio.Task]],
     user_ids: set[int],
 ) -> None:
-    """Do NOT cancel in-flight creates — write results when they finish."""
+    """Write each leftover result as soon as it finishes so the sub updates live."""
     from app.core.database import AsyncSessionLocal
     from app.api.subscription import invalidate_user_feed_cache
 
     if not leftover:
         return
-    gathered = await asyncio.gather(
-        *[t for _aid, t in leftover], return_exceptions=True
-    )
-    try:
-        async with AsyncSessionLocal() as db:
-            now = datetime.now(timezone.utc)
-            for (account_id, _task), raw in zip(leftover, gathered):
+
+    async def _write_one(account_id: int, task: asyncio.Task) -> None:
+        try:
+            raw = await task
+        except Exception as exc:  # noqa: BLE001
+            raw = exc
+        try:
+            async with AsyncSessionLocal() as db:
                 acc = await db.get(PanelAccount, account_id)
                 if acc is None or acc.status == PanelAccountStatus.deleted:
-                    continue
+                    return
+                uid = int(acc.user_id)
                 if isinstance(raw, Exception):
                     acc.status = PanelAccountStatus.error
                     acc.error_message = _exc_msg(raw)[:300]
-                    continue
-                result = raw if isinstance(raw, AdapterResult) else _fail_result("خطای پنل")
-                if result.success:
-                    acc.status = PanelAccountStatus.active
-                    acc.remote_username = result.remote_username or acc.remote_username
-                    acc.remote_id = result.remote_id or acc.remote_id
-                    acc.uuid = result.uuid or acc.uuid
-                    if result.links:
-                        acc.links = result.links
-                    acc.used_traffic = max(
-                        int(acc.used_traffic or 0), int(result.used_traffic or 0)
-                    )
-                    acc.error_message = None
-                    acc.last_sync_at = now
                 else:
-                    acc.status = PanelAccountStatus.error
-                    acc.error_message = (result.error or "ایجاد در پنل ناموفق")[:400]
-            await db.commit()
-            try:
-                invalidate_user_feed_cache(*user_ids)
-            except Exception:  # noqa: BLE001
-                pass
-        logger.info("leftover provision wrote n=%s users=%s", len(leftover), len(user_ids))
-    except Exception:  # noqa: BLE001
-        logger.exception("leftover provision failed n=%s", len(leftover))
+                    result = (
+                        raw if isinstance(raw, AdapterResult) else _fail_result("خطای پنل")
+                    )
+                    if result.success:
+                        now = datetime.now(timezone.utc)
+                        acc.status = PanelAccountStatus.active
+                        acc.remote_username = (
+                            result.remote_username or acc.remote_username
+                        )
+                        acc.remote_id = result.remote_id or acc.remote_id
+                        acc.uuid = result.uuid or acc.uuid
+                        if result.links:
+                            acc.links = result.links
+                        acc.used_traffic = max(
+                            int(acc.used_traffic or 0), int(result.used_traffic or 0)
+                        )
+                        acc.error_message = None
+                        acc.last_sync_at = now
+                    else:
+                        acc.status = PanelAccountStatus.error
+                        acc.error_message = (result.error or "ایجاد در پنل ناموفق")[:400]
+                await db.commit()
+                try:
+                    invalidate_user_feed_cache(uid)
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            logger.exception("leftover write account=%s failed", account_id)
+
+    await asyncio.gather(
+        *[_write_one(aid, t) for aid, t in leftover],
+        return_exceptions=True,
+    )
+    logger.info("leftover provision done n=%s users=%s", len(leftover), len(user_ids))
 
 
 async def probe_unique_panels(
@@ -1214,72 +1226,244 @@ async def probe_unique_panels(
     return out
 
 
+_account_prov_sem: asyncio.Semaphore | None = None
+
+
+def _get_account_prov_sem() -> asyncio.Semaphore:
+    global _account_prov_sem
+    if _account_prov_sem is None:
+        _account_prov_sem = asyncio.Semaphore(48)
+    return _account_prov_sem
+
+
+async def _provision_account_now(account_id: int) -> bool:
+    """Create one remote account, commit links immediately, refresh that sub."""
+    from app.adapters.http_utils import (
+        expand_subscription_links,
+        is_share_link,
+        is_subscription_ref,
+        make_client,
+    )
+    from app.api.subscription import invalidate_user_feed_cache
+    from app.core.database import AsyncSessionLocal
+
+    async with _get_account_prov_sem():
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(PanelAccount)
+                    .where(PanelAccount.id == int(account_id))
+                    .options(
+                        selectinload(PanelAccount.panel),
+                        selectinload(PanelAccount.user),
+                    )
+                )
+                acc = result.scalar_one_or_none()
+                if acc is None or acc.status == PanelAccountStatus.deleted:
+                    return False
+                if acc.status == PanelAccountStatus.active and (acc.links or []):
+                    return True
+                user = acc.user
+                panel = acc.panel
+                uid = int(acc.user_id)
+                if user is None or panel is None or not bool(getattr(panel, "is_active", True)):
+                    acc.status = PanelAccountStatus.error
+                    acc.error_message = "پنل در دسترس نیست"
+                    await db.commit()
+                    invalidate_user_feed_cache(uid)
+                    return False
+                cfg: dict = {}
+                gid = int(getattr(acc, "group_id", 0) or 0)
+                if gid:
+                    gp = (
+                        await db.execute(
+                            select(GroupPanel).where(
+                                GroupPanel.group_id == gid,
+                                GroupPanel.panel_id == int(acc.panel_id),
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    if gp is not None:
+                        cfg = dict(gp.config or {})
+                same_panel = 0
+                if gid:
+                    n = await db.execute(
+                        select(func.count())
+                        .select_from(PanelAccount)
+                        .where(
+                            PanelAccount.user_id == uid,
+                            PanelAccount.panel_id == int(acc.panel_id),
+                            PanelAccount.status != PanelAccountStatus.deleted,
+                        )
+                    )
+                    same_panel = int(n.scalar() or 0)
+                existing_name = (acc.remote_username or "").strip()
+                if existing_name:
+                    preferred = existing_name
+                elif same_panel > 1 and gid:
+                    preferred = make_group_remote_username(user.username, gid)
+                else:
+                    preferred = (user.username or "").strip()
+                payload = build_user_payload(
+                    user,
+                    uuid=acc.uuid,
+                    panel_config=cfg,
+                    remote_username=preferred,
+                )
+                adapter = get_adapter(panel)
+                try:
+                    res = await asyncio.wait_for(
+                        create_user_with_collision_alias(
+                            adapter,
+                            payload,
+                            astra_username=user.username,
+                            panel_id=panel.id,
+                            timeout=5.0,
+                            max_alias_attempts=1,
+                            probe_timeout=2.0,
+                        ),
+                        timeout=6.0,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    res = _fail_result(_exc_msg(exc) or "خطای پنل")
+                finally:
+                    try:
+                        await adapter.close()  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                now = datetime.now(timezone.utc)
+                if res.success:
+                    links = [str(x).strip() for x in (res.links or []) if x]
+                    if links and (
+                        any(is_subscription_ref(x) for x in links)
+                        or not any(is_share_link(x) for x in links)
+                    ):
+                        try:
+                            client = make_client(
+                                panel.base_url,
+                                bool((panel.meta or {}).get("verify_ssl", False)),
+                                timeout=8.0,
+                                xhr=False,
+                            )
+                            try:
+                                expanded = await asyncio.wait_for(
+                                    expand_subscription_links(client, links),
+                                    timeout=6.0,
+                                )
+                            finally:
+                                await client.aclose()
+                            shares = [x for x in (expanded or []) if is_share_link(x)]
+                            if shares:
+                                links = shares
+                        except Exception:  # noqa: BLE001
+                            pass
+                    acc.status = PanelAccountStatus.active
+                    acc.remote_username = (
+                        res.remote_username or payload.username or user.username
+                    )
+                    acc.remote_id = res.remote_id or acc.remote_id
+                    acc.uuid = res.uuid or acc.uuid
+                    if links:
+                        acc.links = links
+                    acc.used_traffic = max(
+                        int(acc.used_traffic or 0), int(res.used_traffic or 0)
+                    )
+                    acc.error_message = None
+                    acc.last_sync_at = now
+                    panel.last_ok_at = now
+                    await db.commit()
+                    invalidate_user_feed_cache(uid)
+                    return True
+                acc.status = PanelAccountStatus.error
+                acc.error_message = _format_remote_error(
+                    panel,
+                    action="ساخت کاربر",
+                    err=res.error or "ایجاد در پنل ناموفق",
+                    username=payload.username,
+                )
+                await db.commit()
+                invalidate_user_feed_cache(uid)
+                return False
+        except Exception:  # noqa: BLE001
+            logger.exception("provision account=%s failed", account_id)
+            return False
+
+
+def start_account_provisions(account_ids: list[int]) -> list[asyncio.Task]:
+    """Fire independent creates that survive the HTTP request."""
+    tasks: list[asyncio.Task] = []
+    for aid in account_ids:
+        if not aid:
+            continue
+        tasks.append(
+            asyncio.create_task(
+                _provision_account_now(int(aid)),
+                name=f"astra-acc-prov-{aid}",
+            )
+        )
+    return tasks
+
+
 async def provision_users_now(
     db: AsyncSession,
     users: list[User],
     panels: list[tuple[Panel, dict] | tuple[Panel, dict, int]],
 ) -> dict[str, int]:
-    """Create on EVERY target panel in parallel. Never skip a live panel.
-
-    Waits a short budget so the HTTP reply already has configs; leftover
-    in-flight creates keep running (not cancelled) and land in the sub.
-    """
+    """Enqueue every panel create; wait briefly so the first configs hit the sub."""
     targets = _normalize_panel_targets(panels)
     if not users or not targets:
         return {"ok": 0, "err": 0, "down": 0, "pending": 0}
 
-    n_jobs = max(1, len(users) * len(targets))
-    # Single user: wait for the whole wave. Bulk: first ~25s then leftover bg.
-    wait = 14.0 if len(users) <= 2 else min(28.0, 8.0 + n_jobs * 0.04)
-    batch = await provision_users_batch(
-        db,
-        users,
-        targets,
-        create_timeout=5.0,
-        concurrency=48,
-        overall_timeout=wait,
-    )
-    stats = {
-        "ok": int(batch.get("ok") or 0),
-        "err": int(batch.get("err") or 0),
-        "down": 0,
-        "pending": int(batch.get("pending") or 0),
-    }
-
-    user_ids = [int(u.id) for u in users]
-    result = await db.execute(
-        select(User)
-        .where(User.id.in_(user_ids))
-        .options(selectinload(User.panel_accounts).selectinload(PanelAccount.panel))
-    )
-    fresh = list(result.scalars().unique().all())
-    t_h = time.monotonic()
-    for user in fresh:
-        if time.monotonic() - t_h > 6.0:
-            break
-        need = any(
-            a.status == PanelAccountStatus.active and not (a.links or [])
-            for a in (user.panel_accounts or [])
-        )
-        if not need:
-            continue
-        try:
-            await hydrate_share_links(db, user)
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "hydrate after create user=%s failed", getattr(user, "username", "?")
-            )
+    n = await ensure_pending_panel_accounts(db, users, targets)
     try:
         await db.commit()
     except Exception:  # noqa: BLE001
         pass
+
+    user_ids = [int(u.id) for u in users]
+    rows = await db.execute(
+        select(PanelAccount.id).where(
+            PanelAccount.user_id.in_(user_ids),
+            PanelAccount.status.in_(
+                (PanelAccountStatus.pending, PanelAccountStatus.error)
+            ),
+        )
+    )
+    account_ids = [int(r[0]) for r in rows.all() if r[0]]
+    tasks = start_account_provisions(account_ids)
+    wait = 8.0 if len(users) <= 2 else 10.0
+    if tasks:
+        await asyncio.wait(tasks, timeout=wait)
+    ok = 0
+    err = 0
+    pending = 0
+    db.expire_all()
+    accs = await db.execute(
+        select(PanelAccount.status).where(PanelAccount.user_id.in_(user_ids))
+    )
+    for (st,) in accs.all():
+        if st == PanelAccountStatus.active:
+            ok += 1
+        elif st == PanelAccountStatus.error:
+            err += 1
+        elif st == PanelAccountStatus.pending:
+            pending += 1
     try:
         from app.api.subscription import invalidate_user_feed_cache
 
         invalidate_user_feed_cache(*user_ids)
     except Exception:  # noqa: BLE001
         pass
-    return stats
+    logger.info(
+        "provision_users_now users=%s queued=%s prepared=%s ok=%s err=%s pending=%s",
+        len(users),
+        len(account_ids),
+        n,
+        ok,
+        err,
+        pending,
+    )
+    return {"ok": ok, "err": err, "down": 0, "pending": pending}
 
 
 async def ensure_pending_panel_accounts(
