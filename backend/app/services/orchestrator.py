@@ -863,7 +863,10 @@ async def provision_user_on_panels(
             account.uuid = result.uuid or account.uuid
             account.links = result.links or account.links or []
             account.links_by_group = None
-            account.used_traffic = int(result.used_traffic or 0)
+            got = int(result.used_traffic or 0)
+            prev = int(account.used_traffic or 0)
+            # Re-adding a retired config must not refund Astra volume
+            account.used_traffic = max(prev, got)
             account.coeff_anchor_raw = 0
             account.coeff_anchor_weighted = 0
             account.applied_coefficient = coeff
@@ -1678,18 +1681,56 @@ async def _delete_panel_accounts_remote(
     accounts: list[PanelAccount],
     *,
     clear_links_always: bool = True,
+    fast: bool = False,
 ) -> list[dict]:
-    """Delete the given PanelAccount rows on remotes (all panel types) and mark deleted.
+    """Cut remotes for these accounts and mark them deleted locally.
 
-    Retries once per account. Treats not-found as success. When
-    ``clear_links_always`` is True, share links are wiped even if remote delete
-    fails so old/new subs cannot keep emitting those configs.
+    Share links are wiped first so the sub drops configs immediately.
+    ``fast=True``: ~1s parallel delete, then disable fallback; local row is
+    always marked deleted so quota stays (used_traffic kept) and heal cannot
+    recreate the tunnel. used_traffic is never reset.
     """
     if not accounts:
         return []
 
+    # Sub feed first — never wait on remote HTTP to hide configs
+    if clear_links_always:
+        for a in accounts:
+            a.links = []
+            a.links_by_group = {}
+        await db.flush()
+
     sem = _remote_sem()
     t0 = time.monotonic()
+    timeout = 1.15 if fast else 20.0
+    attempts = 1 if fast else 3
+
+    async def _disable(account: PanelAccount, panel: Panel, uname: str) -> bool:
+        adapter = get_adapter(panel)
+        try:
+            payload = UserPayload(
+                username=uname,
+                status="disabled",
+                data_limit=1,
+                expire=1,
+                uuid=account.uuid,
+                config={
+                    "_remote_id": (account.remote_id or "").strip(),
+                    "_astra_skip_nginx": True,
+                },
+            )
+            async with sem:
+                res = await asyncio.wait_for(
+                    adapter.modify_user(payload), timeout=timeout
+                )
+            return bool(res and res.success)
+        except Exception:  # noqa: BLE001
+            return False
+        finally:
+            try:
+                await adapter.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
     async def _remote(account: PanelAccount) -> dict:
         panel = account.panel
@@ -1707,9 +1748,8 @@ async def _delete_panel_accounts_remote(
         if not uname:
             return {**base, "ok": False, "error": "یوزرنیم ریموت خالی است"}
 
-        # Inactive Astra panels: still try delete so remotes don't keep junk
         last_err = "حذف از پنل ناموفق بود"
-        for attempt in range(3):
+        for attempt in range(attempts):
             adapter = get_adapter(panel)
             try:
                 async with sem:
@@ -1717,7 +1757,7 @@ async def _delete_panel_accounts_remote(
                         adapter.delete_user(
                             uname, account.remote_id or account.remote_username
                         ),
-                        timeout=20,
+                        timeout=timeout,
                     )
             except Exception as e:  # noqa: BLE001
                 last_err = _exc_msg(e)
@@ -1732,9 +1772,11 @@ async def _delete_panel_accounts_remote(
                 return {**base, "ok": True, "error": None}
             if res is not None:
                 last_err = res.error or last_err
-            if attempt < 2:
-                await asyncio.sleep(0.35 + attempt * 0.25)
+            if attempt + 1 < attempts:
+                await asyncio.sleep(0.2)
 
+        if await _disable(account, panel, uname):
+            return {**base, "ok": True, "error": None}
         return {**base, "ok": False, "error": last_err}
 
     outcomes = list(await asyncio.gather(*[_remote(a) for a in accounts]))
@@ -1744,16 +1786,13 @@ async def _delete_panel_accounts_remote(
         account = by_id.get(row.get("account_id"))
         if account is None:
             continue
-        if clear_links_always:
-            account.links = []
-            account.links_by_group = {}
-        if row.get("ok"):
-            account.status = PanelAccountStatus.deleted
-            account.error_message = None
-            account.links = []
-            account.links_by_group = {}
-        else:
-            account.error_message = row.get("error") or "حذف از پنل ناموفق بود"
+        # Always retire locally — used_traffic kept for Astra quota
+        account.links = []
+        account.links_by_group = {}
+        account.status = PanelAccountStatus.deleted
+        account.error_message = None if row.get("ok") else (
+            row.get("error") or "قطع ریموت ناموفق"
+        )
 
     await db.flush()
     logger.info(
@@ -1885,7 +1924,7 @@ async def sync_delete_user_group_accounts(
         and getattr(a, "group_id", None) is not None
         and int(a.group_id) in want
     ]
-    return await _delete_panel_accounts_remote(db, user, accounts)
+    return await _delete_panel_accounts_remote(db, user, accounts, fast=True)
 
 
 async def sync_delete_user_group_panel_accounts(
@@ -1918,7 +1957,7 @@ async def sync_delete_user_group_panel_accounts(
         and getattr(a, "group_id", None) is not None
         and int(a.group_id) == gid
     ]
-    return await _delete_panel_accounts_remote(db, user, accounts)
+    return await _delete_panel_accounts_remote(db, user, accounts, fast=True)
 
 
 async def retry_failed_accounts(db: AsyncSession, user: User) -> list[PanelAccount]:
@@ -3843,16 +3882,30 @@ def _sync_account_coeff_periods(
 async def _weighted_total(
     accounts: list[PanelAccount], account_coeffs: dict[int, float]
 ) -> int:
-    """Σ (raw_i × coeff_of_account_i's group)."""
+    """Σ (raw_i × coeff_of_account_i's group).
+
+    Deleted remotes still count: removing a config from Astra must cut the
+    live tunnel, but must not refund already-used volume.
+    """
     _sync_account_coeff_periods(accounts, account_coeffs)
     total = 0
     for account in accounts:
-        if account.status not in (
+        if account.status in (
             PanelAccountStatus.active,
             PanelAccountStatus.error,
         ):
+            coeff = _norm_coeff(account_coeffs.get(account.id, 1.0))
+            total += account_weighted_usage(account, coeff)
             continue
-        coeff = _norm_coeff(account_coeffs.get(account.id, 1.0))
+        if account.status != PanelAccountStatus.deleted:
+            continue
+        raw = int(account.used_traffic or 0)
+        if raw <= 0:
+            continue
+        stored = getattr(account, "applied_coefficient", None)
+        coeff = _norm_coeff(
+            stored if stored is not None else account_coeffs.get(account.id, 1.0)
+        )
         total += account_weighted_usage(account, coeff)
     return total
 
@@ -5078,6 +5131,49 @@ async def _users_with_exact_groups(
     return list(result.scalars().unique().all())
 
 
+async def _users_whose_groups_subset_of(
+    db: AsyncSession, allowed: set[int]
+) -> list[User]:
+    """Users whose entire membership sits inside ``allowed`` (non-empty).
+
+    Picks up existing sales users created from a category even if
+    ``source_category_id`` was never set.
+    """
+    from app.models.user import User as UserModel
+
+    allow = {int(g) for g in allowed if g is not None}
+    if not allow:
+        return []
+    have = await db.execute(
+        select(UserGroup.user_id)
+        .where(UserGroup.group_id.in_(list(allow)))
+        .distinct()
+    )
+    cand = [int(r[0]) for r in have.all() if r[0] is not None]
+    if not cand:
+        return []
+    extra = await db.execute(
+        select(UserGroup.user_id)
+        .where(
+            UserGroup.user_id.in_(cand),
+            UserGroup.group_id.notin_(list(allow)),
+        )
+        .distinct()
+    )
+    skip = {int(r[0]) for r in extra.all() if r[0] is not None}
+    keep = [i for i in cand if i not in skip]
+    if not keep:
+        return []
+    result = await db.execute(
+        select(UserModel)
+        .where(UserModel.id.in_(keep))
+        .options(
+            selectinload(UserModel.panel_accounts).selectinload(PanelAccount.panel)
+        )
+    )
+    return list(result.scalars().unique().all())
+
+
 async def resync_users_for_category(
     db: AsyncSession,
     category_id: int,
@@ -5085,15 +5181,14 @@ async def resync_users_for_category(
     removed_group_ids: list[int] | None = None,
     added_group_ids: list[int] | None = None,
 ) -> int:
-    """Sync every user bound to ``category_id`` to current category groups.
+    """Sync existing users of this category to current groups.
 
-    Used when groups are added/removed/moved in a sales category. Preserves
-    volume + coefficient anchors; only membership / remotes change.
+    Adds new groups on remotes + sub; removes dropped groups by cutting
+    remotes fast. used_traffic on retired accounts is kept so Astra quota
+    does not refund.
 
-    ``removed_group_ids``: force remote cleanup (e.g. group deleted from Astra
-    after UserGroup rows were already dropped).
-    ``added_group_ids``: also pick up unbound users who previously matched the
-    category exactly (before these groups were added) and bind them.
+    Includes ``source_category_id`` users and anyone whose membership is a
+    subset of this category (legacy users created before the bind existed).
     """
     from app.api.subscription import invalidate_user_feed_cache
     from app.models.group import GroupCategory
@@ -5117,27 +5212,38 @@ async def resync_users_for_category(
             selectinload(UserModel.panel_accounts).selectinload(PanelAccount.panel)
         )
     )
+    def _skip_sample(u: User) -> bool:
+        name = str(u.username or "")
+        return name.startswith("ag") or "نمونه کانفیگ" in (u.note or "")
+
     users_by_id: dict[int, User] = {}
     for u in result.scalars().unique().all():
-        if str(u.username or "").startswith("ag"):
-            continue
-        if "نمونه کانفیگ" in (u.note or ""):
+        if _skip_sample(u):
             continue
         users_by_id[int(u.id)] = u
 
-    # Fallback: users created from this category before source_category_id existed
-    # (or after a manual tweak cleared the bind) but still have exact prior membership.
+    orbit = set(desired) | set(force_removed) | set(added)
+    if orbit:
+        for u in await _users_whose_groups_subset_of(db, orbit):
+            if _skip_sample(u):
+                continue
+            if int(u.id) in users_by_id:
+                continue
+            other = getattr(u, "source_category_id", None)
+            if other is not None and int(other) != cid:
+                continue
+            if other is None:
+                u.source_category_id = cid
+            users_by_id[int(u.id)] = u
+
     if added and desired:
         prev = sorted(set(desired) - set(added))
         if prev:
             for u in await _users_with_exact_groups(db, prev):
-                if str(u.username or "").startswith("ag"):
-                    continue
-                if "نمونه کانفیگ" in (u.note or ""):
+                if _skip_sample(u):
                     continue
                 if int(u.id) in users_by_id:
                     continue
-                # Bind so future category edits keep syncing
                 if getattr(u, "source_category_id", None) is None:
                     u.source_category_id = cid
                 users_by_id[int(u.id)] = u
@@ -5202,29 +5308,14 @@ async def resync_users_for_category(
     if touched_uids:
         invalidate_user_feed_cache(*touched_uids)
 
-    # Recount coeffs on affected groups (local only — no traffic inflation)
+    # Local recount only — never live-pull remotes here (that refunds/inflates
+    # volume after a config is cut).
     for gid in sorted(touched_gids):
         try:
             await recount_group_usage_local(db, gid)
         except Exception:  # noqa: BLE001
             logger.warning(
                 "category %s recount group=%s failed", cid, gid, exc_info=True
-            )
-
-    # Push remotes for users that changed (caps / enable state)
-    if ok:
-        ids = [int(u.id) for u in users]
-        result2 = await db.execute(
-            select(UserModel)
-            .where(UserModel.id.in_(ids))
-            .options(
-                selectinload(UserModel.panel_accounts).selectinload(PanelAccount.panel)
-            )
-        )
-        fresh = list(result2.scalars().unique().all())
-        if fresh:
-            await refresh_users_usage_batch(
-                db, fresh, force=True, concurrency=8, push_remotes=True
             )
     await db.flush()
     logger.info(
@@ -5337,7 +5428,9 @@ async def resync_users_for_group(
                 seen_acc.add(aid)
 
         if stale:
-            await _delete_panel_accounts_remote(db, user, stale, clear_links_always=True)
+            await _delete_panel_accounts_remote(
+                db, user, stale, clear_links_always=True, fast=True
+            )
             # Force deleted when panel is no longer claimed by any of user's groups
             for a in stale:
                 if int(a.panel_id) not in still_claimed:
@@ -5411,19 +5504,13 @@ async def resync_users_for_group(
                 getattr(user, "username", "?"),
             )
 
-    # Re-apply coeffs from DB raw, then pull remotes + push caps
     await recount_group_usage_local(db, gid)
-    # Reload users after reconcile (accounts may have changed)
-    result2 = await db.execute(
-        select(User)
-        .where(User.id.in_([u.id for u in users]))
-        .options(selectinload(User.panel_accounts).selectinload(PanelAccount.panel))
-    )
-    fresh_users = list(result2.scalars().unique().all())
-    if fresh_users:
-        await refresh_users_usage_batch(
-            db, fresh_users, force=True, concurrency=8, push_remotes=True
-        )
+    try:
+        from app.api.subscription import invalidate_user_feed_cache
+
+        invalidate_user_feed_cache(*[int(u.id) for u in users])
+    except Exception:  # noqa: BLE001
+        pass
     await db.flush()
     logger.info(
         "group %s panel/coeff resync: reconciled=%s/%s desired_panels=%s",
