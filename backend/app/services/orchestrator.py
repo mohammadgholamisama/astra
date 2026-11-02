@@ -927,6 +927,201 @@ async def provision_user_on_panels(
     return accounts
 
 
+async def provision_users_batch(
+    db: AsyncSession,
+    users: list[User],
+    panels: list[tuple[Panel, dict] | tuple[Panel, dict, int]],
+    *,
+    create_timeout: float = 10.0,
+    concurrency: int = 40,
+    overall_timeout: float | None = None,
+) -> dict[str, int]:
+    """Provision many users × all group/panel targets in one parallel wave.
+
+    Local PanelAccount rows are prepared in a single commit, then every remote
+    create runs concurrently. Hydrate is skipped (sub/heal fills links).
+    Returns {jobs, ok, err, pending}.
+    """
+    targets = _normalize_panel_targets(panels)
+    if not users or not targets:
+        return {"jobs": 0, "ok": 0, "err": 0, "pending": 0}
+
+    t0 = time.monotonic()
+    jobs: list[tuple[PanelAccount, Panel, UserPayload, User]] = []
+    panel_counts: dict[int, int] = {}
+    for p, _, gid in targets:
+        if gid:
+            panel_counts[p.id] = panel_counts.get(p.id, 0) + 1
+
+    user_ids = [int(u.id) for u in users]
+    existing_rows = await db.execute(
+        select(PanelAccount).where(PanelAccount.user_id.in_(user_ids))
+    )
+    existing_by: dict[tuple[int, int, int], PanelAccount] = {}
+    for a in existing_rows.scalars().all():
+        gid = int(getattr(a, "group_id", 0) or 0)
+        existing_by[(int(a.user_id), int(a.panel_id), gid)] = a
+
+    created_any = False
+    for user in users:
+        uid = int(user.id)
+        for panel, config, group_id in targets:
+            gid = int(group_id or 0)
+            key = (uid, int(panel.id), gid)
+            account = existing_by.get(key)
+            if account is None:
+                account = PanelAccount(
+                    user_id=uid,
+                    panel_id=panel.id,
+                    group_id=gid or None,
+                    status=PanelAccountStatus.pending,
+                )
+                db.add(account)
+                existing_by[key] = account
+                created_any = True
+            elif account.status == PanelAccountStatus.active:
+                continue
+            shared = panel_counts.get(panel.id, 0) > 1 and gid > 0
+            existing_name = (account.remote_username or "").strip()
+            if existing_name:
+                preferred = existing_name
+            elif shared:
+                preferred = make_group_remote_username(user.username, gid)
+            else:
+                preferred = (user.username or "").strip()
+            payload = build_user_payload(
+                user,
+                uuid=account.uuid,
+                panel_config=config,
+                remote_username=preferred,
+            )
+            jobs.append((account, panel, payload, user))
+
+    if created_any:
+        await db.flush()
+    try:
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        pass
+    if not jobs:
+        return {"jobs": 0, "ok": 0, "err": 0, "pending": 0}
+
+    n_jobs = len(jobs)
+    sem_limit = max(24, min(int(concurrency) or 40, 48, n_jobs))
+    waves = max(1, (n_jobs + sem_limit - 1) // sem_limit)
+    budget = (
+        float(overall_timeout)
+        if overall_timeout is not None
+        else min(40.0, waves * min(create_timeout, 8.0) + 4.0)
+    )
+    sem = asyncio.Semaphore(sem_limit)
+
+    async def _remote(
+        panel: Panel, payload: UserPayload, user: User
+    ) -> AdapterResult:
+        adapter = get_adapter(panel)
+        try:
+            async with sem:
+                return await asyncio.wait_for(
+                    create_user_with_collision_alias(
+                        adapter,
+                        payload,
+                        astra_username=user.username,
+                        panel_id=panel.id,
+                        timeout=create_timeout,
+                        max_alias_attempts=1,
+                        probe_timeout=3.0,
+                    ),
+                    timeout=create_timeout + 1.0,
+                )
+        except asyncio.CancelledError:
+            return _fail_result(_PROVISION_BUDGET_SOFT)
+        except Exception as exc:  # noqa: BLE001
+            return _fail_result(_exc_msg(exc) or "خطای پنل")
+        finally:
+            try:
+                await adapter.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+    tasks = [
+        asyncio.create_task(_remote(panel, payload, user))
+        for account, panel, payload, user in jobs
+    ]
+    logger.info(
+        "bulk provision start users=%s jobs=%s sem=%s budget=%.1fs",
+        len(users),
+        n_jobs,
+        sem_limit,
+        budget,
+    )
+    done, pending = await asyncio.wait(tasks, timeout=budget)
+    for t in pending:
+        t.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    now = datetime.now(timezone.utc)
+    ok_n = 0
+    err_n = 0
+    pend_n = 0
+    for (account, panel, payload, user), task in zip(jobs, tasks):
+        if task in pending or task.cancelled():
+            result = _fail_result(_PROVISION_BUDGET_SOFT)
+        else:
+            try:
+                result = task.result()
+            except Exception as exc:  # noqa: BLE001
+                result = _fail_result(_exc_msg(exc) or "خطای پنل")
+        if result.success:
+            account.status = PanelAccountStatus.active
+            account.remote_username = (
+                result.remote_username or payload.username or user.username
+            )
+            account.remote_id = result.remote_id or account.remote_id
+            account.uuid = result.uuid or account.uuid
+            if result.links:
+                account.links = result.links
+            got = int(result.used_traffic or 0)
+            prev = int(account.used_traffic or 0)
+            account.used_traffic = max(prev, got)
+            account.error_message = None
+            account.last_sync_at = now
+            panel.last_ok_at = now
+            ok_n += 1
+        elif (result.error or "") == _PROVISION_BUDGET_SOFT:
+            account.status = PanelAccountStatus.pending
+            account.remote_username = (
+                account.remote_username or payload.username or user.username
+            )
+            account.error_message = None
+            pend_n += 1
+        else:
+            account.status = PanelAccountStatus.error
+            account.error_message = _format_remote_error(
+                panel,
+                action="ساخت کاربر",
+                err=result.error or "ایجاد در پنل ناموفق",
+                username=payload.username,
+            )
+            err_n += 1
+
+    await db.flush()
+    try:
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        pass
+    logger.info(
+        "bulk provision done users=%s jobs=%s ok=%s err=%s pending=%s dt=%.2fs",
+        len(users),
+        n_jobs,
+        ok_n,
+        err_n,
+        pend_n,
+        time.monotonic() - t0,
+    )
+    return {"jobs": n_jobs, "ok": ok_n, "err": err_n, "pending": pend_n}
+
 
 async def reset_user_traffic_on_panels(
     db: AsyncSession,
