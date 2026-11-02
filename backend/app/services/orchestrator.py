@@ -1191,11 +1191,13 @@ async def sync_modify_user(
     exclude_types: set[PanelType] | None = None,
     remote_timeout: float = 25,
     skip_nginx_sync: bool = False,
+    freeze_fast: bool = False,
 ) -> None:
     """Push status + shared remaining quota to every remote panel account.
 
     When Astra is limited/expired/disabled, every panel type (Marzban / PasarGuard /
-    Sanaei / Rebecca) must receive the freeze — with retries on flaky links.
+    Sanaei / Rebecca / Astra) must receive the freeze. freeze_fast=True cuts all
+    remotes in parallel with a ~1s budget (next watch cycle retries misses).
     """
     result = await db.execute(
         select(PanelAccount)
@@ -1286,8 +1288,14 @@ async def sync_modify_user(
         *,
         timeout: float = 25,
     ) -> AdapterResult:
-        # Freeze pushes get extra retries — soft-fail left remotes online before
-        attempts = 3 if blocked else 1
+        # Fast freeze: one short shot so every panel is cut in ~1s.
+        # Misses retry on the next 3s watch cycle (account marked error).
+        if freeze_fast:
+            attempts = 1
+        elif blocked:
+            attempts = 3
+        else:
+            attempts = 1
         last = _fail_result("modify failed")
         for i in range(attempts):
             adapter = get_adapter(panel)
@@ -1295,12 +1303,19 @@ async def sync_modify_user(
                 async with sem:
                     last = await asyncio.wait_for(
                         adapter.modify_user(payload),
-                        timeout=timeout if not blocked else max(timeout, 14),
+                        timeout=timeout,
                     )
                 if last.success:
                     return last
-                # Missing / reserved name → create with collision aliases
-                if _is_not_found_err(last.error) or _is_username_taken_err(last.error):
+                # Missing / reserved name → create with collision aliases.
+                # Skip on freeze_fast: a missing remote is already offline.
+                if (
+                    not freeze_fast
+                    and (
+                        _is_not_found_err(last.error)
+                        or _is_username_taken_err(last.error)
+                    )
+                ):
                     created = await create_user_with_collision_alias(
                         adapter,
                         payload,
@@ -4507,13 +4522,85 @@ async def sync_all_astra_traffic(db: AsyncSession) -> int:
     return n
 
 
-async def run_quota_watch_cycle() -> dict[str, int]:
-    """Fast background quota: sync Astra → recount → freeze remotes immediately.
+async def _freeze_quota_users(
+    user_ids: list[int],
+    *,
+    remote_timeout: float = 1.05,
+    concurrency: int = 12,
+    wall: float = 1.25,
+) -> tuple[int, int]:
+    """Disable every remote config for these users in ~1s, in parallel."""
+    from app.core.database import AsyncSessionLocal
 
-    Designed so exhausted users are disabled on ALL panels within ~10s without
-    an admin opening the Astra UI.
+    ids = list(dict.fromkeys(int(x) for x in user_ids if x))
+    if not ids:
+        return 0, 0
+    sem = asyncio.Semaphore(max(1, concurrency))
+    ok_n = 0
+    fail_n = 0
+
+    async def _one(uid: int) -> bool:
+        async with sem:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(User)
+                    .where(User.id == uid)
+                    .options(
+                        selectinload(User.panel_accounts).selectinload(
+                            PanelAccount.panel
+                        )
+                    )
+                )
+                user = result.scalar_one_or_none()
+                if not user:
+                    return True
+                if user.status not in (
+                    UserStatus.limited,
+                    UserStatus.expired,
+                    UserStatus.disabled,
+                ):
+                    return True
+                await sync_modify_user(
+                    db,
+                    user,
+                    remote_timeout=remote_timeout,
+                    skip_nginx_sync=True,
+                    freeze_fast=True,
+                )
+                fail = any(
+                    a.status == PanelAccountStatus.error
+                    for a in (user.panel_accounts or [])
+                    if a.status != PanelAccountStatus.deleted
+                )
+                await db.commit()
+                return not fail
+
+    tasks = [asyncio.create_task(_one(uid)) for uid in ids]
+    done, pending = await asyncio.wait(tasks, timeout=wall)
+    for t in pending:
+        t.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+        fail_n += len(pending)
+    for t in done:
+        try:
+            if t.result():
+                ok_n += 1
+            else:
+                fail_n += 1
+        except Exception:  # noqa: BLE001
+            fail_n += 1
+    return ok_n, fail_n
+
+
+async def run_quota_watch_cycle() -> dict[str, int]:
+    """Every ~3s: sync Astra → recount → freeze remotes in ~1s.
+
+    Exhausted users are disabled on ALL panels in the same cycle.
     """
     from app.core.database import AsyncSessionLocal
+
+    t0 = time.monotonic()
 
     stats = {
         "astra_panels": 0,
@@ -4614,7 +4701,7 @@ async def run_quota_watch_cycle() -> dict[str, int]:
                         age = now_ts - ls.timestamp()
                     except Exception:  # noqa: BLE001
                         age = 9999
-                    if age > 90:
+                    if age > 6:
                         needs = True
                         break
                 if needs:
@@ -4627,10 +4714,19 @@ async def run_quota_watch_cycle() -> dict[str, int]:
                     near_limit_ids.append(int(user.id))
         await db.commit()
 
-    # --- Phase 3: pull foreign usage for near-limit + flipped + on_hold (quick, capped) ---
-    # on_hold first — first connect on any panel must start every other clock
-    pull_ids = list(dict.fromkeys(hold_ids + flipped_ids + near_limit_ids))[:60]
+    # --- Phase 3: freeze remotes NOW (~1s parallel) before any extra pulls ---
+    freeze_ids = list(dict.fromkeys(flipped_ids + retry_ids))[:80]
+    if freeze_ids:
+        ok_n, fail_n = await _freeze_quota_users(freeze_ids)
+        stats["freeze_ok"] += ok_n
+        stats["freeze_fail"] += fail_n
+
+    # Remaining cycle budget (~3s total): live-pull near-limit / on_hold
+    pull_ids = list(dict.fromkeys(hold_ids + near_limit_ids))[:12]
+    extra_flip: list[int] = []
     for uid in pull_ids:
+        if time.monotonic() - t0 > 2.15:
+            break
         try:
             async with AsyncSessionLocal() as db:
                 result = await db.execute(
@@ -4654,76 +4750,47 @@ async def run_quota_watch_cycle() -> dict[str, int]:
                     activate_ids.append(int(user.id))
                 if changed and int(user.id) not in flipped_ids:
                     flipped_ids.append(int(user.id))
+                    extra_flip.append(int(user.id))
                     stats["flipped"] += 1
         except Exception:  # noqa: BLE001
             logger.debug("near-limit usage pull failed user_id=%s", uid, exc_info=True)
 
-    # --- Phase 4a: push absolute expire to all remotes after first use ---
-    for uid in list(dict.fromkeys(activate_ids))[:40]:
-        try:
-            async with AsyncSessionLocal() as db:
-                result = await db.execute(
-                    select(User)
-                    .where(User.id == uid)
-                    .options(
-                        selectinload(User.panel_accounts).selectinload(
-                            PanelAccount.panel
-                        )
-                    )
-                )
-                user = result.scalar_one_or_none()
-                if not user or user.status != UserStatus.active:
-                    continue
-                await sync_modify_user(
-                    db, user, remote_timeout=12, skip_nginx_sync=True
-                )
-                await db.commit()
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "on_hold activate push failed user_id=%s", uid, exc_info=True
-            )
+    if extra_flip:
+        ok_n, fail_n = await _freeze_quota_users(extra_flip)
+        stats["freeze_ok"] += ok_n
+        stats["freeze_fail"] += fail_n
 
-    # --- Phase 4: freeze remotes NOW — flipped first, then a few retries ---
-    freeze_ids = list(dict.fromkeys(flipped_ids + retry_ids[:15]))
-    for uid in freeze_ids:
-        try:
-            async with AsyncSessionLocal() as db:
-                result = await db.execute(
-                    select(User)
-                    .where(User.id == uid)
-                    .options(
-                        selectinload(User.panel_accounts).selectinload(
-                            PanelAccount.panel
+    # on_hold activate push — only if the 3s budget still has room
+    if time.monotonic() - t0 < 2.4:
+        for uid in list(dict.fromkeys(activate_ids))[:8]:
+            if time.monotonic() - t0 > 2.7:
+                break
+            try:
+                async with AsyncSessionLocal() as db:
+                    result = await db.execute(
+                        select(User)
+                        .where(User.id == uid)
+                        .options(
+                            selectinload(User.panel_accounts).selectinload(
+                                PanelAccount.panel
+                            )
                         )
                     )
+                    user = result.scalar_one_or_none()
+                    if not user or user.status != UserStatus.active:
+                        continue
+                    await sync_modify_user(
+                        db,
+                        user,
+                        remote_timeout=1.2,
+                        skip_nginx_sync=True,
+                        freeze_fast=True,
+                    )
+                    await db.commit()
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "on_hold activate push failed user_id=%s", uid, exc_info=True
                 )
-                user = result.scalar_one_or_none()
-                if not user:
-                    continue
-                if user.status not in (
-                    UserStatus.limited,
-                    UserStatus.expired,
-                    UserStatus.disabled,
-                ):
-                    continue
-                await sync_modify_user(
-                    db, user, remote_timeout=10, skip_nginx_sync=True
-                )
-                fail = any(
-                    a.status == PanelAccountStatus.error
-                    for a in (user.panel_accounts or [])
-                    if a.status != PanelAccountStatus.deleted
-                )
-                await db.commit()
-                if fail:
-                    stats["freeze_fail"] += 1
-                else:
-                    stats["freeze_ok"] += 1
-        except Exception:  # noqa: BLE001
-            stats["freeze_fail"] += 1
-            logger.warning(
-                "quota freeze failed user_id=%s", uid, exc_info=True
-            )
 
     return stats
 

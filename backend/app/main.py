@@ -117,39 +117,38 @@ async def _outbound_health_loop() -> None:
 
 
 async def _usage_sync_loop() -> None:
-    """Every ~10s: sync Astra traffic, detect quota end, freeze ALL remotes.
+    """Every ~3s: sync Astra traffic, detect quota end, freeze ALL remotes.
 
-    Does not depend on an admin opening the panel — exhausted users are
-    disabled on Marzban/PasarGuard/Sanaei/Rebecca/Astra as soon as the watch
-    cycle sees used ≥ limit.
+    Exhausted users are disabled on Marzban/PasarGuard/Sanaei/Rebecca/Astra
+    in the same cycle (~1s parallel cut). Does not wait for the admin UI.
     """
     import time as _time
 
     from app.services.orchestrator import run_quota_watch_cycle
 
-    await asyncio.sleep(5)
+    await asyncio.sleep(2)
     while True:
         t0 = _time.monotonic()
         try:
             stats = await run_quota_watch_cycle()
             if stats.get("flipped") or stats.get("freeze_ok") or stats.get("freeze_fail"):
                 logger.info(
-                    "quota watch: astra=%s checked=%s flipped=%s freeze_ok=%s freeze_fail=%s pulled=%s",
+                    "quota watch: astra=%s checked=%s flipped=%s freeze_ok=%s freeze_fail=%s pulled=%s dt=%.2fs",
                     stats.get("astra_panels"),
                     stats.get("checked"),
                     stats.get("flipped"),
                     stats.get("freeze_ok"),
                     stats.get("freeze_fail"),
                     stats.get("usage_pulled"),
+                    _time.monotonic() - t0,
                 )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("quota watch loop failed")
-        # Target cadence ≈ USAGE_REFRESH_SECONDS (default 10)
-        interval = max(5, int(settings.USAGE_REFRESH_SECONDS or 10))
+        interval = max(3, int(settings.USAGE_REFRESH_SECONDS or 3))
         elapsed = _time.monotonic() - t0
-        await asyncio.sleep(max(1.0, interval - elapsed))
+        await asyncio.sleep(max(0.15, interval - elapsed))
 
 
 def _resolve_frontend_dist() -> Path | None:

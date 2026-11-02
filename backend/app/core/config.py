@@ -34,9 +34,9 @@ class Settings(BaseSettings):
     # Max concurrent HTTP ops to remotes (create/delete/modify). Caps FD/TLS storm
     # when a user spans many panels; wall time still ≈ ceil(N/limit)×slowest.
     PANEL_REMOTE_CONCURRENCY: int = 32
-    # Background quota watch cadence (seconds). Keep ≤10 so exhausted users
-    # are frozen on remotes without waiting for an admin to open the panel.
-    USAGE_REFRESH_SECONDS: int = 10
+    # Background quota watch cadence (seconds). Exhausted users are frozen
+    # on every remote in the same cycle (~1s parallel disable).
+    USAGE_REFRESH_SECONDS: int = 3
     # Official install helper for SSL / nginx (empty = SSL UI disabled)
     ASTRA_HELPER: str = ""
     ASTRA_APP_PORT: int = 8000
