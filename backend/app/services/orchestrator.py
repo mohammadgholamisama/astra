@@ -1123,6 +1123,129 @@ async def provision_users_batch(
     return {"jobs": n_jobs, "ok": ok_n, "err": err_n, "pending": pend_n}
 
 
+async def ensure_pending_panel_accounts(
+    db: AsyncSession,
+    users: list[User],
+    panels: list[tuple[Panel, dict] | tuple[Panel, dict, int]],
+) -> int:
+    """Create pending PanelAccount rows so the UI shows in-progress immediately."""
+    targets = _normalize_panel_targets(panels)
+    if not users or not targets:
+        return 0
+    user_ids = [int(u.id) for u in users]
+    existing_rows = await db.execute(
+        select(PanelAccount).where(PanelAccount.user_id.in_(user_ids))
+    )
+    have: set[tuple[int, int, int]] = set()
+    for a in existing_rows.scalars().all():
+        have.add(
+            (
+                int(a.user_id),
+                int(a.panel_id),
+                int(getattr(a, "group_id", 0) or 0),
+            )
+        )
+    n = 0
+    for user in users:
+        uid = int(user.id)
+        for panel, _cfg, group_id in targets:
+            gid = int(group_id or 0)
+            key = (uid, int(panel.id), gid)
+            if key in have:
+                continue
+            db.add(
+                PanelAccount(
+                    user_id=uid,
+                    panel_id=panel.id,
+                    group_id=gid or None,
+                    status=PanelAccountStatus.pending,
+                )
+            )
+            have.add(key)
+            n += 1
+    if n:
+        await db.flush()
+    return n
+
+
+def schedule_users_provision(
+    user_ids: list[int],
+    panel_specs: list[tuple[int, dict, int]],
+) -> None:
+    """Fire-and-forget remote create + hydrate so HTTP can return immediately."""
+    ids = [int(x) for x in user_ids if x]
+    if not ids or not panel_specs:
+        return
+    try:
+        asyncio.create_task(
+            _bg_users_provision(ids, panel_specs),
+            name=f"astra-prov-{ids[0]}-n{len(ids)}",
+        )
+    except RuntimeError:
+        pass
+
+
+async def _bg_users_provision(
+    user_ids: list[int],
+    panel_specs: list[tuple[int, dict, int]],
+) -> None:
+    from app.core.database import AsyncSessionLocal
+    from app.api.subscription import invalidate_user_feed_cache
+
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(User)
+                .where(User.id.in_(user_ids))
+                .options(
+                    selectinload(User.panel_accounts).selectinload(PanelAccount.panel)
+                )
+            )
+            users = list(result.scalars().unique().all())
+            pids = list({int(pid) for pid, _, _ in panel_specs})
+            rows = await db.execute(
+                select(Panel).where(Panel.id.in_(pids or [-1]))
+            )
+            by_id = {int(p.id): p for p in rows.scalars().all()}
+            panels = [
+                (by_id[pid], cfg, gid)
+                for pid, cfg, gid in panel_specs
+                if pid in by_id and bool(getattr(by_id[pid], "is_active", True))
+            ]
+            if users and panels:
+                await provision_users_batch(
+                    db,
+                    users,
+                    panels,
+                    create_timeout=12.0,
+                    concurrency=40,
+                    overall_timeout=90.0,
+                )
+            result = await db.execute(
+                select(User)
+                .where(User.id.in_(user_ids))
+                .options(
+                    selectinload(User.panel_accounts).selectinload(PanelAccount.panel)
+                )
+            )
+            fresh = list(result.scalars().unique().all())
+            for user in fresh:
+                try:
+                    await hydrate_share_links(db, user)
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "bg hydrate user=%s failed", getattr(user, "username", "?")
+                    )
+            await db.commit()
+            try:
+                invalidate_user_feed_cache(*user_ids)
+            except Exception:  # noqa: BLE001
+                pass
+        await heal_failed_panel_accounts_batch(limit_users=max(10, len(user_ids)))
+    except Exception:  # noqa: BLE001
+        logger.exception("bg users provision failed n=%s", len(user_ids))
+
+
 async def reset_user_traffic_on_panels(
     db: AsyncSession,
     user: User,

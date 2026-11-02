@@ -574,7 +574,7 @@ export default function UsersPage() {
       const dn = bulkDisplayName.trim();
       return api<BulkCreateResponse>("/api/users/bulk", {
         method: "POST",
-        timeoutMs: 90_000,
+        timeoutMs: 20_000,
         body: JSON.stringify({
           username_prefix: bulkPrefix.trim(),
           count,
@@ -591,6 +591,12 @@ export default function UsersPage() {
     },
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["users"] });
+      window.setTimeout(() => {
+        qc.invalidateQueries({ queryKey: ["users"] });
+      }, 4000);
+      window.setTimeout(() => {
+        qc.invalidateQueries({ queryKey: ["users"] });
+      }, 12000);
       setBulkOpen(false);
       setBulkPrefix("");
       setBulkCount("5");
@@ -2560,7 +2566,8 @@ export default function UsersPage() {
                   <h3 id="bulk-result-title">کاربران ساخته شدند</h3>
                   <p className="modal-sub">
                     {toFaDigits(bulkResult.created.length)} از{" "}
-                    {toFaDigits(bulkResult.total_requested)} موفق
+                    {toFaDigits(bulkResult.total_requested)} در پنل ثبت شد — ساخت
+                    کانفیگ روی پنل‌ها در پس‌زمینه ادامه دارد
                     {bulkResult.failed.length > 0
                       ? ` · ${toFaDigits(bulkResult.failed.length)} ناموفق`
                       : ""}

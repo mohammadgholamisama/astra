@@ -281,52 +281,16 @@ async def create_user(
     if not user:
         raise HTTPException(status_code=500, detail="کاربر ساخته شد ولی قابل خواندن نیست")
 
-    # Always keep the Astra user. Dead/unreachable panels become account.error;
-    # budget-soft pending rows are auto-healed — never block or delete the create.
+    specs = [(int(p.id), dict(cfg or {}), int(gid)) for p, cfg, gid in panels]
     try:
-        # overall_timeout=None → provision scales budget with parallel waves
-        await orchestrator.provision_user_on_panels(db, user, panels, fast=True)
+        await orchestrator.ensure_pending_panel_accounts(db, [user], panels)
         await db.commit()
-    except Exception as exc:  # noqa: BLE001
-        # Unexpected local error — still keep the user; leave unfinished as pending
-        # (heal finishes them). Do not stamp fake "error" on healthy remotes.
+    except Exception:  # noqa: BLE001
         try:
             await db.rollback()
         except Exception:  # noqa: BLE001
             pass
-        try:
-            fresh = await load_user(db, body.username)
-            if fresh:
-                for acc in fresh.panel_accounts or []:
-                    if acc.status == PanelAccountStatus.active:
-                        continue
-                    if acc.status not in (
-                        PanelAccountStatus.pending,
-                        PanelAccountStatus.error,
-                    ):
-                        acc.status = PanelAccountStatus.pending
-                    if not (acc.error_message or "").strip() and acc.status == PanelAccountStatus.error:
-                        acc.error_message = f"ساخت روی پنل ناتمام: {exc}"
-                await db.commit()
-        except Exception:  # noqa: BLE001
-            try:
-                await db.rollback()
-            except Exception:  # noqa: BLE001
-                pass
-
-    # Kick heal for any pending/error left (slow PasarGuard, soft budget, etc.)
-    try:
-        fresh = await load_user(db, body.username)
-        if fresh and any(
-            a.status in (PanelAccountStatus.pending, PanelAccountStatus.error)
-            for a in (fresh.panel_accounts or [])
-        ):
-            asyncio.create_task(
-                orchestrator.heal_failed_panel_accounts_batch(limit_users=5),
-                name=f"astra-heal-after-create-{body.username}",
-            )
-    except Exception:  # noqa: BLE001
-        pass
+    orchestrator.schedule_users_provision([int(user.id)], specs)
 
     db.expire_all()
     user = await load_user(db, body.username)
@@ -526,25 +490,17 @@ async def create_users_bulk(
     ]
     if users and local_panels:
         try:
-            await orchestrator.provision_users_batch(
-                db,
-                users,
-                local_panels,
-                create_timeout=10.0,
-                concurrency=40,
-            )
+            await orchestrator.ensure_pending_panel_accounts(db, users, local_panels)
+            await db.commit()
         except Exception:  # noqa: BLE001
-            log.exception("bulk provision batch failed")
-
-    try:
-        asyncio.create_task(
-            orchestrator.heal_failed_panel_accounts_batch(
-                limit_users=max(10, len(created_names))
-            ),
-            name="astra-heal-after-bulk",
+            log.exception("bulk pending accounts failed")
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+        orchestrator.schedule_users_provision(
+            [int(u.id) for u in users], panel_specs
         )
-    except Exception:  # noqa: BLE001
-        pass
 
     db.expire_all()
     created: list[UserResponse] = []
