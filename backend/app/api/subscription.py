@@ -194,20 +194,17 @@ async def _bg_sub_maintain(user_id: int) -> None:
                 )
                 if has_fail:
                     await asyncio.wait_for(
-                        retry_failed_accounts(db, user), timeout=20.0
+                        retry_failed_accounts(db, user), timeout=8.0
                     )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("bg heal user_id=%s: %s", user_id, exc)
             try:
-                await asyncio.wait_for(hydrate_share_links(db, user), timeout=30.0)
+                await asyncio.wait_for(hydrate_share_links(db, user), timeout=18.0)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("bg hydrate user_id=%s: %s", user_id, exc)
             try:
-                # quick=True → no provision, hard overall budget on panel pulls
-                await asyncio.wait_for(
-                    refresh_usage(db, user, force=False, quick=True),
-                    timeout=5.5,
-                )
+                # Do not pull every remote on /sub — that stalls the tunnel (502).
+                # Quota watch already recounts usage every few seconds.
                 activated = await activate_on_hold_if_used(db, user)
                 changed = bool(activated) or await enforce_user_quota(db, user)
                 from app.models.user import UserStatus

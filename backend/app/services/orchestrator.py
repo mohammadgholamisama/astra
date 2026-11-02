@@ -1007,12 +1007,12 @@ async def provision_users_batch(
         return {"jobs": 0, "ok": 0, "err": 0, "pending": 0}
 
     n_jobs = len(jobs)
-    sem_limit = max(24, min(int(concurrency) or 40, 48, n_jobs))
+    sem_limit = max(32, min(int(concurrency) or 48, 64, n_jobs))
     waves = max(1, (n_jobs + sem_limit - 1) // sem_limit)
     budget = (
         float(overall_timeout)
         if overall_timeout is not None
-        else min(40.0, waves * min(create_timeout, 8.0) + 4.0)
+        else min(28.0, waves * min(create_timeout, 5.0) + 3.0)
     )
     sem = asyncio.Semaphore(sem_limit)
 
@@ -1030,9 +1030,9 @@ async def provision_users_batch(
                         panel_id=panel.id,
                         timeout=create_timeout,
                         max_alias_attempts=1,
-                        probe_timeout=3.0,
+                        probe_timeout=2.0,
                     ),
-                    timeout=create_timeout + 1.0,
+                    timeout=create_timeout + 0.8,
                 )
         except asyncio.CancelledError:
             return _fail_result(_PROVISION_BUDGET_SOFT)
@@ -1056,23 +1056,28 @@ async def provision_users_batch(
         budget,
     )
     done, pending = await asyncio.wait(tasks, timeout=budget)
-    for t in pending:
-        t.cancel()
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
 
     now = datetime.now(timezone.utc)
     ok_n = 0
     err_n = 0
     pend_n = 0
+    leftover: list[tuple[int, asyncio.Task]] = []
+    leftover_uids: set[int] = set()
     for (account, panel, payload, user), task in zip(jobs, tasks):
-        if task in pending or task.cancelled():
-            result = _fail_result(_PROVISION_BUDGET_SOFT)
-        else:
-            try:
-                result = task.result()
-            except Exception as exc:  # noqa: BLE001
-                result = _fail_result(_exc_msg(exc) or "خطای پنل")
+        if task not in done:
+            account.status = PanelAccountStatus.pending
+            account.remote_username = (
+                account.remote_username or payload.username or user.username
+            )
+            account.error_message = None
+            pend_n += 1
+            leftover.append((int(account.id), task))
+            leftover_uids.add(int(user.id))
+            continue
+        try:
+            result = task.result()
+        except Exception as exc:  # noqa: BLE001
+            result = _fail_result(_exc_msg(exc) or "خطای پنل")
         if result.success:
             account.status = PanelAccountStatus.active
             account.remote_username = (
@@ -1089,13 +1094,6 @@ async def provision_users_batch(
             account.last_sync_at = now
             panel.last_ok_at = now
             ok_n += 1
-        elif (result.error or "") == _PROVISION_BUDGET_SOFT:
-            account.status = PanelAccountStatus.pending
-            account.remote_username = (
-                account.remote_username or payload.username or user.username
-            )
-            account.error_message = None
-            pend_n += 1
         else:
             account.status = PanelAccountStatus.error
             account.error_message = _format_remote_error(
@@ -1111,8 +1109,13 @@ async def provision_users_batch(
         await db.commit()
     except Exception:  # noqa: BLE001
         pass
+    if leftover:
+        asyncio.create_task(
+            _finish_leftover_provision(leftover, leftover_uids),
+            name="astra-prov-leftover",
+        )
     logger.info(
-        "bulk provision done users=%s jobs=%s ok=%s err=%s pending=%s dt=%.2fs",
+        "bulk provision wave users=%s jobs=%s ok=%s err=%s leftover=%s dt=%.2fs",
         len(users),
         n_jobs,
         ok_n,
@@ -1121,6 +1124,56 @@ async def provision_users_batch(
         time.monotonic() - t0,
     )
     return {"jobs": n_jobs, "ok": ok_n, "err": err_n, "pending": pend_n}
+
+
+async def _finish_leftover_provision(
+    leftover: list[tuple[int, asyncio.Task]],
+    user_ids: set[int],
+) -> None:
+    """Do NOT cancel in-flight creates — write results when they finish."""
+    from app.core.database import AsyncSessionLocal
+    from app.api.subscription import invalidate_user_feed_cache
+
+    if not leftover:
+        return
+    gathered = await asyncio.gather(
+        *[t for _aid, t in leftover], return_exceptions=True
+    )
+    try:
+        async with AsyncSessionLocal() as db:
+            now = datetime.now(timezone.utc)
+            for (account_id, _task), raw in zip(leftover, gathered):
+                acc = await db.get(PanelAccount, account_id)
+                if acc is None or acc.status == PanelAccountStatus.deleted:
+                    continue
+                if isinstance(raw, Exception):
+                    acc.status = PanelAccountStatus.error
+                    acc.error_message = _exc_msg(raw)[:300]
+                    continue
+                result = raw if isinstance(raw, AdapterResult) else _fail_result("خطای پنل")
+                if result.success:
+                    acc.status = PanelAccountStatus.active
+                    acc.remote_username = result.remote_username or acc.remote_username
+                    acc.remote_id = result.remote_id or acc.remote_id
+                    acc.uuid = result.uuid or acc.uuid
+                    if result.links:
+                        acc.links = result.links
+                    acc.used_traffic = max(
+                        int(acc.used_traffic or 0), int(result.used_traffic or 0)
+                    )
+                    acc.error_message = None
+                    acc.last_sync_at = now
+                else:
+                    acc.status = PanelAccountStatus.error
+                    acc.error_message = (result.error or "ایجاد در پنل ناموفق")[:400]
+            await db.commit()
+            try:
+                invalidate_user_feed_cache(*user_ids)
+            except Exception:  # noqa: BLE001
+                pass
+        logger.info("leftover provision wrote n=%s users=%s", len(leftover), len(user_ids))
+    except Exception:  # noqa: BLE001
+        logger.exception("leftover provision failed n=%s", len(leftover))
 
 
 async def probe_unique_panels(
@@ -1166,87 +1219,33 @@ async def provision_users_now(
     users: list[User],
     panels: list[tuple[Panel, dict] | tuple[Panel, dict, int]],
 ) -> dict[str, int]:
-    """Create remotes NOW on live panels; stamp errors on dead ones.
+    """Create on EVERY target panel in parallel. Never skip a live panel.
 
-    Probe (~3s) then one parallel create wave. Links from create go on the
-    account so the sub is not empty. Does not return until remotes finish
-    or the short budget hits (leftovers stay pending for heal).
+    Waits a short budget so the HTTP reply already has configs; leftover
+    in-flight creates keep running (not cancelled) and land in the sub.
     """
     targets = _normalize_panel_targets(panels)
     if not users or not targets:
         return {"ok": 0, "err": 0, "down": 0, "pending": 0}
 
-    unique_panels: list[Panel] = []
-    seen_p: set[int] = set()
-    for p, _, _ in targets:
-        pid = int(p.id)
-        if pid in seen_p:
-            continue
-        seen_p.add(pid)
-        unique_panels.append(p)
-    probe = await probe_unique_panels(unique_panels, timeout=3.2)
-    down_ids = {
-        pid for pid, (st, _e) in probe.items() if st == "down"
+    n_jobs = max(1, len(users) * len(targets))
+    # Single user: wait for the whole wave. Bulk: first ~25s then leftover bg.
+    wait = 14.0 if len(users) <= 2 else min(28.0, 8.0 + n_jobs * 0.04)
+    batch = await provision_users_batch(
+        db,
+        users,
+        targets,
+        create_timeout=5.0,
+        concurrency=48,
+        overall_timeout=wait,
+    )
+    stats = {
+        "ok": int(batch.get("ok") or 0),
+        "err": int(batch.get("err") or 0),
+        "down": 0,
+        "pending": int(batch.get("pending") or 0),
     }
-    live_targets = [
-        t for t in targets if int(t[0].id) not in down_ids
-    ]
 
-    if down_ids:
-        await ensure_pending_panel_accounts(db, users, targets)
-        user_ids = [int(u.id) for u in users]
-        acc_rows = await db.execute(
-            select(PanelAccount).where(PanelAccount.user_id.in_(user_ids))
-        )
-        by_key: dict[tuple[int, int, int], PanelAccount] = {}
-        for a in acc_rows.scalars().all():
-            by_key[
-                (
-                    int(a.user_id),
-                    int(a.panel_id),
-                    int(getattr(a, "group_id", 0) or 0),
-                )
-            ] = a
-        for user in users:
-            uid = int(user.id)
-            for panel, _cfg, gid in targets:
-                pid = int(panel.id)
-                if pid not in down_ids:
-                    continue
-                key = (uid, pid, int(gid or 0))
-                acc = by_key.get(key)
-                if acc is None:
-                    acc = PanelAccount(
-                        user_id=uid,
-                        panel_id=pid,
-                        group_id=int(gid) or None,
-                        status=PanelAccountStatus.error,
-                    )
-                    db.add(acc)
-                    by_key[key] = acc
-                acc.status = PanelAccountStatus.error
-                acc.links = []
-                acc.links_by_group = {}
-                acc.error_message = (
-                    f"اتصال پنل برقرار نیست: {probe.get(pid, ('down', ''))[1] or 'timeout'}"
-                )
-        await db.flush()
-
-    stats = {"ok": 0, "err": 0, "down": len(down_ids), "pending": 0}
-    if live_targets:
-        batch = await provision_users_batch(
-            db,
-            users,
-            live_targets,
-            create_timeout=8.0,
-            concurrency=40,
-            overall_timeout=22.0,
-        )
-        stats["ok"] = int(batch.get("ok") or 0)
-        stats["err"] = int(batch.get("err") or 0)
-        stats["pending"] = int(batch.get("pending") or 0)
-
-    # Fill share links for the sub (create often already has them)
     user_ids = [int(u.id) for u in users]
     result = await db.execute(
         select(User)
@@ -1256,7 +1255,7 @@ async def provision_users_now(
     fresh = list(result.scalars().unique().all())
     t_h = time.monotonic()
     for user in fresh:
-        if time.monotonic() - t_h > 8.0:
+        if time.monotonic() - t_h > 6.0:
             break
         need = any(
             a.status == PanelAccountStatus.active and not (a.links or [])
