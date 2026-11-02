@@ -131,6 +131,23 @@ async def _bg_resync_category_users(
             logger.exception("bg category %s resync failed", cid)
 
 
+async def _bg_move_group_between_categories(
+    group_id: int,
+    old_category_id: int | None,
+    new_category_id: int | None,
+) -> None:
+    """Leave old category (delete remotes) then join new (provision) — sequential."""
+    gid = int(group_id)
+    if old_category_id is not None:
+        await _bg_resync_category_users(
+            int(old_category_id), removed_group_ids=[gid]
+        )
+    if new_category_id is not None:
+        await _bg_resync_category_users(
+            int(new_category_id), added_group_ids=[gid]
+        )
+
+
 async def _bg_recount_group_users(group_id: int) -> None:
     """Coefficient-only save: recount Astra usage, freeze remotes that flipped."""
     from sqlalchemy.orm import selectinload
@@ -489,23 +506,16 @@ async def move_group(
     new_cat = await _ensure_category(db, body.category_id)
     group.category_id = new_cat
     await db.commit()
-    if old_cat != new_cat:
-        # Leaving old category → drop this group from those users' membership
-        if old_cat is not None:
-            asyncio.create_task(
-                _bg_resync_category_users(
-                    old_cat, removed_group_ids=[int(group_id)]
-                ),
-                name=f"astra-cat-leave-{group_id}",
-            )
-        # Entering new category → add this group for category-bound users
-        if new_cat is not None:
-            asyncio.create_task(
-                _bg_resync_category_users(
-                    new_cat, added_group_ids=[int(group_id)]
-                ),
-                name=f"astra-cat-join-{group_id}",
-            )
+    if old_cat != new_cat and (old_cat is not None or new_cat is not None):
+        # Sequential: scrub remotes for old-category users, then provision for new
+        asyncio.create_task(
+            _bg_move_group_between_categories(
+                int(group_id),
+                int(old_cat) if old_cat is not None else None,
+                int(new_cat) if new_cat is not None else None,
+            ),
+            name=f"astra-cat-move-{group_id}",
+        )
     group = await _load_group(db, group_id)
     return _to_out(group)  # type: ignore[arg-type]
 
@@ -588,11 +598,21 @@ async def update_group(
                 name=f"astra-cat-join-g{group_id}",
             )
         elif new_cat is not None and body.is_disabled is not None:
-            # enable/disable inside same category — refresh membership
-            asyncio.create_task(
-                _bg_resync_category_users(new_cat),
-                name=f"astra-cat-toggle-g{group_id}",
-            )
+            # enable/disable inside same category — drop or add remotes precisely
+            if bool(body.is_disabled):
+                asyncio.create_task(
+                    _bg_resync_category_users(
+                        new_cat, removed_group_ids=[int(group_id)]
+                    ),
+                    name=f"astra-cat-disable-g{group_id}",
+                )
+            else:
+                asyncio.create_task(
+                    _bg_resync_category_users(
+                        new_cat, added_group_ids=[int(group_id)]
+                    ),
+                    name=f"astra-cat-enable-g{group_id}",
+                )
     group = await _load_group(db, group_id)
     return _to_out(group)  # type: ignore[arg-type]
 
@@ -603,18 +623,32 @@ async def delete_group(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
-    """Remove group from Astra only — does not touch remote panels."""
+    """Remove group from Astra AFTER deleting its remotes on every panel.
+
+    Order matters: PanelAccount.group_id is SET NULL when Group is deleted, so
+    remotes must be scrubbed while group_id is still set.
+    """
+    from app.services.orchestrator import deprovision_group_from_all_users
+
     group = await db.get(Group, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
     old_cat = getattr(group, "category_id", None)
 
-    # Explicit child cleanup (avoids async lazy-load / FK 500s)
-    await db.execute(delete(GroupConfigItem).where(GroupConfigItem.group_id == group_id))
-    await db.execute(delete(UserGroup).where(UserGroup.group_id == group_id))
-    await db.execute(delete(GroupPanel).where(GroupPanel.group_id == group_id))
+    # 1) Delete remotes + UserGroup for this sales group (all users)
+    try:
+        remote_stats = await deprovision_group_from_all_users(db, group_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("delete group=%s remote deprovision failed", group_id)
+        remote_stats = {"users": 0, "ok": 0, "fail": 0}
 
-    # Drop local sample probe user if present (local DB only — no remote delete)
+    # 2) Explicit child cleanup (avoids async lazy-load / FK 500s)
+    await db.execute(delete(GroupConfigItem).where(GroupConfigItem.group_id == group_id))
+    await db.execute(delete(GroupPanel).where(GroupPanel.group_id == group_id))
+    # UserGroup already wiped in deprovision; belt-and-suspenders
+    await db.execute(delete(UserGroup).where(UserGroup.group_id == group_id))
+
+    # Drop local sample probe user if present
     from app.models.user import PanelAccount, User
 
     sample_name = sample_username_for_group(group_id)
@@ -633,10 +667,16 @@ async def delete_group(
         await db.rollback()
         raise HTTPException(status_code=400, detail=f"حذف گروه ناموفق: {exc}") from exc
     if old_cat is not None:
+        # Heal remaining category-bound users to current desired set
         asyncio.create_task(
             _bg_resync_category_users(
                 old_cat, removed_group_ids=[int(group_id)]
             ),
             name=f"astra-cat-resync-del-{group_id}",
         )
-    return {"detail": "Group deleted"}
+    return {
+        "detail": "Group deleted",
+        "remote_users": remote_stats.get("users", 0),
+        "remote_ok": remote_stats.get("ok", 0),
+        "remote_failed": remote_stats.get("fail", 0),
+    }

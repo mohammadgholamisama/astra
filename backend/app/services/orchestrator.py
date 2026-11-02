@@ -4832,6 +4832,10 @@ async def apply_user_group_membership(
     Same safety as admin edit: delete remotes for removed groups first, then
     rewrite membership, provision new panels, hydrate links. Does NOT reset
     used_traffic / coeff anchors — only membership changes.
+
+    ``wanted_group_ids=[]`` clears every group: remotes deleted, UserGroup wiped
+    (needed when the last enabled group leaves a bound category).
+
     Returns True if membership actually changed.
     """
     from sqlalchemy import delete as sa_delete
@@ -4847,8 +4851,6 @@ async def apply_user_group_membership(
             continue
         seen.add(gid)
         ordered.append(gid)
-    if not ordered:
-        return False
 
     ug = await db.execute(
         select(UserGroup.group_id)
@@ -4879,18 +4881,92 @@ async def apply_user_group_membership(
         db.add(UserGroup(user_id=user.id, group_id=gid, sort_order=i))
     await db.flush()
 
-    panels = await resolve_panels_for_groups(db, ordered)
-    if panels:
-        await provision_user_on_panels(db, user, panels)
-        try:
-            await hydrate_share_links(db, user)
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "hydrate after category sync user=%s failed",
-                getattr(user, "username", "?"),
-                exc_info=True,
-            )
+    if ordered:
+        panels = await resolve_panels_for_groups(db, ordered)
+        if panels:
+            await provision_user_on_panels(db, user, panels)
+            try:
+                await hydrate_share_links(db, user)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "hydrate after category sync user=%s failed",
+                    getattr(user, "username", "?"),
+                    exc_info=True,
+                )
     return True
+
+
+async def deprovision_group_from_all_users(
+    db: AsyncSession, group_id: int
+) -> dict:
+    """Delete every remote account for this sales group, then wipe UserGroup rows.
+
+    Must run BEFORE the Group row is deleted — PanelAccount.group_id is SET NULL
+    by FK and would otherwise skip remote cleanup.
+    """
+    from app.api.subscription import invalidate_user_feed_cache
+    from sqlalchemy import delete as sa_delete
+
+    gid = int(group_id)
+    ug = await db.execute(
+        select(UserGroup.user_id).where(UserGroup.group_id == gid).distinct()
+    )
+    pa = await db.execute(
+        select(PanelAccount.user_id)
+        .where(
+            PanelAccount.group_id == gid,
+            PanelAccount.status != PanelAccountStatus.deleted,
+        )
+        .distinct()
+    )
+    uids = sorted(
+        {
+            int(r[0])
+            for r in list(ug.all()) + list(pa.all())
+            if r[0] is not None
+        }
+    )
+    stats = {"users": len(uids), "ok": 0, "fail": 0}
+    if not uids:
+        await db.execute(sa_delete(UserGroup).where(UserGroup.group_id == gid))
+        await db.flush()
+        return stats
+
+    result = await db.execute(
+        select(User)
+        .where(User.id.in_(uids))
+        .options(
+            selectinload(User.panel_accounts).selectinload(PanelAccount.panel)
+        )
+    )
+    users = list(result.scalars().unique().all())
+    for user in users:
+        try:
+            outcomes = await sync_delete_user_group_accounts(db, user, [gid])
+            stats["ok"] += sum(1 for r in outcomes if r.get("ok"))
+            stats["fail"] += sum(1 for r in outcomes if not r.get("ok"))
+        except Exception:  # noqa: BLE001
+            stats["fail"] += 1
+            logger.exception(
+                "deprovision-group=%s user=%s failed",
+                gid,
+                getattr(user, "username", "?"),
+            )
+
+    await db.execute(sa_delete(UserGroup).where(UserGroup.group_id == gid))
+    await db.flush()
+    try:
+        invalidate_user_feed_cache(*uids)
+    except Exception:  # noqa: BLE001
+        pass
+    logger.info(
+        "deprovision-group=%s users=%s ok=%s fail=%s",
+        gid,
+        stats["users"],
+        stats["ok"],
+        stats["fail"],
+    )
+    return stats
 
 
 async def _users_with_exact_groups(
@@ -5002,44 +5078,44 @@ async def resync_users_for_category(
     users = list(users_by_id.values())
     if not users:
         logger.info(
-            "category %s resync — no bound users (desired=%s added=%s)",
+            "category %s resync — no bound users (desired=%s added=%s removed=%s)",
             cid,
             desired,
             added,
+            force_removed,
         )
         return 0
 
-    if not desired and not force_removed:
-        logger.info("category %s resync skipped — no enabled groups", cid)
-        return 0
-
     ok = 0
-    touched_gids: set[int] = set(desired)
+    touched_gids: set[int] = set(desired) | set(force_removed)
     touched_uids: list[int] = []
     for user in users:
         try:
             changed = False
-            if force_removed:
+            # Always drive membership to exactly ``desired`` (including []).
+            # Empty desired = last group left/disabled → wipe remotes + UserGroup.
+            if await apply_user_group_membership(db, user, desired):
+                changed = True
+            elif desired:
+                # Membership already matches — still heal missing remotes
+                # (e.g. prior provision failed / panel added later).
+                panels = await resolve_panels_for_groups(db, desired)
+                if panels:
+                    await provision_user_on_panels(db, user, panels)
+                    try:
+                        await hydrate_share_links(db, user)
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "hydrate after category heal user=%s failed",
+                            getattr(user, "username", "?"),
+                            exc_info=True,
+                        )
+                    changed = True
+            elif force_removed:
+                # desired=[] and membership already empty — still scrub remotes
+                # if Group was deleted before UserGroup rewrite finished.
                 await sync_delete_user_group_accounts(db, user, force_removed)
                 changed = True
-            if desired:
-                if await apply_user_group_membership(db, user, desired):
-                    changed = True
-                else:
-                    # Membership already matches — still heal missing remotes
-                    # (e.g. prior provision failed / panel added later).
-                    panels = await resolve_panels_for_groups(db, desired)
-                    if panels:
-                        await provision_user_on_panels(db, user, panels)
-                        try:
-                            await hydrate_share_links(db, user)
-                        except Exception:  # noqa: BLE001
-                            logger.warning(
-                                "hydrate after category heal user=%s failed",
-                                getattr(user, "username", "?"),
-                                exc_info=True,
-                            )
-                        changed = True
             if changed:
                 ok += 1
                 touched_uids.append(int(user.id))
