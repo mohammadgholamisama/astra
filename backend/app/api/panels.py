@@ -156,16 +156,17 @@ async def _probe_panel(panel: Panel) -> None:
         adapter = get_adapter(panel)
         result = None
         try:
-            # Drop any stale shared token before a fresh probe
-            clear = getattr(adapter, "_token", None)
-            if clear is not None:
+            # Drop stale Marzban-family JWT cache. Sanaei uses `_token()` as a
+            # method — never overwrite that with None (TypeError: not callable).
+            cached = getattr(adapter, "_token", None)
+            if cached is not None and not callable(cached):
                 adapter._token = None  # type: ignore[attr-defined]
-            cache = getattr(adapter, "_cache_key", None)
-            if callable(cache):
+            cache_key = getattr(adapter, "_cache_key", None)
+            if callable(cache_key):
                 try:
                     from app.adapters import marzban as marz_mod
 
-                    marz_mod._TOKEN_CACHE.pop(adapter._cache_key(), None)  # type: ignore[attr-defined]
+                    marz_mod._TOKEN_CACHE.pop(cache_key(), None)
                 except Exception:  # noqa: BLE001
                     pass
             result = await adapter.test_connection()
