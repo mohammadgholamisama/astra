@@ -488,6 +488,49 @@ button, input, select, textarea { font: inherit; }
   border-color: color-mix(in srgb, var(--danger) 42%, var(--line));
   background: color-mix(in srgb, var(--danger) 10%, var(--card-solid));
 }
+.panels-test-all {
+  margin: 0 0 18px;
+  padding: 14px 16px 8px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: var(--card);
+}
+.panels-test-all-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.panels-test-all-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.panels-test-all-list li {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+.panels-test-all-list li span {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.panels-test-all-list li em {
+  font-style: normal;
+  font-size: 0.75rem;
+  opacity: 0.7;
+}
+.panels-test-all-list li.ok { color: var(--ok); }
+.panels-test-all-list li.err { color: var(--danger); }
+.panels-test-all-list small {
+  padding-inline-start: 23px;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
 @keyframes panel-toast-in {
   from {
     opacity: 0;

@@ -22,6 +22,8 @@ from app.schemas.panel import (
     PanelActiveSet,
     PanelCreate,
     PanelOut,
+    PanelTestAllOut,
+    PanelTestOut,
     PanelUpdate,
     RemoteGroupOut,
 )
@@ -586,6 +588,50 @@ async def delete_panel(
     }
 
 
+@router.post("/api/admin/panels/test-all", response_model=PanelTestAllOut)
+@router.post("/api/panel/test-all", response_model=PanelTestAllOut)
+async def test_all_panels(
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """Probe every saved panel in parallel — report which connections fail."""
+    rows = await db.execute(select(Panel).order_by(Panel.id.asc()))
+    panels = list(rows.scalars().all())
+    if not panels:
+        return PanelTestAllOut(results=[], ok=0, fail=0)
+
+    async def _one(panel: Panel) -> PanelTestOut:
+        if panel.type == PanelType.astra:
+            ok = True
+            err = None
+        else:
+            adapter = get_adapter(panel)
+            try:
+                result = await asyncio.wait_for(adapter.test_connection(), timeout=4.5)
+                ok = bool(result.success)
+                err = None if ok else (result.error or "اتصال ناموفق")
+            except Exception as exc:  # noqa: BLE001
+                ok = False
+                err = str(exc).strip() or exc.__class__.__name__
+            finally:
+                await _close_adapter(adapter)
+        if ok:
+            panel.last_ok_at = datetime.now(timezone.utc)
+        return PanelTestOut(
+            id=int(panel.id),
+            name=panel.name,
+            type=panel.type,
+            is_active=bool(panel.is_active),
+            success=ok,
+            error=err,
+        )
+
+    results = list(await asyncio.gather(*[_one(p) for p in panels]))
+    await db.commit()
+    ok_n = sum(1 for r in results if r.success)
+    return PanelTestAllOut(results=results, ok=ok_n, fail=len(results) - ok_n)
+
+
 @router.post("/api/panel/{panel_id}/test")
 @router.post("/api/admin/panels/{panel_id}/test")
 async def test_panel(
@@ -597,7 +643,10 @@ async def test_panel(
     if not panel:
         raise HTTPException(status_code=404, detail="Panel not found")
     adapter = get_adapter(panel)
-    result = await adapter.test_connection()
+    try:
+        result = await adapter.test_connection()
+    finally:
+        await _close_adapter(adapter)
     if result.success:
         panel.last_ok_at = datetime.now(timezone.utc)
         await db.commit()

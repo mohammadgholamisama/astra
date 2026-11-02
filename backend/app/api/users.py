@@ -281,16 +281,22 @@ async def create_user(
     if not user:
         raise HTTPException(status_code=500, detail="کاربر ساخته شد ولی قابل خواندن نیست")
 
-    specs = [(int(p.id), dict(cfg or {}), int(gid)) for p, cfg, gid in panels]
     try:
-        await orchestrator.ensure_pending_panel_accounts(db, [user], panels)
-        await db.commit()
+        await orchestrator.provision_users_now(db, [user], panels)
     except Exception:  # noqa: BLE001
+        log = __import__("logging").getLogger("astra.users")
+        log.exception("create provision failed user=%s", body.username)
         try:
             await db.rollback()
         except Exception:  # noqa: BLE001
             pass
-    orchestrator.schedule_users_provision([int(user.id)], specs)
+    try:
+        asyncio.create_task(
+            orchestrator.heal_failed_panel_accounts_batch(limit_users=5),
+            name=f"astra-heal-after-create-{body.username}",
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
     db.expire_all()
     user = await load_user(db, body.username)
@@ -490,17 +496,22 @@ async def create_users_bulk(
     ]
     if users and local_panels:
         try:
-            await orchestrator.ensure_pending_panel_accounts(db, users, local_panels)
-            await db.commit()
+            await orchestrator.provision_users_now(db, users, local_panels)
         except Exception:  # noqa: BLE001
-            log.exception("bulk pending accounts failed")
+            log.exception("bulk provision failed")
             try:
                 await db.rollback()
             except Exception:  # noqa: BLE001
                 pass
-        orchestrator.schedule_users_provision(
-            [int(u.id) for u in users], panel_specs
-        )
+        try:
+            asyncio.create_task(
+                orchestrator.heal_failed_panel_accounts_batch(
+                    limit_users=max(10, len(created_names))
+                ),
+                name="astra-heal-after-bulk",
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     db.expire_all()
     created: list[UserResponse] = []
@@ -522,7 +533,7 @@ async def create_users_bulk(
                 )
                 continue
             try:
-                created.append(to_user_response(user, include_links=False))
+                created.append(to_user_response(user, include_links=True))
             except Exception as exc:  # noqa: BLE001
                 log.warning("bulk serialize user=%s: %s", uname, exc)
                 created.append(

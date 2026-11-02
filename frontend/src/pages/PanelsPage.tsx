@@ -529,10 +529,13 @@ export default function PanelsPage() {
     };
   }, []);
 
+  const [testAllOpen, setTestAllOpen] = useState(false);
+
   const test = useMutation({
     mutationFn: (id: number) =>
       api<{ success: boolean; error?: string }>(`/api/admin/panels/${id}/test`, {
         method: "POST",
+        timeoutMs: 12_000,
       }),
     onSuccess: (res, id) => {
       const panelName = data.find((p) => p.id === id)?.name;
@@ -548,6 +551,42 @@ export default function PanelsPage() {
     },
     onError: (e: Error) => {
       showTestToast(false, e.message || "خطای تست");
+    },
+  });
+
+  type PanelTestAll = {
+    results: {
+      id: number;
+      name: string;
+      type: string;
+      is_active: boolean;
+      success: boolean;
+      error?: string | null;
+    }[];
+    ok: number;
+    fail: number;
+  };
+
+  const testAll = useMutation({
+    mutationFn: () =>
+      api<PanelTestAll>("/api/admin/panels/test-all", {
+        method: "POST",
+        timeoutMs: 25_000,
+      }),
+    onSuccess: (res) => {
+      setTestAllOpen(true);
+      qc.invalidateQueries({ queryKey: ["panels"] });
+      if (res.fail === 0) {
+        showTestToast(true, `اتصال همه ${toFaDigits(res.ok)} پنل برقرار است`);
+      } else {
+        showTestToast(
+          false,
+          `${toFaDigits(res.fail)} پنل مشکل اتصال دارد`
+        );
+      }
+    },
+    onError: (e: Error) => {
+      showTestToast(false, e.message || "تست کلی ناموفق بود");
     },
   });
 
@@ -669,6 +708,15 @@ export default function PanelsPage() {
 
       <div className="toolbar">
         <span className="muted">{toFaDigits(data.length)} پنل</span>
+        <button
+          type="button"
+          className="btn ghost"
+          disabled={testAll.isPending || data.length === 0}
+          onClick={() => testAll.mutate()}
+        >
+          <Wifi size={16} />
+          {testAll.isPending ? "در حال تست همه…" : "تست کلی اتصال"}
+        </button>
         <button className="btn toolbar-primary" onClick={openCreate}>
           <Plus size={16} />
           افزودن پنل
@@ -693,6 +741,39 @@ export default function PanelsPage() {
         >
           {testToast.ok ? <CheckCircle2 size={18} /> : <XCircle size={18} />}
           <span>{testToast.text}</span>
+        </div>
+      )}
+
+      {testAllOpen && testAll.data && (
+        <div className="panels-test-all">
+          <div className="panels-test-all-head">
+            <strong>
+              نتیجه تست کلی — {toFaDigits(testAll.data.ok)} سالم
+              {testAll.data.fail > 0
+                ? ` · ${toFaDigits(testAll.data.fail)} مشکل`
+                : ""}
+            </strong>
+            <button
+              type="button"
+              className="modal-close"
+              onClick={() => setTestAllOpen(false)}
+              aria-label="بستن"
+            >
+              ×
+            </button>
+          </div>
+          <ul className="panels-test-all-list">
+            {testAll.data.results.map((r) => (
+              <li key={r.id} className={r.success ? "ok" : "err"}>
+                <span>
+                  {r.success ? <CheckCircle2 size={15} /> : <XCircle size={15} />}
+                  <b>{r.name}</b>
+                  {!r.is_active ? <em>خاموش</em> : null}
+                </span>
+                <small>{r.success ? "اتصال برقرار است" : r.error || "اتصال ناموفق"}</small>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
 

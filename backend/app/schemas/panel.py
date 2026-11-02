@@ -34,6 +34,21 @@ class PanelActiveSet(BaseModel):
     is_active: bool
 
 
+class PanelTestOut(BaseModel):
+    id: int
+    name: str
+    type: PanelType
+    is_active: bool
+    success: bool
+    error: str | None = None
+
+
+class PanelTestAllOut(BaseModel):
+    results: list[PanelTestOut] = Field(default_factory=list)
+    ok: int = 0
+    fail: int = 0
+
+
 class PanelOut(ORMModel):
     id: int
     name: str

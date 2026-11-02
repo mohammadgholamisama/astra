@@ -1123,6 +1123,166 @@ async def provision_users_batch(
     return {"jobs": n_jobs, "ok": ok_n, "err": err_n, "pending": pend_n}
 
 
+async def probe_unique_panels(
+    panels: list[Panel],
+    *,
+    timeout: float = 3.2,
+) -> dict[int, tuple[str, str]]:
+    """Parallel live-check. Astra local is always ok. Returns id → (ok|soft|down, err)."""
+    uniq: dict[int, Panel] = {}
+    for p in panels:
+        if p is None:
+            continue
+        uniq[int(p.id)] = p
+    if not uniq:
+        return {}
+
+    async def _one(panel: Panel) -> tuple[int, str, str]:
+        if panel.type == PanelType.astra:
+            return int(panel.id), "ok", ""
+        state, err = await _probe_panel_alive(panel, timeout)
+        return int(panel.id), state, err
+
+    tasks = [asyncio.create_task(_one(p)) for p in uniq.values()]
+    done, pending = await asyncio.wait(tasks, timeout=timeout + 0.8)
+    for t in pending:
+        t.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    out: dict[int, tuple[str, str]] = {
+        pid: ("down", "timeout تست اتصال") for pid in uniq
+    }
+    for t in done:
+        try:
+            pid, state, err = t.result()
+            out[int(pid)] = (state, err or "")
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+async def provision_users_now(
+    db: AsyncSession,
+    users: list[User],
+    panels: list[tuple[Panel, dict] | tuple[Panel, dict, int]],
+) -> dict[str, int]:
+    """Create remotes NOW on live panels; stamp errors on dead ones.
+
+    Probe (~3s) then one parallel create wave. Links from create go on the
+    account so the sub is not empty. Does not return until remotes finish
+    or the short budget hits (leftovers stay pending for heal).
+    """
+    targets = _normalize_panel_targets(panels)
+    if not users or not targets:
+        return {"ok": 0, "err": 0, "down": 0, "pending": 0}
+
+    unique_panels: list[Panel] = []
+    seen_p: set[int] = set()
+    for p, _, _ in targets:
+        pid = int(p.id)
+        if pid in seen_p:
+            continue
+        seen_p.add(pid)
+        unique_panels.append(p)
+    probe = await probe_unique_panels(unique_panels, timeout=3.2)
+    down_ids = {
+        pid for pid, (st, _e) in probe.items() if st == "down"
+    }
+    live_targets = [
+        t for t in targets if int(t[0].id) not in down_ids
+    ]
+
+    if down_ids:
+        await ensure_pending_panel_accounts(db, users, targets)
+        user_ids = [int(u.id) for u in users]
+        acc_rows = await db.execute(
+            select(PanelAccount).where(PanelAccount.user_id.in_(user_ids))
+        )
+        by_key: dict[tuple[int, int, int], PanelAccount] = {}
+        for a in acc_rows.scalars().all():
+            by_key[
+                (
+                    int(a.user_id),
+                    int(a.panel_id),
+                    int(getattr(a, "group_id", 0) or 0),
+                )
+            ] = a
+        for user in users:
+            uid = int(user.id)
+            for panel, _cfg, gid in targets:
+                pid = int(panel.id)
+                if pid not in down_ids:
+                    continue
+                key = (uid, pid, int(gid or 0))
+                acc = by_key.get(key)
+                if acc is None:
+                    acc = PanelAccount(
+                        user_id=uid,
+                        panel_id=pid,
+                        group_id=int(gid) or None,
+                        status=PanelAccountStatus.error,
+                    )
+                    db.add(acc)
+                    by_key[key] = acc
+                acc.status = PanelAccountStatus.error
+                acc.links = []
+                acc.links_by_group = {}
+                acc.error_message = (
+                    f"اتصال پنل برقرار نیست: {probe.get(pid, ('down', ''))[1] or 'timeout'}"
+                )
+        await db.flush()
+
+    stats = {"ok": 0, "err": 0, "down": len(down_ids), "pending": 0}
+    if live_targets:
+        batch = await provision_users_batch(
+            db,
+            users,
+            live_targets,
+            create_timeout=8.0,
+            concurrency=40,
+            overall_timeout=22.0,
+        )
+        stats["ok"] = int(batch.get("ok") or 0)
+        stats["err"] = int(batch.get("err") or 0)
+        stats["pending"] = int(batch.get("pending") or 0)
+
+    # Fill share links for the sub (create often already has them)
+    user_ids = [int(u.id) for u in users]
+    result = await db.execute(
+        select(User)
+        .where(User.id.in_(user_ids))
+        .options(selectinload(User.panel_accounts).selectinload(PanelAccount.panel))
+    )
+    fresh = list(result.scalars().unique().all())
+    t_h = time.monotonic()
+    for user in fresh:
+        if time.monotonic() - t_h > 8.0:
+            break
+        need = any(
+            a.status == PanelAccountStatus.active and not (a.links or [])
+            for a in (user.panel_accounts or [])
+        )
+        if not need:
+            continue
+        try:
+            await hydrate_share_links(db, user)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "hydrate after create user=%s failed", getattr(user, "username", "?")
+            )
+    try:
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from app.api.subscription import invalidate_user_feed_cache
+
+        invalidate_user_feed_cache(*user_ids)
+    except Exception:  # noqa: BLE001
+        pass
+    return stats
+
+
 async def ensure_pending_panel_accounts(
     db: AsyncSession,
     users: list[User],
