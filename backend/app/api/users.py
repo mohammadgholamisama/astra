@@ -186,14 +186,14 @@ async def create_user(
         )
 
     display = (body.display_name or "").strip() or None
-    status, expire, hold_dur = _normalize_on_hold(
+    user_status, expire, hold_dur = _normalize_on_hold(
         body.status, body.expire, body.on_hold_expire_duration
     )
     source_cat = await _resolve_source_category(db, body.category_id)
     user = User(
         username=body.username,
         display_name=display,
-        status=status,
+        status=user_status,
         data_limit=body.data_limit or 0,
         expire=expire,
         on_hold_expire_duration=hold_dur,
@@ -347,8 +347,18 @@ async def create_users_bulk(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
-    """Create ``count`` users as ``{prefix}_1`` … ``{prefix}_{count}`` in parallel."""
+    """Create ``count`` users as ``{prefix}_1`` … ``{prefix}_{count}``.
+
+    Users are committed one-by-one (SQLite-safe). Remote provision is soft:
+    a dead/failing panel never rolls back the Astra user or blocks other panels.
+    The HTTP response is always 200 when at least one user row was created —
+    never a bare 500 for partial remote failures.
+    """
+    import logging
+
     from app.core.database import AsyncSessionLocal
+
+    log = logging.getLogger("astra.users.bulk")
 
     if not body.group_ids:
         raise HTTPException(
@@ -409,78 +419,137 @@ async def create_users_bulk(
         )
 
     display = (body.display_name or "").strip() or None
-    status, expire, hold_dur = _normalize_on_hold(
+    # Do NOT name this ``status`` — shadows fastapi.status and can 500 later.
+    user_status, expire, hold_dur = _normalize_on_hold(
         body.status, body.expire, body.on_hold_expire_duration
     )
     source_cat = await _resolve_source_category(db, body.category_id)
     now = datetime.now(timezone.utc)
-    created_names: list[str] = []
     # Snapshot panel targets once — (panel_id, config, group_id) for fast reload
     panel_specs: list[tuple[int, dict, int]] = [
         (int(p.id), dict(cfg or {}), int(gid)) for p, cfg, gid in panels
     ]
     panel_id_set = list({pid for pid, _, _ in panel_specs})
 
-    try:
-        pending_users: list[User] = []
-        for uname in names:
-            user = User(
-                username=uname,
-                display_name=display,
-                status=status,
-                data_limit=body.data_limit or 0,
-                expire=expire,
-                on_hold_expire_duration=hold_dur,
-                include_promo_first=bool(body.include_promo_first),
-                note=body.note,
-                data_limit_reset_strategy=body.data_limit_reset_strategy,
-                proxy_settings={
-                    "proxies": body.proxies or {},
-                    **(body.proxy_settings or {}),
-                    "inbounds": body.inbounds or {},
-                },
-                sub_token=generate_sub_token(),
-                source_category_id=source_cat,
-                created_at=now,
-            )
-            db.add(user)
-            pending_users.append(user)
-            created_names.append(uname)
-        # One flush for all rows, then attach groups
-        await db.flush()
-        for user in pending_users:
-            await _attach_groups(db, user, body.group_ids)
-        await db.commit()
-    except IntegrityError as exc:
-        await db.rollback()
-        raise _username_exists_error(prefix) from exc
-    except HTTPException:
-        await db.rollback()
-        raise
-    except OperationalError as exc:
-        await db.rollback()
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "code": "DB_BUSY",
-                "message": "دیتابیس موقتاً شلوغ است — چند ثانیه بعد دوباره بسازید",
-            },
-        ) from exc
-    except Exception:
-        await db.rollback()
-        raise
-
-    # High concurrency across users — each has its own DB session
-    n_users = len(created_names)
-    sem = asyncio.Semaphore(min(24, max(4, n_users)))
+    created_names: list[str] = []
     failed: list[UserBulkFail] = []
+
+    def _is_db_busy(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return "locked" in msg or "busy" in msg
+
+    # Create + attach groups one user at a time so one failure never wipes the batch
+    for uname in names:
+        row_ok = False
+        last_exc: BaseException | None = None
+        for attempt in range(8):
+            try:
+                async with AsyncSessionLocal() as session:
+                    user = User(
+                        username=uname,
+                        display_name=display,
+                        status=user_status,
+                        data_limit=body.data_limit or 0,
+                        expire=expire,
+                        on_hold_expire_duration=hold_dur,
+                        include_promo_first=bool(
+                            getattr(body, "include_promo_first", True)
+                        ),
+                        note=body.note,
+                        data_limit_reset_strategy=body.data_limit_reset_strategy,
+                        proxy_settings={
+                            "proxies": body.proxies or {},
+                            **(body.proxy_settings or {}),
+                            "inbounds": body.inbounds or {},
+                        },
+                        sub_token=generate_sub_token(),
+                        source_category_id=source_cat,
+                        created_at=now,
+                    )
+                    session.add(user)
+                    await session.flush()
+                    await _attach_groups(session, user, body.group_ids)
+                    await session.commit()
+                row_ok = True
+                break
+            except IntegrityError:
+                failed.append(
+                    UserBulkFail(
+                        username=uname, message="این یوزرنیم قبلاً ثبت شده است"
+                    )
+                )
+                last_exc = None
+                break
+            except HTTPException as exc:
+                detail = exc.detail
+                msg = (
+                    detail.get("message")
+                    if isinstance(detail, dict)
+                    else (str(detail) if detail else "خطا")
+                )
+                failed.append(UserBulkFail(username=uname, message=str(msg)[:200]))
+                last_exc = None
+                break
+            except OperationalError as exc:
+                last_exc = exc
+                if _is_db_busy(exc) and attempt < 7:
+                    await asyncio.sleep(0.15 * (attempt + 1))
+                    continue
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                log.exception("bulk create row failed user=%s", uname)
+                break
+        if row_ok:
+            created_names.append(uname)
+        elif last_exc is not None:
+            if isinstance(last_exc, OperationalError) and _is_db_busy(last_exc):
+                failed.append(
+                    UserBulkFail(
+                        username=uname,
+                        message="دیتابیس شلوغ بود — این کاربر ساخته نشد، بقیه ادامه یافت",
+                    )
+                )
+            else:
+                failed.append(
+                    UserBulkFail(
+                        username=uname,
+                        message=f"خطای ساخت: {str(last_exc)[:160]}",
+                    )
+                )
+
+    if not created_names:
+        # Nothing created — surface a clear client error, not opaque 500
+        if failed:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "BULK_CREATE_FAILED",
+                    "message": failed[0].message or "ساخت گروهی ناموفق بود",
+                    "failed": [f.model_dump() for f in failed],
+                },
+            )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "BULK_CREATE_FAILED",
+                "message": "هیچ کاربری ساخته نشد",
+            },
+        )
+
+    # Soft provision: moderate concurrency — SQLite + many remotes
+    n_users = len(created_names)
+    sem = asyncio.Semaphore(min(8, max(2, n_users)))
     fail_lock = asyncio.Lock()
 
     async def _mark_fail(uname: str, message: str) -> None:
         async with fail_lock:
+            if any(f.username == uname for f in failed):
+                return
             failed.append(UserBulkFail(username=uname, message=message))
 
     async def _provision_one(uname: str) -> None:
+        """Provision all panels for one user. Never raises out — soft per panel."""
         async with sem:
             try:
                 async with AsyncSessionLocal() as session:
@@ -488,7 +557,6 @@ async def create_users_bulk(
                     if not user:
                         await _mark_fail(uname, "کاربر بعد از ساخت پیدا نشد")
                         return
-                    # Reload panels in this session (cheap by id, no group join)
                     rows = await session.execute(
                         select(Panel).where(Panel.id.in_(panel_id_set or [-1]))
                     )
@@ -496,14 +564,29 @@ async def create_users_bulk(
                     local_panels = [
                         (by_id[pid], cfg, gid)
                         for pid, cfg, gid in panel_specs
-                        if pid in by_id and by_id[pid].is_active
+                        if pid in by_id and bool(getattr(by_id[pid], "is_active", True))
                     ]
+                    if not local_panels:
+                        # User stays; heal later when a panel is back
+                        return
                     try:
+                        # Remote failures become panel_account.error — never abort
                         await orchestrator.provision_user_on_panels(
                             session, user, local_panels, fast=True
                         )
-                        await session.commit()
+                        for c_try in range(6):
+                            try:
+                                await session.commit()
+                                break
+                            except OperationalError as exc:
+                                if _is_db_busy(exc) and c_try < 5:
+                                    await asyncio.sleep(0.12 * (c_try + 1))
+                                    continue
+                                raise
                     except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "bulk provision soft-fail user=%s: %s", uname, exc
+                        )
                         try:
                             await session.rollback()
                         except Exception:  # noqa: BLE001
@@ -522,41 +605,100 @@ async def create_users_bulk(
                                             acc.status = PanelAccountStatus.pending
                                         if (
                                             not (acc.error_message or "").strip()
-                                            and acc.status == PanelAccountStatus.error
+                                            and acc.status
+                                            == PanelAccountStatus.error
                                         ):
-                                            acc.error_message = f"ساخت روی پنل ناتمام: {exc}"
+                                            acc.error_message = (
+                                                f"ساخت روی پنل ناتمام: {exc}"
+                                            )
                                     await s2.commit()
                         except Exception:  # noqa: BLE001
                             pass
             except Exception as exc:  # noqa: BLE001
-                await _mark_fail(uname, str(exc)[:200])
+                # User row already exists — note soft issue, do not fail the batch
+                log.warning("bulk provision outer user=%s: %s", uname, exc)
 
-    await asyncio.gather(*[_provision_one(u) for u in created_names])
+    try:
+        await asyncio.gather(
+            *[_provision_one(u) for u in created_names],
+            return_exceptions=True,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("bulk provision gather failed")
 
     try:
         asyncio.create_task(
-            orchestrator.heal_failed_panel_accounts_batch(limit_users=max(10, len(created_names))),
+            orchestrator.heal_failed_panel_accounts_batch(
+                limit_users=max(10, len(created_names))
+            ),
             name="astra-heal-after-bulk",
         )
     except Exception:  # noqa: BLE001
         pass
 
     created: list[UserResponse] = []
-    async with AsyncSessionLocal() as session:
-        for uname in created_names:
-            user = await load_user(session, uname)
-            if not user:
-                if not any(f.username == uname for f in failed):
+    try:
+        async with AsyncSessionLocal() as session:
+            for uname in created_names:
+                try:
+                    user = await load_user(session, uname)
+                except Exception as exc:  # noqa: BLE001
                     failed.append(
-                        UserBulkFail(username=uname, message="کاربر ساخته شد ولی قابل خواندن نیست")
+                        UserBulkFail(
+                            username=uname,
+                            message=f"خواندن کاربر ناموفق: {str(exc)[:120]}",
+                        )
                     )
-                continue
-            try:
-                created.append(to_user_response(user))
-            except Exception as exc:  # noqa: BLE001
-                failed.append(
-                    UserBulkFail(username=uname, message=f"پاسخ API خطا داد: {exc}")
-                )
+                    continue
+                if not user:
+                    if not any(f.username == uname for f in failed):
+                        failed.append(
+                            UserBulkFail(
+                                username=uname,
+                                message="کاربر ساخته شد ولی قابل خواندن نیست",
+                            )
+                        )
+                    continue
+                try:
+                    created.append(to_user_response(user, include_links=False))
+                except Exception as exc:  # noqa: BLE001
+                    # Still count as created — client can refresh list
+                    log.warning("bulk serialize user=%s: %s", uname, exc)
+                    try:
+                        created.append(
+                            UserResponse(
+                                username=user.username,
+                                display_name=user.display_name,
+                                status=user.status,
+                                used_traffic=int(user.used_traffic or 0),
+                                lifetime_used_traffic=int(
+                                    user.lifetime_used_traffic or 0
+                                ),
+                                data_limit=int(user.data_limit or 0),
+                                expire=int(user.expire or 0),
+                                on_hold_expire_duration=int(
+                                    getattr(user, "on_hold_expire_duration", 0) or 0
+                                ),
+                                include_promo_first=bool(
+                                    getattr(user, "include_promo_first", True)
+                                ),
+                                note=user.note,
+                                subscription_url="",
+                                group_ids=body.group_ids,
+                                source_category_id=getattr(
+                                    user, "source_category_id", None
+                                ),
+                            )
+                        )
+                    except Exception:  # noqa: BLE001
+                        failed.append(
+                            UserBulkFail(
+                                username=uname,
+                                message=f"پاسخ API خطا داد: {exc}",
+                            )
+                        )
+    except Exception:  # noqa: BLE001
+        log.exception("bulk final load failed")
 
     return UserBulkCreateResponse(
         created=created,

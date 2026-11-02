@@ -574,6 +574,8 @@ export default function UsersPage() {
       const dn = bulkDisplayName.trim();
       return api<BulkCreateResponse>("/api/users/bulk", {
         method: "POST",
+        // Many users × panels can take a while — don't abort mid-create
+        timeoutMs: 320_000,
         body: JSON.stringify({
           username_prefix: bulkPrefix.trim(),
           count,
