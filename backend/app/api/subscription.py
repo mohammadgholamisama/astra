@@ -647,25 +647,16 @@ async def get_subscription(
             _schedule_bg_maintain(int(user.id))
             return _feed_response(cached, headers)
 
-        # Always serve cached shares ASAP. Incomplete panels hydrate in BG.
-        # Only cold users (zero share links) get a tiny request-time hydrate.
-        if _user_has_share_links(user):
-            try:
-                links = await _collect_feed_links(
-                    user, include_hidden=include_hidden, db=db
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("sub collect user=%s: %s", user.username, exc)
-                links = []
-        else:
-            user, links = await _ensure_share_links(
-                db,
-                token,
-                user,
-                timeout=10.0,
-                force=False,
-                include_hidden=include_hidden,
+        # NEVER hydrate on this request. Tunnel nginx (Iran reverse SSH) 502s
+        # if uvicorn is cancelled mid-hydrate (DetachedInstance / sqlite dead).
+        # Serve whatever share links are already in DB; BG fills the rest.
+        try:
+            links = await _collect_feed_links(
+                user, include_hidden=include_hidden, db=db
             )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("sub collect user=%s: %s", user.username, exc)
+            links = []
         _schedule_bg_maintain(int(user.id))
 
         body = _encode_feed(links)
