@@ -1459,7 +1459,7 @@ async def provision_users_now(
     )
     account_ids = [int(r[0]) for r in rows.all() if r[0]]
     tasks = start_account_provisions(account_ids)
-    wait = 8.0 if len(users) <= 2 else 10.0
+    wait = 2.5 if len(users) <= 2 else 3.5
     if tasks:
         await asyncio.wait(tasks, timeout=wait)
     ok = 0
@@ -5755,33 +5755,103 @@ async def deprovision_group_from_all_users(
         )
     )
     users = list(result.scalars().unique().all())
+    cut_ids: list[int] = []
     for user in users:
-        try:
-            outcomes = await sync_delete_user_group_accounts(db, user, [gid])
-            stats["ok"] += sum(1 for r in outcomes if r.get("ok"))
-            stats["fail"] += sum(1 for r in outcomes if not r.get("ok"))
-        except Exception:  # noqa: BLE001
-            stats["fail"] += 1
-            logger.exception(
-                "deprovision-group=%s user=%s failed",
-                gid,
-                getattr(user, "username", "?"),
-            )
-
+        for a in user.panel_accounts or []:
+            if a.status == PanelAccountStatus.deleted:
+                continue
+            if getattr(a, "group_id", None) is None:
+                continue
+            if int(a.group_id) != gid:
+                continue
+            a.links = []
+            a.links_by_group = {}
+            a.status = PanelAccountStatus.deleted
+            a.error_message = None
+            cut_ids.append(int(a.id))
+            stats["ok"] += 1
+    await db.flush()
     await db.execute(sa_delete(UserGroup).where(UserGroup.group_id == gid))
     await db.flush()
     try:
         invalidate_user_feed_cache(*uids)
     except Exception:  # noqa: BLE001
         pass
+    if cut_ids:
+        try:
+            asyncio.create_task(
+                _bg_cut_remote_accounts(cut_ids),
+                name=f"astra-cut-g{gid}",
+            )
+        except RuntimeError:
+            await _bg_cut_remote_accounts(cut_ids)
     logger.info(
-        "deprovision-group=%s users=%s ok=%s fail=%s",
+        "deprovision-group=%s users=%s local=%s remote-bg=%s",
         gid,
         stats["users"],
         stats["ok"],
-        stats["fail"],
+        len(cut_ids),
     )
     return stats
+
+
+async def _bg_cut_remote_accounts(account_ids: list[int]) -> None:
+    """Delete remotes in parallel after Astra already dropped sub links."""
+    from app.core.database import AsyncSessionLocal
+
+    ids = [int(x) for x in account_ids if x]
+    if not ids:
+        return
+    sem = asyncio.Semaphore(48)
+
+    async def _one(aid: int) -> None:
+        async with sem:
+            try:
+                async with AsyncSessionLocal() as db:
+                    result = await db.execute(
+                        select(PanelAccount)
+                        .where(PanelAccount.id == aid)
+                        .options(selectinload(PanelAccount.panel))
+                    )
+                    acc = result.scalar_one_or_none()
+                    if acc is None or not acc.panel:
+                        return
+                    uname = (acc.remote_username or "").strip()
+                    if not uname:
+                        return
+                    adapter = get_adapter(acc.panel)
+                    try:
+                        await asyncio.wait_for(
+                            adapter.delete_user(
+                                uname, acc.remote_id or acc.remote_username
+                            ),
+                            timeout=1.4,
+                        )
+                    except Exception:  # noqa: BLE001
+                        try:
+                            payload = UserPayload(
+                                username=uname,
+                                status="disabled",
+                                data_limit=1,
+                                expire=1,
+                                uuid=acc.uuid,
+                                config={"_remote_id": (acc.remote_id or "").strip()},
+                            )
+                            await asyncio.wait_for(
+                                adapter.modify_user(payload), timeout=1.2
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                    finally:
+                        try:
+                            await adapter.close()  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+            except Exception:  # noqa: BLE001
+                logger.debug("bg cut account=%s failed", aid, exc_info=True)
+
+    await asyncio.gather(*[_one(i) for i in ids], return_exceptions=True)
+    logger.info("bg cut remotes done n=%s", len(ids))
 
 
 async def _users_with_exact_groups(

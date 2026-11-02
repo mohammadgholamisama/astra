@@ -445,7 +445,8 @@ export default function GroupsPage() {
   });
 
   const remove = useMutation({
-    mutationFn: (id: number) => api(`/api/group/${id}`, { method: "DELETE" }),
+    mutationFn: (id: number) =>
+      api(`/api/group/${id}`, { method: "DELETE", timeoutMs: 20_000 }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["groups"] });
       qc.invalidateQueries({ queryKey: ["group-categories"] });
@@ -1411,7 +1412,7 @@ export default function GroupsPage() {
               <div>
                 <h3>تأیید حذف گروه</h3>
                 <p className="modal-sub">
-                  فقط از سایت Astra حذف می‌شود — پنل‌های ریموت و کانفیگ‌های آنجا دست نمی‌خورند
+                  کانفیگ این گروه از ساب کاربران و از همه پنل‌های ریموت حذف می‌شود
                 </p>
               </div>
               <button
@@ -1427,8 +1428,8 @@ export default function GroupsPage() {
               مطمئنید می‌خواهید گروه <strong>{confirmGroup.name}</strong> را حذف کنید؟
               <br />
               <span className="muted" style={{ fontSize: "0.9rem" }}>
-                {(confirmGroup.panels || []).length} پنل از این گروه جدا می‌شود. کاربران ساخته‌شده
-                روی پنل‌ها باقی می‌مانند.
+                {(confirmGroup.panels || []).length} پنل — کانفیگ‌های همین گروه از پنل‌ها و
+                ساب پاک می‌شود. خود کاربر در Astra می‌ماند.
               </span>
             </p>
             {remove.isError && <p className="error">{(remove.error as Error).message}</p>}
