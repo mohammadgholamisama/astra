@@ -27,6 +27,8 @@ from app.services import orchestrator
 from app.services.config_locations import (
     extract_link_endpoint,
     extract_link_match_host,
+    extract_link_path,
+    extract_link_remark_key,
     normalize_host,
     normalize_match_host,
     try_normalize_endpoint,
@@ -88,20 +90,28 @@ def link_order_index(link: str) -> int:
     """Sort rank for a share link; large number if not in the global list.
 
     Match priority:
-      1) exact host:port:match_host (www. already normalized away)
-      2) host:port with empty match_host (general row)
-    Never collapse different SNIs on the same host:port — those are distinct slots.
+      1) Astra outbound slot host:port:sni|ob|remark
+      2) exact host:port:match_host
+      3) host:port with empty match_host
     """
     ep = extract_link_endpoint(link)
     if not ep:
         return 10**6
     host, port = ep
     match = extract_link_match_host(link) or ""
+    remark = extract_link_remark_key(link)
     norm = try_normalize_endpoint(host, port, match)
     if not norm:
         return 10**6
     host, port, match = norm
     with _lock:
+        if remark:
+            ob_key = _fp_key(
+                host, port, f"{match}|ob|{remark}" if match else f"|ob|{remark}"
+            )
+            hit = _order_idx.get(ob_key)
+            if hit is not None:
+                return hit
         exact = _order_idx.get(_fp_key(host, port, match))
         if exact is not None:
             return exact
@@ -269,6 +279,7 @@ def _ingest_link(
     group_name: str = "",
     label: str | None = None,
     protocol: str | None = None,
+    distinct_remark: bool = False,
 ) -> None:
     raw = (link or "").strip()
     if not raw:
@@ -278,6 +289,9 @@ def _ingest_link(
         return
     host, port = ep
     match = extract_link_match_host(raw) or ""
+    remark_key = extract_link_remark_key(raw)
+    if distinct_remark and remark_key:
+        match = f"{match}|ob|{remark_key}" if match else f"|ob|{remark_key}"
     norm = try_normalize_endpoint(host, port, match)
     if not norm:
         return
@@ -289,7 +303,7 @@ def _ingest_link(
             "host": host,
             "port": port,
             "match_host": match,
-            "label": (label or remark or "").strip() or None,
+            "label": (label or "").strip() or None,
             "sample_link": raw,
             "protocol": protocol or proto or None,
             "panel_names": [],
@@ -300,8 +314,10 @@ def _ingest_link(
         entry["panel_names"].append(panel_name)
     if group_name and group_name not in entry["group_names"]:
         entry["group_names"].append(group_name)
-    if not entry.get("label") and (label or remark):
-        entry["label"] = (label or remark or "").strip() or None
+    if label:
+        entry["label"] = str(label).strip() or entry.get("label")
+    elif not entry.get("label") and remark:
+        entry["label"] = remark.strip() or None
     if not entry.get("sample_link"):
         entry["sample_link"] = raw
     if not entry.get("protocol") and (protocol or proto):
@@ -396,8 +412,16 @@ async def _sample_fingerprints(db: AsyncSession) -> dict[tuple[str, int, str], d
         panel_name = str(getattr(panel, "name", "") or "") if panel is not None else ""
         gid = getattr(account, "group_id", None)
         group_name = ""
+        group_tag = ""
         if gid is not None and int(gid) in groups_by_id:
-            group_name = str(getattr(groups_by_id[int(gid)], "name", "") or "")
+            g = groups_by_id[int(gid)]
+            group_name = str(getattr(g, "name", "") or "")
+            group_tag = _normalize_label(getattr(g, "config_tag", None) or "") or ""
+        is_astra = (
+            panel is not None
+            and getattr(getattr(panel, "type", None), "value", getattr(panel, "type", None))
+            in ("astra", PanelType.astra)
+        )
         for link in account.links or []:
             text = str(link or "").strip()
             if not text or not is_share_link(text):
@@ -407,6 +431,8 @@ async def _sample_fingerprints(db: AsyncSession) -> dict[tuple[str, int, str], d
                 text,
                 panel_name=panel_name,
                 group_name=group_name,
+                label=group_tag or None,
+                distinct_remark=bool(is_astra),
             )
     return out
 
@@ -451,7 +477,7 @@ async def list_workspace(db: AsyncSession) -> ConfigOrderWorkspaceOut:
                 host=host,
                 port=port,
                 match_host=match,
-                label=row.label or (sample or {}).get("label"),
+                label=(sample or {}).get("label") or row.label,
                 sort_order=len(items),
                 in_sample=sample is not None,
                 sample=sample,

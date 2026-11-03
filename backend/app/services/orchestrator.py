@@ -4193,7 +4193,7 @@ async def collect_links_detailed(
     # One share-link per endpoint fingerprint so sub #N matches config-order #N.
     # Same host:port[+SNI] with different UUIDs collapse (multi-panel duplicates).
     # Distinct CDN paths (Astra WS/XHTTP on one domain:port) must BOTH stay.
-    from app.services.config_locations import extract_link_path
+    from app.services.config_locations import extract_link_path, extract_link_remark_key
 
     seen_fp: set[tuple] = set()
     deduped: list[dict] = []
@@ -4204,7 +4204,11 @@ async def collect_links_detailed(
             mh = extract_link_match_host(link) or ""
             norm = try_normalize_endpoint(ep[0], ep[1], mh)
             if norm:
-                key: tuple = (*norm, extract_link_path(link))
+                key: tuple = (
+                    *norm,
+                    extract_link_path(link),
+                    extract_link_remark_key(link),
+                )
                 if key in seen_fp:
                     continue
                 seen_fp.add(key)

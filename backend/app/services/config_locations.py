@@ -348,6 +348,46 @@ def extract_link_path(link: str) -> str:
     return path.lower()
 
 
+def extract_link_remark_key(link: str) -> str:
+    """Stable outbound/inbound name from fragment or vmess ps — for Astra order slots."""
+    raw = (link or "").strip()
+    if not raw or "://" not in raw:
+        return ""
+    scheme, rest = raw.split("://", 1)
+    label = ""
+    if scheme.lower() == "vmess":
+        try:
+            data = json.loads(_b64decode(rest.split("#", 1)[0]).decode("utf-8", errors="ignore"))
+            if isinstance(data, dict):
+                label = str(data.get("ps") or data.get("remark") or "")
+        except Exception:  # noqa: BLE001
+            label = ""
+    elif "#" in rest:
+        label = unquote(rest.split("#", 1)[1])
+    text = _CTRL.sub("", label).strip().lower()
+    if not text:
+        return ""
+    # Drop subscription-style rewritten names
+    if text.startswith("#") and "|" in text:
+        return ""
+    out = []
+    for ch in text:
+        if ch.isalnum() or ch in "._-":
+            out.append(ch)
+        elif ch.isspace():
+            out.append("_")
+    key = "".join(out).strip("._-")
+    return key[:80]
+
+
+def match_host_sni_only(match_host: str) -> str:
+    """Strip Astra outbound suffix ``|ob|remark`` for flag/hide fallback."""
+    raw = str(match_host or "")
+    if "|ob|" in raw:
+        return raw.split("|ob|", 1)[0]
+    return raw
+
+
 def flag_for_link(link: str) -> str | None:
     """Resolve flag: specific (host+port+match_host) wins over general (host+port)."""
     info = resolve_location_for_link(link)
@@ -365,18 +405,22 @@ def resolve_location_for_endpoint(
     try:
         h = normalize_host(host)
         p = int(port)
-        m = normalize_match_host(match_host or "")
+        raw_m = match_host or ""
+        m = normalize_match_host(raw_m)
+        m_sni = normalize_match_host(match_host_sni_only(raw_m))
     except (ValueError, TypeError):
         return None
     with _lock:
-        if m:
-            flag = _specific_map.get((h, p, m))
-            code = _specific_codes.get((h, p, m))
+        for cand in (m, m_sni):
+            if not cand:
+                continue
+            flag = _specific_map.get((h, p, cand))
+            code = _specific_codes.get((h, p, cand))
             if flag and code:
                 return {
                     "host": h,
                     "port": p,
-                    "match_host": m,
+                    "match_host": cand,
                     "country_code": code,
                     "flag": flag,
                     "exact": True,

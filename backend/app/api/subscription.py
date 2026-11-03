@@ -50,7 +50,8 @@ def _is_cancel(exc: BaseException) -> bool:
 
 # Debounce background maintain so many clients don't stampede one user
 _bg_last: dict[int, float] = {}
-_BG_MIN_INTERVAL = 8.0
+_BG_MIN_INTERVAL = 45.0
+_bg_heavy = asyncio.Lock()
 
 # Tiny in-process feed cache — VPN clients often refresh in bursts.
 _feed_cache: dict[tuple[int, bool], tuple[float, bytes]] = {}
@@ -168,8 +169,11 @@ async def _bg_sub_maintain(user_id: int) -> None:
     if now - last < _BG_MIN_INTERVAL:
         return
     _bg_last[user_id] = now
+    if _bg_heavy.locked():
+        return
     try:
-        async with AsyncSessionLocal() as db:
+        async with _bg_heavy:
+          async with AsyncSessionLocal() as db:
             result = await db.execute(
                 select(User)
                 .where(User.id == user_id)
@@ -181,25 +185,10 @@ async def _bg_sub_maintain(user_id: int) -> None:
             user = result.scalar_one_or_none()
             if not user:
                 return
-            # If some panels failed at create time, retry them when sub is opened
-            # so configs appear automatically once the panel is reachable again.
+            if _user_has_share_links(user):
+                return
             try:
-                from app.models.user import PanelAccountStatus
-                from app.services.orchestrator import retry_failed_accounts
-
-                has_fail = any(
-                    a.status
-                    in (PanelAccountStatus.error, PanelAccountStatus.pending)
-                    for a in (user.panel_accounts or [])
-                )
-                if has_fail:
-                    await asyncio.wait_for(
-                        retry_failed_accounts(db, user), timeout=8.0
-                    )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("bg heal user_id=%s: %s", user_id, exc)
-            try:
-                await asyncio.wait_for(hydrate_share_links(db, user), timeout=18.0)
+                await asyncio.wait_for(hydrate_share_links(db, user), timeout=12.0)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("bg hydrate user_id=%s: %s", user_id, exc)
             try:
@@ -644,7 +633,8 @@ async def get_subscription(
 
         cached = _feed_cache_get(int(user.id), include_hidden)
         if cached is not None:
-            _schedule_bg_maintain(int(user.id))
+            if not _user_has_share_links(user):
+                _schedule_bg_maintain(int(user.id))
             return _feed_response(cached, headers)
 
         # NEVER hydrate on this request. Tunnel nginx (Iran reverse SSH) 502s
@@ -657,7 +647,8 @@ async def get_subscription(
         except Exception as exc:  # noqa: BLE001
             logger.warning("sub collect user=%s: %s", user.username, exc)
             links = []
-        _schedule_bg_maintain(int(user.id))
+        if not _user_has_share_links(user):
+            _schedule_bg_maintain(int(user.id))
 
         body = _encode_feed(links)
         from app.adapters.http_utils import is_share_link as _isl
