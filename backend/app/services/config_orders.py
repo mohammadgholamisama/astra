@@ -221,7 +221,7 @@ async def _wipe_order_sample_on_remotes(
                     remote_name,
                     account.remote_id if account else None,
                 ),
-                timeout=25,
+                timeout=1.5,
             )
         except Exception:  # noqa: BLE001
             pass
@@ -366,11 +366,10 @@ def _item_out(
 
 
 async def _sample_fingerprints(db: AsyncSession) -> dict[tuple[str, int, str], dict[str, Any]]:
-    """Unique endpoints from the order-sample user — same set a full-group sub would emit.
+    """Unique endpoints from RAW sample share links (every panel including Astra).
 
-    Uses ``collect_links_detailed`` (panel×group membership + share-link rules) then
-    fingerprint-dedupes like the live subscription. Does not pull stale GroupConfigItem
-    leftovers (those inflated the order page vs real users).
+    Uses stored account.links, not collect_links_detailed — that rewrites remarks
+    to ``#N. tag | username`` and would overwrite admin labels.
     """
     out: dict[tuple[str, int, str], dict[str, Any]] = {}
     result = await db.execute(
@@ -386,65 +385,29 @@ async def _sample_fingerprints(db: AsyncSession) -> dict[tuple[str, int, str], d
     if user is None:
         return out
 
-    try:
-        rows = await orchestrator.collect_links_detailed(
-            user,
-            include_notices=False,
-            include_hidden=True,
-            db=db,
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("order-sample collect_links failed; falling back to raw accounts")
-        rows = []
-        for account in user.panel_accounts or []:
-            status_val = getattr(account.status, "value", account.status)
-            if status_val not in (
-                PanelAccountStatus.active.value,
-                "active",
-                PanelAccountStatus.error.value,
-                "error",
-            ):
-                continue
-            panel_name = ""
-            if account.panel is not None:
-                panel_name = str(getattr(account.panel, "name", "") or "")
-            for link in account.links or []:
-                if isinstance(link, str) and is_share_link(link):
-                    rows.append({"link": link, "panel": panel_name})
-
-    # Mirror subscription fingerprint collapse (host:port[+SNI][+path])
-    from app.services.config_locations import extract_link_path
-
-    seen_fp: set[tuple] = set()
-    for row in rows:
-        link = str(row.get("link") or "").strip()
-        if not link or not is_share_link(link):
+    groups_by_id = {int(g.id): g for g in (user.groups or []) if getattr(g, "id", None)}
+    for account in user.panel_accounts or []:
+        st = getattr(account.status, "value", account.status)
+        if st in (PanelAccountStatus.deleted.value, "deleted"):
             continue
-        ep = extract_link_endpoint(link)
-        if not ep:
+        panel = account.__dict__.get("panel")
+        if panel is not None and not bool(getattr(panel, "is_active", True)):
             continue
-        match = extract_link_match_host(link) or ""
-        norm = try_normalize_endpoint(ep[0], ep[1], match)
-        if not norm:
-            continue
-        key: tuple = (*norm, extract_link_path(link))
-        if key in seen_fp:
-            continue
-        seen_fp.add(key)
-        panel_name = str(row.get("panel") or "")
+        panel_name = str(getattr(panel, "name", "") or "") if panel is not None else ""
+        gid = getattr(account, "group_id", None)
         group_name = ""
-        gid = row.get("group_id")
-        if gid is not None:
-            for g in user.groups or []:
-                if int(g.id) == int(gid):
-                    group_name = str(g.name or "")
-                    break
-        _ingest_link(
-            out,
-            link,
-            panel_name=panel_name,
-            group_name=group_name,
-        )
+        if gid is not None and int(gid) in groups_by_id:
+            group_name = str(getattr(groups_by_id[int(gid)], "name", "") or "")
+        for link in account.links or []:
+            text = str(link or "").strip()
+            if not text or not is_share_link(text):
+                continue
+            _ingest_link(
+                out,
+                text,
+                panel_name=panel_name,
+                group_name=group_name,
+            )
     return out
 
 
@@ -868,9 +831,8 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
             )
         await db.flush()
 
-    await orchestrator.provision_user_on_panels(db, user, targets)
+    await orchestrator.provision_users_now(db, [user], targets, wait=45.0)
 
-    # If Rebecca still trapped (soft-delete), rotate remote name once more
     user = await _get_order_sample_user(db) or user
     trapped_rebecca: list[tuple[Panel, dict, int]] = []
     for panel, cfg, gid in rebecca_targets:
@@ -897,30 +859,64 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
             trapped_rebecca.append((panel, cfg, gid))
     if trapped_rebecca:
         await db.flush()
-        await orchestrator.provision_user_on_panels(db, user, trapped_rebecca)
+        await orchestrator.provision_users_now(
+            db, [user], trapped_rebecca, wait=20.0
+        )
 
-    # Expand /sub → real share links (do not treat subscription URLs as success)
-    for attempt in range(4):
+    for attempt in range(5):
         user = await _get_order_sample_user(db)
         if not user:
             break
         try:
             await asyncio.wait_for(
                 orchestrator.hydrate_share_links(db, user),
-                timeout=18.0,
+                timeout=25.0,
             )
         except Exception:  # noqa: BLE001
             pass
-        user = await _get_order_sample_user(db)
-        if not user:
-            break
-        accounts = list(user.panel_accounts or [])
-        active = [
-            a
-            for a in accounts
-            if getattr(a.status, "value", a.status)
-            in (PanelAccountStatus.active.value, "active")
-        ]
+        user = await _get_order_sample_user(db) or user
+        # Astra: merge live outbound share-links (every outbound remark)
+        try:
+            from app.services import astra_node as astra_node_svc
+
+            for panel, _cfg, _gid in targets:
+                if getattr(panel, "type", None) != PanelType.astra:
+                    continue
+                email = user.username
+                for acc in user.panel_accounts or []:
+                    if int(acc.panel_id) == int(panel.id) and (
+                        acc.remote_username or ""
+                    ).strip():
+                        email = acc.remote_username
+                        break
+                _c, astra_links, _u = await astra_node_svc.client_usage_and_links(
+                    db, panel, email
+                )
+                shares = [
+                    str(x).strip()
+                    for x in (astra_links or [])
+                    if x and is_share_link(str(x))
+                ]
+                if not shares:
+                    continue
+                for acc in user.panel_accounts or []:
+                    if int(acc.panel_id) != int(panel.id):
+                        continue
+                    have = {
+                        str(x).strip()
+                        for x in (acc.links or [])
+                        if x and is_share_link(str(x))
+                    }
+                    merged = list(have)
+                    for lk in shares:
+                        if lk not in have:
+                            merged.append(lk)
+                    acc.links = merged
+                    if acc.status != PanelAccountStatus.active:
+                        acc.status = PanelAccountStatus.active
+                        acc.error_message = None
+        except Exception:  # noqa: BLE001
+            logger.warning("order-sample astra merge failed", exc_info=True)
 
         def _shares(acc: PanelAccount) -> list[str]:
             return [
@@ -929,19 +925,18 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
                 if x and is_share_link(str(x))
             ]
 
-        share_total = sum(len(_shares(a)) for a in active)
-        still_need = any(
-            (not _shares(a))
-            and (
-                not (a.links or [])
-                or any(is_subscription_ref(str(x)) for x in (a.links or []) if x)
-            )
-            for a in active
-        )
-        if active and share_total > 0 and not still_need:
+        accounts = [
+            a
+            for a in (user.panel_accounts or [])
+            if getattr(a.status, "value", a.status)
+            not in (PanelAccountStatus.deleted.value, "deleted")
+        ]
+        share_total = sum(len(_shares(a)) for a in accounts)
+        still_need = any(not _shares(a) for a in accounts if a.status == PanelAccountStatus.active)
+        if share_total > 0 and not still_need:
             break
-        if attempt < 3:
-            await asyncio.sleep(0.45 + 0.25 * attempt)
+        if attempt < 4:
+            await asyncio.sleep(0.4 + 0.2 * attempt)
 
     await db.commit()
     # Replace stale fingerprints in saved order with the fresh sample set

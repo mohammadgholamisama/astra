@@ -187,6 +187,7 @@ export default function ConfigOrderPage() {
         };
       }>("/api/admin/config-order/sample", {
         method: "POST",
+        timeoutMs: 90_000,
       }),
     onSuccess: (res) => {
       const ws = res.workspace;

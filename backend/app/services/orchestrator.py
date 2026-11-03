@@ -1436,6 +1436,8 @@ async def provision_users_now(
     db: AsyncSession,
     users: list[User],
     panels: list[tuple[Panel, dict] | tuple[Panel, dict, int]],
+    *,
+    wait: float | None = None,
 ) -> dict[str, int]:
     """Enqueue every panel create; wait briefly so the first configs hit the sub."""
     targets = _normalize_panel_targets(panels)
@@ -1459,9 +1461,13 @@ async def provision_users_now(
     )
     account_ids = [int(r[0]) for r in rows.all() if r[0]]
     tasks = start_account_provisions(account_ids)
-    wait = 2.5 if len(users) <= 2 else 3.5
+    wait_s = (
+        float(wait)
+        if wait is not None
+        else (2.5 if len(users) <= 2 else 3.5)
+    )
     if tasks:
-        await asyncio.wait(tasks, timeout=wait)
+        await asyncio.wait(tasks, timeout=max(0.2, wait_s))
     ok = 0
     err = 0
     pending = 0
