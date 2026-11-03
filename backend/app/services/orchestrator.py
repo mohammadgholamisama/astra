@@ -1538,6 +1538,7 @@ async def heal_users_missing_panel_accounts(*, limit_users: int = 20) -> int:
                 .where(User.id.notin_(live))
                 .options(selectinload(User.groups))
                 .distinct()
+                .order_by(User.id.desc())
                 .limit(max(1, int(limit_users)))
             )
             users = list(result.scalars().unique().all())
@@ -1574,32 +1575,38 @@ async def ensure_pending_panel_accounts(
     existing_rows = await db.execute(
         select(PanelAccount).where(PanelAccount.user_id.in_(user_ids))
     )
-    have: set[tuple[int, int, int]] = set()
+    have: dict[tuple[int, int, int], PanelAccount] = {}
     for a in existing_rows.scalars().all():
-        have.add(
+        have[
             (
                 int(a.user_id),
                 int(a.panel_id),
                 int(getattr(a, "group_id", 0) or 0),
             )
-        )
+        ] = a
     n = 0
     for user in users:
         uid = int(user.id)
         for panel, _cfg, group_id in targets:
             gid = int(group_id or 0)
             key = (uid, int(panel.id), gid)
-            if key in have:
+            existing = have.get(key)
+            if existing is not None:
+                if existing.status == PanelAccountStatus.deleted:
+                    existing.status = PanelAccountStatus.pending
+                    existing.links = []
+                    existing.links_by_group = {}
+                    existing.error_message = None
+                    n += 1
                 continue
-            db.add(
-                PanelAccount(
-                    user_id=uid,
-                    panel_id=panel.id,
-                    group_id=gid or None,
-                    status=PanelAccountStatus.pending,
-                )
+            acc = PanelAccount(
+                user_id=uid,
+                panel_id=panel.id,
+                group_id=gid or None,
+                status=PanelAccountStatus.pending,
             )
-            have.add(key)
+            db.add(acc)
+            have[key] = acc
             n += 1
     if n:
         await db.flush()
@@ -5135,6 +5142,8 @@ async def refresh_usage(
             a for a in accounts if not (a.panel and a.panel.type == PanelType.astra)
         ]
         tasks = [asyncio.create_task(_remote(a)) for a in remote_accounts]
+        if not tasks:
+            return
         done, pending = await asyncio.wait(tasks, timeout=overall_budget)
         for t in pending:
             t.cancel()
