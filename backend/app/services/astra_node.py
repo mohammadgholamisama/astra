@@ -19,6 +19,7 @@ from urllib.parse import quote, urlencode
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.models.astra_outbound import AstraNodeClient, AstraOutbound
 from app.models.panel import Panel, PanelType
@@ -622,12 +623,13 @@ async def reconcile_outbounds_health(
     return {"pinged": len(rows), "changed": changed, "ok": ok_n}
 
 
-def outbound_included_in_sub(ob: AstraOutbound) -> bool:
-    """Whether this outbound should appear in client share-links / sub / balancer.
+def outbound_in_share_links(ob: AstraOutbound) -> bool:
+    """Enabled outbounds always appear in the subscription (local Astra)."""
+    return bool(ob.is_enabled)
 
-    Disabled → never. Explicit ping-fail → hide until the next successful ping
-    (API or background reconcile_outbounds_health) brings it back.
-    """
+
+def outbound_included_in_sub(ob: AstraOutbound) -> bool:
+    """Xray balancer: skip disabled and ping-failed hops."""
     if not ob.is_enabled:
         return False
     return ob.last_ping_ok is not False
@@ -736,27 +738,40 @@ async def share_links_by_email(db: AsyncSession, panel: Panel) -> dict[str, list
 
 async def refresh_panel_account_links(db: AsyncSession, panel: Panel) -> int:
     """Rewrite PanelAccount.links after public_host / port / outbound changes."""
-    from app.models.user import PanelAccount
+    from app.api.subscription import invalidate_user_feed_cache
+    from app.models.user import PanelAccount, User
 
     by_email = await share_links_by_email(db, panel)
     accounts = (
         await db.execute(
-            select(PanelAccount).where(PanelAccount.panel_id == panel.id)
+            select(PanelAccount)
+            .where(PanelAccount.panel_id == panel.id)
+            .options(selectinload(PanelAccount.user))
         )
     ).scalars().all()
     updated = 0
+    uids: list[int] = []
     for acc in accounts:
         email = (acc.remote_username or "").strip()
-        if not email:
-            continue
+        user = acc.__dict__.get("user")
+        uname = (getattr(user, "username", None) or "").strip()
         fresh = list(by_email.get(email) or [])
+        if not fresh and uname:
+            fresh = list(by_email.get(uname) or [])
+        if not fresh:
+            continue
         prev = [str(x) for x in (acc.links or []) if x]
         if prev != fresh:
             acc.links = fresh
             acc.links_by_group = None
             updated += 1
+            uids.append(int(acc.user_id))
     if updated:
         await db.flush()
+        try:
+            invalidate_user_feed_cache(*uids)
+        except Exception:  # noqa: BLE001
+            pass
     return updated
 
 
@@ -772,7 +787,7 @@ def _client_links(
     net = panel_inbound_network(meta=meta)
     links: list[str] = []
     for ob in outbounds:
-        if not outbound_included_in_sub(ob):
+        if not outbound_in_share_links(ob):
             continue
         remark = (ob.remark or f"ob-{ob.id}").replace(" ", "_")
         if net == "ws":

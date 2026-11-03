@@ -4033,9 +4033,9 @@ async def collect_links_detailed(
         and (not claim_keys or _account_in_membership(a))
     ]
 
-    # Astra live rewrite is for domain/port changes — skip on subscription GET.
+    # Astra is local — always rebuild share links from current outbounds (no HTTP).
     astra_mutated = False
-    if live_rebuild and db is not None:
+    if db is not None:
         from app.models.panel import PanelType
         from app.services import astra_node as astra_node_svc
 
@@ -4056,7 +4056,12 @@ async def collect_links_detailed(
                     )
                     astra_links_cache[pid] = {}
             email = (acc.remote_username or "").strip()
+            uname = (getattr(user, "username", None) or "").strip()
             fresh = list(astra_links_cache[pid].get(email) or [])
+            if not fresh and uname:
+                fresh = list(astra_links_cache[pid].get(uname) or [])
+            if not fresh:
+                continue
             if list(acc.links or []) != fresh:
                 acc.links = fresh
                 acc.links_by_group = None
@@ -4167,7 +4172,7 @@ async def collect_links_detailed(
                     }
                 )
 
-    if astra_mutated and db is not None:
+    if astra_mutated and live_rebuild and db is not None:
         try:
             await db.flush()
         except Exception:  # noqa: BLE001
