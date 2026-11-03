@@ -4033,9 +4033,10 @@ async def collect_links_detailed(
         and (not claim_keys or _account_in_membership(a))
     ]
 
-    # Astra is local — always rebuild share links from current outbounds (no HTTP).
+    # Astra live rewrite is local SQL — skip on the tunneled /sub GET so nginx
+    # never waits. Outbound add/toggle already rewrites PanelAccount.links.
     astra_mutated = False
-    if db is not None:
+    if live_rebuild and db is not None:
         from app.models.panel import PanelType
         from app.services import astra_node as astra_node_svc
 

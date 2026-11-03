@@ -637,18 +637,17 @@ async def get_subscription(
                 _schedule_bg_maintain(int(user.id))
             return _feed_response(cached, headers)
 
-        # NEVER hydrate on this request. Tunnel nginx (Iran reverse SSH) 502s
-        # if uvicorn is cancelled mid-hydrate (DetachedInstance / sqlite dead).
-        # Serve whatever share links are already in DB; BG fills the rest.
+        # Tunnel nginx 502s if this handler is slow or cancelled. DB links only.
         try:
-            links = await _collect_feed_links(
-                user, include_hidden=include_hidden, db=db
+            links = await asyncio.wait_for(
+                _collect_feed_links(
+                    user, include_hidden=include_hidden, db=db
+                ),
+                timeout=2.0,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("sub collect user=%s: %s", user.username, exc)
             links = []
-        if not _user_has_share_links(user):
-            _schedule_bg_maintain(int(user.id))
 
         body = _encode_feed(links)
         from app.adapters.http_utils import is_share_link as _isl
