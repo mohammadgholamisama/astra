@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timezone
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -1445,10 +1446,29 @@ async def provision_users_now(
         return {"ok": 0, "err": 0, "down": 0, "pending": 0}
 
     n = await ensure_pending_panel_accounts(db, users, targets)
-    try:
-        await db.commit()
-    except Exception:  # noqa: BLE001
-        pass
+    for attempt in range(8):
+        try:
+            await db.commit()
+            break
+        except OperationalError as exc:
+            msg = str(exc).lower()
+            if "locked" not in msg and "busy" not in msg:
+                raise
+            if attempt >= 7:
+                await db.rollback()
+                n = await ensure_pending_panel_accounts(db, users, targets)
+                await db.commit()
+                break
+            await asyncio.sleep(0.15 * (attempt + 1))
+        except Exception:  # noqa: BLE001
+            logger.exception("provision_users_now commit failed")
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            n = await ensure_pending_panel_accounts(db, users, targets)
+            await db.commit()
+            break
 
     user_ids = [int(u.id) for u in users]
     rows = await db.execute(
@@ -1498,6 +1518,47 @@ async def provision_users_now(
         pending,
     )
     return {"ok": ok, "err": err, "down": 0, "pending": pending}
+
+
+async def heal_users_missing_panel_accounts(*, limit_users: int = 20) -> int:
+    """Users that have groups but zero live PanelAccount rows — recreate remotes."""
+    from app.core.database import AsyncSessionLocal
+
+    live = (
+        select(PanelAccount.user_id)
+        .where(PanelAccount.status != PanelAccountStatus.deleted)
+        .distinct()
+    )
+    n = 0
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(User)
+                .join(UserGroup, UserGroup.user_id == User.id)
+                .where(User.id.notin_(live))
+                .options(selectinload(User.groups))
+                .distinct()
+                .limit(max(1, int(limit_users)))
+            )
+            users = list(result.scalars().unique().all())
+            for user in users:
+                gids = [int(g.id) for g in (user.groups or []) if getattr(g, "id", None)]
+                if not gids:
+                    continue
+                panels = await resolve_panels_for_groups(db, gids)
+                if not panels:
+                    continue
+                await provision_users_now(db, [user], panels, wait=10.0)
+                n += 1
+                logger.info(
+                    "healed missing accounts user=%s groups=%s targets=%s",
+                    user.username,
+                    len(gids),
+                    len(panels),
+                )
+    except Exception:  # noqa: BLE001
+        logger.exception("heal missing panel accounts failed")
+    return n
 
 
 async def ensure_pending_panel_accounts(
@@ -5400,6 +5461,10 @@ async def run_quota_watch_cycle() -> dict[str, int]:
     from app.core.database import AsyncSessionLocal
 
     t0 = time.monotonic()
+    try:
+        await heal_users_missing_panel_accounts(limit_users=8)
+    except Exception:  # noqa: BLE001
+        logger.debug("quota-watch missing-account heal skipped", exc_info=True)
 
     stats = {
         "astra_panels": 0,

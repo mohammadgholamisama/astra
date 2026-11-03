@@ -633,8 +633,6 @@ async def get_subscription(
 
         cached = _feed_cache_get(int(user.id), include_hidden)
         if cached is not None:
-            if not _user_has_share_links(user):
-                _schedule_bg_maintain(int(user.id))
             return _feed_response(cached, headers)
 
         # Tunnel nginx 502s if this handler is slow or cancelled. DB links only.

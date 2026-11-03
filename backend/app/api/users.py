@@ -290,6 +290,17 @@ async def create_user(
             await db.rollback()
         except Exception:  # noqa: BLE001
             pass
+        try:
+            await orchestrator.provision_users_now(db, [user], panels, wait=8.0)
+        except Exception:  # noqa: BLE001
+            log.exception("create provision retry failed user=%s", body.username)
+    try:
+        asyncio.create_task(
+            orchestrator.heal_users_missing_panel_accounts(limit_users=8),
+            name=f"astra-heal-missing-after-create-{body.username}",
+        )
+    except Exception:  # noqa: BLE001
+        pass
     try:
         asyncio.create_task(
             orchestrator.heal_failed_panel_accounts_batch(limit_users=5),
@@ -1048,6 +1059,23 @@ async def list_users(
         q.order_by(User.id.desc()).offset(offset).limit(limit)
     )
     users = list(result.scalars().unique().all())
+    missing = [
+        u
+        for u in users
+        if (u.groups or [])
+        and not any(
+            a.status != PanelAccountStatus.deleted
+            for a in (u.panel_accounts or [])
+        )
+    ]
+    if missing:
+        try:
+            asyncio.create_task(
+                orchestrator.heal_users_missing_panel_accounts(limit_users=12),
+                name="astra-heal-missing-on-list",
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     if refresh and users:
         # Fail-fast parallel pull for this page only (UI paints DB first, then patches)
