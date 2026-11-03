@@ -402,6 +402,25 @@ async def _sample_fingerprints(db: AsyncSession) -> dict[tuple[str, int, str], d
         return out
 
     groups_by_id = {int(g.id): g for g in (user.groups or []) if getattr(g, "id", None)}
+    tag_by_gid: dict[int, str] = {}
+    tag_by_panel: dict[int, str] = {}
+    try:
+        from app.models.group import Group, GroupPanel
+
+        g_rows = await db.execute(select(Group.id, Group.config_tag))
+        for gid, tag in g_rows.all():
+            t = _normalize_label(tag or "") or ""
+            if gid is not None and t:
+                tag_by_gid[int(gid)] = t
+        gp_rows = await db.execute(
+            select(GroupPanel.panel_id, GroupPanel.group_id)
+        )
+        for pid, gid in gp_rows.all():
+            t = tag_by_gid.get(int(gid), "") if gid is not None else ""
+            if pid is not None and t and int(pid) not in tag_by_panel:
+                tag_by_panel[int(pid)] = t
+    except Exception:  # noqa: BLE001
+        logger.debug("order-sample group tags load failed", exc_info=True)
     for account in user.panel_accounts or []:
         st = getattr(account.status, "value", account.status)
         if st in (PanelAccountStatus.deleted.value, "deleted"):
@@ -413,10 +432,20 @@ async def _sample_fingerprints(db: AsyncSession) -> dict[tuple[str, int, str], d
         gid = getattr(account, "group_id", None)
         group_name = ""
         group_tag = ""
-        if gid is not None and int(gid) in groups_by_id:
-            g = groups_by_id[int(gid)]
-            group_name = str(getattr(g, "name", "") or "")
-            group_tag = _normalize_label(getattr(g, "config_tag", None) or "") or ""
+        if gid is not None:
+            if int(gid) in groups_by_id:
+                g = groups_by_id[int(gid)]
+                group_name = str(getattr(g, "name", "") or "")
+            group_tag = tag_by_gid.get(int(gid), "") or ""
+            if not group_tag and int(gid) in groups_by_id:
+                group_tag = (
+                    _normalize_label(
+                        getattr(groups_by_id[int(gid)], "config_tag", None) or ""
+                    )
+                    or ""
+                )
+        if not group_tag and panel is not None:
+            group_tag = tag_by_panel.get(int(panel.id), "") or ""
         is_astra = (
             panel is not None
             and getattr(getattr(panel, "type", None), "value", getattr(panel, "type", None))

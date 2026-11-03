@@ -570,6 +570,18 @@ async def update_group(
     if body.is_disabled is not None and old_cat is not None:
         cat_changed = True
     await db.commit()
+    try:
+        from app.api.subscription import invalidate_user_feed_cache
+        from app.models.user import UserGroup as UG
+
+        uid_rows = await db.execute(
+            select(UG.user_id).where(UG.group_id == int(group_id))
+        )
+        invalidate_user_feed_cache(
+            *[int(r[0]) for r in uid_rows.all() if r[0] is not None]
+        )
+    except Exception:  # noqa: BLE001
+        pass
     # Never block PUT /api/group on remote I/O or a full user recount.
     if need_full_resync:
         asyncio.create_task(

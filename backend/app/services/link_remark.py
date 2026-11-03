@@ -256,11 +256,12 @@ def apply_display_name(
             pid_i = int(pid) if pid is not None else 0
         except (TypeError, ValueError):
             pid_i = 0
-        if "config_tag" in row:
-            tag = row.get("config_tag") or None
-        else:
-            tag = panel_tags.get(pid_i) if pid_i else None
-        if tag is None:
+        raw_tag = row.get("config_tag") if "config_tag" in row else None
+        tag = str(raw_tag).strip() if raw_tag else ""
+        if not tag:
+            got = panel_tags.get(pid_i) if pid_i else None
+            tag = str(got).strip() if got else ""
+        if not tag:
             tag = brand_tag
         location_flag = None
         try:

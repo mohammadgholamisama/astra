@@ -3982,6 +3982,19 @@ async def collect_links_detailed(
         claims = loaded_claims
 
     tag_by_gid = {str(c["group_id"]): _normalize_config_tag(c.get("tag")) for c in claims}
+    tag_by_panel: dict[int, str] = {}
+    for c in claims:
+        pid_c = int(c.get("panel_id") or 0)
+        t = _normalize_config_tag(c.get("tag"))
+        if pid_c and t and pid_c not in tag_by_panel:
+            tag_by_panel[pid_c] = t
+
+    def _tag_for(gid: object, pid: int) -> str:
+        if gid is not None:
+            t = tag_by_gid.get(str(int(gid)), "") or ""
+            if t:
+                return t
+        return tag_by_panel.get(int(pid), "") or ""
 
     head: list[dict] = [
         build_status_row(
@@ -4003,6 +4016,21 @@ async def collect_links_detailed(
     notices = notice_rows_from_groups(groups) if include_notices else []
     rows: list[dict] = []
     seen: set[str] = set()
+    by_link: dict[str, dict] = {}
+
+    def _emit(text: str, **fields: object) -> None:
+        prev = by_link.get(text)
+        if prev is not None:
+            new_tag = str(fields.get("config_tag") or "").strip()
+            if new_tag and not str(prev.get("config_tag") or "").strip():
+                prev["config_tag"] = new_tag
+                if fields.get("group_id") is not None:
+                    prev["group_id"] = fields.get("group_id")
+            return
+        seen.add(text)
+        row = {"link": text, **fields}
+        by_link[text] = row
+        rows.append(row)
 
     # Only emit configs for live (panel × group) claims — not merely group membership
     # (a panel removed from a group must leave the sub even before remote delete finishes).
@@ -4101,23 +4129,19 @@ async def collect_links_detailed(
 
         if acct_gid is not None:
             # Dedicated per-group remote account — all its links belong to that group
-            gid_s = str(int(acct_gid))
-            tag = tag_by_gid.get(gid_s, "")
+            tag = _tag_for(acct_gid, pid)
             for link in account.links or []:
                 text = (link or "").strip()
-                if not text or text in seen or not is_share_link(text):
+                if not text or not is_share_link(text):
                     continue
                 if not include_hidden and _config_hidden(text):
                     continue
-                seen.add(text)
-                rows.append(
-                    {
-                        "link": text,
-                        "panel": label,
-                        "panel_id": pid,
-                        "config_tag": tag,
-                        "group_id": int(acct_gid),
-                    }
+                _emit(
+                    text,
+                    panel=label,
+                    panel_id=pid,
+                    config_tag=tag,
+                    group_id=int(acct_gid),
                 )
             continue
 
@@ -4127,13 +4151,16 @@ async def collect_links_detailed(
         if not panel_claims:
             for link in account.links or []:
                 text = (link or "").strip()
-                if not text or text in seen or not is_share_link(text):
+                if not text or not is_share_link(text):
                     continue
                 if not include_hidden and _config_hidden(text):
                     continue
-                seen.add(text)
-                rows.append(
-                    {"link": text, "panel": label, "panel_id": pid, "config_tag": ""}
+                _emit(
+                    text,
+                    panel=label,
+                    panel_id=pid,
+                    config_tag=_tag_for(acct_gid, pid),
+                    group_id=int(acct_gid) if acct_gid is not None else None,
                 )
             continue
 
@@ -4154,23 +4181,20 @@ async def collect_links_detailed(
                 }
 
         for gid in sorted(by_group.keys(), key=lambda x: int(x) if str(x).isdigit() else 0):
-            tag = tag_by_gid.get(str(gid), "")
             gid_i = int(gid) if str(gid).isdigit() else 0
+            tag = _tag_for(gid_i, pid)
             for link in by_group.get(gid) or []:
                 text = (link or "").strip()
-                if not text or text in seen or not is_share_link(text):
+                if not text or not is_share_link(text):
                     continue
                 if not include_hidden and _config_hidden(text):
                     continue
-                seen.add(text)
-                rows.append(
-                    {
-                        "link": text,
-                        "panel": label,
-                        "panel_id": pid,
-                        "config_tag": tag,
-                        "group_id": gid_i,
-                    }
+                _emit(
+                    text,
+                    panel=label,
+                    panel_id=pid,
+                    config_tag=tag,
+                    group_id=gid_i,
                 )
 
     if astra_mutated and live_rebuild and db is not None:
@@ -4201,25 +4225,35 @@ async def collect_links_detailed(
     # Distinct CDN paths (Astra WS/XHTTP on one domain:port) must BOTH stay.
     from app.services.config_locations import extract_link_path, extract_link_remark_key
 
-    seen_fp: set[tuple] = set()
-    deduped: list[dict] = []
+    by_fp: dict[tuple, dict] = {}
+    no_fp: list[dict] = []
     for row in rows:
         link = str(row.get("link") or "")
         ep = extract_link_endpoint(link)
+        key: tuple | None = None
         if ep:
             mh = extract_link_match_host(link) or ""
             norm = try_normalize_endpoint(ep[0], ep[1], mh)
             if norm:
-                key: tuple = (
+                key = (
                     *norm,
                     extract_link_path(link),
                     extract_link_remark_key(link),
                 )
-                if key in seen_fp:
-                    continue
-                seen_fp.add(key)
-        deduped.append(row)
-    rows = deduped
+        if key is None:
+            no_fp.append(row)
+            continue
+        prev = by_fp.get(key)
+        if prev is None:
+            by_fp[key] = row
+            continue
+        new_tag = str(row.get("config_tag") or "").strip()
+        old_tag = str(prev.get("config_tag") or "").strip()
+        if new_tag and not old_tag:
+            prev["config_tag"] = new_tag
+            if row.get("group_id") is not None:
+                prev["group_id"] = row.get("group_id")
+    rows = list(by_fp.values()) + no_fp
 
     renamed = apply_display_name(
         rows,
