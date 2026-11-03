@@ -5359,7 +5359,7 @@ th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
   border: 1px solid var(--line);
   background: var(--card-solid);
   box-shadow: var(--shadow);
-  max-height: 260px;
+  max-height: min(420px, 70vh);
   overflow: auto;
   animation: rise 0.18s ease;
 }

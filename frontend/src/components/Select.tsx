@@ -37,7 +37,7 @@ export default function Select<T extends string | number>({
     if (!el) return;
     const r = el.getBoundingClientRect();
     const gap = 6;
-    const maxH = 260;
+    const maxH = Math.min(420, Math.floor(window.innerHeight * 0.7));
     const spaceBelow = window.innerHeight - r.bottom - gap;
     const openUp = spaceBelow < 140 && r.top > spaceBelow + 40;
     setPos({

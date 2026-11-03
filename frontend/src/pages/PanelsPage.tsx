@@ -69,6 +69,11 @@ const TYPES: { value: PanelType; label: string; hint: string }[] = [
     hint: "یوزر/پسورد اوپراتور یا ادمین — آدرس بدون /dashboard",
   },
   {
+    value: "guard",
+    label: "گارد",
+    hint: "یوزر/پسورد یا API Key — سرویس‌ها؛ خاموشی حجم از Astra",
+  },
+  {
     value: "marzban",
     label: "مرزبان",
     hint: "یوزر و پسورد ادمین — انتخاب پروتکل (vless/vmess/...)",
@@ -77,11 +82,6 @@ const TYPES: { value: PanelType; label: string; hint: string }[] = [
     value: "rebecca",
     label: "ربکا",
     hint: "یوزر و پسورد ادمین — کانفیگ از سرویس‌های پنل (بدون انتخاب پروتکل)",
-  },
-  {
-    value: "guard",
-    label: "گارد",
-    hint: "یوزر/پسورد یا API Key — کانفیگ از سرویس‌های پنل (مثل ربکا)",
   },
 ];
 

@@ -346,6 +346,8 @@ def build_user_payload(
         hold_dur = 0
     if hold_dur > 0:
         cfg["on_hold_expire_duration"] = hold_dur
+        # Guard API uses days; adapters that need seconds keep on_hold_expire_duration
+        cfg["on_hold_timeout_days"] = max(1, min(365, (hold_dur + 86399) // 86400))
     data_limit = remote_data_limit_bytes(
         user.data_limit or 0,
         cfg,
