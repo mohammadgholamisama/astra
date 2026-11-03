@@ -112,6 +112,7 @@ class MarzProtocolOut(BaseModel):
 
 class MarzInboundPreviewRequest(BaseModel):
     base_url: str
-    username: str = Field(min_length=1)
-    password: str = Field(min_length=1)
+    username: str = ""
+    password: str = ""
+    api_token: str | None = None
     panel_type: PanelType = PanelType.marzban

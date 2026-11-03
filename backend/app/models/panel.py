@@ -13,6 +13,7 @@ class PanelType(str, enum.Enum):
     pasarguard = "pasarguard"
     marzban = "marzban"
     rebecca = "rebecca"
+    guard = "guard"
     astra = "astra"
 
 

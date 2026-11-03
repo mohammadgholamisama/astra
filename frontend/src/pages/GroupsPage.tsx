@@ -134,8 +134,8 @@ function pickToConfig(pick: PanelPick, type: PanelType): Record<string, unknown>
     }
     cfg.inbounds = inbounds;
   }
-  if (type === "rebecca") {
-    // Rebecca: one service_id per user (configs come from that service)
+  if (type === "rebecca" || type === "guard") {
+    // Rebecca/Guard: service_id(s) — configs come from that service
     const serviceIds = pick.protocols
       .map((p) => {
         const m = String(p).match(/^service-(\d+)$/i);
@@ -145,6 +145,7 @@ function pickToConfig(pick: PanelPick, type: PanelType): Record<string, unknown>
     if (serviceIds.length) {
       cfg.service_id = serviceIds[0];
       cfg.service_ids = serviceIds;
+      if (type === "guard") cfg.services = serviceIds;
     }
   }
   if (pick.limit_ip > 0) {
@@ -172,7 +173,7 @@ function configToPick(
     Array.isArray(remoteGroups) && remoteGroups.length ? remoteGroups : cfg.group_ids
   );
 
-  if (type === "rebecca" || cfg.service_id != null) {
+  if (type === "rebecca" || type === "guard" || cfg.service_id != null) {
     const sid = Number(cfg.service_id);
     if (!Number.isNaN(sid) && sid > 0) {
       pick.protocols = [`service-${sid}`];
@@ -340,7 +341,7 @@ export default function GroupsPage() {
             return { ...p, protocols, marz_inbounds };
           })
         );
-      } else if (panel.type === "rebecca") {
+      } else if (panel.type === "rebecca" || panel.type === "guard") {
         const list = await api<MarzProtocolInfo[]>(
           `/api/admin/panels/${panel.id}/marz-protocols`
         );
@@ -350,6 +351,8 @@ export default function GroupsPage() {
           [panel.id]: { ...emptyCatalog(), protocols: list },
         }));
         // Default: first service (or keep prior valid selection). Empty = auto first on create.
+        // Guard allows multiple services; Rebecca stays single.
+        const multi = panel.type === "guard";
         setPicks((prev) =>
           prev.map((p) => {
             if (p.panel_id !== panel.id) return p;
@@ -357,7 +360,7 @@ export default function GroupsPage() {
             let protocols = p.protocols.filter((x) => names.includes(x));
             if (firstTime || !protocols.length) {
               protocols = names.length ? [names[0]] : [];
-            } else if (protocols.length > 1) {
+            } else if (!multi && protocols.length > 1) {
               protocols = [protocols[0]];
             }
             const marz_inbounds: Record<string, string[]> = {};
@@ -628,13 +631,20 @@ export default function GroupsPage() {
           marz_inbounds: { [first.protocol]: [...(first.tags || [])] },
         });
       }
+    } else if (panel.type === "guard") {
+      updatePick(panel.id, {
+        protocols: cat.protocols.map((x) => x.protocol),
+        marz_inbounds: Object.fromEntries(
+          cat.protocols.map((x) => [x.protocol, [...(x.tags || [])]])
+        ),
+      });
     }
   }
 
   function clearAll(panel: Panel) {
     if (panel.type === "sanaei") updatePick(panel.id, { inbound_ids: [] });
     else if (panel.type === "pasarguard") updatePick(panel.id, { group_ids: [] });
-    else if (panel.type === "marzban" || panel.type === "rebecca") {
+    else if (panel.type === "marzban" || panel.type === "rebecca" || panel.type === "guard") {
       updatePick(panel.id, { protocols: [], marz_inbounds: {} });
     }
   }
@@ -695,7 +705,7 @@ export default function GroupsPage() {
     if (panel.type === "marzban") {
       return `${pick.protocols.length} از ${cat.protocols.length} پروتکل`;
     }
-    if (panel.type === "rebecca") {
+    if (panel.type === "rebecca" || panel.type === "guard") {
       return pick.protocols.length
         ? `${pick.protocols.length} از ${cat.protocols.length} سرویس`
         : `خودکار · ${cat.protocols.length} سرویس`;
@@ -1056,14 +1066,16 @@ export default function GroupsPage() {
                                   ? "اینباندها"
                                   : p.type === "pasarguard"
                                     ? "گروه‌های ریموت"
-                                    : p.type === "rebecca"
+                                    : p.type === "rebecca" || p.type === "guard"
                                       ? "سرویس‌ها"
                                       : "پروتکل‌ها"}
                               </h4>
                               <p className="field-hint">
                                 {p.type === "rebecca"
                                   ? "یک سرویس انتخاب کنید؛ خالی = اولین سرویس پنل. کانفیگ‌ها از همان سرویس می‌آیند."
-                                  : "پیش‌فرض همه انتخاب‌اند — هر کدام را که نمی‌خواهید خاموش کنید"}
+                                  : p.type === "guard"
+                                    ? "یک یا چند سرویس گارد را انتخاب کنید؛ خالی = اولین سرویس."
+                                    : "پیش‌فرض همه انتخاب‌اند — هر کدام را که نمی‌خواهید خاموش کنید"}
                               </p>
                             </div>
                             <div className="group-route-actions">
@@ -1164,7 +1176,7 @@ export default function GroupsPage() {
                             </div>
                           )}
 
-                          {p.type === "rebecca" &&
+                          {(p.type === "rebecca" || p.type === "guard") &&
                             cat &&
                             !cat.loading &&
                             cat.protocols.length > 0 && (
@@ -1174,19 +1186,32 @@ export default function GroupsPage() {
                                   const label =
                                     proto.service_name ||
                                     proto.protocol.replace(/^service-/i, "Service ");
+                                  const multi = p.type === "guard";
                                   return (
                                     <button
                                       key={proto.protocol}
                                       type="button"
                                       className={`inbound-item${selected ? " selected" : ""}${proto.is_disabled ? " off" : ""}`}
-                                      onClick={() =>
-                                        updatePick(p.id, {
-                                          protocols: selected ? [] : [proto.protocol],
-                                          marz_inbounds: selected
-                                            ? {}
-                                            : { [proto.protocol]: [...(proto.tags || [])] },
-                                        })
-                                      }
+                                      onClick={() => {
+                                        if (multi) {
+                                          const next = selected
+                                            ? pick.protocols.filter((x) => x !== proto.protocol)
+                                            : [...pick.protocols, proto.protocol];
+                                          const marz_inbounds: Record<string, string[]> = {};
+                                          for (const name of next) {
+                                            const row = cat.protocols.find((x) => x.protocol === name);
+                                            marz_inbounds[name] = [...(row?.tags || [])];
+                                          }
+                                          updatePick(p.id, { protocols: next, marz_inbounds });
+                                        } else {
+                                          updatePick(p.id, {
+                                            protocols: selected ? [] : [proto.protocol],
+                                            marz_inbounds: selected
+                                              ? {}
+                                              : { [proto.protocol]: [...(proto.tags || [])] },
+                                          });
+                                        }
+                                      }}
                                     >
                                       <span className="inbound-check" aria-hidden>
                                         {selected ? "✓" : ""}
@@ -1276,12 +1301,16 @@ export default function GroupsPage() {
                             !cat.error &&
                             ((p.type === "sanaei" && !cat.inbounds.length) ||
                               (p.type === "pasarguard" && !cat.groups.length) ||
-                              ((p.type === "marzban" || p.type === "rebecca") &&
+                              ((p.type === "marzban" ||
+                                p.type === "rebecca" ||
+                                p.type === "guard") &&
                                 !cat.protocols.length)) && (
                               <p className="muted inbound-empty">
                                 {p.type === "rebecca"
                                   ? "سرویسی در پنل ربکا پیدا نشد — اول در داشبورد ربکا Service بسازید"
-                                  : "موردی در این پنل پیدا نشد"}
+                                  : p.type === "guard"
+                                    ? "سرویسی در پنل گارد پیدا نشد — اول در داشبورد گارد Service بسازید"
+                                    : "موردی در این پنل پیدا نشد"}
                               </p>
                             )}
 

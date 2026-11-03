@@ -118,7 +118,7 @@ export async function login(username: string, password: string) {
   return res.json() as Promise<{ access_token: string; token_type: string }>;
 }
 
-export type PanelType = "sanaei" | "pasarguard" | "marzban" | "rebecca" | "astra";
+export type PanelType = "sanaei" | "pasarguard" | "marzban" | "rebecca" | "guard" | "astra";
 
 export interface AstraOutbound {
   id: number;

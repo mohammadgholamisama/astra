@@ -1219,6 +1219,7 @@ export default function UsersPage() {
     sanaei: "سنایی",
     astra: "آسترا",
     rebecca: "ربکا",
+    guard: "گارد",
   };
 
   const counts = data?.counts;

@@ -79,13 +79,20 @@ async def _fetch_pasarguard_groups(panel: Panel) -> list[RemoteGroupOut]:
 
 
 async def _fetch_marz_protocols(panel: Panel) -> list[MarzProtocolOut]:
-    if panel.type not in (PanelType.marzban, PanelType.rebecca):
-        raise HTTPException(status_code=400, detail="فقط برای مرزبان/ربکا لیست پروتکل/سرویس در دسترس است")
+    if panel.type not in (PanelType.marzban, PanelType.rebecca, PanelType.guard):
+        raise HTTPException(
+            status_code=400,
+            detail="فقط برای مرزبان/ربکا/گارد لیست پروتکل/سرویس در دسترس است",
+        )
     adapter = get_adapter(panel)
     try:
         rows = await adapter.list_protocols()  # type: ignore[attr-defined]
     except Exception as exc:  # noqa: BLE001
-        label = "سرویس‌ها" if panel.type == PanelType.rebecca else "پروتکل‌ها"
+        label = (
+            "سرویس‌ها"
+            if panel.type in (PanelType.rebecca, PanelType.guard)
+            else "پروتکل‌ها"
+        )
         msg = str(exc).strip() or exc.__class__.__name__
         logger.warning("marz protocols failed for %s: %s", panel.base_url, msg)
         raise HTTPException(status_code=400, detail=f"دریافت {label} ناموفق: {msg}") from exc
@@ -121,6 +128,15 @@ def _validate_credentials(panel_type: PanelType, username: str | None, password:
                 status_code=400,
                 detail="برای سنایی (3x-ui) API Token الزامی است — Settings → Security → API Token",
             )
+    elif panel_type == PanelType.guard:
+        token = (api_token or "").strip()
+        user = (username or "").strip()
+        pwd = (password or "").strip()
+        if not token and (not user or not pwd):
+            raise HTTPException(
+                status_code=400,
+                detail="برای گارد یوزر/پسورد ادمین یا API Key الزامی است",
+            )
     else:
         # marzban / rebecca / pasarguard
         if not username or not password:
@@ -153,7 +169,7 @@ async def _probe_panel(panel: Panel) -> None:
     """
     last_err = "اطلاعات ورود یا آدرس اشتباه است"
     # Marzban/Rebecca: more attempts (token + /api/admin can be slow/flaky)
-    tries = 4 if panel.type in (PanelType.marzban, PanelType.rebecca) else 2
+    tries = 4 if panel.type in (PanelType.marzban, PanelType.rebecca, PanelType.guard) else 2
     for attempt in range(tries):
         adapter = get_adapter(panel)
         result = None
@@ -329,15 +345,17 @@ async def preview_marz_protocols(
     _admin=Depends(get_current_admin),
 ):
     """List Marzban/Rebecca protocols (from /api/inbounds) before the panel is saved."""
-    if body.panel_type not in (PanelType.marzban, PanelType.rebecca):
-        raise HTTPException(status_code=400, detail="panel_type باید marzban یا rebecca باشد")
+    if body.panel_type not in (PanelType.marzban, PanelType.rebecca, PanelType.guard):
+        raise HTTPException(
+            status_code=400, detail="panel_type باید marzban یا rebecca یا guard باشد"
+        )
     panel = Panel(
         name="_preview_marz",
         type=body.panel_type,
         base_url=normalize_panel_base_url(str(body.base_url)),
         username=body.username,
         password=body.password,
-        api_token=None,
+        api_token=(getattr(body, "api_token", None) or None),
         meta={},
         is_active=True,
     )

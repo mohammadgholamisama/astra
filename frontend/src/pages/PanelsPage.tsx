@@ -78,6 +78,11 @@ const TYPES: { value: PanelType; label: string; hint: string }[] = [
     label: "ربکا",
     hint: "یوزر و پسورد ادمین — کانفیگ از سرویس‌های پنل (بدون انتخاب پروتکل)",
   },
+  {
+    value: "guard",
+    label: "گارد",
+    hint: "یوزر/پسورد یا API Key — کانفیگ از سرویس‌های پنل (مثل ربکا)",
+  },
 ];
 
 function parseMarzProtocols(meta: Record<string, unknown>): string[] {
@@ -156,6 +161,8 @@ export default function PanelsPage() {
   const isPasarguard = form.type === "pasarguard";
   const isMarzban = form.type === "marzban";
   const isRebecca = form.type === "rebecca";
+  const isGuard = form.type === "guard";
+  const isServicePanel = isRebecca || isGuard;
   const isAstra = form.type === "astra";
   const isEdit = !!editing;
 
@@ -436,8 +443,8 @@ export default function PanelsPage() {
       }
       delete meta.service_id;
       delete meta.service_ids;
-    } else if (isRebecca) {
-      // Rebecca: configs come from Services — no protocol/inbound meta
+    } else if (isServicePanel) {
+      // Rebecca/Guard: configs come from Services — no protocol/inbound meta
       delete meta.protocols;
       delete meta.inbounds;
       delete meta.service_ids;
@@ -652,13 +659,22 @@ export default function PanelsPage() {
   function onSubmit(e: FormEvent) {
     e.preventDefault();
     if (!isAstra) {
-      if (!form.username.trim()) {
-        setMsg("نام کاربری الزامی است");
-        return;
-      }
-      if (!isEdit && !form.password.trim()) {
-        setMsg("رمز عبور الزامی است");
-        return;
+      if (isGuard) {
+        const hasKey = !!form.api_token.trim();
+        const hasUserPass = !!form.username.trim() && (!!form.password.trim() || isEdit);
+        if (!hasKey && !hasUserPass) {
+          setMsg("برای گارد یوزر/پسورد ادمین یا API Key را وارد کنید");
+          return;
+        }
+      } else {
+        if (!form.username.trim()) {
+          setMsg("نام کاربری الزامی است");
+          return;
+        }
+        if (!isEdit && !form.password.trim()) {
+          setMsg("رمز عبور الزامی است");
+          return;
+        }
       }
       if (!isEdit && isSanaei && !form.api_token.trim()) {
         setMsg("برای سنایی API Token الزامی است");
@@ -799,7 +815,9 @@ export default function PanelsPage() {
                 ? true
                 : p.type === "sanaei"
                   ? p.has_token
-                  : p.has_password;
+                  : p.type === "guard"
+                    ? p.has_password || p.has_token
+                    : p.has_password;
             const credLabel =
               p.type === "astra"
                 ? "نود محلی"
@@ -807,9 +825,15 @@ export default function PanelsPage() {
                   ? p.has_token
                     ? "توکن دارد"
                     : "بدون توکن"
-                  : p.has_password
-                    ? "رمز تنظیم شده"
-                    : "رمز ناقص";
+                  : p.type === "guard"
+                    ? p.has_token
+                      ? "API Key"
+                      : p.has_password
+                        ? "رمز تنظیم شده"
+                        : "رمز/کلید ناقص"
+                    : p.has_password
+                      ? "رمز تنظیم شده"
+                      : "رمز ناقص";
             return (
               <article key={p.id} className={`admin-card ${p.is_active ? "" : "is-off"}`}>
                 <div className="admin-card-top">
@@ -1103,9 +1127,11 @@ export default function PanelsPage() {
                 {!isAstra && (
                   <div className="form-grid">
                     <div className="field">
-                      <label>نام کاربری ادمین *</label>
+                      <label>
+                        {isGuard ? "نام کاربری ادمین (یا API Key پایین)" : "نام کاربری ادمین *"}
+                      </label>
                       <input
-                        required
+                        required={!isGuard}
                         name="panel_admin_username"
                         autoComplete="off"
                         value={form.username}
@@ -1115,10 +1141,14 @@ export default function PanelsPage() {
                     </div>
                     <div className="field">
                       <label>
-                        {isEdit ? "رمز عبور (خالی = بدون تغییر)" : "رمز عبور *"}
+                        {isEdit
+                          ? "رمز عبور (خالی = بدون تغییر)"
+                          : isGuard
+                            ? "رمز عبور"
+                            : "رمز عبور *"}
                       </label>
                       <input
-                        required={!isEdit}
+                        required={!isEdit && !isGuard}
                         type="password"
                         name="panel_admin_password"
                         value={form.password}
@@ -1130,18 +1160,30 @@ export default function PanelsPage() {
                   </div>
                 )}
 
-                {isSanaei && (
+                {(isSanaei || isGuard) && (
                   <div className="field">
-                    <label>{isEdit ? "API Token (خالی = بدون تغییر)" : "API Token *"}</label>
+                    <label>
+                      {isGuard
+                        ? isEdit
+                          ? "API Key (خالی = بدون تغییر)"
+                          : "API Key (اختیاری اگر یوزر/پسورد دارید)"
+                        : isEdit
+                          ? "API Token (خالی = بدون تغییر)"
+                          : "API Token *"}
+                    </label>
                     <input
-                      required={!isEdit}
-                      placeholder="Settings → Security → API Token"
+                      required={!isEdit && isSanaei}
+                      placeholder={
+                        isGuard ? "X-API-Key از پروفایل ادمین گارد" : "Settings → Security → API Token"
+                      }
                       value={form.api_token}
                       onChange={(e) => setForm({ ...form, api_token: e.target.value })}
                       dir="ltr"
                     />
                     <p className="field-hint">
-                      توکن را کامل کپی کنید. اگر اشتباه باشد سنایی اغلب خطای ۴۰۴ می‌دهد (نه ۴۰۱).
+                      {isGuard
+                        ? "یا یوزر/پسورد بدهید تا Astra خودش JWT بگیرد، یا فقط API Key."
+                        : "توکن را کامل کپی کنید. اگر اشتباه باشد سنایی اغلب خطای ۴۰۴ می‌دهد (نه ۴۰۱)."}
                     </p>
                   </div>
                 )}
@@ -1310,15 +1352,15 @@ export default function PanelsPage() {
                 </section>
               )}
 
-              {isRebecca && (
+              {isServicePanel && (
                 <section className="panel-section">
                   <div className="inbound-head">
                     <div>
-                      <h4>ربکا</h4>
+                      <h4>{isGuard ? "گارد" : "ربکا"}</h4>
                       <p className="field-hint">
-                        در ربکا انتخاب پروتکل/اینباند وجود ندارد. با ساخت کاربر، کانفیگ‌ها از
-                        سرویس‌های تعریف‌شده در داشبورد ربکا می‌آیند. سرویس را هنگام ساخت گروه
-                        انتخاب کنید (خالی = اولین سرویس).
+                        {isGuard
+                          ? "در گارد انتخاب پروتکل/اینباند وجود ندارد. با ساخت کاربر، کانفیگ‌ها از سرویس‌های داشبورد گارد می‌آیند. سرویس را در گروه انتخاب کنید (خالی = اولین سرویس)."
+                          : "در ربکا انتخاب پروتکل/اینباند وجود ندارد. با ساخت کاربر، کانفیگ‌ها از سرویس‌های تعریف‌شده در داشبورد ربکا می‌آیند. سرویس را هنگام ساخت گروه انتخاب کنید (خالی = اولین سرویس)."}
                       </p>
                     </div>
                   </div>

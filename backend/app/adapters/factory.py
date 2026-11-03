@@ -1,5 +1,6 @@
 from app.adapters.astra import AstraAdapter
 from app.adapters.base import BasePanelAdapter
+from app.adapters.guard import GuardAdapter
 from app.adapters.marzban import MarzbanAdapter
 from app.adapters.pasarguard import PasarGuardAdapter
 from app.adapters.rebecca import RebeccaAdapter
@@ -10,6 +11,7 @@ _ADAPTERS = {
     PanelType.marzban: MarzbanAdapter,
     PanelType.pasarguard: PasarGuardAdapter,
     PanelType.rebecca: RebeccaAdapter,
+    PanelType.guard: GuardAdapter,
     PanelType.sanaei: SanaeiAdapter,
     PanelType.astra: AstraAdapter,
 }
