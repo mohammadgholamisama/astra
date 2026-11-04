@@ -130,7 +130,8 @@ def _quality(
 
 _QUALITY_RANK = {"exact": 0, "uuid": 1, "uri": 1, "sni": 2, "host_port": 3}
 
-_TOKEN_RE = re.compile(r"[A-Za-z\u0600-\u06FF]+|\d+")
+# Keep letter+digit units together: Hajmi6, Tunnel (not Hajmi / 6 separately)
+_STEM_RE = re.compile(r"[A-Za-z\u0600-\u06FF]+\d*", re.UNICODE)
 
 
 def _remark_close(a: str | None, b: str | None) -> bool:
@@ -141,24 +142,32 @@ def _remark_close(a: str | None, b: str | None) -> bool:
     return x == y or x in y or y in x
 
 
-def _name_tokens(s: str) -> set[str]:
-    return {t.lower() for t in _TOKEN_RE.findall(s or "") if len(t) >= 2}
+def _norm_key(s: str) -> str:
+    return re.sub(r"[^a-z0-9\u0600-\u06ff]+", "", (s or "").lower())
+
+
+def _panel_stems(panel_name: str) -> list[str]:
+    return [m.group(0).lower() for m in _STEM_RE.finditer(panel_name or "") if len(m.group(0)) >= 2]
 
 
 def _group_fit(panel_name: str, group_name: str | None) -> tuple[int, int, int]:
-    """Higher is better: how closely the sales-group name matches the panel."""
+    """Higher is better: how closely the sales-group name matches the panel.
+
+    Hajmi6-Tunnel → prefers Hajmi6x…-Tunnel… over Hajmi5x…-Tunnel…
+    """
     gn = (group_name or "").strip()
     if not gn:
         return (0, 0, 0)
-    pt = _name_tokens(panel_name)
-    gt = _name_tokens(gn)
-    if not pt:
+    stems = _panel_stems(panel_name)
+    if not stems:
         return (0, 0, 0)
-    overlap = len(pt & gt)
-    gnl = re.sub(r"[\s_\-]+", "", gn.lower())
-    # Prefer group that contains panel tokens (Hajmi6-Tunnel → Hajmi6…Tunnel…)
-    contained = sum(1 for t in pt if t in gnl)
-    return (contained, overlap, -abs(len(gn) - len(panel_name or "")))
+    gkey = _norm_key(gn)
+    # Exact stem hits (hajmi6 in group key beats hajmi5)
+    hits = sum(1 for s in stems if s in gkey)
+    # Full normalized panel blob inside group (hajmi6tunnel ⊂ …)
+    pkey = _norm_key(panel_name)
+    blob = 1 if pkey and pkey in gkey else 0
+    return (hits, blob, -abs(len(gn) - len(panel_name or "")))
 
 
 def _pick_best_group_hits(pool: list[dict[str, Any]]) -> list[dict[str, Any]]:
