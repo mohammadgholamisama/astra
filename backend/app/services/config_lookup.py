@@ -107,20 +107,36 @@ def _quality(
     *,
     uuid_match: bool,
 ) -> str | None:
+    """Match only when host:port agree; SNI/header must not contradict."""
     qh, qp, qm = q_fp
     ch, cp, cm = c_fp
-    if qh == ch and qp == cp and (qm or "") == (cm or ""):
+    if qh != ch or qp != cp:
+        return None
+    q_match = (qm or "").strip()
+    c_match = (cm or "").strip()
+    if q_match == c_match:
         return "exact"
-    if uuid_match and qh == ch and qp == cp:
+    if uuid_match:
         return "uuid"
-    if qh == ch and qp == cp and _sni_core(qm) == _sni_core(cm):
+    qs = _sni_core(q_match)
+    cs = _sni_core(c_match)
+    if qs and cs and qs == cs:
         return "sni"
-    if qh == ch and qp == cp:
+    # Bare host:port only when neither side has a discriminating SNI/header
+    if not q_match and not c_match:
         return "host_port"
     return None
 
 
 _QUALITY_RANK = {"exact": 0, "uuid": 1, "uri": 1, "sni": 2, "host_port": 3}
+
+
+def _remark_close(a: str | None, b: str | None) -> bool:
+    x = (a or "").strip().lower()
+    y = (b or "").strip().lower()
+    if not x or not y:
+        return False
+    return x == y or x in y or y in x
 
 
 def _panel_type_str(panel: Any) -> str | None:
@@ -491,10 +507,61 @@ def _finalize(
     parsed: ConfigLookupParsed,
     links: list[str],
 ) -> ConfigLookupOut:
+    raw_hits = list(buckets.values())
+
+    # Same panel with/without group → keep rows that name a sales group
+    by_panel: dict[int, list[dict[str, Any]]] = {}
+    for h in raw_hits:
+        by_panel.setdefault(int(h["panel_id"]), []).append(h)
+    collapsed: list[dict[str, Any]] = []
+    for _pid, lst in by_panel.items():
+        with_group = [x for x in lst if x.get("group_id") is not None]
+        pool = with_group or lst
+        best_local = min(
+            (_QUALITY_RANK.get(str(x.get("match_quality") or ""), 9) for x in pool),
+            default=9,
+        )
+        collapsed.extend(
+            x
+            for x in pool
+            if _QUALITY_RANK.get(str(x.get("match_quality") or ""), 9) == best_local
+        )
+
+    # Keep only the strongest match tier globally (exact beats host_port, …)
+    if collapsed:
+        best = min(
+            _QUALITY_RANK.get(str(h.get("match_quality") or ""), 9) for h in collapsed
+        )
+        collapsed = [
+            h
+            for h in collapsed
+            if _QUALITY_RANK.get(str(h.get("match_quality") or ""), 9) == best
+        ]
+
+    # If several panels still tie, prefer remark / panel-name closeness
+    q_remark = (parsed.remark or "").strip()
+    if q_remark and len(collapsed) > 1:
+        remarked = [
+            h
+            for h in collapsed
+            if _remark_close(str(h.get("source_remark") or ""), q_remark)
+            or _remark_close(str(h.get("panel_name") or ""), q_remark)
+            or _remark_close(str(h.get("group_name") or ""), q_remark)
+        ]
+        if remarked:
+            collapsed = remarked
+
+    # Prefer rows that actually saw live accounts when still ambiguous
+    if len(collapsed) > 1:
+        with_acc = [h for h in collapsed if int(h.get("accounts_count") or 0) > 0]
+        if with_acc:
+            collapsed = with_acc
+
     hits = sorted(
-        buckets.values(),
+        collapsed,
         key=lambda h: (
             _QUALITY_RANK.get(str(h.get("match_quality") or ""), 9),
+            -int(h.get("accounts_count") or 0),
             str(h.get("panel_name") or ""),
             str(h.get("group_name") or ""),
         ),

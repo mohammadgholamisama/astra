@@ -228,7 +228,12 @@ export default function ConfigLookupPage() {
                         <div>
                           <span className="muted">پنل</span>
                           <strong>
-                            <Link to="/panels">{h.panel_name}</Link>
+                            <Link
+                              to={`/panels?panel=${h.panel_id}`}
+                              title="باز کردن این پنل"
+                            >
+                              {h.panel_name}
+                            </Link>
                           </strong>
                         </div>
                       </div>
@@ -237,8 +242,13 @@ export default function ConfigLookupPage() {
                         <div>
                           <span className="muted">گروه</span>
                           <strong>
-                            {h.group_name ? (
-                              <Link to="/groups">{h.group_name}</Link>
+                            {h.group_id != null && h.group_name ? (
+                              <Link
+                                to={`/groups?group=${h.group_id}`}
+                                title="باز کردن این گروه"
+                              >
+                                {h.group_name}
+                              </Link>
                             ) : (
                               <span className="muted">— بدون گروه مشخص</span>
                             )}

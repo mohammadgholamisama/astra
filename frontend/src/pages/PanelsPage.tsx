@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowRightLeft,
@@ -8,10 +8,12 @@ import {
   Pencil,
   Plus,
   Power,
+  Search,
   Server,
   ShieldCheck,
   Trash2,
   Wifi,
+  X,
   XCircle,
 } from "lucide-react";
 import Select from "../components/Select";
@@ -140,10 +142,14 @@ function inboundLabel(ib: InboundInfo) {
 
 export default function PanelsPage() {
   const qc = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Panel | null>(null);
   const [form, setForm] = useState(emptyForm);
   const [activeTab, setActiveTab] = useState<CatTab>(null);
+  const [search, setSearch] = useState("");
+  const [highlightId, setHighlightId] = useState<number | null>(null);
+  const deepLinkDone = useRef<string | null>(null);
   const [movePanel, setMovePanel] = useState<Panel | null>(null);
   const [catModal, setCatModal] = useState<"create" | { edit: PanelCategory } | null>(
     null
@@ -196,10 +202,27 @@ export default function PanelsPage() {
     () => data.filter((p) => p.category_id == null).length,
     [data]
   );
+  const searchQ = search.trim().toLowerCase();
   const visiblePanels = useMemo(() => {
-    if (activeTab == null) return data.filter((p) => p.category_id == null);
-    return data.filter((p) => p.category_id === activeTab);
-  }, [data, activeTab]);
+    let list = data;
+    if (searchQ) {
+      list = data.filter((p) => {
+        const typeLabel =
+          TYPES.find((t) => t.value === p.type)?.label || p.type || "";
+        return (
+          p.name.toLowerCase().includes(searchQ) ||
+          (p.base_url || "").toLowerCase().includes(searchQ) ||
+          String(p.id) === searchQ ||
+          typeLabel.toLowerCase().includes(searchQ)
+        );
+      });
+    } else if (activeTab == null) {
+      list = data.filter((p) => p.category_id == null);
+    } else {
+      list = data.filter((p) => p.category_id === activeTab);
+    }
+    return list;
+  }, [data, activeTab, searchQ]);
   const activeCat = useMemo(
     () => (activeTab == null ? null : categories.find((c) => c.id === activeTab) || null),
     [activeTab, categories]
@@ -209,6 +232,36 @@ export default function PanelsPage() {
     if (activeTab == null) return;
     if (!categories.some((c) => c.id === activeTab)) setActiveTab(null);
   }, [activeTab, categories]);
+
+  // Deep-link from config lookup: /panels?panel=ID
+  useEffect(() => {
+    const raw = searchParams.get("panel");
+    if (!raw || !data.length) return;
+    if (deepLinkDone.current === raw) return;
+    const id = Number(raw);
+    if (!Number.isFinite(id)) return;
+    const p = data.find((x) => x.id === id);
+    if (!p) return;
+    deepLinkDone.current = raw;
+    setActiveTab(p.category_id == null ? null : p.category_id);
+    setSearch(p.name);
+    setHighlightId(p.id);
+    openEdit(p);
+    setSearchParams({}, { replace: true });
+    window.setTimeout(() => {
+      document
+        .getElementById(`panel-card-${p.id}`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 80);
+    // openEdit is stable enough for this mount-time deep link
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data, searchParams, setSearchParams]);
+
+  useEffect(() => {
+    if (highlightId == null) return;
+    const t = window.setTimeout(() => setHighlightId(null), 3500);
+    return () => window.clearTimeout(t);
+  }, [highlightId]);
 
   function resetModal() {
     setOpen(false);
@@ -810,7 +863,31 @@ export default function PanelsPage() {
       </p>
 
       <div className="toolbar">
-        <span className="muted">{toFaDigits(data.length)} پنل</span>
+        <div className="admin-search">
+          <Search size={16} strokeWidth={2} />
+          <input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="جستجوی پنل (نام، آدرس، نوع…)"
+            aria-label="جستجوی پنل"
+            dir="auto"
+          />
+          {!!search.trim() && (
+            <button
+              type="button"
+              className="admin-search-clear"
+              onClick={() => setSearch("")}
+              aria-label="پاک کردن جستجو"
+            >
+              <X size={14} />
+            </button>
+          )}
+        </div>
+        <span className="muted">
+          {searchQ
+            ? `${toFaDigits(visiblePanels.length)} از ${toFaDigits(data.length)} پنل`
+            : `${toFaDigits(data.length)} پنل`}
+        </span>
         <button
           type="button"
           className="btn ghost"
@@ -955,13 +1032,21 @@ export default function PanelsPage() {
         <div className="admin-empty">
           <Server size={36} strokeWidth={1.4} />
           <p>
-            {activeTab == null
-              ? "پنلی بدون دسته نیست"
-              : "در این دسته پنلی نیست"}
+            {searchQ
+              ? "پنلی با این جستجو پیدا نشد"
+              : activeTab == null
+                ? "پنلی بدون دسته نیست"
+                : "در این دسته پنلی نیست"}
           </p>
-          <button className="btn" onClick={openCreate}>
-            افزودن پنل
-          </button>
+          {searchQ ? (
+            <button className="btn ghost" onClick={() => setSearch("")}>
+              پاک کردن جستجو
+            </button>
+          ) : (
+            <button className="btn" onClick={openCreate}>
+              افزودن پنل
+            </button>
+          )}
         </div>
       ) : (
         <div className="admin-grid">
@@ -992,7 +1077,13 @@ export default function PanelsPage() {
                       ? "رمز تنظیم شده"
                       : "رمز ناقص";
             return (
-              <article key={p.id} className={`admin-card ${p.is_active ? "" : "is-off"}`}>
+              <article
+                key={p.id}
+                id={`panel-card-${p.id}`}
+                className={`admin-card${p.is_active ? "" : " is-off"}${
+                  highlightId === p.id ? " is-highlight" : ""
+                }`}
+              >
                 <div className="admin-card-top">
                   <div className="admin-card-id">
                     <b>{p.name}</b>

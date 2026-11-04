@@ -2429,6 +2429,13 @@ button, input, select, textarea { font: inherit; }
   opacity: 0.78;
   border-color: color-mix(in srgb, var(--danger) 28%, var(--line));
 }
+.admin-card.is-highlight,
+.groups-row.is-highlight {
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--line));
+  box-shadow:
+    0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent),
+    var(--shadow);
+}
 .admin-card-top {
   display: flex;
   align-items: flex-start;
@@ -3425,6 +3432,48 @@ th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
   align-items: center;
   justify-content: space-between;
   margin-bottom: 16px;
+}
+.admin-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 220px;
+  min-width: min(100%, 200px);
+  max-width: 420px;
+  min-height: 42px;
+  padding: 0 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--input-bg);
+  color: var(--muted);
+  transition: border-color 0.15s;
+}
+.admin-search:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+}
+.admin-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  padding: 10px 0;
+  outline: none;
+  font-size: 0.9rem;
+}
+.admin-search-clear {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  display: grid;
+  place-items: center;
+  padding: 4px;
+  cursor: pointer;
+  border-radius: 8px;
+}
+.admin-search-clear:hover {
+  color: var(--text);
 }
 .form-grid {
   display: grid;

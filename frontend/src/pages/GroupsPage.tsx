@@ -1,4 +1,5 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowRightLeft,
@@ -220,9 +221,12 @@ function mergeProtocols(prev: string[], next: string[], reseed: boolean): string
 
 export default function GroupsPage() {
   const qc = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [open, setOpen] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [activeTab, setActiveTab] = useState<CatTab>(null);
+  const [highlightId, setHighlightId] = useState<number | null>(null);
+  const deepLinkDone = useRef<string | null>(null);
   const [moveGroup, setMoveGroup] = useState<Group | null>(null);
   const [catModal, setCatModal] = useState<"create" | { edit: GroupCategory } | null>(null);
   const [catName, setCatName] = useState("");
@@ -697,6 +701,34 @@ export default function GroupsPage() {
     setOpen(true);
   }
 
+  // Deep-link from config lookup: /groups?group=ID
+  useEffect(() => {
+    const raw = searchParams.get("group");
+    if (!raw || !groups.length || !panels.length) return;
+    if (deepLinkDone.current === raw) return;
+    const id = Number(raw);
+    if (!Number.isFinite(id)) return;
+    const g = groups.find((x) => x.id === id);
+    if (!g) return;
+    deepLinkDone.current = raw;
+    setActiveTab(g.category_id == null ? null : g.category_id);
+    setHighlightId(g.id);
+    openEdit(g);
+    setSearchParams({}, { replace: true });
+    window.setTimeout(() => {
+      document
+        .getElementById(`group-row-${g.id}`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 80);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groups, panels, searchParams, setSearchParams]);
+
+  useEffect(() => {
+    if (highlightId == null) return;
+    const t = window.setTimeout(() => setHighlightId(null), 3500);
+    return () => window.clearTimeout(t);
+  }, [highlightId]);
+
   function selectionSummary(panel: Panel, pick: PanelPick, cat?: PanelCatalog) {
     if (!cat || cat.loading) return "در حال دریافت…";
     if (cat.error) return "خطا در دریافت";
@@ -834,7 +866,13 @@ export default function GroupsPage() {
       ) : (
         <div className="groups-list">
           {visibleGroups.map((g) => (
-            <article key={g.id} className={`groups-row${g.is_disabled ? " is-off" : ""}`}>
+            <article
+              key={g.id}
+              id={`group-row-${g.id}`}
+              className={`groups-row${g.is_disabled ? " is-off" : ""}${
+                highlightId === g.id ? " is-highlight" : ""
+              }`}
+            >
               <div className="groups-row-main">
                 <div className="groups-row-title">
                   <b>{g.name}</b>
