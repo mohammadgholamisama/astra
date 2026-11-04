@@ -349,12 +349,14 @@ def _ingest_link(
     host, port, match = norm
     key = _fp_key(host, port, match)
     proto, remark, _ = _parse_link_meta(raw)
+    panel_remark = (remark or "").strip() or None
     if key not in out:
         out[key] = {
             "host": host,
             "port": port,
             "match_host": match,
             "label": (label or "").strip() or None,
+            "source_remark": panel_remark,
             "sample_link": raw,
             "protocol": protocol or proto or None,
             "panel_names": [],
@@ -369,6 +371,8 @@ def _ingest_link(
         entry["label"] = str(label).strip() or entry.get("label")
     elif not entry.get("label") and remark:
         entry["label"] = remark.strip() or None
+    if panel_remark and not entry.get("source_remark"):
+        entry["source_remark"] = panel_remark
     if not entry.get("sample_link"):
         entry["sample_link"] = raw
     if not entry.get("protocol") and (protocol or proto):
@@ -412,11 +416,27 @@ def _item_out(
 ) -> ConfigOrderItemOut:
     meta = _endpoint_meta(host, port, match_host)
     s = sample or {}
+    source_remark = (str(s.get("source_remark") or "").strip() or None)
+    # If sample has no stored remark, fall back to parsing the share link
+    if not source_remark:
+        raw_link = str(s.get("sample_link") or "").strip()
+        if raw_link:
+            try:
+                _p, rem, _ = _parse_link_meta(raw_link)
+                source_remark = (rem or "").strip() or None
+            except Exception:  # noqa: BLE001
+                source_remark = None
+    display = (label or "").strip() or None
+    # Prefer showing the real panel remark as the primary title when label is
+    # only a group tag / empty — keep source_remark for the secondary line.
+    if not display and source_remark:
+        display = source_remark
     return ConfigOrderItemOut(
         host=host,
         port=port,
         match_host=match_host,
-        label=label,
+        label=display,
+        source_remark=source_remark,
         sort_order=sort_order,
         in_sample=in_sample,
         sample_link=s.get("sample_link"),

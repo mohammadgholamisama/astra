@@ -690,6 +690,33 @@ def _migrate_group_config_hide_nullable_group_id(connection: Connection) -> list
     return changed
 
 
+def _migrate_group_config_tag_widen(connection: Connection) -> list[str]:
+    """Widen groups.config_tag from VARCHAR(24) → VARCHAR(200) (UI no longer truncates)."""
+    changed: list[str] = []
+    inspector = inspect(connection)
+    if "groups" not in set(inspector.get_table_names()):
+        return changed
+    cols = {c["name"]: c for c in inspector.get_columns("groups")}
+    col = cols.get("config_tag")
+    if not col:
+        return changed
+    dialect = connection.dialect.name
+    try:
+        if dialect == "postgresql":
+            connection.execute(
+                text(
+                    'ALTER TABLE "groups" '
+                    "ALTER COLUMN config_tag TYPE VARCHAR(200)"
+                )
+            )
+            changed.append("groups.config_tag.varchar200")
+            logger.info("Widened groups.config_tag to VARCHAR(200)")
+        # SQLite ignores VARCHAR length — no ALTER needed
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not widen groups.config_tag: %s", exc)
+    return changed
+
+
 def sync_schema_sync(connection: Connection) -> dict[str, Any]:
     import app.models  # noqa: F401
 
@@ -700,11 +727,12 @@ def sync_schema_sync(connection: Connection) -> dict[str, Any]:
     mig2 = _migrate_config_location_match_host(connection)
     mig3 = _migrate_group_config_hide_match_host(connection)
     mig4 = _migrate_group_config_hide_nullable_group_id(connection)
+    mig5 = _migrate_group_config_tag_widen(connection)
     added_idx = _add_missing_indexes(connection)
     return {
         "added_columns": added_cols,
         "added_indexes": added_idx,
-        "migrations": mig + mig2 + mig3 + mig4,
+        "migrations": mig + mig2 + mig3 + mig4 + mig5,
     }
 
 

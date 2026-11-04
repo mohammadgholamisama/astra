@@ -939,7 +939,6 @@ export default function GroupsPage() {
                   value={configTag}
                   onChange={(e) => setConfigTag(e.target.value)}
                   placeholder="مثلاً VIP — خالی = بدون متن اضافه"
-                  maxLength={24}
                 />
                 <p className="field-hint" dir="ltr">
                   {configTag.trim()

@@ -16,7 +16,7 @@ class GroupCreate(BaseModel):
     name: str = Field(min_length=3, max_length=64)
     description: str | None = None
     is_disabled: bool = False
-    config_tag: str = Field(default="", max_length=24)
+    config_tag: str = Field(default="", max_length=200)
     notices: list[str] = Field(default_factory=list, max_length=10)
     # None = default «همه گروه‌ها» bucket
     category_id: int | None = None
@@ -28,7 +28,7 @@ class GroupUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     is_disabled: bool | None = None
-    config_tag: str | None = Field(default=None, max_length=24)
+    config_tag: str | None = Field(default=None, max_length=200)
     notices: list[str] | None = Field(default=None, max_length=10)
     category_id: int | None = None
     # Explicit clear: send true to move group back to «همه گروه‌ها»

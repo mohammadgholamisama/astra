@@ -3702,7 +3702,7 @@ async def heal_failed_panel_accounts_batch(
 
 
 def _normalize_config_tag(raw: object) -> str:
-    return " ".join(str(raw or "").split()).strip()[:24]
+    return " ".join(str(raw or "").split()).strip()[:200]
 
 
 def _link_protocol(link: str) -> str:

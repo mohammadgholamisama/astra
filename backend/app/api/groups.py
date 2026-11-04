@@ -199,7 +199,7 @@ async def _bg_recount_group_users(group_id: int) -> None:
 def _normalize_config_tag(raw: str | None) -> str:
     text = " ".join(str(raw or "").split()).strip()
     text = "".join(ch for ch in text if ord(ch) >= 32 and ch not in "<>\"'`")
-    return text[:24]
+    return text[:200]
 
 
 def _normalize_category_name(raw: str | None) -> str:

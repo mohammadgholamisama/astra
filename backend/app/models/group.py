@@ -27,8 +27,8 @@ class Group(Base):
     name: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_disabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    # Optional short tag in real config remarks: ``#1. TAG 2.5G | name`` (empty = omitted)
-    config_tag: Mapped[str | None] = mapped_column(String(24), nullable=True, default="")
+    # Optional text in real config remarks: ``#1. TAG 2.5G | name`` (empty = omitted)
+    config_tag: Mapped[str | None] = mapped_column(String(200), nullable=True, default="")
     # Optional info messages → fake configs prepended to subscription (first in list)
     notices: Mapped[list | None] = mapped_column(JSONType, nullable=True, default=list)
     # NULL = default bucket «همه گروه‌ها» on the Groups page

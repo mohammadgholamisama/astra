@@ -23,6 +23,8 @@ type OrderItem = {
   port: number;
   match_host: string;
   label: string | null;
+  /** Original remark from upstream panel share-link */
+  source_remark?: string | null;
   sort_order: number;
   in_sample: boolean;
   sample_link: string | null;
@@ -503,6 +505,7 @@ export default function ConfigOrderPage() {
           String(it.port),
           it.match_host || "",
           it.label || "",
+          it.source_remark || "",
           it.protocol || "",
           ...(it.panel_names || []),
           ...(it.group_names || []),
@@ -715,8 +718,10 @@ export default function ConfigOrderPage() {
                 </span>
                 <div className="config-order-body">
                   <div className="config-order-title">
-                    {it.label ? (
-                      <strong className="config-order-label">{it.label}</strong>
+                    {it.label || it.source_remark ? (
+                      <strong className="config-order-label">
+                        {it.label || it.source_remark}
+                      </strong>
                     ) : null}
                     {it.protocol ? (
                       <span className="badge muted">{it.protocol}</span>
@@ -730,6 +735,18 @@ export default function ConfigOrderPage() {
                       <span className="badge warn">دیگر در نمونه نیست</span>
                     ) : null}
                   </div>
+                  {it.source_remark &&
+                  (it.source_remark || "").trim() !== (it.label || "").trim() ? (
+                    <div
+                      className="config-order-real-name"
+                      title="نام واقعی از پنل اصلی"
+                    >
+                      <span className="config-order-real-k">نام پنل</span>
+                      <span className="config-order-real-v" dir="auto">
+                        {it.source_remark}
+                      </span>
+                    </div>
+                  ) : null}
                   <div className="config-order-fp" dir="ltr">
                     <div className="config-order-fp-cell">
                       <span className="config-order-fp-k">دامنه</span>

@@ -7891,6 +7891,31 @@ html[dir="rtl"] .configs-switch input:checked + .configs-switch-track::after,
   font-size: 0.98rem;
   font-weight: 740;
 }
+.config-order-real-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 10px;
+  margin-top: 2px;
+  font-size: 0.8rem;
+  color: color-mix(in srgb, var(--muted) 88%, var(--text));
+}
+.config-order-real-k {
+  font-size: 0.68rem;
+  font-weight: 720;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+.config-order-real-v {
+  font-weight: 650;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 100%;
+}
 .config-order-fp {
   display: grid;
   grid-template-columns: minmax(0, 1.6fr) minmax(72px, 0.45fr) minmax(0, 1.4fr);

@@ -13,6 +13,8 @@ class ConfigOrderItemOut(BaseModel):
     port: int
     match_host: str = ""
     label: str | None = None
+    # Original remark from the upstream panel share-link (for admin UI)
+    source_remark: str | None = None
     sort_order: int = 0
     in_sample: bool = True
     sample_link: str | None = None
