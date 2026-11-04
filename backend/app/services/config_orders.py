@@ -729,7 +729,10 @@ async def apply_ping_rank(
     - Remaining successful by cost then quality; untested stay after
     """
     from app.services.config_hides import clear_stale_ping_auto_hides_once
-    from app.services.ping_category_order import arrange_by_category_slots
+    from app.services.ping_category_order import (
+        SUB_MAX_CONFIGS,
+        arrange_by_category_slots,
+    )
 
     # Never call set_hidden(True) here. One-shot undo of old auto-hide damage.
     await clear_stale_ping_auto_hides_once(db)
@@ -875,7 +878,8 @@ async def apply_ping_rank(
         or "",
         cost_of=lambda it: getattr(it, "usage_cost", None),
     )
-    ordered = list(arranged) + unscored_rows
+    # Keep only the top SUB_MAX_CONFIGS after category/cost layout — same cap as user sub
+    ordered = (list(arranged) + unscored_rows)[: int(SUB_MAX_CONFIGS)]
 
     payload: list[ConfigOrderItemIn] = []
     for it in ordered:

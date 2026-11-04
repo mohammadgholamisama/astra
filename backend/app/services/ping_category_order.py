@@ -19,6 +19,8 @@ T = TypeVar("T")
 DIRECT_SLOT = 20
 TUNNEL_PER_COST = 35
 GAMING_SLOT = 9
+# Hard cap for user subscription (and post-test saved order)
+SUB_MAX_CONFIGS = 99
 
 _GAMING = re.compile(r"گیمینگ|gaming|\bgame\b|گیم\b", re.I)
 _TUNNEL = re.compile(r"تانل|تونل|tunnel", re.I)

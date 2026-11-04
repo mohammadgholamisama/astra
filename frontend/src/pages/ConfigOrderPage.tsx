@@ -682,7 +682,8 @@ export default function ConfigOrderPage() {
             شمارهٔ <strong>#</strong> همان شمارهٔ صفحهٔ ساب است. چیدمان خودکار تست‌ها:{" "}
             <strong>۲۰ مستقیم</strong> → <strong>۳۵ تانل</strong> به‌ازای هر هزینه
             مصرف (کم به زیاد، مثل ۵ بعد ۷) → <strong>۹ گیمینگ</strong>؛ داخل هر بخش
-            اول هزینه کمتر، بعد سریع‌ترها بالاتر می‌آیند.
+            اول هزینه کمتر، بعد سریع‌ترها. در نهایت حداکثر{" "}
+            <strong>۹۹ کانفیگ</strong> در ساب کاربر می‌ماند.
           </p>
         </div>
         <div className="config-order-hero-actions">

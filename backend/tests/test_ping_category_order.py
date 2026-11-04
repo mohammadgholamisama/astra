@@ -1,6 +1,10 @@
 """Slot layout: 20 direct → tunnel cost tiers ×35 → 9 gaming."""
 
-from app.services.ping_category_order import arrange_by_category_slots, detect_category
+from app.services.ping_category_order import (
+    SUB_MAX_CONFIGS,
+    arrange_by_category_slots,
+    detect_category,
+)
 
 
 def _row(label: str, ping: float, *, cat: str = "", cost=None, dl: float = 0):
@@ -71,3 +75,7 @@ def test_layout_slots_and_cost_tiers():
     g = out[90:99]
     assert len(g) == 9
     assert all(detect_category(x["category_name"]) == "gaming" for x in g)
+
+    capped = out[:SUB_MAX_CONFIGS]
+    assert len(capped) == SUB_MAX_CONFIGS
+    assert SUB_MAX_CONFIGS == 99

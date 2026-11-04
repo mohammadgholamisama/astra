@@ -4467,6 +4467,16 @@ async def collect_links_detailed(
                 prev["group_id"] = row.get("group_id")
     rows = list(by_fp.values()) + no_fp
 
+    # After global order + dedupe: never send more than SUB_MAX_CONFIGS real configs
+    try:
+        from app.services.ping_category_order import SUB_MAX_CONFIGS
+
+        max_n = int(SUB_MAX_CONFIGS)
+    except Exception:  # noqa: BLE001
+        max_n = 99
+    if max_n > 0 and len(rows) > max_n:
+        rows = rows[:max_n]
+
     renamed = apply_display_name(
         rows,
         getattr(user, "display_name", None),
