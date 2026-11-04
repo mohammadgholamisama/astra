@@ -32,6 +32,12 @@ def _default_sql_for_not_null(connection: Connection, column) -> str | None:
         arg = column.server_default.arg
         if hasattr(arg, "text"):
             return f"DEFAULT {arg.text}"
+        # Quote bare string literals so ALTER … DEFAULT other does not break SQL
+        if isinstance(arg, str):
+            if arg.upper() in ("TRUE", "FALSE", "NULL") or arg[:1] in "'\"":
+                return f"DEFAULT {arg}"
+            safe = arg.replace("'", "''")
+            return f"DEFAULT '{safe}'"
         return f"DEFAULT {arg}"
 
     type_sql = _compile_type(connection, column).lower()
@@ -717,11 +723,58 @@ def _migrate_group_config_tag_widen(connection: Connection) -> list[str]:
     return changed
 
 
+def _migrate_group_order_kind(connection: Connection) -> list[str]:
+    """Ensure groups.order_kind exists with a safe DEFAULT 'other'."""
+    changed: list[str] = []
+    inspector = inspect(connection)
+    if "groups" not in set(inspector.get_table_names()):
+        return changed
+    cols = {c["name"] for c in inspector.get_columns("groups")}
+    if "order_kind" in cols:
+        # Backfill nulls if a previous broken migration left NULLs
+        try:
+            connection.execute(
+                text(
+                    "UPDATE groups SET order_kind = 'other' "
+                    "WHERE order_kind IS NULL OR TRIM(order_kind) = ''"
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("order_kind backfill skipped: %s", exc)
+        return changed
+    dialect = connection.dialect.name
+    try:
+        if dialect == "postgresql":
+            connection.execute(
+                text(
+                    'ALTER TABLE "groups" '
+                    "ADD COLUMN order_kind VARCHAR(16) NOT NULL DEFAULT 'other'"
+                )
+            )
+        else:
+            connection.execute(
+                text(
+                    'ALTER TABLE "groups" '
+                    "ADD COLUMN order_kind VARCHAR(16) NOT NULL DEFAULT 'other'"
+                )
+            )
+        changed.append("groups.order_kind")
+        logger.info("Added groups.order_kind DEFAULT 'other'")
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc).lower()
+        if "duplicate" in msg or "already exists" in msg:
+            return changed
+        logger.warning("Could not add groups.order_kind: %s", exc)
+    return changed
+
+
 def sync_schema_sync(connection: Connection) -> dict[str, Any]:
     import app.models  # noqa: F401
 
     _ensure_enum_types(connection)
     Base.metadata.create_all(bind=connection)
+    # order_kind first with quoted DEFAULT — generic ADD used to emit DEFAULT other (SQL error)
+    mig6 = _migrate_group_order_kind(connection)
     added_cols = _add_missing_columns(connection)
     mig = _migrate_panel_account_group_unique(connection)
     mig2 = _migrate_config_location_match_host(connection)
@@ -732,7 +785,7 @@ def sync_schema_sync(connection: Connection) -> dict[str, Any]:
     return {
         "added_columns": added_cols,
         "added_indexes": added_idx,
-        "migrations": mig + mig2 + mig3 + mig4 + mig5,
+        "migrations": mig6 + mig + mig2 + mig3 + mig4 + mig5,
     }
 
 

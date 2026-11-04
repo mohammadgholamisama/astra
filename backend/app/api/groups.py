@@ -252,7 +252,9 @@ def _to_out(group: Group) -> GroupOut:
         is_disabled=group.is_disabled,
         config_tag=_normalize_config_tag(getattr(group, "config_tag", None) or ""),
         usage_cost=cost_out,
-        order_kind=_normalize_order_kind(getattr(group, "order_kind", None) or "other"),
+        order_kind=_normalize_order_kind(
+            getattr(group, "order_kind", None) or "other"
+        ),
         notices=list(group.notices or []),
         category_id=getattr(group, "category_id", None),
         inbound_tags=[],

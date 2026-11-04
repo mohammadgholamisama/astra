@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -33,8 +33,12 @@ class Group(Base):
     usage_cost: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     # Explicit sub-order bucket set by admin (never inferred from config remark):
     # direct | tunnel | gaming | other
+    # server_default MUST be quoted SQL text — bare "other" breaks ALTER TABLE
     order_kind: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="other", server_default="other"
+        String(16),
+        nullable=False,
+        default="other",
+        server_default=text("'other'"),
     )
     # Optional info messages → fake configs prepended to subscription (first in list)
     notices: Mapped[list | None] = mapped_column(JSONType, nullable=True, default=list)

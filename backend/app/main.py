@@ -191,12 +191,15 @@ async def lifespan(_app: FastAPI):
         )
 
         await clear_stale_ping_auto_hides_once(db)
+    # Never block panel boot on order seed/relayout — site must serve data first
+    async def _bg_order_kind_boot() -> None:
         try:
-            await seed_order_kind_from_folders_once(db)
-            # Re-layout with group.order_kind (no remark guessing)
-            await relayout_order_slots_once(db)
+            async with AsyncSessionLocal() as s:
+                await seed_order_kind_from_folders_once(s)
+                await relayout_order_slots_once(s)
         except Exception:  # noqa: BLE001
-            pass
+            logging.getLogger("astra").exception("order_kind boot task failed")
+
     usage_task = asyncio.create_task(_usage_sync_loop(), name="astra-usage-sync")
     heal_task = asyncio.create_task(
         _heal_failed_panels_loop(), name="astra-heal-panels"
@@ -204,13 +207,17 @@ async def lifespan(_app: FastAPI):
     outbound_task = asyncio.create_task(
         _outbound_health_loop(), name="astra-outbound-health"
     )
+    order_boot_task = asyncio.create_task(
+        _bg_order_kind_boot(), name="astra-order-kind-boot"
+    )
     try:
         yield
     finally:
         usage_task.cancel()
         heal_task.cancel()
         outbound_task.cancel()
-        for task in (usage_task, heal_task, outbound_task):
+        order_boot_task.cancel()
+        for task in (usage_task, heal_task, outbound_task, order_boot_task):
             try:
                 await task
             except asyncio.CancelledError:
