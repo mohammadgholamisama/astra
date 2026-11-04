@@ -902,8 +902,17 @@ async def retry_all_errors(
 
     Unreachable panels are probed once and skipped (errors stay). Recovered
     panels clear their user errors. Remaining failures stay on the Users page.
+    Also recreates missing group×panel slots lost during panel outages.
     """
     stats = await orchestrator.retry_all_failed_accounts(db)
+    try:
+        healed = await orchestrator.heal_users_missing_panel_accounts(
+            limit_users=40
+        )
+        if isinstance(stats, dict):
+            stats["healed_coverage"] = int(healed or 0)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         await db.commit()
     except Exception:  # noqa: BLE001
@@ -1071,7 +1080,7 @@ async def list_users(
     if missing:
         try:
             asyncio.create_task(
-                orchestrator.heal_users_missing_panel_accounts(limit_users=12),
+                orchestrator.heal_users_missing_panel_accounts(limit_users=20),
                 name="astra-heal-missing-on-list",
             )
         except Exception:  # noqa: BLE001

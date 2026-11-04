@@ -155,15 +155,14 @@ async def _user_sub_links_complete(db: AsyncSession, user) -> bool:
     for pid, gid in expected:
         account = by_key.get((pid, int(gid))) or legacy_by_panel.get(pid)
         if account is None:
-            # Missing provision — don't block forever; bg maintain will create.
-            continue
+            return False  # missing provision — bg maintain must create
         if not _account_has_ready_shares(account):
             return False
     return True
 
 
 async def _bg_sub_maintain(user_id: int) -> None:
-    """Fill missing share links + soft usage refresh — never on the HTTP path."""
+    """Fill missing remotes/share links + soft usage refresh — never on the HTTP path."""
     now = time.monotonic()
     last = _bg_last.get(user_id, 0.0)
     if now - last < _BG_MIN_INTERVAL:
@@ -185,19 +184,28 @@ async def _bg_sub_maintain(user_id: int) -> None:
             user = result.scalar_one_or_none()
             if not user:
                 return
-            if _user_has_share_links(user):
-                return
-            try:
-                await asyncio.wait_for(hydrate_share_links(db, user), timeout=12.0)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("bg hydrate user_id=%s: %s", user_id, exc)
+            from app.models.user import UserStatus
+            from app.services.orchestrator import heal_user_coverage
+
+            complete = await _user_sub_links_complete(db, user)
+            if not complete:
+                try:
+                    # Recreate missing group×panel slots (post-outage recovery)
+                    await asyncio.wait_for(
+                        heal_user_coverage(db, user, wait=14.0),
+                        timeout=20.0,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("bg heal user_id=%s: %s", user_id, exc)
+                try:
+                    await asyncio.wait_for(hydrate_share_links(db, user), timeout=12.0)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("bg hydrate user_id=%s: %s", user_id, exc)
             try:
                 # Do not pull every remote on /sub — that stalls the tunnel (502).
                 # Quota watch already recounts usage every few seconds.
                 activated = await activate_on_hold_if_used(db, user)
                 changed = bool(activated) or await enforce_user_quota(db, user)
-                from app.models.user import UserStatus
-
                 blocked = user.status in (
                     UserStatus.limited,
                     UserStatus.expired,
@@ -206,7 +214,12 @@ async def _bg_sub_maintain(user_id: int) -> None:
                 if changed or blocked:
                     # Freeze remotes immediately when sub client hits the limit
                     await asyncio.wait_for(
-                        sync_modify_user(db, user, skip_nginx_sync=True),
+                        sync_modify_user(
+                            db,
+                            user,
+                            skip_nginx_sync=True,
+                            freeze_fast=True,
+                        ),
                         timeout=12.0,
                     )
             except Exception as exc:  # noqa: BLE001
@@ -631,8 +644,17 @@ async def get_subscription(
         if user.status not in (UserStatus.active, UserStatus.on_hold):
             return _feed_response(b"", headers)
 
+        # Recover missing group×panel remotes after panel outages (non-blocking)
+        try:
+            complete = await _user_sub_links_complete(db, user)
+        except Exception:  # noqa: BLE001
+            complete = True
+        if not complete:
+            _schedule_bg_maintain(int(user.id))
+
         cached = _feed_cache_get(int(user.id), include_hidden)
-        if cached is not None:
+        # Only serve cache when coverage is complete — else stale partial sub sticks
+        if cached is not None and complete:
             return _feed_response(cached, headers)
 
         # Tunnel nginx 502s if this handler is slow or cancelled. DB links only.
@@ -662,7 +684,7 @@ async def get_subscription(
                 token[:8],
                 real_n,
             )
-        else:
+        elif complete:
             _feed_cache_put(int(user.id), include_hidden, body)
 
         return _feed_response(body, headers)

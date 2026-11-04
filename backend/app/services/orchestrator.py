@@ -1522,43 +1522,179 @@ async def provision_users_now(
     return {"ok": ok, "err": err, "down": 0, "pending": pending}
 
 
+async def user_coverage_gaps(
+    db: AsyncSession,
+    user: User,
+    *,
+    include_empty_links: bool = True,
+) -> list[tuple[Panel, dict, int]]:
+    """Return (panel, cfg, group_id) slots the user should have but is missing live.
+
+    Always covers missing/deleted rows. With ``include_empty_links`` also
+    error/pending/active rows that have no share links (post-outage recovery).
+    """
+    from app.adapters.http_utils import is_share_link
+
+    gids = [int(g.id) for g in (user.groups or []) if getattr(g, "id", None)]
+    if not gids:
+        ug = await db.execute(
+            select(UserGroup.group_id).where(UserGroup.user_id == user.id)
+        )
+        gids = [int(r[0]) for r in ug.all() if r[0] is not None]
+    if not gids:
+        return []
+    targets = await resolve_panels_for_groups(db, gids)
+    if not targets:
+        return []
+
+    # Ensure accounts are loaded
+    if not hasattr(user, "panel_accounts") or user.panel_accounts is None:
+        acc_q = await db.execute(
+            select(PanelAccount).where(PanelAccount.user_id == user.id)
+        )
+        user.panel_accounts = list(acc_q.scalars().all())
+
+    by_key: dict[tuple[int, int], PanelAccount] = {}
+    legacy: dict[int, PanelAccount] = {}
+    for a in user.panel_accounts or []:
+        gid = int(getattr(a, "group_id", 0) or 0)
+        if gid:
+            by_key[(int(a.panel_id), gid)] = a
+        else:
+            legacy[int(a.panel_id)] = a
+
+    gaps: list[tuple[Panel, dict, int]] = []
+    for panel, cfg, gid in targets:
+        key = (int(panel.id), int(gid))
+        acc = by_key.get(key) or legacy.get(int(panel.id))
+        if acc is None or acc.status == PanelAccountStatus.deleted:
+            gaps.append((panel, cfg, int(gid)))
+            continue
+        if not include_empty_links:
+            continue
+        shares = [
+            str(x).strip()
+            for x in (acc.links or [])
+            if x and is_share_link(str(x))
+        ]
+        if not shares and acc.status in (
+            PanelAccountStatus.error,
+            PanelAccountStatus.pending,
+            PanelAccountStatus.active,
+        ):
+            # Active-with-empty often means wipe/failure during outage
+            if acc.status == PanelAccountStatus.active:
+                acc.status = PanelAccountStatus.pending
+                acc.error_message = None
+            gaps.append((panel, cfg, int(gid)))
+    return gaps
+
+
+async def heal_user_coverage(
+    db: AsyncSession,
+    user: User,
+    *,
+    wait: float = 12.0,
+    include_empty_links: bool = True,
+) -> int:
+    """Provision every missing group×panel slot for one user; freeze if limited."""
+    gaps = await user_coverage_gaps(
+        db, user, include_empty_links=include_empty_links
+    )
+    if not gaps:
+        return 0
+    # Full target set (not only gaps) so ensure_pending + revive deleted works
+    gids = [int(g.id) for g in (user.groups or []) if getattr(g, "id", None)]
+    if not gids:
+        ug = await db.execute(
+            select(UserGroup.group_id).where(UserGroup.user_id == user.id)
+        )
+        gids = [int(r[0]) for r in ug.all() if r[0] is not None]
+    panels = await resolve_panels_for_groups(db, gids)
+    if not panels:
+        return 0
+    await provision_users_now(db, [user], panels, wait=wait)
+    try:
+        await hydrate_share_links(db, user)
+    except Exception:  # noqa: BLE001
+        logger.debug("heal hydrate user=%s failed", user.username, exc_info=True)
+    # Quota is owned by Astra — if already exhausted, cut remotes immediately
+    if user.status in (
+        UserStatus.limited,
+        UserStatus.expired,
+        UserStatus.disabled,
+    ):
+        try:
+            await sync_modify_user(
+                db,
+                user,
+                skip_nginx_sync=True,
+                freeze_fast=True,
+                remote_timeout=8,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "heal freeze user=%s failed", user.username, exc_info=True
+            )
+    logger.info(
+        "healed coverage user=%s gaps=%s targets=%s status=%s",
+        user.username,
+        len(gaps),
+        len(panels),
+        getattr(user.status, "value", user.status),
+    )
+    return len(gaps)
+
+
 async def heal_users_missing_panel_accounts(*, limit_users: int = 20) -> int:
-    """Users that have groups but zero live PanelAccount rows — recreate remotes."""
+    """Heal users with zero OR partial panel coverage (missing group×panel slots)."""
     from app.core.database import AsyncSessionLocal
 
-    live = (
-        select(PanelAccount.user_id)
-        .where(PanelAccount.status != PanelAccountStatus.deleted)
-        .distinct()
-    )
     n = 0
     try:
         async with AsyncSessionLocal() as db:
+            # Prefer users that still have groups (buyers), newest first
             result = await db.execute(
                 select(User)
                 .join(UserGroup, UserGroup.user_id == User.id)
-                .where(User.id.notin_(live))
-                .options(selectinload(User.groups))
+                .where(
+                    User.status.in_(
+                        (
+                            UserStatus.active,
+                            UserStatus.on_hold,
+                            UserStatus.limited,
+                            UserStatus.expired,
+                        )
+                    )
+                )
+                .options(
+                    selectinload(User.groups),
+                    selectinload(User.panel_accounts).selectinload(PanelAccount.panel),
+                )
                 .distinct()
                 .order_by(User.id.desc())
-                .limit(max(1, int(limit_users)))
+                .limit(max(40, int(limit_users) * 4))
             )
-            users = list(result.scalars().unique().all())
-            for user in users:
-                gids = [int(g.id) for g in (user.groups or []) if getattr(g, "id", None)]
-                if not gids:
-                    continue
-                panels = await resolve_panels_for_groups(db, gids)
-                if not panels:
-                    continue
-                await provision_users_now(db, [user], panels, wait=10.0)
-                n += 1
-                logger.info(
-                    "healed missing accounts user=%s groups=%s targets=%s",
-                    user.username,
-                    len(gids),
-                    len(panels),
+            candidates = list(result.scalars().unique().all())
+            for user in candidates:
+                if n >= max(1, int(limit_users)):
+                    break
+                # Watch cycle: only missing/deleted slots (cheap). Empty-link
+                # recovery runs via /sub maintain + admin retry-errors.
+                gaps = await user_coverage_gaps(
+                    db, user, include_empty_links=False
                 )
+                if not gaps:
+                    continue
+                healed = await heal_user_coverage(
+                    db, user, wait=10.0, include_empty_links=False
+                )
+                if healed:
+                    n += 1
+            try:
+                await db.commit()
+            except Exception:  # noqa: BLE001
+                await db.rollback()
     except Exception:  # noqa: BLE001
         logger.exception("heal missing panel accounts failed")
     return n
@@ -5479,7 +5615,8 @@ async def run_quota_watch_cycle() -> dict[str, int]:
 
     t0 = time.monotonic()
     try:
-        await heal_users_missing_panel_accounts(limit_users=8)
+        # Partial coverage too (not only zero-account users) after panel outages
+        await heal_users_missing_panel_accounts(limit_users=12)
     except Exception:  # noqa: BLE001
         logger.debug("quota-watch missing-account heal skipped", exc_info=True)
 

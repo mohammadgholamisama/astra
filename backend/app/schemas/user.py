@@ -151,3 +151,4 @@ class UserRetryErrorsResponse(BaseModel):
     panels_down: list[str] = Field(default_factory=list)
     users_recovered: int = 0
     users_remaining: int = 0
+    healed_coverage: int = 0
