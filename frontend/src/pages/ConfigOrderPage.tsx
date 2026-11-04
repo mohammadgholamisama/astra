@@ -680,10 +680,10 @@ export default function ConfigOrderPage() {
           <h1 className="page-title">ترتیب کانفیگ‌ها</h1>
           <p className="page-sub">
             شمارهٔ <strong>#</strong> همان شمارهٔ صفحهٔ ساب است. چیدمان خودکار تست‌ها:{" "}
-            <strong>۲۰ مستقیم</strong> → <strong>۳۵ تانل</strong> به‌ازای هر هزینه
-            مصرف (کم به زیاد، مثل ۵ بعد ۷) → <strong>۹ گیمینگ</strong>؛ داخل هر بخش
-            اول هزینه کمتر، بعد سریع‌ترها. در نهایت حداکثر{" "}
-            <strong>۹۹ کانفیگ</strong> در ساب کاربر می‌ماند.
+            <strong>۲۰ مستقیم</strong> → <strong>۳۵ تانل گیگی۵</strong> →{" "}
+            <strong>۳۵ تانل گیگی۷</strong> → <strong>۹ گیمینگ</strong>؛ داخل هر بخش
+            اول هزینه کمتر، بعد سریع‌ترها. ساب کاربر حداکثر{" "}
+            <strong>۹۹</strong> تا؛ اپ تست با probe همه را می‌گیرد.
           </p>
         </div>
         <div className="config-order-hero-actions">

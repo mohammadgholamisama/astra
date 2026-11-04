@@ -6,6 +6,9 @@ export type ConfigCategory = 'direct' | 'tunnel' | 'gaming' | 'other';
 export const DIRECT_SLOT = 20;
 export const TUNNEL_PER_COST = 35;
 export const GAMING_SLOT = 9;
+export const SUB_MAX_CONFIGS = 99;
+/** Tunnel window before gaming so 20 + 70 + 9 = 99 */
+export const TUNNEL_BUDGET = SUB_MAX_CONFIGS - DIRECT_SLOT - GAMING_SLOT; // 70
 
 export function detectConfigCategory(remark: string | null | undefined): ConfigCategory {
   const t = String(remark || '').toLowerCase();
@@ -92,7 +95,7 @@ function resolveCat(it: Rankable): ConfigCategory {
 /**
  * Arrange successful rows:
  *   20 مستقیم (cost↑ then quality) →
- *   تانل per usage_cost↑ up to 35 each →
+ *   تانل per usage_cost↑ up to 35 each, total ≤ TUNNEL_BUDGET (70) →
  *   9 گیمینگ → leftover by cost/quality.
  * Failures/untested stay at the end.
  */
@@ -132,21 +135,24 @@ export function arrangeByCategorySlots<T extends Rankable>(items: T[]): T[] {
     picked.add(it);
   }
 
-  // Tunnel tiers by ascending usage_cost
+  // Tunnel tiers by ascending usage_cost — stop at TUNNEL_BUDGET so gaming fits
   let i = 0;
+  let tunnelTaken = 0;
   const tunnel = buckets.tunnel;
-  while (i < tunnel.length) {
-    const cost = costKey(tunnel[i]);
+  while (i < tunnel.length && tunnelTaken < TUNNEL_BUDGET) {
+    const cost = costKey(tunnel[i]!);
     let j = i;
-    while (j < tunnel.length && costKey(tunnel[j]) === cost) j += 1;
+    while (j < tunnel.length && costKey(tunnel[j]!) === cost) j += 1;
     const tier = tunnel.slice(i, j);
     let taken = 0;
     for (const it of tier) {
+      if (tunnelTaken >= TUNNEL_BUDGET) break;
       if (taken >= TUNNEL_PER_COST) break;
       if (picked.has(it)) continue;
       head.push(it);
       picked.add(it);
       taken += 1;
+      tunnelTaken += 1;
     }
     i = j;
   }

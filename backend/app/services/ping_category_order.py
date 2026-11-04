@@ -2,7 +2,9 @@
 
 Layout (successful / scored configs first):
   1) up to 20 مستقیم — sorted by usage_cost↑ then quality
-  2) for each tunnel usage_cost ascending: up to 35 (e.g. گیگ ۵ سپس گیگ ۷)
+  2) تانل — ascending usage_cost, up to 35 per cost, within a
+     fixed tunnel budget so gaming always fits before leftover
+     (budget = SUB_MAX − 20 − 9 = 70 → e.g. گیگ ۵ سپس گیگ ۷)
   3) up to 9 گیمینگ — sorted by usage_cost↑ then quality
   4) leftover successful by cost then quality
   5) unscored / failed keep relative order at the end
@@ -19,8 +21,10 @@ T = TypeVar("T")
 DIRECT_SLOT = 20
 TUNNEL_PER_COST = 35
 GAMING_SLOT = 9
-# Hard cap for user subscription (and post-test saved order)
+# Hard cap for normal user subscription feed (probe/app gets uncapped)
 SUB_MAX_CONFIGS = 99
+# Tunnel window before gaming so 20 + 70 + 9 = 99
+TUNNEL_BUDGET = SUB_MAX_CONFIGS - DIRECT_SLOT - GAMING_SLOT  # 70
 
 _GAMING = re.compile(r"گیمینگ|gaming|\bgame\b|گیم\b", re.I)
 _TUNNEL = re.compile(r"تانل|تونل|tunnel", re.I)
@@ -62,8 +66,13 @@ def arrange_by_category_slots(
     direct_slot: int = DIRECT_SLOT,
     tunnel_per_cost: int = TUNNEL_PER_COST,
     gaming_slot: int = GAMING_SLOT,
+    tunnel_budget: int | None = TUNNEL_BUDGET,
 ) -> list[T]:
-    """Sort successful items into category/cost slots then leftover by quality."""
+    """Sort successful items into category/cost slots then leftover by quality.
+
+    Tunnel tiers never push gaming out of the priority head: total tunnels
+    taken before gaming is capped by ``tunnel_budget`` (default 70).
+    """
 
     def _num(call: Callable[[T], Any] | None, it: T, default: float = 0.0) -> float:
         if call is None:
@@ -157,12 +166,22 @@ def arrange_by_category_slots(
         head.append(it)
         picked.add(id(it))
 
-    # 2) تانل — each usage_cost tier gets up to tunnel_per_cost (ascending cost)
+    # 2) تانل — each usage_cost tier ≤ tunnel_per_cost, total ≤ tunnel_budget
+    budget = (
+        10**9
+        if tunnel_budget is None
+        else max(0, int(tunnel_budget))
+    )
+    tunnel_taken = 0
     tunnel = buckets["tunnel"]
     for _cost_val, group in groupby(tunnel, key=_cost):
+        if tunnel_taken >= budget:
+            break
         tier = list(group)
         taken = 0
         for it in tier:
+            if tunnel_taken >= budget:
+                break
             if taken >= int(tunnel_per_cost):
                 break
             if id(it) in picked:
@@ -170,8 +189,9 @@ def arrange_by_category_slots(
             head.append(it)
             picked.add(id(it))
             taken += 1
+            tunnel_taken += 1
 
-    # 3) گیمینگ — up to N
+    # 3) گیمینگ — up to N (always before leftover / extra tunnel tiers)
     for it in buckets["gaming"][: max(0, int(gaming_slot))]:
         if id(it) in picked:
             continue

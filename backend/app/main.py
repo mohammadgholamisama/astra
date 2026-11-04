@@ -185,8 +185,14 @@ async def lifespan(_app: FastAPI):
         await refresh_config_orders(db)
         # Undo mass hides from older ping-rank bug (once per install)
         from app.services.config_hides import clear_stale_ping_auto_hides_once
+        from app.services.config_orders import relayout_order_slots_once
 
         await clear_stale_ping_auto_hides_once(db)
+        try:
+            # Fix 20/35/35/9 layout (tunnel budget) once after 1.9.154
+            await relayout_order_slots_once(db)
+        except Exception:  # noqa: BLE001
+            pass
     usage_task = asyncio.create_task(_usage_sync_loop(), name="astra-usage-sync")
     heal_task = asyncio.create_task(
         _heal_failed_panels_loop(), name="astra-heal-panels"

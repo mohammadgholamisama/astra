@@ -729,10 +729,7 @@ async def apply_ping_rank(
     - Remaining successful by cost then quality; untested stay after
     """
     from app.services.config_hides import clear_stale_ping_auto_hides_once
-    from app.services.ping_category_order import (
-        SUB_MAX_CONFIGS,
-        arrange_by_category_slots,
-    )
+    from app.services.ping_category_order import arrange_by_category_slots
 
     # Never call set_hidden(True) here. One-shot undo of old auto-hide damage.
     await clear_stale_ping_auto_hides_once(db)
@@ -878,8 +875,9 @@ async def apply_ping_rank(
         or "",
         cost_of=lambda it: getattr(it, "usage_cost", None),
     )
-    # Keep only the top SUB_MAX_CONFIGS after category/cost layout — same cap as user sub
-    ordered = (list(arranged) + unscored_rows)[: int(SUB_MAX_CONFIGS)]
+    # Full order: 20 direct → ≤70 tunnel (35/cost) → 9 gaming → leftover.
+    # User sub caps at SUB_MAX in collect_links; probe/app gets everything.
+    ordered = list(arranged) + unscored_rows
 
     payload: list[ConfigOrderItemIn] = []
     for it in ordered:
@@ -923,6 +921,140 @@ async def apply_ping_rank(
     await db.commit()
     await refresh_cache(db)
     return await list_workspace(db)
+
+
+async def relayout_order_slots_once(db: AsyncSession) -> int:
+    """One-shot: re-apply 20/35×cost/9 layout using stored pings + group cost/cat.
+
+    Flag: ``data/relayout_slots_v154``. Fixes orders saved before tunnel-budget
+    (extra cost tiers pushed gaming out of the top 99).
+    """
+    from pathlib import Path
+
+    from app.services.ping_category_order import arrange_by_category_slots
+
+    # Same data root as config_hides one-shot flags (repo /opt/astra data/)
+    data_dir = Path(__file__).resolve().parents[3] / "data"
+    flag = data_dir / "relayout_slots_v154"
+    if flag.exists():
+        return 0
+
+    try:
+        workspace = await list_workspace(db)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("relayout_slots_v154 list failed: %s", exc)
+        return 0
+    current = list(workspace.items)
+    if not current:
+        try:
+            data_dir.mkdir(parents=True, exist_ok=True)
+            flag.write_text("empty\n", encoding="utf-8")
+        except OSError:
+            pass
+        return 0
+
+    scored: list[ConfigOrderItemOut] = []
+    unscored: list[ConfigOrderItemOut] = []
+    for it in current:
+        avg = getattr(it, "avg_ping", None)
+        try:
+            avg_f = float(avg) if avg is not None else -1.0
+        except (TypeError, ValueError):
+            avg_f = -1.0
+        if avg_f > 0:
+            scored.append(it)
+        else:
+            unscored.append(it)
+
+    if not scored:
+        try:
+            data_dir.mkdir(parents=True, exist_ok=True)
+            flag.write_text("no-scores\n", encoding="utf-8")
+        except OSError:
+            pass
+        return 0
+
+    # Preserve previous avg_ping / device_count across save_order wipe
+    ping_by_key: dict[tuple[str, int, str], tuple[float, int | None]] = {}
+    for it in current:
+        try:
+            key = _fp_key(
+                normalize_host(it.host),
+                int(it.port),
+                normalize_match_host(it.match_host or ""),
+            )
+        except (ValueError, TypeError):
+            continue
+        avg = getattr(it, "avg_ping", None)
+        try:
+            avg_f = float(avg) if avg is not None else None
+        except (TypeError, ValueError):
+            avg_f = None
+        if avg_f is None:
+            continue
+        dcount = getattr(it, "device_count", None)
+        try:
+            dcount_i = int(dcount) if dcount is not None else None
+        except (TypeError, ValueError):
+            dcount_i = None
+        ping_by_key[key] = (avg_f, dcount_i)
+
+    arranged = arrange_by_category_slots(
+        scored,
+        avg_of=lambda it: float(getattr(it, "avg_ping", None) or 1e18),
+        label_of=lambda it: it.label or "",
+        device_of=lambda it: getattr(it, "device_count", None) or 1,
+        category_of=lambda it: getattr(it, "category_name", None)
+        or " ".join(getattr(it, "group_names", None) or [])
+        or it.label
+        or "",
+        cost_of=lambda it: getattr(it, "usage_cost", None),
+    )
+    ordered = list(arranged) + unscored
+    payload = [
+        ConfigOrderItemIn(
+            host=it.host,
+            port=int(it.port),
+            match_host=it.match_host or "",
+            label=it.label,
+        )
+        for it in ordered
+    ]
+    await save_order(db, payload)
+
+    result = await db.execute(select(ConfigLinkOrder))
+    rows = list(result.scalars().all())
+    restored = 0
+    for row in rows:
+        try:
+            key = _fp_key(
+                normalize_host(row.host),
+                int(row.port),
+                normalize_match_host(row.match_host or ""),
+            )
+        except (ValueError, TypeError):
+            continue
+        meta = ping_by_key.get(key)
+        if meta is None:
+            continue
+        row.avg_ping = float(meta[0])
+        if meta[1] is not None:
+            row.device_count = int(meta[1])
+        restored += 1
+    await db.commit()
+    await refresh_cache(db)
+
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        flag.write_text(f"n={len(payload)} restored={restored}\n", encoding="utf-8")
+    except OSError:
+        pass
+    logger.info(
+        "relayout_slots_v154 ordered=%s restored_pings=%s",
+        len(payload),
+        restored,
+    )
+    return len(payload)
 
 
 async def save_order(db: AsyncSession, items: list[ConfigOrderItemIn]) -> ConfigOrderWorkspaceOut:
