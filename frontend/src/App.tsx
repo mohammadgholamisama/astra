@@ -10,6 +10,7 @@ import UsersPage from "./pages/UsersPage";
 import BackupPage from "./pages/BackupPage";
 import SettingsPage from "./pages/SettingsPage";
 import ConfigOrderPage from "./pages/ConfigOrderPage";
+import ConfigLookupPage from "./pages/ConfigLookupPage";
 
 function Private({ children }: { children: React.ReactNode }) {
   const token = useAuth((s) => s.token);
@@ -36,6 +37,7 @@ export default function App() {
         <Route path="users" element={<UsersPage />} />
         <Route path="configs" element={<Navigate to="/config-order" replace />} />
         <Route path="config-order" element={<ConfigOrderPage />} />
+        <Route path="config-lookup" element={<ConfigLookupPage />} />
         <Route path="backup" element={<BackupPage />} />
         <Route path="settings" element={<SettingsPage />} />
       </Route>

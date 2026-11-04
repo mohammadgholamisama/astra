@@ -6,6 +6,7 @@ import {
   LayoutDashboard,
   ListOrdered,
   LogOut,
+  Search,
   Server,
   Settings,
   Users,
@@ -53,6 +54,7 @@ const navSections: NavSection[] = [
     title: "ابزارها",
     links: [
       { to: "/config-order", label: "ترتیب کانفیگ‌ها", icon: ListOrdered },
+      { to: "/config-lookup", label: "شناسایی کانفیگ", icon: Search },
       { to: "/backup", label: "بک‌آپ", icon: DatabaseBackup },
       { to: "/settings", label: "تنظیمات", icon: Settings },
     ],

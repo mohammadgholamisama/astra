@@ -18,6 +18,7 @@ from app.api import (
     auth,
     backup,
     config_locations,
+    config_lookup,
     config_orders,
     group_configs,
     groups,
@@ -281,6 +282,7 @@ app.include_router(api_keys.router)
 app.include_router(settings_api.router)
 app.include_router(config_locations.router)
 app.include_router(config_orders.router)
+app.include_router(config_lookup.router)
 app.include_router(backup.router)
 app.include_router(subscription.router)
 app.include_router(system.router)
