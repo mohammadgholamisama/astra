@@ -130,6 +130,8 @@ def _quality(
 
 _QUALITY_RANK = {"exact": 0, "uuid": 1, "uri": 1, "sni": 2, "host_port": 3}
 
+_TOKEN_RE = re.compile(r"[A-Za-z\u0600-\u06FF]+|\d+")
+
 
 def _remark_close(a: str | None, b: str | None) -> bool:
     x = (a or "").strip().lower()
@@ -137,6 +139,57 @@ def _remark_close(a: str | None, b: str | None) -> bool:
     if not x or not y:
         return False
     return x == y or x in y or y in x
+
+
+def _name_tokens(s: str) -> set[str]:
+    return {t.lower() for t in _TOKEN_RE.findall(s or "") if len(t) >= 2}
+
+
+def _group_fit(panel_name: str, group_name: str | None) -> tuple[int, int, int]:
+    """Higher is better: how closely the sales-group name matches the panel."""
+    gn = (group_name or "").strip()
+    if not gn:
+        return (0, 0, 0)
+    pt = _name_tokens(panel_name)
+    gt = _name_tokens(gn)
+    if not pt:
+        return (0, 0, 0)
+    overlap = len(pt & gt)
+    gnl = re.sub(r"[\s_\-]+", "", gn.lower())
+    # Prefer group that contains panel tokens (Hajmi6-Tunnel → Hajmi6…Tunnel…)
+    contained = sum(1 for t in pt if t in gnl)
+    return (contained, overlap, -abs(len(gn) - len(panel_name or "")))
+
+
+def _pick_best_group_hits(pool: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One panel + same fingerprint in several groups → keep the best-fitting group."""
+    if len(pool) <= 1:
+        return pool
+    # Same host:port:match → treat as duplicate samples across groups
+    by_fp: dict[tuple[str, int, str], list[dict[str, Any]]] = {}
+    for h in pool:
+        key = (
+            str(h.get("host") or ""),
+            int(h.get("port") or 0),
+            str(h.get("match_host") or ""),
+        )
+        by_fp.setdefault(key, []).append(h)
+    out: list[dict[str, Any]] = []
+    for group in by_fp.values():
+        if len(group) == 1:
+            out.append(group[0])
+            continue
+        best = max(
+            group,
+            key=lambda h: (
+                _group_fit(str(h.get("panel_name") or ""), h.get("group_name")),
+                int(h.get("accounts_count") or 0),
+                # stable tie-break: prefer smaller group id
+                -(int(h["group_id"]) if h.get("group_id") is not None else 10**9),
+            ),
+        )
+        out.append(best)
+    return out
 
 
 def _panel_type_str(panel: Any) -> str | None:
@@ -521,11 +574,13 @@ def _finalize(
             (_QUALITY_RANK.get(str(x.get("match_quality") or ""), 9) for x in pool),
             default=9,
         )
-        collapsed.extend(
+        tier = [
             x
             for x in pool
             if _QUALITY_RANK.get(str(x.get("match_quality") or ""), 9) == best_local
-        )
+        ]
+        # Same sample link often sits in several groups of one panel — pick one
+        collapsed.extend(_pick_best_group_hits(tier))
 
     # Keep only the strongest match tier globally (exact beats host_port, …)
     if collapsed:
