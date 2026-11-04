@@ -5,8 +5,10 @@ import {
   ArrowUp,
   Eye,
   EyeOff,
+  Globe2,
   GripVertical,
   Loader2,
+  Radar,
   RefreshCw,
   Save,
   Search,
@@ -86,6 +88,26 @@ function itemKey(it: Pick<OrderItem, "host" | "port" | "match_host">): string {
   return `${it.host}|${it.port}|${it.match_host || ""}`;
 }
 
+const AUTO_FLAG_KEY = "astra.config-order.auto-flag-probe";
+
+type ProbeOut = {
+  ok: boolean;
+  updated: number;
+  resolved: number;
+  failed: number;
+  total: number;
+  results: Array<{
+    host: string;
+    port: number;
+    match_host: string;
+    country_code: string | null;
+    flag: string | null;
+    source: string;
+    ok: boolean;
+    detail: string | null;
+  }>;
+};
+
 function endpointLabel(it: Pick<OrderItem, "host" | "port" | "match_host">): string {
   const base = `${it.host}:${it.port}`;
   return it.match_host ? `${base} · ${it.match_host}` : base;
@@ -109,8 +131,17 @@ export default function ConfigOrderPage() {
   const [flagRow, setFlagRow] = useState<OrderItem | null>(null);
   const [flagQ, setFlagQ] = useState("");
   const [pendingKey, setPendingKey] = useState<string | null>(null);
+  const [autoFlag, setAutoFlag] = useState(() => {
+    try {
+      return localStorage.getItem(AUTO_FLAG_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const [wantProbe, setWantProbe] = useState(false);
   const flagPopRef = useRef<HTMLDivElement | null>(null);
   const dragIndex = useRef<number | null>(null);
+  const autoBooted = useRef(false);
   const [overIndex, setOverIndex] = useState<number | null>(null);
 
   const { data, isLoading, error } = useQuery({
@@ -216,6 +247,9 @@ export default function ConfigOrderPage() {
         failN > 0 && okN === 0 ? "err" : "ok",
         `${base} — لیست به‌روز شد`
       );
+      if (autoFlag && (ws?.items?.length || 0) > 0) {
+        setWantProbe(true);
+      }
     },
     onError: (e) => {
       pushToast(
@@ -364,12 +398,124 @@ export default function ConfigOrderPage() {
     onSettled: () => setPendingKey(null),
   });
 
+  function applyProbeResults(res: ProbeOut) {
+    const byKey = new Map(
+      (res.results || [])
+        .filter((r) => r.ok && r.country_code)
+        .map((r) => [
+          itemKey({
+            host: r.host,
+            port: r.port,
+            match_host: r.match_host || "",
+          }),
+          r,
+        ])
+    );
+    if (!byKey.size) return;
+    setItems((prev) =>
+      prev.map((it) => {
+        const hit = byKey.get(itemKey(it));
+        if (!hit || !hit.country_code) return it;
+        return {
+          ...it,
+          country_code: hit.country_code,
+          flag: hit.flag || flagEmoji(hit.country_code),
+          flag_exact: true,
+        };
+      })
+    );
+    qc.setQueryData<Workspace>(["config-order"], (old) => {
+      if (!old) return old;
+      return {
+        ...old,
+        items: (old.items || []).map((it) => {
+          const hit = byKey.get(itemKey(it));
+          if (!hit || !hit.country_code) return it;
+          return {
+            ...it,
+            country_code: hit.country_code,
+            flag: hit.flag || flagEmoji(hit.country_code),
+            flag_exact: true,
+          };
+        }),
+      };
+    });
+  }
+
+  const probeFlags = useMutation({
+    mutationFn: async (rows: OrderItem[]) => {
+      const res = await api<ProbeOut>("/api/admin/config-locations/probe", {
+        method: "POST",
+        body: JSON.stringify({
+          overwrite: true,
+          items: rows.map((it) => ({
+            host: it.host,
+            port: Number(it.port),
+            match_host: (it.match_host || "").trim(),
+            source_remark: it.source_remark || it.label || null,
+            label: it.label || null,
+            country_code: it.country_code || null,
+          })),
+        }),
+        timeoutMs: 120_000,
+      });
+      return { res, single: rows.length === 1 ? itemKey(rows[0]) : null };
+    },
+    onMutate: (rows) => {
+      if (rows.length === 1) setPendingKey(itemKey(rows[0]));
+      else setPendingKey("__probe_all__");
+    },
+    onSuccess: ({ res, single }) => {
+      applyProbeResults(res);
+      if (single) {
+        const one = res.results?.[0];
+        if (one?.ok && one.country_code) {
+          pushToast(
+            "ok",
+            `پرچم ${countryName(one.country_code) || one.country_code} تنظیم شد`
+          );
+        } else {
+          pushToast("err", one?.detail || "کشور این کانفیگ پیدا نشد");
+        }
+      } else {
+        pushToast(
+          "ok",
+          `استعلام پرچم: ${toFaDigits(res.resolved)} موفق` +
+            (res.failed ? ` · ${toFaDigits(res.failed)} ناموفق` : "")
+        );
+      }
+    },
+    onError: (e) => {
+      pushToast(
+        "err",
+        e instanceof ApiError ? e.message : "استعلام پرچم ناموفق بود"
+      );
+    },
+    onSettled: () => setPendingKey(null),
+  });
+
+  // Run queued auto/manual bulk probe against the current list
+  useEffect(() => {
+    if (!wantProbe || !items.length || probeFlags.isPending) return;
+    setWantProbe(false);
+    probeFlags.mutate(items);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wantProbe, items]);
+
+  // First load with auto-flag already enabled
+  useEffect(() => {
+    if (!autoFlag || !items.length || autoBooted.current) return;
+    autoBooted.current = true;
+    setWantProbe(true);
+  }, [autoFlag, items.length]);
+
   const busy =
     save.isPending ||
     buildSamples.isPending ||
     toggleHide.isPending ||
     setFlag.isPending ||
-    unhideAll.isPending;
+    unhideAll.isPending ||
+    probeFlags.isPending;
 
   function applyOrder(next: OrderItem[], { persist = true }: { persist?: boolean } = {}) {
     const ordered = next.map((it, i) => ({ ...it, sort_order: i }));
@@ -623,6 +769,58 @@ export default function ConfigOrderPage() {
               </button>
             ))}
           </div>
+          <label
+            className={`configs-switch config-order-auto-flag${
+              probeFlags.isPending ? " busy" : ""
+            }`}
+            title="با روشن بودن، پرچم همه کانفیگ‌ها خودکار از نام/GeoIP گرفته می‌شود و با هر استعلام دوباره عوض می‌شود"
+          >
+            <span className="configs-switch-label">
+              <Globe2 size={14} />
+              پرچم خودکار
+            </span>
+            <input
+              type="checkbox"
+              checked={autoFlag}
+              disabled={busy && !probeFlags.isPending}
+              onChange={() => {
+                const next = !autoFlag;
+                setAutoFlag(next);
+                try {
+                  localStorage.setItem(AUTO_FLAG_KEY, next ? "1" : "0");
+                } catch {
+                  /* ignore */
+                }
+                if (next && items.length) {
+                  autoBooted.current = true;
+                  setWantProbe(true);
+                }
+              }}
+              aria-label="استعلام خودکار پرچم همه کانفیگ‌ها"
+            />
+            <span className="configs-switch-track" aria-hidden />
+          </label>
+          <button
+            type="button"
+            className="btn ghost config-order-probe-all"
+            disabled={busy || !items.length}
+            onClick={() => {
+              autoBooted.current = true;
+              probeFlags.mutate(items);
+            }}
+            title="استعلام دوباره پرچم همه کانفیگ‌ها (جایگزین پرچم‌های فعلی)"
+          >
+            {probeFlags.isPending && pendingKey === "__probe_all__" ? (
+              <Loader2 size={15} className="configs-spin" />
+            ) : (
+              <Radar size={15} />
+            )}
+            <span>
+              {probeFlags.isPending && pendingKey === "__probe_all__"
+                ? "در حال استعلام…"
+                : "استعلام همه پرچم‌ها"}
+            </span>
+          </button>
           {hiddenCount > 0 ? (
             <button
               type="button"
@@ -904,6 +1102,27 @@ export default function ConfigOrderPage() {
                       </div>
                     ) : null}
                   </div>
+
+                  <button
+                    type="button"
+                    className={`config-order-probe-one${
+                      hideBusy && probeFlags.isPending ? " busy" : ""
+                    }`}
+                    disabled={busy}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setFlagRow(null);
+                      probeFlags.mutate([it]);
+                    }}
+                    title="استعلام پرچم این کانفیگ"
+                    aria-label="استعلام پرچم این کانفیگ"
+                  >
+                    {hideBusy && probeFlags.isPending ? (
+                      <Loader2 size={14} className="configs-spin" />
+                    ) : (
+                      <Radar size={14} />
+                    )}
+                  </button>
 
                   <label
                     className={`configs-switch${hideBusy ? " busy" : ""}`}

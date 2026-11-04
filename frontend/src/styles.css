@@ -7244,6 +7244,39 @@ th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
   position: relative;
   flex-shrink: 0;
 }
+.config-order-probe-one {
+  appearance: none;
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--card-solid) 80%, transparent);
+  color: var(--muted);
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+.config-order-probe-one:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+}
+.config-order-probe-one:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.config-order-probe-one.busy {
+  color: var(--accent);
+}
+.config-order-probe-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+.config-order-auto-flag {
+  flex: 0 0 auto;
+}
 .configs-flag-btn {
   width: 44px;
   height: 44px;

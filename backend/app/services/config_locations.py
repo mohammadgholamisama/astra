@@ -550,6 +550,49 @@ async def _find_endpoint_rows(
     return matched
 
 
+async def _apply_endpoint_upsert(
+    db: AsyncSession,
+    *,
+    host: str,
+    port: int,
+    match_host: str,
+    country_code: str | None,
+) -> ConfigLocation | None:
+    """Upsert/clear one fingerprint in the current transaction (no commit)."""
+    h = normalize_host(host)
+    p = int(port)
+    if p < 1 or p > 65535:
+        raise ValueError("پورت نامعتبر است")
+    m = normalize_match_host(match_host or "")
+
+    matched = await _find_endpoint_rows(db, host=h, port=p, match_host=m)
+    row = next((r for r in matched if (r.match_host or "") == m), None)
+    if row is None and matched:
+        row = matched[0]
+    extras = [r for r in matched if r is not row]
+
+    if country_code is None or str(country_code).strip() == "":
+        for r in matched:
+            await db.delete(r)
+        return None
+
+    code = normalize_country_code(country_code)
+    flag_from_country_code(code)
+
+    if row is None:
+        row = ConfigLocation(host=h, port=p, match_host=m, country_code=code, label=None)
+        db.add(row)
+    else:
+        row.host = h
+        row.port = p
+        row.match_host = m
+        row.country_code = code
+    for extra in extras:
+        await db.delete(extra)
+    await db.flush()
+    return row
+
+
 async def upsert_endpoint_location(
     db: AsyncSession,
     *,
@@ -568,50 +611,30 @@ async def upsert_endpoint_location(
     """
     from sqlalchemy.exc import IntegrityError
 
-    h = normalize_host(host)
-    p = int(port)
-    if p < 1 or p > 65535:
-        raise ValueError("پورت نامعتبر است")
-    m = normalize_match_host(match_host or "")
-
-    matched = await _find_endpoint_rows(db, host=h, port=p, match_host=m)
-    # Prefer exact normalized row; else any www./legacy variant
-    row = next((r for r in matched if (r.match_host or "") == m), None)
-    if row is None and matched:
-        row = matched[0]
-    # Drop duplicate variants (www. vs bare) so one fingerprint → one row
-    extras = [r for r in matched if r is not row]
-
-    if country_code is None or str(country_code).strip() == "":
-        for r in matched:
-            await db.delete(r)
-        await db.commit()
-        await refresh_cache(db)
-        return None
-
-    code = normalize_country_code(country_code)
-    flag_from_country_code(code)  # validate
-
-    if row is None:
-        row = ConfigLocation(host=h, port=p, match_host=m, country_code=code, label=None)
-        db.add(row)
-    else:
-        row.host = h
-        row.port = p
-        row.match_host = m
-        row.country_code = code
-    for extra in extras:
-        await db.delete(extra)
-
     try:
+        row = await _apply_endpoint_upsert(
+            db,
+            host=host,
+            port=port,
+            match_host=match_host,
+            country_code=country_code,
+        )
         await db.commit()
     except IntegrityError:
-        # Legacy UNIQUE(host,port) or race — reload and update in place
         await db.rollback()
+        h = normalize_host(host)
+        p = int(port)
+        m = normalize_match_host(match_host or "")
+        if country_code is None or str(country_code).strip() == "":
+            matched = await _find_endpoint_rows(db, host=h, port=p, match_host=m)
+            for r in matched:
+                await db.delete(r)
+            await db.commit()
+            await refresh_cache(db)
+            return None
+        code = normalize_country_code(country_code)
         matched = await _find_endpoint_rows(db, host=h, port=p, match_host=m)
         if not matched:
-            # Same host:port with different match still blocked by legacy unique:
-            # update the sole host:port row to this fingerprint
             result = await db.execute(
                 select(ConfigLocation).where(
                     ConfigLocation.host == h,
@@ -630,9 +653,59 @@ async def upsert_endpoint_location(
             await db.delete(extra)
         await db.commit()
 
+    if row is None:
+        await refresh_cache(db)
+        return None
     await db.refresh(row)
     await refresh_cache(db)
     return to_out(row)
+
+
+async def upsert_endpoint_locations_many(
+    db: AsyncSession,
+    rows: list[tuple[str, int, str, str]],
+) -> list[dict]:
+    """Bulk set flags — one commit + one cache refresh. Each tuple is host,port,match,code."""
+    from sqlalchemy.exc import IntegrityError
+
+    outs: list[dict] = []
+    if not rows:
+        return outs
+    try:
+        saved_rows: list[ConfigLocation] = []
+        for host, port, match_host, code in rows:
+            row = await _apply_endpoint_upsert(
+                db,
+                host=host,
+                port=int(port),
+                match_host=match_host or "",
+                country_code=code,
+            )
+            if row is not None:
+                saved_rows.append(row)
+        await db.commit()
+        for row in saved_rows:
+            await db.refresh(row)
+            outs.append(to_out(row))
+    except IntegrityError:
+        await db.rollback()
+        # Fallback: one-by-one (rare legacy unique conflicts)
+        for host, port, match_host, code in rows:
+            try:
+                out = await upsert_endpoint_location(
+                    db,
+                    host=host,
+                    port=int(port),
+                    match_host=match_host or "",
+                    country_code=code,
+                )
+                if out:
+                    outs.append(out)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("bulk flag upsert fallback failed %s:%s: %s", host, port, exc)
+        return outs
+    await refresh_cache(db)
+    return outs
 
 
 def attach_location_to_rows(rows: list[dict]) -> None:

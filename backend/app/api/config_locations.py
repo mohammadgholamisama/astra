@@ -10,8 +10,11 @@ from app.schemas.config_location import (
     ConfigLocationCreate,
     ConfigLocationEndpointSet,
     ConfigLocationOut,
+    ConfigLocationProbeIn,
+    ConfigLocationProbeOut,
     ConfigLocationUpdate,
 )
+from app.services import config_location_probe as probe_svc
 from app.services.config_locations import (
     flag_from_country_code,
     normalize_country_code,
@@ -124,6 +127,40 @@ async def set_endpoint_location(
             if hasattr(val, "isoformat"):
                 out[key] = val.isoformat()
     return {"ok": True, "location": out}
+
+
+@router.post(
+    "/api/admin/config-locations/probe",
+    response_model=ConfigLocationProbeOut,
+)
+async def probe_locations(
+    body: ConfigLocationProbeIn,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """Auto-detect country flags for config-order rows (remark emoji + GeoIP).
+
+    Always overwrites existing flags when ``overwrite`` is true (default) so a
+    fresh probe refreshes every row; manual picker can still change afterward.
+    """
+    if not body.items:
+        raise HTTPException(status_code=400, detail="لیست کانفیگ خالی است")
+    try:
+        raw = await probe_svc.probe_config_flags(
+            db,
+            [it.model_dump() for it in body.items],
+            overwrite=bool(body.overwrite),
+        )
+    except Exception as exc:  # noqa: BLE001
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"استعلام پرچم ناموفق بود: {exc}",
+        ) from exc
+    return ConfigLocationProbeOut(**raw)
 
 
 @router.put("/api/admin/config-locations/{location_id}", response_model=ConfigLocationOut)
