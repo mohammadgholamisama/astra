@@ -367,9 +367,15 @@ def extract_link_remark_key(link: str) -> str:
     text = _CTRL.sub("", label).strip().lower()
     if not text:
         return ""
-    # Drop subscription-style rewritten names
-    if text.startswith("#") and "|" in text:
-        return ""
+    # Drop pure subscription-style rewritten names ("#12. tag | user") — keep a
+    # mid-token when present so distinct endpoints are not collapsed in the sub.
+    if "|" in text:
+        # "#N. name | user" or "N. name | user" → keep the name segment
+        left = text.split("|", 1)[0].strip()
+        left = re.sub(r"^#?\d+[.)\-\s]+", "", left).strip()
+        text = left or ""
+        if not text:
+            return ""
     out = []
     for ch in text:
         if ch.isalnum() or ch in "._-":
@@ -378,6 +384,35 @@ def extract_link_remark_key(link: str) -> str:
             out.append("_")
     key = "".join(out).strip("._-")
     return key[:80]
+
+
+def extract_link_client_id(link: str) -> str:
+    """Client UUID/password from share link — last-resort fingerprint when remark/path empty."""
+    raw = (link or "").strip()
+    if not raw or "://" not in raw:
+        return ""
+    scheme, rest = raw.split("://", 1)
+    scheme_l = scheme.lower()
+    rest = rest.split("#", 1)[0].strip()
+    if scheme_l == "vmess":
+        try:
+            data = json.loads(_b64decode(rest).decode("utf-8", errors="ignore"))
+        except Exception:  # noqa: BLE001
+            return ""
+        if isinstance(data, dict):
+            cid = str(data.get("id") or "").strip().lower()
+            return cid[:64] if cid else ""
+    # vless/trojan/ss: uuid or userinfo before '@'
+    if "@" not in rest:
+        return ""
+    userinfo = rest.split("@", 1)[0]
+    if ":" in userinfo and scheme_l in ("ss", "shadowsocks"):
+        userinfo = userinfo.rsplit(":", 1)[-1]
+    cid = userinfo.strip().lower()
+    # keep uuid-like / opaque ids only
+    if len(cid) < 8:
+        return ""
+    return cid[:64]
 
 
 def match_host_sni_only(match_host: str) -> str:

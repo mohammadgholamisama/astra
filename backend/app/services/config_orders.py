@@ -29,6 +29,7 @@ from app.services.config_locations import (
     extract_link_match_host,
     extract_link_path,
     extract_link_remark_key,
+    match_host_sni_only,
     normalize_host,
     normalize_match_host,
     try_normalize_endpoint,
@@ -49,6 +50,56 @@ _loaded = False
 
 def _fp_key(host: str, port: int, match_host: str = "") -> tuple[str, int, str]:
     return (host, int(port), match_host or "")
+
+
+def _sni_core(match_host: str) -> str:
+    """Strip Astra ``|ob|remark`` suffix so order ↔ sample fingerprints align."""
+    try:
+        return normalize_match_host(match_host_sni_only(match_host or ""))
+    except ValueError:
+        return (match_host_sni_only(match_host or "") or "").strip().lower()
+
+
+def _find_sample(
+    samples: dict[tuple[str, int, str], dict[str, Any]],
+    host: str,
+    port: int,
+    match_host: str = "",
+) -> dict[str, Any] | None:
+    """Resolve a sample row for a saved order fingerprint (exact, then fuzzy).
+
+    Saved order often stores plain SNI while the live sample uses ``sni|ob|name``
+    (Astra outbounds). Exact-only lookup falsely marks hundreds as «not in sample»
+    and reconcile then drops them — breaking sub numbering / visibility.
+    """
+    if not samples:
+        return None
+    key = _fp_key(host, int(port), match_host or "")
+    hit = samples.get(key)
+    if hit is not None:
+        return hit
+    core = _sni_core(match_host or "")
+    empty = _fp_key(host, int(port), "")
+    if empty in samples:
+        return samples[empty]
+    # Prefer sample whose SNI core matches (with or without |ob|remark)
+    candidates: list[dict[str, Any]] = []
+    for sk, sample in samples.items():
+        if sk[0] != host or int(sk[1]) != int(port):
+            continue
+        if _sni_core(sk[2] or "") == core:
+            candidates.append(sample)
+    if candidates:
+        # Prefer the |ob| slot when several share the same SNI
+        for sample in candidates:
+            if "|ob|" in str(sample.get("match_host") or ""):
+                return sample
+        return candidates[0]
+    # Last resort: any sample on same host:port
+    for sk, sample in samples.items():
+        if sk[0] == host and int(sk[1]) == int(port):
+            return sample
+    return None
 
 
 def apply_cache(rows: list[ConfigLinkOrder]) -> None:
@@ -477,6 +528,8 @@ async def list_workspace(db: AsyncSession) -> ConfigOrderWorkspaceOut:
 
     items: list[ConfigOrderItemOut] = []
     seen: set[tuple[str, int, str]] = set()
+    # Sample keys already covered via fuzzy match of a saved row
+    covered_sample_keys: set[tuple[str, int, str]] = set()
 
     # 1) Saved order first (admin arrangement)
     for i, row in enumerate(saved):
@@ -490,7 +543,26 @@ async def list_workspace(db: AsyncSession) -> ConfigOrderWorkspaceOut:
         if key in seen:
             # www./non-www (or other normalize collapses) — keep earliest row
             continue
-        sample = samples.get(key)
+        sample = _find_sample(samples, host, port, match)
+        # Prefer live sample fingerprint so UI / hide / sub stay aligned
+        out_host, out_port, out_match = host, port, match
+        if sample is not None:
+            try:
+                out_host = normalize_host(str(sample.get("host") or host))
+                out_port = int(sample.get("port") or port)
+                out_match = normalize_match_host(str(sample.get("match_host") or match))
+            except (ValueError, TypeError):
+                out_host, out_port, out_match = host, port, match
+            sk = _fp_key(out_host, out_port, out_match)
+            covered_sample_keys.add(sk)
+            # Also mark exact sample dict key
+            for sk2, s2 in samples.items():
+                if s2 is sample:
+                    covered_sample_keys.add(sk2)
+                    break
+        out_key = _fp_key(out_host, out_port, out_match)
+        if out_key in seen:
+            continue
         avg = getattr(row, "avg_ping", None)
         dcount = getattr(row, "device_count", None)
         try:
@@ -503,9 +575,9 @@ async def list_workspace(db: AsyncSession) -> ConfigOrderWorkspaceOut:
             dcount_i = None
         items.append(
             _item_out(
-                host=host,
-                port=port,
-                match_host=match,
+                host=out_host,
+                port=out_port,
+                match_host=out_match,
                 label=(sample or {}).get("label") or row.label,
                 sort_order=len(items),
                 in_sample=sample is not None,
@@ -514,11 +586,12 @@ async def list_workspace(db: AsyncSession) -> ConfigOrderWorkspaceOut:
                 device_count=dcount_i,
             )
         )
+        seen.add(out_key)
         seen.add(key)
 
     # 2) New sample endpoints not yet ordered — append
     for key, sample in samples.items():
-        if key in seen:
+        if key in seen or key in covered_sample_keys:
             continue
         items.append(
             _item_out(
@@ -794,7 +867,11 @@ async def save_order(db: AsyncSession, items: list[ConfigOrderItemIn]) -> Config
 
 
 async def reconcile_order_with_sample(db: AsyncSession) -> int:
-    """Drop stale order rows after rebuild; keep surviving order; append new endpoints."""
+    """Drop stale order rows after rebuild; keep surviving order; append new endpoints.
+
+    Uses fuzzy fingerprint match so plain-SNI rows map onto live ``sni|ob|…``
+    sample slots instead of being wiped (which desynced order vs subscription).
+    """
     samples = await _sample_fingerprints(db)
     result = await db.execute(
         select(ConfigLinkOrder).order_by(
@@ -814,16 +891,24 @@ async def reconcile_order_with_sample(db: AsyncSession) -> int:
             match = normalize_match_host(row.match_host or "")
         except (ValueError, TypeError):
             continue
-        key = _fp_key(host, port, match)
-        if key not in samples or key in seen:
+        sample = _find_sample(samples, host, port, match)
+        if sample is None:
+            continue
+        try:
+            sh = normalize_host(str(sample.get("host") or host))
+            sp = int(sample.get("port") or port)
+            sm = normalize_match_host(str(sample.get("match_host") or match))
+        except (ValueError, TypeError):
+            continue
+        key = _fp_key(sh, sp, sm)
+        if key in seen:
             continue
         seen.add(key)
-        sample = samples[key]
         db.add(
             ConfigLinkOrder(
-                host=host,
-                port=port,
-                match_host=match,
+                host=sh,
+                port=sp,
+                match_host=sm,
                 sort_order=order_i,
                 label=_normalize_label(row.label or sample.get("label")),
             )

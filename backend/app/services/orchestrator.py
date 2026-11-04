@@ -4293,7 +4293,11 @@ async def collect_links_detailed(
     # One share-link per endpoint fingerprint so sub #N matches config-order #N.
     # Same host:port[+SNI] with different UUIDs collapse (multi-panel duplicates).
     # Distinct CDN paths (Astra WS/XHTTP on one domain:port) must BOTH stay.
-    from app.services.config_locations import extract_link_path, extract_link_remark_key
+    from app.services.config_locations import (
+        extract_link_client_id,
+        extract_link_path,
+        extract_link_remark_key,
+    )
 
     by_fp: dict[tuple, dict] = {}
     no_fp: list[dict] = []
@@ -4305,11 +4309,13 @@ async def collect_links_detailed(
             mh = extract_link_match_host(link) or ""
             norm = try_normalize_endpoint(ep[0], ep[1], mh)
             if norm:
-                key = (
-                    *norm,
-                    extract_link_path(link),
-                    extract_link_remark_key(link),
-                )
+                path = extract_link_path(link)
+                remark = extract_link_remark_key(link)
+                # Never silently collapse distinct clients that share host:port:sni
+                # with empty path/remark (common on Guard/Marzban multi-inbound).
+                if not path and not remark:
+                    remark = extract_link_client_id(link)
+                key = (*norm, path, remark)
         if key is None:
             no_fp.append(row)
             continue
