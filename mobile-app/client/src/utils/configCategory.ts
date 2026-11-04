@@ -1,8 +1,11 @@
-/** Remark categories used for panel + app ordering. */
+/** Remark / folder categories used for panel + app ordering. */
 
 export type ConfigCategory = 'direct' | 'tunnel' | 'gaming' | 'other';
 
-const SLOT = 5;
+/** Layout quotas — keep in sync with backend ping_category_order.py */
+export const DIRECT_SLOT = 20;
+export const TUNNEL_PER_COST = 35;
+export const GAMING_SLOT = 9;
 
 export function detectConfigCategory(remark: string | null | undefined): ConfigCategory {
   const t = String(remark || '').toLowerCase();
@@ -20,6 +23,8 @@ type Rankable = {
   packet_loss_pct?: number;
   label?: string;
   remark?: string;
+  category_name?: string | null;
+  usage_cost?: number | null;
 };
 
 function hasSpeed(it: Rankable): boolean {
@@ -34,6 +39,12 @@ function lossKey(it: Rankable): number {
   const v = it.packet_loss_pct;
   if (v == null || v < 0) return 101;
   return v;
+}
+
+function costKey(it: Rankable): number {
+  const c = it.usage_cost;
+  if (c == null || !Number.isFinite(c)) return 1e9;
+  return Number(c);
 }
 
 /**
@@ -65,9 +76,25 @@ function quality(a: Rankable, b: Rankable): number {
   return 0;
 }
 
+function segmentCmp(a: Rankable, b: Rankable): number {
+  const ca = costKey(a);
+  const cb = costKey(b);
+  if (ca !== cb) return ca - cb;
+  return quality(a, b);
+}
+
+function resolveCat(it: Rankable): ConfigCategory {
+  const fromFolder = detectConfigCategory(it.category_name || '');
+  if (fromFolder !== 'other') return fromFolder;
+  return detectConfigCategory(it.label || it.remark || '');
+}
+
 /**
- * Arrange successful rows: up to 5 best direct → 5 tunnel → 5 gaming,
- * then remaining by quality. Failures/untested stay at the end.
+ * Arrange successful rows:
+ *   20 مستقیم (cost↑ then quality) →
+ *   تانل per usage_cost↑ up to 35 each →
+ *   9 گیمینگ → leftover by cost/quality.
+ * Failures/untested stay at the end.
  */
 export function arrangeByCategorySlots<T extends Rankable>(items: T[]): T[] {
   const ok: T[] = [];
@@ -91,22 +118,45 @@ export function arrangeByCategorySlots<T extends Rankable>(items: T[]): T[] {
     other: [],
   };
   for (const it of ok) {
-    const cat = detectConfigCategory(it.label || it.remark || '');
-    buckets[cat].push(it);
+    buckets[resolveCat(it)].push(it);
   }
   for (const cat of Object.keys(buckets) as ConfigCategory[]) {
-    buckets[cat].sort(quality);
+    buckets[cat].sort(segmentCmp);
   }
 
   const picked = new Set<T>();
   const head: T[] = [];
-  for (const cat of ['direct', 'tunnel', 'gaming'] as const) {
-    for (const it of buckets[cat].slice(0, SLOT)) {
-      head.push(it);
-      picked.add(it);
-    }
+
+  for (const it of buckets.direct.slice(0, DIRECT_SLOT)) {
+    head.push(it);
+    picked.add(it);
   }
 
-  const leftover = ok.filter((it) => !picked.has(it)).sort(quality);
+  // Tunnel tiers by ascending usage_cost
+  let i = 0;
+  const tunnel = buckets.tunnel;
+  while (i < tunnel.length) {
+    const cost = costKey(tunnel[i]);
+    let j = i;
+    while (j < tunnel.length && costKey(tunnel[j]) === cost) j += 1;
+    const tier = tunnel.slice(i, j);
+    let taken = 0;
+    for (const it of tier) {
+      if (taken >= TUNNEL_PER_COST) break;
+      if (picked.has(it)) continue;
+      head.push(it);
+      picked.add(it);
+      taken += 1;
+    }
+    i = j;
+  }
+
+  for (const it of buckets.gaming.slice(0, GAMING_SLOT)) {
+    if (picked.has(it)) continue;
+    head.push(it);
+    picked.add(it);
+  }
+
+  const leftover = ok.filter((it) => !picked.has(it)).sort(segmentCmp);
   return [...head, ...leftover, ...rest];
 }

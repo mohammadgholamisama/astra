@@ -679,10 +679,10 @@ export default function ConfigOrderPage() {
           <p className="configs-kicker">سابسکریپشن</p>
           <h1 className="page-title">ترتیب کانفیگ‌ها</h1>
           <p className="page-sub">
-            شمارهٔ <strong>#</strong> همان شمارهٔ صفحهٔ ساب است. هر ردیف با{" "}
-            <strong>دامنه</strong>، <strong>پورت</strong> و <strong>هاست/SNI</strong>{" "}
-            مشخص می‌شود. هر ۱۰ دقیقه میانگین پینگ چند دستگاه از هاب می‌آید و ترتیب
-            خودکار بهتر می‌شود (پینگ کمتر = بالاتر).
+            شمارهٔ <strong>#</strong> همان شمارهٔ صفحهٔ ساب است. چیدمان خودکار تست‌ها:{" "}
+            <strong>۲۰ مستقیم</strong> → <strong>۳۵ تانل</strong> به‌ازای هر هزینه
+            مصرف (کم به زیاد، مثل ۵ بعد ۷) → <strong>۹ گیمینگ</strong>؛ داخل هر بخش
+            اول هزینه کمتر، بعد سریع‌ترها بالاتر می‌آیند.
           </p>
         </div>
         <div className="config-order-hero-actions">

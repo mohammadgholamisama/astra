@@ -331,6 +331,8 @@ def _ingest_link(
     label: str | None = None,
     protocol: str | None = None,
     distinct_remark: bool = False,
+    category_name: str | None = None,
+    usage_cost: int | None = None,
 ) -> None:
     raw = (link or "").strip()
     if not raw:
@@ -361,6 +363,8 @@ def _ingest_link(
             "protocol": protocol or proto or None,
             "panel_names": [],
             "group_names": [],
+            "category_name": None,
+            "usage_cost": None,
         }
     entry = out[key]
     if panel_name and panel_name not in entry["panel_names"]:
@@ -377,6 +381,18 @@ def _ingest_link(
         entry["sample_link"] = raw
     if not entry.get("protocol") and (protocol or proto):
         entry["protocol"] = protocol or proto
+    cat = (category_name or "").strip() or None
+    if cat and not entry.get("category_name"):
+        entry["category_name"] = cat
+    if usage_cost is not None:
+        try:
+            cost_i = int(usage_cost)
+        except (TypeError, ValueError):
+            cost_i = None
+        if cost_i is not None and cost_i >= 0:
+            prev = entry.get("usage_cost")
+            if prev is None or cost_i < int(prev):
+                entry["usage_cost"] = cost_i
 
 
 def _endpoint_meta(host: str, port: int, match_host: str) -> dict[str, Any]:
@@ -431,6 +447,12 @@ def _item_out(
     # only a group tag / empty — keep source_remark for the secondary line.
     if not display and source_remark:
         display = source_remark
+    cost_raw = s.get("usage_cost")
+    try:
+        cost_out = int(cost_raw) if cost_raw is not None else None
+    except (TypeError, ValueError):
+        cost_out = None
+    cat_out = (str(s.get("category_name") or "").strip() or None)
     return ConfigOrderItemOut(
         host=host,
         port=port,
@@ -443,6 +465,8 @@ def _item_out(
         protocol=s.get("protocol"),
         panel_names=list(s.get("panel_names") or []),
         group_names=list(s.get("group_names") or []),
+        category_name=cat_out,
+        usage_cost=cost_out,
         hidden=bool(meta["hidden"]),
         country_code=meta["country_code"],
         flag=meta["flag"],
@@ -475,23 +499,64 @@ async def _sample_fingerprints(db: AsyncSession) -> dict[tuple[str, int, str], d
     groups_by_id = {int(g.id): g for g in (user.groups or []) if getattr(g, "id", None)}
     tag_by_gid: dict[int, str] = {}
     tag_by_panel: dict[int, str] = {}
+    cost_by_gid: dict[int, int] = {}
+    cat_by_gid: dict[int, str] = {}
+    cost_by_panel: dict[int, int] = {}
+    cat_by_panel: dict[int, str] = {}
     try:
-        from app.models.group import Group, GroupPanel
+        from app.models.group import Group, GroupCategory, GroupPanel
 
-        g_rows = await db.execute(select(Group.id, Group.config_tag))
-        for gid, tag in g_rows.all():
+        cat_names: dict[int, str] = {}
+        c_rows = await db.execute(select(GroupCategory.id, GroupCategory.name))
+        for cid, cname in c_rows.all():
+            if cid is not None and cname:
+                cat_names[int(cid)] = str(cname).strip()
+
+        g_rows = await db.execute(
+            select(
+                Group.id,
+                Group.config_tag,
+                Group.name,
+                Group.usage_cost,
+                Group.category_id,
+            )
+        )
+        for gid, tag, gname, cost, category_id in g_rows.all():
+            if gid is None:
+                continue
+            gid_i = int(gid)
             t = _normalize_label(tag or "") or ""
-            if gid is not None and t:
-                tag_by_gid[int(gid)] = t
+            if t:
+                tag_by_gid[gid_i] = t
+            if gname and gid_i not in groups_by_id:
+                # lightweight stand-in so account.group_id resolves name
+                pass
+            try:
+                if cost is not None:
+                    cost_by_gid[gid_i] = int(cost)
+            except (TypeError, ValueError):
+                pass
+            if category_id is not None:
+                cn = cat_names.get(int(category_id), "")
+                if cn:
+                    cat_by_gid[gid_i] = cn
+
         gp_rows = await db.execute(
             select(GroupPanel.panel_id, GroupPanel.group_id)
         )
         for pid, gid in gp_rows.all():
-            t = tag_by_gid.get(int(gid), "") if gid is not None else ""
-            if pid is not None and t and int(pid) not in tag_by_panel:
-                tag_by_panel[int(pid)] = t
+            if pid is None or gid is None:
+                continue
+            pid_i, gid_i = int(pid), int(gid)
+            t = tag_by_gid.get(gid_i, "")
+            if t and pid_i not in tag_by_panel:
+                tag_by_panel[pid_i] = t
+            if gid_i in cost_by_gid and pid_i not in cost_by_panel:
+                cost_by_panel[pid_i] = cost_by_gid[gid_i]
+            if gid_i in cat_by_gid and pid_i not in cat_by_panel:
+                cat_by_panel[pid_i] = cat_by_gid[gid_i]
     except Exception:  # noqa: BLE001
-        logger.debug("order-sample group tags load failed", exc_info=True)
+        logger.debug("order-sample group tags/cost load failed", exc_info=True)
     for account in user.panel_accounts or []:
         st = getattr(account.status, "value", account.status)
         if st in (PanelAccountStatus.deleted.value, "deleted"):
@@ -503,20 +568,29 @@ async def _sample_fingerprints(db: AsyncSession) -> dict[tuple[str, int, str], d
         gid = getattr(account, "group_id", None)
         group_name = ""
         group_tag = ""
+        category_name: str | None = None
+        usage_cost: int | None = None
         if gid is not None:
-            if int(gid) in groups_by_id:
-                g = groups_by_id[int(gid)]
+            gid_i = int(gid)
+            if gid_i in groups_by_id:
+                g = groups_by_id[gid_i]
                 group_name = str(getattr(g, "name", "") or "")
-            group_tag = tag_by_gid.get(int(gid), "") or ""
-            if not group_tag and int(gid) in groups_by_id:
+            group_tag = tag_by_gid.get(gid_i, "") or ""
+            if not group_tag and gid_i in groups_by_id:
                 group_tag = (
                     _normalize_label(
-                        getattr(groups_by_id[int(gid)], "config_tag", None) or ""
+                        getattr(groups_by_id[gid_i], "config_tag", None) or ""
                     )
                     or ""
                 )
+            category_name = cat_by_gid.get(gid_i)
+            usage_cost = cost_by_gid.get(gid_i)
         if not group_tag and panel is not None:
             group_tag = tag_by_panel.get(int(panel.id), "") or ""
+        if category_name is None and panel is not None:
+            category_name = cat_by_panel.get(int(panel.id))
+        if usage_cost is None and panel is not None:
+            usage_cost = cost_by_panel.get(int(panel.id))
         is_astra = (
             panel is not None
             and getattr(getattr(panel, "type", None), "value", getattr(panel, "type", None))
@@ -533,6 +607,8 @@ async def _sample_fingerprints(db: AsyncSession) -> dict[tuple[str, int, str], d
                 group_name=group_name,
                 label=group_tag or None,
                 distinct_remark=bool(is_astra),
+                category_name=category_name,
+                usage_cost=usage_cost,
             )
     return out
 
@@ -647,9 +723,10 @@ async def apply_ping_rank(
     hid dead pings (flag file under data/).
 
     Order rules:
-    - Up to 5 best مستقیم, then 5 تانل, then 5 گیمینگ
-    - Remaining successful fingerprints by quality
-    - Untested / unmatched keep relative order after scored ones
+    - Up to 20 best مستقیم (usage_cost↑ then quality)
+    - Tunnel tiers by usage_cost↑ — up to 35 per cost (e.g. ۵ سپس ۷)
+    - Up to 9 گیمینگ (usage_cost↑ then quality)
+    - Remaining successful by cost then quality; untested stay after
     """
     from app.services.config_hides import clear_stale_ping_auto_hides_once
     from app.services.ping_category_order import arrange_by_category_slots
@@ -792,6 +869,11 @@ async def apply_ping_rank(
         download_of=lambda it: downloads.get(_sk(it), 0),
         upload_of=lambda it: uploads.get(_sk(it), 0),
         packet_of=lambda it: packet_loss.get(_sk(it), 101.0),
+        category_of=lambda it: getattr(it, "category_name", None)
+        or " ".join(getattr(it, "group_names", None) or [])
+        or it.label
+        or "",
+        cost_of=lambda it: getattr(it, "usage_cost", None),
     )
     ordered = list(arranged) + unscored_rows
 

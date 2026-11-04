@@ -21,6 +21,10 @@ class ConfigOrderItemOut(BaseModel):
     protocol: str | None = None
     panel_names: list[str] = Field(default_factory=list)
     group_names: list[str] = Field(default_factory=list)
+    # From sales-group category folder (مستقیم / تانل / گیمینگ)
+    category_name: str | None = None
+    # From group.usage_cost (e.g. 5 = گیگی ۵ تومن)
+    usage_cost: int | None = None
     hidden: bool = False
     country_code: str | None = None
     flag: str | None = None
