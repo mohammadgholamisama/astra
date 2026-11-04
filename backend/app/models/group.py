@@ -31,6 +31,11 @@ class Group(Base):
     config_tag: Mapped[str | None] = mapped_column(String(200), nullable=True, default="")
     # Admin-only cost unit for this group's traffic (e.g. 7) — stored for later billing/organize
     usage_cost: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    # Explicit sub-order bucket set by admin (never inferred from config remark):
+    # direct | tunnel | gaming | other
+    order_kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="other", server_default="other"
+    )
     # Optional info messages → fake configs prepended to subscription (first in list)
     notices: Mapped[list | None] = mapped_column(JSONType, nullable=True, default=list)
     # NULL = default bucket «همه گروه‌ها» on the Groups page

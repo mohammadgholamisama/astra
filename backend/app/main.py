@@ -185,11 +185,15 @@ async def lifespan(_app: FastAPI):
         await refresh_config_orders(db)
         # Undo mass hides from older ping-rank bug (once per install)
         from app.services.config_hides import clear_stale_ping_auto_hides_once
-        from app.services.config_orders import relayout_order_slots_once
+        from app.services.config_orders import (
+            relayout_order_slots_once,
+            seed_order_kind_from_folders_once,
+        )
 
         await clear_stale_ping_auto_hides_once(db)
         try:
-            # Fix 20/35/35/9 layout (tunnel budget) once after 1.9.154
+            await seed_order_kind_from_folders_once(db)
+            # Re-layout with group.order_kind (no remark guessing)
             await relayout_order_slots_once(db)
         except Exception:  # noqa: BLE001
             pass

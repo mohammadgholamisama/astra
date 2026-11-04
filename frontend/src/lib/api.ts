@@ -217,6 +217,8 @@ export interface Group {
   config_tag?: string;
   /** Admin cost unit for this group's traffic (e.g. 7) — for later billing/organize */
   usage_cost?: number | null;
+  /** Sub layout bucket set by admin: direct | tunnel | gaming | other */
+  order_kind?: "direct" | "tunnel" | "gaming" | "other" | string;
   /** Optional info messages prepended as first configs in subscription */
   notices?: string[];
   /** null = default bucket «همه گروه‌ها» */

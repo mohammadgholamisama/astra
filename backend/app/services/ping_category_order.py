@@ -6,13 +6,15 @@ Layout (successful / scored configs first):
      fixed tunnel budget so gaming always fits before leftover
      (budget = SUB_MAX − 20 − 9 = 70 → e.g. گیگ ۵ سپس گیگ ۷)
   3) up to 9 گیمینگ — sorted by usage_cost↑ then quality
-  4) leftover successful by cost then quality
+  4) leftover successful by cost then quality (extra of above + other)
   5) unscored / failed keep relative order at the end
+
+Category comes ONLY from group.order_kind set by admin — never from
+config remark / label text.
 """
 
 from __future__ import annotations
 
-import re
 from itertools import groupby
 from typing import Any, Callable, TypeVar
 
@@ -26,20 +28,42 @@ SUB_MAX_CONFIGS = 99
 # Tunnel window before gaming so 20 + 70 + 9 = 99
 TUNNEL_BUDGET = SUB_MAX_CONFIGS - DIRECT_SLOT - GAMING_SLOT  # 70
 
-_GAMING = re.compile(r"گیمینگ|gaming|\bgame\b|گیم\b", re.I)
-_TUNNEL = re.compile(r"تانل|تونل|tunnel", re.I)
-_DIRECT = re.compile(r"مستقیم|mostaghim|direct", re.I)
+ORDER_KINDS = ("direct", "tunnel", "gaming", "other")
+
+# Accept canonical keys + Persian (and a few Latin) aliases from admin UI / legacy
+_KIND_ALIASES: dict[str, str] = {
+    "direct": "direct",
+    "مستقیم": "direct",
+    "mostaghim": "direct",
+    "tunnel": "tunnel",
+    "تانل": "tunnel",
+    "تونل": "tunnel",
+    "gaming": "gaming",
+    "گیمینگ": "gaming",
+    "گیم": "gaming",
+    "game": "gaming",
+    "other": "other",
+    "دیگر": "other",
+    "سایر": "other",
+    "": "other",
+}
+
+
+def normalize_order_kind(raw: str | None) -> str:
+    """Map admin value → canonical order_kind. Unknown → other."""
+    t = " ".join(str(raw or "").split()).strip().lower()
+    if t in _KIND_ALIASES:
+        return _KIND_ALIASES[t]
+    # tolerate mixed case canonical
+    low = t.lower()
+    if low in ORDER_KINDS:
+        return low
+    return "other"
 
 
 def detect_category(label: str | None) -> str:
-    t = (label or "").lower()
-    if _GAMING.search(t):
-        return "gaming"
-    if _TUNNEL.search(t):
-        return "tunnel"
-    if _DIRECT.search(t):
-        return "direct"
-    return "other"
+    """Backward-compat wrapper — same as normalize_order_kind (no remark guessing)."""
+    return normalize_order_kind(label)
 
 
 def _cost_key(raw: Any) -> int:
@@ -70,8 +94,7 @@ def arrange_by_category_slots(
 ) -> list[T]:
     """Sort successful items into category/cost slots then leftover by quality.
 
-    Tunnel tiers never push gaming out of the priority head: total tunnels
-    taken before gaming is capped by ``tunnel_budget`` (default 70).
+    ``category_of`` must return group.order_kind (or alias). Labels are ignored.
     """
 
     def _num(call: Callable[[T], Any] | None, it: T, default: float = 0.0) -> float:
@@ -94,15 +117,13 @@ def arrange_by_category_slots(
         return v
 
     def _cat(it: T) -> str:
-        if category_of is not None:
-            try:
-                raw = category_of(it)
-            except Exception:  # noqa: BLE001
-                raw = None
-            d = detect_category(str(raw or ""))
-            if d != "other":
-                return d
-        return detect_category(str(label_of(it) or ""))
+        if category_of is None:
+            return "other"
+        try:
+            raw = category_of(it)
+        except Exception:  # noqa: BLE001
+            raw = None
+        return normalize_order_kind(str(raw or ""))
 
     def _cost(it: T) -> int:
         if cost_of is None:
@@ -223,6 +244,9 @@ def arrange_rank_dicts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         download_of=lambda d: d.get("download_kbps") or 0,
         upload_of=lambda d: d.get("upload_kbps") or 0,
         packet_of=_packet,
-        category_of=lambda d: d.get("category_name") or d.get("category") or "",
+        category_of=lambda d: d.get("order_kind")
+        or d.get("category_name")
+        or d.get("category")
+        or "",
         cost_of=lambda d: d.get("usage_cost"),
     )

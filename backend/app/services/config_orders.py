@@ -504,13 +504,8 @@ async def _sample_fingerprints(db: AsyncSession) -> dict[tuple[str, int, str], d
     cost_by_panel: dict[int, int] = {}
     cat_by_panel: dict[int, str] = {}
     try:
-        from app.models.group import Group, GroupCategory, GroupPanel
-
-        cat_names: dict[int, str] = {}
-        c_rows = await db.execute(select(GroupCategory.id, GroupCategory.name))
-        for cid, cname in c_rows.all():
-            if cid is not None and cname:
-                cat_names[int(cid)] = str(cname).strip()
+        from app.models.group import Group, GroupPanel
+        from app.services.ping_category_order import normalize_order_kind
 
         g_rows = await db.execute(
             select(
@@ -518,10 +513,10 @@ async def _sample_fingerprints(db: AsyncSession) -> dict[tuple[str, int, str], d
                 Group.config_tag,
                 Group.name,
                 Group.usage_cost,
-                Group.category_id,
+                Group.order_kind,
             )
         )
-        for gid, tag, gname, cost, category_id in g_rows.all():
+        for gid, tag, gname, cost, order_kind in g_rows.all():
             if gid is None:
                 continue
             gid_i = int(gid)
@@ -536,10 +531,7 @@ async def _sample_fingerprints(db: AsyncSession) -> dict[tuple[str, int, str], d
                     cost_by_gid[gid_i] = int(cost)
             except (TypeError, ValueError):
                 pass
-            if category_id is not None:
-                cn = cat_names.get(int(category_id), "")
-                if cn:
-                    cat_by_gid[gid_i] = cn
+            cat_by_gid[gid_i] = normalize_order_kind(order_kind)
 
         gp_rows = await db.execute(
             select(GroupPanel.panel_id, GroupPanel.group_id)
@@ -869,10 +861,8 @@ async def apply_ping_rank(
         download_of=lambda it: downloads.get(_sk(it), 0),
         upload_of=lambda it: uploads.get(_sk(it), 0),
         packet_of=lambda it: packet_loss.get(_sk(it), 101.0),
-        category_of=lambda it: getattr(it, "category_name", None)
-        or " ".join(getattr(it, "group_names", None) or [])
-        or it.label
-        or "",
+        # Only group.order_kind (exposed as category_name on workspace items)
+        category_of=lambda it: getattr(it, "category_name", None) or "",
         cost_of=lambda it: getattr(it, "usage_cost", None),
     )
     # Full order: 20 direct → ≤70 tunnel (35/cost) → 9 gaming → leftover.
@@ -923,34 +913,64 @@ async def apply_ping_rank(
     return await list_workspace(db)
 
 
-async def relayout_order_slots_once(db: AsyncSession) -> int:
-    """One-shot: re-apply 20/35×cost/9 layout using stored pings + group cost/cat.
+async def seed_order_kind_from_folders_once(db: AsyncSession) -> int:
+    """One-shot: copy folder name → group.order_kind when still default other.
 
-    Flag: ``data/relayout_slots_v154``. Fixes orders saved before tunnel-budget
-    (extra cost tiers pushed gaming out of the top 99).
+    Only maps شناخته‌شده‌ها (مستقیم/تانل/گیمینگ). Manual order_kind wins afterward.
+    Flag: ``data/seed_order_kind_v155``.
     """
     from pathlib import Path
 
-    from app.services.ping_category_order import arrange_by_category_slots
+    from app.models.group import Group, GroupCategory
+    from app.services.ping_category_order import normalize_order_kind
 
-    # Same data root as config_hides one-shot flags (repo /opt/astra data/)
     data_dir = Path(__file__).resolve().parents[3] / "data"
-    flag = data_dir / "relayout_slots_v154"
+    flag = data_dir / "seed_order_kind_v155"
     if flag.exists():
         return 0
+    try:
+        cat_names: dict[int, str] = {}
+        c_rows = await db.execute(select(GroupCategory.id, GroupCategory.name))
+        for cid, cname in c_rows.all():
+            if cid is not None and cname:
+                cat_names[int(cid)] = str(cname).strip()
+        result = await db.execute(select(Group))
+        groups = list(result.scalars().all())
+        n = 0
+        for g in groups:
+            current = normalize_order_kind(getattr(g, "order_kind", None) or "other")
+            if current != "other":
+                continue
+            cid = getattr(g, "category_id", None)
+            if cid is None:
+                continue
+            guessed = normalize_order_kind(cat_names.get(int(cid), ""))
+            if guessed == "other":
+                continue
+            g.order_kind = guessed
+            n += 1
+        if n:
+            await db.commit()
+        data_dir.mkdir(parents=True, exist_ok=True)
+        flag.write_text(f"seeded={n}\n", encoding="utf-8")
+        logger.info("seed_order_kind_v155 seeded=%s", n)
+        return n
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("seed_order_kind_v155 failed: %s", exc)
+        return 0
+
+
+async def relayout_order_from_stored(db: AsyncSession) -> int:
+    """Re-apply 20/35×cost/9 layout from stored pings + group.order_kind/cost."""
+    from app.services.ping_category_order import arrange_by_category_slots
 
     try:
         workspace = await list_workspace(db)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("relayout_slots_v154 list failed: %s", exc)
+        logger.warning("relayout list failed: %s", exc)
         return 0
     current = list(workspace.items)
     if not current:
-        try:
-            data_dir.mkdir(parents=True, exist_ok=True)
-            flag.write_text("empty\n", encoding="utf-8")
-        except OSError:
-            pass
         return 0
 
     scored: list[ConfigOrderItemOut] = []
@@ -967,14 +987,8 @@ async def relayout_order_slots_once(db: AsyncSession) -> int:
             unscored.append(it)
 
     if not scored:
-        try:
-            data_dir.mkdir(parents=True, exist_ok=True)
-            flag.write_text("no-scores\n", encoding="utf-8")
-        except OSError:
-            pass
         return 0
 
-    # Preserve previous avg_ping / device_count across save_order wipe
     ping_by_key: dict[tuple[str, int, str], tuple[float, int | None]] = {}
     for it in current:
         try:
@@ -1004,10 +1018,7 @@ async def relayout_order_slots_once(db: AsyncSession) -> int:
         avg_of=lambda it: float(getattr(it, "avg_ping", None) or 1e18),
         label_of=lambda it: it.label or "",
         device_of=lambda it: getattr(it, "device_count", None) or 1,
-        category_of=lambda it: getattr(it, "category_name", None)
-        or " ".join(getattr(it, "group_names", None) or [])
-        or it.label
-        or "",
+        category_of=lambda it: getattr(it, "category_name", None) or "",
         cost_of=lambda it: getattr(it, "usage_cost", None),
     )
     ordered = list(arranged) + unscored
@@ -1043,18 +1054,32 @@ async def relayout_order_slots_once(db: AsyncSession) -> int:
         restored += 1
     await db.commit()
     await refresh_cache(db)
-
-    try:
-        data_dir.mkdir(parents=True, exist_ok=True)
-        flag.write_text(f"n={len(payload)} restored={restored}\n", encoding="utf-8")
-    except OSError:
-        pass
     logger.info(
-        "relayout_slots_v154 ordered=%s restored_pings=%s",
+        "relayout_order_from_stored ordered=%s restored_pings=%s",
         len(payload),
         restored,
     )
     return len(payload)
+
+
+async def relayout_order_slots_once(db: AsyncSession) -> int:
+    """One-shot after order_kind: re-layout with explicit group kinds.
+
+    Flag: ``data/relayout_slots_v155``.
+    """
+    from pathlib import Path
+
+    data_dir = Path(__file__).resolve().parents[3] / "data"
+    flag = data_dir / "relayout_slots_v155"
+    if flag.exists():
+        return 0
+    n = await relayout_order_from_stored(db)
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        flag.write_text(f"n={n}\n", encoding="utf-8")
+    except OSError:
+        pass
+    return n
 
 
 async def save_order(db: AsyncSession, items: list[ConfigOrderItemIn]) -> ConfigOrderWorkspaceOut:

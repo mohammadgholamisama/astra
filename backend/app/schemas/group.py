@@ -19,6 +19,8 @@ class GroupCreate(BaseModel):
     config_tag: str = Field(default="", max_length=200)
     # Null/omit = unset; used later for consumption cost organization
     usage_cost: int | None = Field(default=None, ge=0, le=1_000_000)
+    # Sub layout bucket: direct | tunnel | gaming | other
+    order_kind: str = Field(default="other", max_length=16)
     notices: list[str] = Field(default_factory=list, max_length=10)
     # None = default «همه گروه‌ها» bucket
     category_id: int | None = None
@@ -34,6 +36,7 @@ class GroupUpdate(BaseModel):
     usage_cost: int | None = Field(default=None, ge=0, le=1_000_000)
     # Explicit clear of usage_cost when true
     clear_usage_cost: bool | None = None
+    order_kind: str | None = Field(default=None, max_length=16)
     notices: list[str] | None = Field(default=None, max_length=10)
     category_id: int | None = None
     # Explicit clear: send true to move group back to «همه گروه‌ها»
@@ -58,6 +61,7 @@ class GroupOut(ORMModel):
     is_disabled: bool
     config_tag: str = ""
     usage_cost: int | None = None
+    order_kind: str = "other"
     notices: list[str] = Field(default_factory=list)
     category_id: int | None = None
     inbound_tags: list[str] = Field(default_factory=list)

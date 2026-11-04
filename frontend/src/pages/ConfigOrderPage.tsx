@@ -679,11 +679,11 @@ export default function ConfigOrderPage() {
           <p className="configs-kicker">سابسکریپشن</p>
           <h1 className="page-title">ترتیب کانفیگ‌ها</h1>
           <p className="page-sub">
-            شمارهٔ <strong>#</strong> همان شمارهٔ صفحهٔ ساب است. چیدمان خودکار تست‌ها:{" "}
-            <strong>۲۰ مستقیم</strong> → <strong>۳۵ تانل گیگی۵</strong> →{" "}
-            <strong>۳۵ تانل گیگی۷</strong> → <strong>۹ گیمینگ</strong>؛ داخل هر بخش
-            اول هزینه کمتر، بعد سریع‌ترها. ساب کاربر حداکثر{" "}
-            <strong>۹۹</strong> تا؛ اپ تست با probe همه را می‌گیرد.
+            شمارهٔ <strong>#</strong> همان شمارهٔ صفحهٔ ساب است. نوع هر کانفیگ از{" "}
+            <strong>گزینهٔ «نوع ترتیب ساب»</strong> روی گروه می‌آید (نه از اسم کانفیگ).
+            چیدمان تست: <strong>۲۰ مستقیم</strong> → <strong>۳۵ تانل</strong> به‌ازای هر
+            هزینه → <strong>۹ گیمینگ</strong> → بقیه. ساب کاربر حداکثر{" "}
+            <strong>۹۹</strong>؛ اپ تست همه را می‌گیرد.
           </p>
         </div>
         <div className="config-order-hero-actions">

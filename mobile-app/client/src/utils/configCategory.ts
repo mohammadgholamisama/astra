@@ -1,4 +1,8 @@
-/** Remark / folder categories used for panel + app ordering. */
+/** Remark / folder categories used for panel + app ordering.
+
+ * Category MUST come from group.order_kind (category_name on rank items).
+ * Never guess from remark / label text.
+ */
 
 export type ConfigCategory = 'direct' | 'tunnel' | 'gaming' | 'other';
 
@@ -10,12 +14,43 @@ export const SUB_MAX_CONFIGS = 99;
 /** Tunnel window before gaming so 20 + 70 + 9 = 99 */
 export const TUNNEL_BUDGET = SUB_MAX_CONFIGS - DIRECT_SLOT - GAMING_SLOT; // 70
 
-export function detectConfigCategory(remark: string | null | undefined): ConfigCategory {
-  const t = String(remark || '').toLowerCase();
-  if (/گیمینگ|gaming|\bgame\b|گیم\b/.test(t)) return 'gaming';
-  if (/تانل|تونل|tunnel/.test(t)) return 'tunnel';
-  if (/مستقیم|mostaghim|direct/.test(t)) return 'direct';
+const KIND_ALIASES: Record<string, ConfigCategory> = {
+  direct: 'direct',
+  مستقیم: 'direct',
+  mostaghim: 'direct',
+  tunnel: 'tunnel',
+  تانل: 'tunnel',
+  تونل: 'tunnel',
+  gaming: 'gaming',
+  گیمینگ: 'gaming',
+  گیم: 'gaming',
+  game: 'gaming',
+  other: 'other',
+  دیگر: 'other',
+  سایر: 'other',
+};
+
+/** Normalize admin order_kind — no remark guessing. */
+export function normalizeOrderKind(
+  raw: string | null | undefined,
+): ConfigCategory {
+  const t = String(raw || '')
+    .trim()
+    .toLowerCase();
+  if (!t) return 'other';
+  const aliased = KIND_ALIASES[t];
+  if (aliased) return aliased;
+  if (t === 'direct' || t === 'tunnel' || t === 'gaming' || t === 'other') {
+    return t;
+  }
   return 'other';
+}
+
+/** @deprecated use normalizeOrderKind — kept for older call sites */
+export function detectConfigCategory(
+  remark: string | null | undefined,
+): ConfigCategory {
+  return normalizeOrderKind(remark);
 }
 
 type Rankable = {
@@ -27,6 +62,7 @@ type Rankable = {
   label?: string;
   remark?: string;
   category_name?: string | null;
+  order_kind?: string | null;
   usage_cost?: number | null;
 };
 
@@ -87,16 +123,15 @@ function segmentCmp(a: Rankable, b: Rankable): number {
 }
 
 function resolveCat(it: Rankable): ConfigCategory {
-  const fromFolder = detectConfigCategory(it.category_name || '');
-  if (fromFolder !== 'other') return fromFolder;
-  return detectConfigCategory(it.label || it.remark || '');
+  // Explicit group.order_kind only — never label/remark
+  return normalizeOrderKind(it.order_kind || it.category_name || '');
 }
 
 /**
  * Arrange successful rows:
  *   20 مستقیم (cost↑ then quality) →
  *   تانل per usage_cost↑ up to 35 each, total ≤ TUNNEL_BUDGET (70) →
- *   9 گیمینگ → leftover by cost/quality.
+ *   9 گیمینگ → leftover by cost/quality (extra + other).
  * Failures/untested stay at the end.
  */
 export function arrangeByCategorySlots<T extends Rankable>(items: T[]): T[] {

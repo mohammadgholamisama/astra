@@ -235,6 +235,10 @@ export default function GroupsPage() {
   const [configTag, setConfigTag] = useState("");
   /** Draft text for usage_cost input (empty = unset). */
   const [usageCost, setUsageCost] = useState("");
+  /** Sub order bucket — never inferred from config names. */
+  const [orderKind, setOrderKind] = useState<"direct" | "tunnel" | "gaming" | "other">(
+    "other",
+  );
   const [picks, setPicks] = useState<PanelPick[]>([]);
   const [catalogs, setCatalogs] = useState<Record<number, PanelCatalog>>({});
   const [confirmGroup, setConfirmGroup] = useState<Group | null>(null);
@@ -438,6 +442,7 @@ export default function GroupsPage() {
         name,
         description: description || null,
         config_tag: configTag.trim(),
+        order_kind: orderKind,
         notices: [] as string[],
         panels: bodyPanels,
       };
@@ -679,6 +684,7 @@ export default function GroupsPage() {
     setDescription("");
     setConfigTag("");
     setUsageCost("");
+    setOrderKind("other");
     setPicks([]);
     setCatalogs({});
     setCoeffDrafts({});
@@ -701,6 +707,12 @@ export default function GroupsPage() {
       group.usage_cost != null && Number.isFinite(group.usage_cost)
         ? String(group.usage_cost)
         : ""
+    );
+    const ok = String(group.order_kind || "other").toLowerCase();
+    setOrderKind(
+      ok === "direct" || ok === "tunnel" || ok === "gaming" || ok === "other"
+        ? ok
+        : "other",
     );
     setCatalogs({});
     attemptedRef.current = new Set();
@@ -907,6 +919,22 @@ export default function GroupsPage() {
                       {(g.config_tag || "").trim()}
                     </span>
                   ) : null}
+                  {(() => {
+                    const k = String(g.order_kind || "other").toLowerCase();
+                    const label =
+                      k === "direct"
+                        ? "مستقیم"
+                        : k === "tunnel"
+                          ? "تانل"
+                          : k === "gaming"
+                            ? "گیمینگ"
+                            : "سایر";
+                    return (
+                      <span className="badge muted" title="نوع ترتیب ساب">
+                        {label}
+                      </span>
+                    );
+                  })()}
                   {g.usage_cost != null ? (
                     <span
                       className="badge muted"
@@ -1018,6 +1046,29 @@ export default function GroupsPage() {
               </div>
 
               <div className="field">
+                <label>نوع ترتیب ساب</label>
+                <select
+                  value={orderKind}
+                  onChange={(e) =>
+                    setOrderKind(
+                      e.target.value as "direct" | "tunnel" | "gaming" | "other",
+                    )
+                  }
+                  aria-label="نوع ترتیب ساب"
+                >
+                  <option value="direct">مستقیم</option>
+                  <option value="tunnel">تانل</option>
+                  <option value="gaming">گیمینگ</option>
+                  <option value="other">سایر / بعد از سهمیه‌ها</option>
+                </select>
+                <p className="field-hint">
+                  خودت مشخص کن این گروه چیست — ترتیب ساب و تست اپ فقط از همین گزینه
+                  می‌فهمد (از روی اسم کانفیگ حدس نمی‌زند). چیدمان: ۲۰ مستقیم → ۳۵ تانل
+                  به‌ازای هر هزینه → ۹ گیمینگ → بقیه.
+                </p>
+              </div>
+
+              <div className="field">
                 <label>هزینه مصرف (اختیاری)</label>
                 <input
                   type="text"
@@ -1028,12 +1079,12 @@ export default function GroupsPage() {
                     const v = e.target.value.replace(/[^\d]/g, "");
                     setUsageCost(v);
                   }}
-                  placeholder="مثلاً ۷"
+                  placeholder="مثلاً ۵ یا ۷"
                   aria-label="هزینه مصرف گروه"
                 />
                 <p className="field-hint">
-                  عدد دلخواه برای هزینه مصرف کانفیگ این گروه — فقط برای نظم خودت ذخیره
-                  می‌شود و فعلاً روی ساب اثر ندارد.
+                  برای گروه‌های تانل: هزینه کمتر زودتر می‌آید (مثلاً ۵ بعد ۷، هر کدام تا
+                  ۳۵ کانفیگ). روی سرعت ساب اثر ندارد.
                 </p>
               </div>
 

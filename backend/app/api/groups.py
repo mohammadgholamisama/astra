@@ -216,6 +216,12 @@ def _normalize_usage_cost(raw: int | None) -> int | None:
     return n
 
 
+def _normalize_order_kind(raw: str | None) -> str:
+    from app.services.ping_category_order import normalize_order_kind
+
+    return normalize_order_kind(raw)
+
+
 def _normalize_category_name(raw: str | None) -> str:
     text = " ".join(str(raw or "").split()).strip()
     return text[:48]
@@ -246,6 +252,7 @@ def _to_out(group: Group) -> GroupOut:
         is_disabled=group.is_disabled,
         config_tag=_normalize_config_tag(getattr(group, "config_tag", None) or ""),
         usage_cost=cost_out,
+        order_kind=_normalize_order_kind(getattr(group, "order_kind", None) or "other"),
         notices=list(group.notices or []),
         category_id=getattr(group, "category_id", None),
         inbound_tags=[],
@@ -472,6 +479,7 @@ async def create_group(
         is_disabled=body.is_disabled,
         config_tag=_normalize_config_tag(body.config_tag),
         usage_cost=usage_cost,
+        order_kind=_normalize_order_kind(body.order_kind),
         notices=normalize_notices(body.notices),
         category_id=category_id,
     )
@@ -555,6 +563,9 @@ async def update_group(
     group = await _load_group(db, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
+    prev_kind = _normalize_order_kind(getattr(group, "order_kind", None) or "other")
+    prev_cost = getattr(group, "usage_cost", None)
+    layout_changed = False
     if body.name is not None:
         group.name = body.name
     if body.description is not None:
@@ -565,11 +576,16 @@ async def update_group(
         group.config_tag = _normalize_config_tag(body.config_tag)
     if body.clear_usage_cost:
         group.usage_cost = None
+        layout_changed = prev_cost is not None
     elif body.usage_cost is not None:
         try:
             group.usage_cost = _normalize_usage_cost(body.usage_cost)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        layout_changed = group.usage_cost != prev_cost
+    if body.order_kind is not None:
+        group.order_kind = _normalize_order_kind(body.order_kind)
+        layout_changed = layout_changed or group.order_kind != prev_kind
     if body.notices is not None:
         group.notices = normalize_notices(body.notices)
     old_cat = getattr(group, "category_id", None)
@@ -614,6 +630,21 @@ async def update_group(
         )
     except Exception:  # noqa: BLE001
         pass
+    # Re-layout config-order in background — never block group save / sub speed
+    if layout_changed:
+        async def _bg_relayout() -> None:
+            from app.core.database import AsyncSessionLocal
+            from app.services.config_orders import relayout_order_from_stored
+
+            try:
+                async with AsyncSessionLocal() as s:
+                    await relayout_order_from_stored(s)
+            except Exception:  # noqa: BLE001
+                logger.exception("bg relayout after group %s failed", group_id)
+
+        asyncio.create_task(
+            _bg_relayout(), name=f"astra-relayout-g{group_id}"
+        )
     # Never block PUT /api/group on remote I/O or a full user recount.
     if need_full_resync:
         asyncio.create_task(
