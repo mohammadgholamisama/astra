@@ -63,7 +63,7 @@ export default function ConfigLookupPage() {
       api<LookupOut>("/api/admin/config-lookup", {
         method: "POST",
         body: JSON.stringify({ text: payload }),
-        timeoutMs: 60_000,
+        timeoutMs: 20_000,
       }),
   });
 
