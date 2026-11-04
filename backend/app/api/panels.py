@@ -4,14 +4,14 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.factory import get_adapter
 from app.adapters.http_utils import normalize_panel_base_url
 from app.api.deps import get_current_admin
 from app.core.database import get_db
-from app.models.panel import Panel, PanelType
+from app.models.panel import Panel, PanelCategory, PanelType
 from app.schemas.panel import (
     GroupPreviewRequest,
     InboundOut,
@@ -20,7 +20,11 @@ from app.schemas.panel import (
     MarzInboundPreviewRequest,
     MarzProtocolOut,
     PanelActiveSet,
+    PanelCategoryCreate,
+    PanelCategoryOut,
+    PanelCategoryUpdate,
     PanelCreate,
+    PanelMoveBody,
     PanelOut,
     PanelTestAllOut,
     PanelTestOut,
@@ -146,6 +150,21 @@ def _validate_credentials(panel_type: PanelType, username: str | None, password:
             )
 
 
+def _normalize_category_name(raw: str | None) -> str:
+    return " ".join(str(raw or "").split()).strip()[:48]
+
+
+async def _ensure_panel_category(
+    db: AsyncSession, category_id: int | None
+) -> int | None:
+    if category_id is None:
+        return None
+    cat = await db.get(PanelCategory, int(category_id))
+    if not cat:
+        raise HTTPException(status_code=400, detail="دسته پنل پیدا نشد")
+    return int(cat.id)
+
+
 def _to_out(p: Panel) -> PanelOut:
     return PanelOut(
         id=p.id,
@@ -157,6 +176,7 @@ def _to_out(p: Panel) -> PanelOut:
         has_token=bool(p.api_token),
         meta=p.meta or {},
         is_active=p.is_active,
+        category_id=getattr(p, "category_id", None),
         last_ok_at=p.last_ok_at,
         created_at=p.created_at,
     )
@@ -217,6 +237,158 @@ async def _probe_panel(panel: Panel) -> None:
     )
 
 
+# ── Panel categories (UI folders only) ───────────────────────────────────────
+
+
+@router.get("/api/panel-categories", response_model=list[PanelCategoryOut])
+@router.get("/api/admin/panel-categories", response_model=list[PanelCategoryOut])
+async def list_panel_categories(
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    counts = {
+        int(cid): int(n)
+        for cid, n in (
+            await db.execute(
+                select(Panel.category_id, func.count())
+                .where(Panel.category_id.is_not(None))
+                .group_by(Panel.category_id)
+            )
+        ).all()
+        if cid is not None
+    }
+    rows = (
+        await db.execute(
+            select(PanelCategory).order_by(PanelCategory.sort_order, PanelCategory.id)
+        )
+    ).scalars().all()
+    return [
+        PanelCategoryOut(
+            id=c.id,
+            name=c.name,
+            sort_order=c.sort_order,
+            panels_count=counts.get(c.id, 0),
+            created_at=c.created_at,
+        )
+        for c in rows
+    ]
+
+
+@router.post("/api/panel-categories", response_model=PanelCategoryOut)
+@router.post("/api/admin/panel-categories", response_model=PanelCategoryOut)
+async def create_panel_category(
+    body: PanelCategoryCreate,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    name = _normalize_category_name(body.name)
+    if len(name) < 1:
+        raise HTTPException(status_code=400, detail="نام دسته خالی است")
+    exists = await db.execute(select(PanelCategory).where(PanelCategory.name == name))
+    if exists.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="دسته با این نام از قبل هست")
+    max_ord = (await db.execute(select(func.max(PanelCategory.sort_order)))).scalar()
+    cat = PanelCategory(
+        name=name,
+        sort_order=body.sort_order if body.sort_order else int(max_ord or 0) + 1,
+    )
+    db.add(cat)
+    await db.commit()
+    await db.refresh(cat)
+    return PanelCategoryOut(
+        id=cat.id,
+        name=cat.name,
+        sort_order=cat.sort_order,
+        panels_count=0,
+        created_at=cat.created_at,
+    )
+
+
+@router.put("/api/panel-categories/{category_id}", response_model=PanelCategoryOut)
+@router.put("/api/admin/panel-categories/{category_id}", response_model=PanelCategoryOut)
+async def update_panel_category(
+    category_id: int,
+    body: PanelCategoryUpdate,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    cat = await db.get(PanelCategory, category_id)
+    if not cat:
+        raise HTTPException(status_code=404, detail="دسته پیدا نشد")
+    if body.name is not None:
+        name = _normalize_category_name(body.name)
+        if len(name) < 1:
+            raise HTTPException(status_code=400, detail="نام دسته خالی است")
+        clash = await db.execute(
+            select(PanelCategory).where(
+                PanelCategory.name == name, PanelCategory.id != category_id
+            )
+        )
+        if clash.scalar_one_or_none():
+            raise HTTPException(status_code=409, detail="دسته با این نام از قبل هست")
+        cat.name = name
+    if body.sort_order is not None:
+        cat.sort_order = int(body.sort_order)
+    await db.commit()
+    await db.refresh(cat)
+    n = (
+        await db.execute(
+            select(func.count()).select_from(Panel).where(Panel.category_id == cat.id)
+        )
+    ).scalar() or 0
+    return PanelCategoryOut(
+        id=cat.id,
+        name=cat.name,
+        sort_order=cat.sort_order,
+        panels_count=int(n),
+        created_at=cat.created_at,
+    )
+
+
+@router.delete("/api/panel-categories/{category_id}")
+@router.delete("/api/admin/panel-categories/{category_id}")
+async def delete_panel_category(
+    category_id: int,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """Delete category tab only — panels move to default «همه پنل‌ها»."""
+    cat = await db.get(PanelCategory, category_id)
+    if not cat:
+        raise HTTPException(status_code=404, detail="دسته پیدا نشد")
+    moved = await db.execute(
+        update(Panel)
+        .where(Panel.category_id == category_id)
+        .values(category_id=None)
+        .execution_options(synchronize_session="fetch")
+    )
+    await db.flush()
+    await db.delete(cat)
+    await db.commit()
+    return {
+        "detail": "Category deleted",
+        "panels_moved_to_default": int(moved.rowcount or 0),
+    }
+
+
+@router.put("/api/panel/{panel_id}/move", response_model=PanelOut)
+@router.put("/api/admin/panels/{panel_id}/move", response_model=PanelOut)
+async def move_panel(
+    panel_id: int,
+    body: PanelMoveBody,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """UI-only: move panel between category tabs. No provision/sub side effects."""
+    panel = await db.get(Panel, panel_id)
+    if not panel:
+        raise HTTPException(status_code=404, detail="Panel not found")
+    panel.category_id = await _ensure_panel_category(db, body.category_id)
+    await db.commit()
+    await db.refresh(panel)
+    return _to_out(panel)
+
+
 @router.post("/api/panel", response_model=PanelOut)
 @router.post("/api/admin/panels", response_model=PanelOut)
 async def create_panel(
@@ -228,6 +400,7 @@ async def create_panel(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Panel name already exists")
     _validate_credentials(body.type, body.username, body.password, body.api_token)
+    category_id = await _ensure_panel_category(db, body.category_id)
 
     meta = dict(body.meta or {})
     if body.type == PanelType.astra:
@@ -247,6 +420,7 @@ async def create_panel(
             api_token=str(meta.get("node_token") or ""),
             meta=meta,
             is_active=body.is_active,
+            category_id=category_id,
         )
         db.add(panel)
         await db.flush()
@@ -275,6 +449,7 @@ async def create_panel(
         api_token=(body.api_token or "").strip() or None,
         meta=meta,
         is_active=body.is_active,
+        category_id=category_id,
     )
     # Test BEFORE persisting — wrong credentials must not create a row
     await _probe_panel(panel)
@@ -387,6 +562,11 @@ async def update_panel(
     if not panel:
         raise HTTPException(status_code=404, detail="Panel not found")
     data = body.model_dump(exclude_unset=True)
+    clear_category = bool(data.pop("clear_category", False))
+    if clear_category:
+        data["category_id"] = None
+    elif "category_id" in data:
+        data["category_id"] = await _ensure_panel_category(db, data.get("category_id"))
     only_active = set(data.keys()) == {"is_active"}
     was_active = bool(panel.is_active)
     old_astra_meta = (

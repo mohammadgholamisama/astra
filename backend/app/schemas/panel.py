@@ -16,6 +16,7 @@ class PanelCreate(BaseModel):
     api_token: str | None = None
     meta: dict[str, Any] = Field(default_factory=dict)
     is_active: bool = True
+    category_id: int | None = None
 
 
 class PanelUpdate(BaseModel):
@@ -26,6 +27,8 @@ class PanelUpdate(BaseModel):
     api_token: str | None = None
     meta: dict[str, Any] | None = None
     is_active: bool | None = None
+    category_id: int | None = None
+    clear_category: bool = False
 
 
 class PanelActiveSet(BaseModel):
@@ -59,8 +62,33 @@ class PanelOut(ORMModel):
     has_token: bool = False
     meta: dict[str, Any]
     is_active: bool
+    category_id: int | None = None
     last_ok_at: datetime | None
     created_at: datetime
+
+
+class PanelCategoryCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=48)
+    sort_order: int = 0
+
+
+class PanelCategoryUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=48)
+    sort_order: int | None = None
+
+
+class PanelCategoryOut(ORMModel):
+    id: int
+    name: str
+    sort_order: int
+    panels_count: int = 0
+    created_at: datetime
+
+
+class PanelMoveBody(BaseModel):
+    """Move a panel into a category tab, or null for default «همه پنل‌ها»."""
+
+    category_id: int | None = None
 
 
 class InboundOut(BaseModel):

@@ -172,7 +172,17 @@ export interface Panel {
   has_token: boolean;
   meta: Record<string, unknown>;
   is_active: boolean;
+  /** null = default bucket «همه پنل‌ها» (UI only) */
+  category_id?: number | null;
   last_ok_at: string | null;
+  created_at: string;
+}
+
+export interface PanelCategory {
+  id: number;
+  name: string;
+  sort_order: number;
+  panels_count: number;
   created_at: string;
 }
 

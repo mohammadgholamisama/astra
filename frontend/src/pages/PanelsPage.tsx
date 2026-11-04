@@ -2,7 +2,9 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  ArrowRightLeft,
   CheckCircle2,
+  FolderPlus,
   Pencil,
   Plus,
   Power,
@@ -13,8 +15,10 @@ import {
   XCircle,
 } from "lucide-react";
 import Select from "../components/Select";
-import { api, ApiError, Panel, PanelType } from "../lib/api";
+import { api, ApiError, Panel, PanelCategory, PanelType } from "../lib/api";
 import { toFaDigits } from "../lib/format";
+
+type CatTab = null | number;
 
 function hostFromBaseUrl(url: string): string {
   return url
@@ -139,6 +143,12 @@ export default function PanelsPage() {
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Panel | null>(null);
   const [form, setForm] = useState(emptyForm);
+  const [activeTab, setActiveTab] = useState<CatTab>(null);
+  const [movePanel, setMovePanel] = useState<Panel | null>(null);
+  const [catModal, setCatModal] = useState<"create" | { edit: PanelCategory } | null>(
+    null
+  );
+  const [catName, setCatName] = useState("");
   const [selectedInbounds, setSelectedInbounds] = useState<number[]>([]);
   const [inbounds, setInbounds] = useState<InboundInfo[]>([]);
   const [inboundsLoading, setInboundsLoading] = useState(false);
@@ -170,6 +180,10 @@ export default function PanelsPage() {
     queryKey: ["panels"],
     queryFn: () => api<Panel[]>("/api/admin/panels"),
   });
+  const { data: categories = [] } = useQuery({
+    queryKey: ["panel-categories"],
+    queryFn: () => api<PanelCategory[]>("/api/admin/panel-categories"),
+  });
 
   const { data: siteSettings } = useQuery({
     queryKey: ["site-settings"],
@@ -177,6 +191,24 @@ export default function PanelsPage() {
     staleTime: 60_000,
   });
   const sslAvailable = Boolean(siteSettings?.ssl_available);
+
+  const uncategorizedCount = useMemo(
+    () => data.filter((p) => p.category_id == null).length,
+    [data]
+  );
+  const visiblePanels = useMemo(() => {
+    if (activeTab == null) return data.filter((p) => p.category_id == null);
+    return data.filter((p) => p.category_id === activeTab);
+  }, [data, activeTab]);
+  const activeCat = useMemo(
+    () => (activeTab == null ? null : categories.find((c) => c.id === activeTab) || null),
+    [activeTab, categories]
+  );
+
+  useEffect(() => {
+    if (activeTab == null) return;
+    if (!categories.some((c) => c.id === activeTab)) setActiveTab(null);
+  }, [activeTab, categories]);
 
   function resetModal() {
     setOpen(false);
@@ -486,12 +518,14 @@ export default function PanelsPage() {
           password: isAstra ? null : form.password || null,
           api_token: isAstra ? null : isSanaei ? form.api_token || null : form.api_token || null,
           is_active: form.is_active,
+          category_id: activeTab,
           meta,
         }),
       });
     },
     onSuccess: (p) => {
       qc.invalidateQueries({ queryKey: ["panels"] });
+      qc.invalidateQueries({ queryKey: ["panel-categories"] });
       resetModal();
       if (!isEdit && p?.type === "astra") {
         setMsg("پنل آسترا ساخته شد — اوتباندها را اضافه کنید");
@@ -506,12 +540,65 @@ export default function PanelsPage() {
     mutationFn: (id: number) => api(`/api/admin/panels/${id}`, { method: "DELETE" }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["panels"] });
+      qc.invalidateQueries({ queryKey: ["panel-categories"] });
       setConfirmPanel(null);
       setMsg("پنل حذف شد");
     },
     onError: (e: Error) => {
       setConfirmPanel(null);
       setMsg(e.message);
+    },
+  });
+
+  const moveMut = useMutation({
+    mutationFn: ({ id, category_id }: { id: number; category_id: number | null }) =>
+      api<Panel>(`/api/admin/panels/${id}/move`, {
+        method: "PUT",
+        body: JSON.stringify({ category_id }),
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["panels"] });
+      qc.invalidateQueries({ queryKey: ["panel-categories"] });
+      setMovePanel(null);
+      setMsg("دسته پنل عوض شد");
+    },
+    onError: (e: Error) => setMsg(e.message),
+  });
+
+  const saveCategory = useMutation({
+    mutationFn: async () => {
+      const n = catName.trim();
+      if (!n) throw new Error("نام دسته را وارد کنید");
+      if (catModal === "create") {
+        return api<PanelCategory>("/api/admin/panel-categories", {
+          method: "POST",
+          body: JSON.stringify({ name: n }),
+        });
+      }
+      if (catModal && typeof catModal === "object" && "edit" in catModal) {
+        return api<PanelCategory>(`/api/admin/panel-categories/${catModal.edit.id}`, {
+          method: "PUT",
+          body: JSON.stringify({ name: n }),
+        });
+      }
+      throw new Error("invalid");
+    },
+    onSuccess: (cat) => {
+      qc.invalidateQueries({ queryKey: ["panel-categories"] });
+      setCatModal(null);
+      setCatName("");
+      if (catModal === "create") setActiveTab(cat.id);
+    },
+  });
+
+  const deleteCategory = useMutation({
+    mutationFn: (id: number) =>
+      api(`/api/admin/panel-categories/${id}`, { method: "DELETE" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["panel-categories"] });
+      qc.invalidateQueries({ queryKey: ["panels"] });
+      setActiveTab(null);
+      setCatModal(null);
     },
   });
 
@@ -739,10 +826,68 @@ export default function PanelsPage() {
         </button>
       </div>
 
+      <div className="groups-cat-bar" role="tablist" aria-label="دسته‌بندی پنل‌ها">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab == null}
+          className={`groups-cat-tab${activeTab == null ? " active" : ""}`}
+          onClick={() => setActiveTab(null)}
+        >
+          همه پنل‌ها
+          <span className="groups-cat-count">{toFaDigits(uncategorizedCount)}</span>
+        </button>
+        {categories.map((c) => (
+          <button
+            key={c.id}
+            type="button"
+            role="tab"
+            aria-selected={activeTab === c.id}
+            className={`groups-cat-tab${activeTab === c.id ? " active" : ""}`}
+            onClick={() => setActiveTab(c.id)}
+            onDoubleClick={() => {
+              setCatName(c.name);
+              setCatModal({ edit: c });
+            }}
+            title="دبل‌کلیک برای ویرایش نام"
+          >
+            {c.name}
+            <span className="groups-cat-count">{toFaDigits(c.panels_count)}</span>
+          </button>
+        ))}
+        <button
+          type="button"
+          className="groups-cat-add"
+          onClick={() => {
+            setCatName("");
+            setCatModal("create");
+          }}
+          title="دسته جدید"
+        >
+          <FolderPlus size={16} />
+          <span>دسته جدید</span>
+        </button>
+        {activeCat && (
+          <button
+            type="button"
+            className="groups-cat-manage"
+            onClick={() => {
+              setCatName(activeCat.name);
+              setCatModal({ edit: activeCat });
+            }}
+          >
+            <Pencil size={14} />
+            ویرایش دسته
+          </button>
+        )}
+      </div>
+
       {msg && (
         <p
           className={
-            msg.includes("موفق") || msg.includes("به‌روز") ? "admin-toast ok" : "admin-toast err"
+            msg.includes("موفق") || msg.includes("به‌روز") || msg.includes("دسته")
+              ? "admin-toast ok"
+              : "admin-toast err"
           }
         >
           {msg}
@@ -806,9 +951,21 @@ export default function PanelsPage() {
             افزودن اولین پنل
           </button>
         </div>
+      ) : visiblePanels.length === 0 ? (
+        <div className="admin-empty">
+          <Server size={36} strokeWidth={1.4} />
+          <p>
+            {activeTab == null
+              ? "پنلی بدون دسته نیست"
+              : "در این دسته پنلی نیست"}
+          </p>
+          <button className="btn" onClick={openCreate}>
+            افزودن پنل
+          </button>
+        </div>
       ) : (
         <div className="admin-grid">
-          {data.map((p) => {
+          {visiblePanels.map((p) => {
             const typeLabel = TYPES.find((t) => t.value === p.type)?.label || p.type;
             const credOk =
               p.type === "astra"
@@ -886,6 +1043,15 @@ export default function PanelsPage() {
                   <button type="button" className="btn ghost sm" onClick={() => openEdit(p)}>
                     <Pencil size={14} />
                     ویرایش
+                  </button>
+                  <button
+                    type="button"
+                    className="btn ghost sm"
+                    onClick={() => setMovePanel(p)}
+                    title="جابه‌جایی بین دسته‌ها"
+                  >
+                    <ArrowRightLeft size={14} />
+                    دسته
                   </button>
                   <button
                     type="button"
@@ -1465,6 +1631,175 @@ export default function PanelsPage() {
                     : isEdit
                       ? "ذخیره تغییرات"
                       : "تست و افزودن"}
+                </button>
+              </footer>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {movePanel && (
+        <div
+          className="modal-backdrop"
+          onClick={() => !moveMut.isPending && setMovePanel(null)}
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <header className="modal-head">
+              <div>
+                <h3>جابه‌جایی پنل</h3>
+                <p className="modal-sub">
+                  «{movePanel.name}» را به کدام دسته ببرید؟ فقط برای مدیریت در این صفحه
+                  است و روی ساب/گروه اثر ندارد.
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setMovePanel(null)}
+                aria-label="بستن"
+              >
+                ×
+              </button>
+            </header>
+            <div className="groups-move-list">
+              <button
+                type="button"
+                className={`groups-move-opt${movePanel.category_id == null ? " current" : ""}`}
+                disabled={moveMut.isPending || movePanel.category_id == null}
+                onClick={() =>
+                  moveMut.mutate({ id: movePanel.id, category_id: null })
+                }
+              >
+                <span>همه پنل‌ها</span>
+                <span className="muted">بدون دسته</span>
+              </button>
+              {categories.map((c) => (
+                <button
+                  key={c.id}
+                  type="button"
+                  className={`groups-move-opt${
+                    movePanel.category_id === c.id ? " current" : ""
+                  }`}
+                  disabled={moveMut.isPending || movePanel.category_id === c.id}
+                  onClick={() =>
+                    moveMut.mutate({ id: movePanel.id, category_id: c.id })
+                  }
+                >
+                  <span>{c.name}</span>
+                  <span className="muted">
+                    {toFaDigits(c.panels_count)} پنل
+                  </span>
+                </button>
+              ))}
+              {categories.length === 0 && (
+                <p className="muted" style={{ margin: "8px 0 0", fontSize: "0.86rem" }}>
+                  هنوز دسته‌ای نساخته‌اید — اول «دسته جدید» را بزنید.
+                </p>
+              )}
+            </div>
+            {moveMut.isError && (
+              <p className="error">{(moveMut.error as Error).message}</p>
+            )}
+            <footer className="modal-foot">
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={moveMut.isPending}
+                onClick={() => setMovePanel(null)}
+              >
+                بستن
+              </button>
+            </footer>
+          </div>
+        </div>
+      )}
+
+      {catModal && (
+        <div
+          className="modal-backdrop"
+          onClick={() =>
+            !saveCategory.isPending && !deleteCategory.isPending && setCatModal(null)
+          }
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <header className="modal-head">
+              <div>
+                <h3>{catModal === "create" ? "دسته جدید" : "ویرایش دسته"}</h3>
+                <p className="modal-sub">
+                  {catModal === "create"
+                    ? "مثلاً ایران، خارج، تانل"
+                    : "تغییر نام یا حذف دسته — پنل‌هایش به «همه پنل‌ها» برمی‌گردند"}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setCatModal(null)}
+                aria-label="بستن"
+              >
+                ×
+              </button>
+            </header>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                saveCategory.mutate();
+              }}
+            >
+              <div className="field">
+                <label>نام دسته</label>
+                <input
+                  required
+                  maxLength={48}
+                  value={catName}
+                  onChange={(e) => setCatName(e.target.value)}
+                  placeholder="مثلاً ایران"
+                  autoFocus
+                />
+              </div>
+              {saveCategory.isError && (
+                <p className="error">{(saveCategory.error as Error).message}</p>
+              )}
+              {deleteCategory.isError && (
+                <p className="error">{(deleteCategory.error as Error).message}</p>
+              )}
+              <footer className="modal-foot">
+                {catModal !== "create" && typeof catModal === "object" && (
+                  <button
+                    type="button"
+                    className="btn danger"
+                    disabled={saveCategory.isPending || deleteCategory.isPending}
+                    onClick={() => {
+                      if (
+                        window.confirm(
+                          `فقط دسته «${catModal.edit.name}» حذف شود؟\nپنل‌های داخلش پاک نمی‌شوند و به تب «همه پنل‌ها» منتقل می‌شوند.`
+                        )
+                      ) {
+                        deleteCategory.mutate(catModal.edit.id);
+                      }
+                    }}
+                  >
+                    {deleteCategory.isPending ? "…" : "حذف دسته"}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="btn ghost"
+                  disabled={saveCategory.isPending || deleteCategory.isPending}
+                  onClick={() => setCatModal(null)}
+                >
+                  انصراف
+                </button>
+                <button
+                  type="submit"
+                  className="btn"
+                  disabled={saveCategory.isPending || !catName.trim()}
+                >
+                  {saveCategory.isPending
+                    ? "…"
+                    : catModal === "create"
+                      ? "ساخت"
+                      : "ذخیره"}
                 </button>
               </footer>
             </form>
