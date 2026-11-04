@@ -1,4 +1,4 @@
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, Navigate, useParams } from "react-router-dom";
 import {
@@ -11,6 +11,7 @@ import {
   Eye,
   EyeOff,
   Gauge,
+  Link2,
   Power,
   Radio,
   RefreshCw,
@@ -28,6 +29,7 @@ import {
   api,
   AstraNodeClient,
   AstraOutbound,
+  AstraOutboundSubscription,
   formatBytes,
   Panel,
 } from "../lib/api";
@@ -35,6 +37,17 @@ import { toFaDigits } from "../lib/format";
 
 type Filter = "all" | "ok" | "down" | "off";
 type Tab = "outbounds" | "clients";
+type AddMode = "link" | "sub";
+
+type SubSyncResult = {
+  ok: boolean;
+  created: number;
+  updated: number;
+  removed: number;
+  total: number;
+  subscription: AstraOutboundSubscription | null;
+  outbounds: AstraOutbound[];
+};
 
 function latencyTone(ms: number | null | undefined): "fast" | "mid" | "slow" | "dead" | "none" {
   if (ms == null || ms < 0) return "none";
@@ -84,6 +97,17 @@ function statusLabel(s: string | null | undefined): string {
   }
 }
 
+function subExpireLabel(ts: number): string {
+  if (!ts || ts <= 0) return "بدون انقضا";
+  const now = Math.floor(Date.now() / 1000);
+  const diff = ts - now;
+  if (diff <= 0) return "منقضی شده";
+  const days = Math.ceil(diff / 86400);
+  if (days >= 1) return `${toFaDigits(days)} روز مانده`;
+  const hours = Math.max(1, Math.ceil(diff / 3600));
+  return `${toFaDigits(hours)} ساعت مانده`;
+}
+
 function clientExpireLabel(c: AstraNodeClient): string {
   if ((c.user_status || "").toLowerCase() === "on_hold") {
     const dur = Number(c.on_hold_expire_duration) || 0;
@@ -131,7 +155,9 @@ export default function OutboundsPage() {
   const id = Number(panelId);
   const qc = useQueryClient();
   const [tab, setTab] = useState<Tab>("outbounds");
+  const [addMode, setAddMode] = useState<AddMode>("link");
   const [text, setText] = useState("");
+  const [subUrl, setSubUrl] = useState("");
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [filter, setFilter] = useState<Filter>("all");
   const [q, setQ] = useState("");
@@ -139,6 +165,7 @@ export default function OutboundsPage() {
   const [confirmId, setConfirmId] = useState<number | null>(null);
   const [pingingId, setPingingId] = useState<number | null>(null);
   const [subOpenId, setSubOpenId] = useState<number | null>(null);
+  const autoSynced = useRef(false);
 
   const { data: panels = [] } = useQuery({
     queryKey: ["panels"],
@@ -149,6 +176,15 @@ export default function OutboundsPage() {
   const { data: rows = [], isLoading, refetch, isFetching } = useQuery({
     queryKey: ["astra-outbounds", id],
     queryFn: () => api<AstraOutbound[]>(`/api/admin/panels/${id}/outbounds`),
+    enabled: Number.isFinite(id) && id > 0,
+  });
+
+  const { data: boundSub = null, refetch: refetchSub } = useQuery({
+    queryKey: ["astra-outbound-sub", id],
+    queryFn: () =>
+      api<AstraOutboundSubscription | null>(
+        `/api/admin/panels/${id}/outbounds/subscription`
+      ),
     enabled: Number.isFinite(id) && id > 0,
   });
 
@@ -198,6 +234,7 @@ export default function OutboundsPage() {
       ),
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["astra-outbounds", id] });
+      qc.invalidateQueries({ queryKey: ["astra-outbound-sub", id] });
       qc.invalidateQueries({ queryKey: ["astra-health", id] });
       setText("");
       if (res.total_created > 0) {
@@ -211,6 +248,73 @@ export default function OutboundsPage() {
     },
     onError: (e: Error) => flash(false, e.message),
   });
+
+  const bindSub = useMutation({
+    mutationFn: (url: string) =>
+      api<SubSyncResult>(`/api/admin/panels/${id}/outbounds/subscription`, {
+        method: "POST",
+        body: JSON.stringify({ url, ping: false }),
+        timeoutMs: 90_000,
+      }),
+    onSuccess: (res) => {
+      if (res.outbounds) {
+        qc.setQueryData(["astra-outbounds", id], res.outbounds);
+      } else {
+        qc.invalidateQueries({ queryKey: ["astra-outbounds", id] });
+      }
+      if (res.subscription) {
+        qc.setQueryData(["astra-outbound-sub", id], res.subscription);
+      } else {
+        qc.invalidateQueries({ queryKey: ["astra-outbound-sub", id] });
+      }
+      qc.invalidateQueries({ queryKey: ["astra-health", id] });
+      setSubUrl("");
+      flash(
+        true,
+        `ساب همگام شد — ${toFaDigits(res.total)} کانفیگ` +
+          (res.subscription?.title ? ` · ${res.subscription.title}` : "")
+      );
+    },
+    onError: (e: Error) => flash(false, e.message),
+  });
+
+  const syncSub = useMutation({
+    mutationFn: () =>
+      api<SubSyncResult>(
+        `/api/admin/panels/${id}/outbounds/subscription/sync`,
+        { method: "POST", timeoutMs: 90_000 }
+      ),
+    onSuccess: (res) => {
+      if (res.outbounds) {
+        qc.setQueryData(["astra-outbounds", id], res.outbounds);
+      } else {
+        void refetch();
+      }
+      if (res.subscription) {
+        qc.setQueryData(["astra-outbound-sub", id], res.subscription);
+      } else {
+        void refetchSub();
+      }
+      qc.invalidateQueries({ queryKey: ["astra-health", id] });
+      flash(
+        true,
+        `بروزرسانی ساب — ${toFaDigits(res.total)} کانفیگ` +
+          (res.created || res.removed
+            ? ` (جدید ${toFaDigits(res.created)} · حذف ${toFaDigits(res.removed)})`
+            : "")
+      );
+    },
+    onError: (e: Error) => flash(false, e.message),
+  });
+
+  // Auto-refresh bound subscription once when opening the page
+  useEffect(() => {
+    if (!boundSub?.url || autoSynced.current) return;
+    if (syncSub.isPending || bindSub.isPending) return;
+    autoSynced.current = true;
+    syncSub.mutate();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [boundSub?.url]);
 
   const pingAll = useMutation({
     mutationFn: () =>
@@ -358,9 +462,21 @@ export default function OutboundsPage() {
 
   function onAdd(e: FormEvent) {
     e.preventDefault();
-    if (!text.trim() || hasOutbound) return;
+    if (addMode === "sub") {
+      const u = subUrl.trim();
+      if (!u) return;
+      bindSub.mutate(u);
+      return;
+    }
+    if (!text.trim() || (hasOutbound && !boundSub)) return;
     add.mutate();
   }
+
+  const subBusy = bindSub.isPending || syncSub.isPending;
+  const usedTraffic =
+    (boundSub?.upload || 0) + (boundSub?.download || 0);
+  const subLimit = boundSub?.total || 0;
+  const subPct = usagePct(usedTraffic, subLimit);
 
   async function onCopy(label: string, value: string) {
     const ok = await copyText(value);
@@ -594,48 +710,209 @@ export default function OutboundsPage() {
             </article>
           </section>
 
-          {!hasOutbound && (
+          {boundSub ? (
+            <section className="ob-sub-card">
+              <div className="ob-sub-card-head">
+                <div className="ob-sub-card-title">
+                  <span className="ob-compose-badge">
+                    <Link2 size={15} />
+                  </span>
+                  <div>
+                    <h2>{boundSub.title || "ساب اوتباند"}</h2>
+                    <p dir="ltr" title={boundSub.url}>
+                      {boundSub.url}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="ob-btn accent"
+                  disabled={subBusy}
+                  onClick={() => syncSub.mutate()}
+                >
+                  <RefreshCw
+                    size={15}
+                    className={syncSub.isPending ? "configs-spin" : undefined}
+                  />
+                  {syncSub.isPending ? "در حال بروزرسانی…" : "بروزرسانی از ساب"}
+                </button>
+              </div>
+              <div className="ob-sub-meta">
+                <div>
+                  <span className="muted">حجم مصرف</span>
+                  <strong>
+                    {fmtTraffic(usedTraffic)}
+                    {subLimit > 0 ? ` / ${fmtTraffic(subLimit)}` : " / ∞"}
+                  </strong>
+                  {subLimit > 0 ? (
+                    <div className="ob-sub-bar" aria-hidden>
+                      <i style={{ width: `${subPct}%` }} />
+                    </div>
+                  ) : null}
+                </div>
+                <div>
+                  <span className="muted">انقضا</span>
+                  <strong>{subExpireLabel(boundSub.expire)}</strong>
+                </div>
+                <div>
+                  <span className="muted">کانفیگ‌ها</span>
+                  <strong>{toFaDigits(boundSub.count || rows.length)}</strong>
+                </div>
+                <div>
+                  <span className="muted">آخرین همگام‌سازی</span>
+                  <strong>
+                    {boundSub.synced_at
+                      ? new Date(boundSub.synced_at).toLocaleString("fa-IR")
+                      : "—"}
+                  </strong>
+                </div>
+              </div>
+              {boundSub.error ? (
+                <p className="ob-sub-err">{boundSub.error}</p>
+              ) : null}
+              <form
+                className="ob-sub-rebind"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const u = subUrl.trim() || boundSub.url;
+                  if (!u || subBusy) return;
+                  bindSub.mutate(u);
+                }}
+              >
+                <input
+                  className="ob-sub-url"
+                  dir="ltr"
+                  placeholder="تعویض آدرس ساب…"
+                  value={subUrl}
+                  onChange={(e) => setSubUrl(e.target.value)}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <button
+                  type="submit"
+                  className="ob-btn ghost"
+                  disabled={subBusy || !(subUrl.trim() || boundSub.url)}
+                >
+                  {bindSub.isPending ? "…" : "ثبت آدرس جدید"}
+                </button>
+              </form>
+            </section>
+          ) : null}
+
+          {(!hasOutbound || !boundSub) && (
             <section className="ob-compose">
               <div className="ob-compose-head">
                 <div className="ob-compose-title">
                   <span className="ob-compose-badge">
-                    <ClipboardPaste size={15} />
+                    {addMode === "sub" ? <Link2 size={15} /> : <ClipboardPaste size={15} />}
                   </span>
                   <div>
                     <h2>افزودن اوتباند</h2>
-                    <p>فقط یک لینک share برای این پنل — بعد از افزودن، تست خودکار زده می‌شود</p>
+                    <p>
+                      {addMode === "sub"
+                        ? "لینک ساب را بدهید — کانفیگ‌ها با نام و حجم ساب اضافه و هر بار همگام می‌شوند"
+                        : "یک لینک share برای این پنل — بعد از افزودن، تست خودکار زده می‌شود"}
+                    </p>
                   </div>
                 </div>
-                <span className="ob-compose-count">ظرفیت ۱/۱</span>
+                {!boundSub ? (
+                  <span className="ob-compose-count">
+                    {addMode === "sub" ? "از ساب" : "ظرفیت ۱/۱"}
+                  </span>
+                ) : null}
               </div>
+
+              {!hasOutbound ? (
+                <div className="ob-add-modes" role="tablist" aria-label="نحوه افزودن">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={addMode === "link"}
+                    className={`ob-add-mode${addMode === "link" ? " on" : ""}`}
+                    onClick={() => setAddMode("link")}
+                  >
+                    لینک کانفیگ
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={addMode === "sub"}
+                    className={`ob-add-mode${addMode === "sub" ? " on" : ""}`}
+                    onClick={() => setAddMode("sub")}
+                  >
+                    لینک ساب
+                  </button>
+                </div>
+              ) : (
+                <div className="ob-add-modes" role="tablist">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected
+                    className="ob-add-mode on"
+                  >
+                    تعویض با ساب
+                  </button>
+                </div>
+              )}
+
               <form onSubmit={onAdd} className="ob-compose-form">
-                <textarea
-                  className="ob-textarea"
-                  rows={3}
-                  dir="ltr"
-                  placeholder="vless://uuid@host:443?encryption=none&security=reality&pbk=...&sid=...&sni=...#Out-DE"
-                  value={text}
-                  onChange={(e) => setText(e.target.value)}
-                />
+                {addMode === "sub" || hasOutbound ? (
+                  <input
+                    className="ob-textarea ob-sub-url"
+                    dir="ltr"
+                    placeholder="https://example.com/sub/xxxx"
+                    value={subUrl}
+                    onChange={(e) => setSubUrl(e.target.value)}
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                ) : (
+                  <textarea
+                    className="ob-textarea"
+                    rows={3}
+                    dir="ltr"
+                    placeholder="vless://uuid@host:443?encryption=none&security=reality&pbk=...&sid=...&sni=...#Out-DE"
+                    value={text}
+                    onChange={(e) => setText(e.target.value)}
+                  />
+                )}
                 <div className="ob-compose-foot">
-                  <p>vless · vmess · trojan · ss — هر پنل Astra فقط یک اوتباند</p>
+                  <p>
+                    {addMode === "sub" || hasOutbound
+                      ? "نام و حجم از هدر ساب خوانده می‌شود و با هر ورود به صفحه بروز می‌شود"
+                      : "vless · vmess · trojan · ss — افزودن تکی یک اوتباند"}
+                  </p>
                   <button
                     type="submit"
                     className="ob-btn accent"
-                    disabled={add.isPending || !text.trim()}
+                    disabled={
+                      subBusy ||
+                      add.isPending ||
+                      (addMode === "sub" || hasOutbound
+                        ? !subUrl.trim()
+                        : !text.trim())
+                    }
                   >
-                    {add.isPending ? "در حال افزودن…" : "افزودن اوتباند"}
+                    {bindSub.isPending
+                      ? "در حال دریافت ساب…"
+                      : add.isPending
+                        ? "در حال افزودن…"
+                        : addMode === "sub" || hasOutbound
+                          ? "افزودن از ساب"
+                          : "افزودن اوتباند"}
                   </button>
                 </div>
               </form>
             </section>
           )}
 
-          {hasOutbound && (
+          {hasOutbound && !boundSub ? (
             <p className="ob-slot-note">
-              این پنل اوتباند دارد. برای تعویض، اوتباند فعلی را حذف کنید و لینک جدید اضافه کنید.
+              این پنل اوتباند تکی دارد. برای تعویض با ساب، آدرس ساب را بالا بگذارید یا اوتباند
+              فعلی را حذف کنید.
             </p>
-          )}
+          ) : null}
 
           <section className="ob-list-wrap">
             {rows.length > 1 && (

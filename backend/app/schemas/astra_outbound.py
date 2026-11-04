@@ -33,6 +33,35 @@ class AstraOutboundBulkResult(BaseModel):
     total_created: int = 0
 
 
+class AstraOutboundSubBind(BaseModel):
+    """Bind an upstream subscription URL and import all share-links as outbounds."""
+
+    url: str = Field(..., min_length=8, max_length=2000)
+    ping: bool = False
+
+
+class AstraOutboundSubscriptionOut(BaseModel):
+    url: str
+    title: str | None = None
+    upload: int = 0
+    download: int = 0
+    total: int = 0
+    expire: int = 0
+    synced_at: str | None = None
+    error: str | None = None
+    count: int = 0
+
+
+class AstraOutboundSubSyncResult(BaseModel):
+    ok: bool = True
+    created: int = 0
+    updated: int = 0
+    removed: int = 0
+    total: int = 0
+    subscription: AstraOutboundSubscriptionOut | None = None
+    outbounds: list[AstraOutboundOut] = Field(default_factory=list)
+
+
 class AstraOutboundEnable(BaseModel):
     is_enabled: bool
 

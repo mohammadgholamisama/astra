@@ -136,6 +136,19 @@ export interface AstraOutbound {
   created_at?: string | null;
 }
 
+/** Upstream subscription bound as the outbound source for an Astra panel. */
+export interface AstraOutboundSubscription {
+  url: string;
+  title: string | null;
+  upload: number;
+  download: number;
+  total: number;
+  expire: number;
+  synced_at: string | null;
+  error: string | null;
+  count: number;
+}
+
 export interface AstraNodeClient {
   id: number;
   panel_id: number;

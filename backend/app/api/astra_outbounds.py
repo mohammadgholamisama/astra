@@ -16,8 +16,12 @@ from app.schemas.astra_outbound import (
     AstraOutboundBulkResult,
     AstraOutboundEnable,
     AstraOutboundOut,
+    AstraOutboundSubBind,
+    AstraOutboundSubscriptionOut,
+    AstraOutboundSubSyncResult,
 )
 from app.services import astra_node as node
+from app.services import astra_outbound_sub as ob_sub
 
 router = APIRouter(tags=["AstraOutbounds"])
 
@@ -74,6 +78,9 @@ async def bulk_add_outbounds(
     _admin=Depends(get_current_admin),
 ):
     panel = await _astra_panel(db, panel_id)
+    # Manual paste replaces any bound subscription source
+    if ob_sub.subscription_info(panel):
+        ob_sub.clear_subscription_meta(panel)
     created, errors = await node.add_outbounds_from_text(db, panel, body.text)
     await db.commit()
     for r in created:
@@ -83,6 +90,101 @@ async def bulk_add_outbounds(
         errors=errors,
         total_created=len(created),
     )
+
+
+@router.get(
+    "/api/admin/panels/{panel_id}/outbounds/subscription",
+    response_model=AstraOutboundSubscriptionOut | None,
+)
+async def get_outbound_subscription(
+    panel_id: int,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    panel = await _astra_panel(db, panel_id)
+    info = ob_sub.subscription_info(panel)
+    return AstraOutboundSubscriptionOut(**info) if info else None
+
+
+@router.post(
+    "/api/admin/panels/{panel_id}/outbounds/subscription",
+    response_model=AstraOutboundSubSyncResult,
+)
+async def bind_outbound_subscription(
+    panel_id: int,
+    body: AstraOutboundSubBind,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    panel = await _astra_panel(db, panel_id)
+    try:
+        result = await ob_sub.sync_outbounds_from_subscription(
+            db, panel, body.url.strip(), ping=bool(body.ping)
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502, detail=f"دریافت ساب ناموفق بود: {exc}"
+        ) from exc
+    await db.commit()
+    rows = await node.list_outbounds(db, panel_id)
+    sub = result.get("subscription")
+    return AstraOutboundSubSyncResult(
+        ok=True,
+        created=int(result.get("created") or 0),
+        updated=int(result.get("updated") or 0),
+        removed=int(result.get("removed") or 0),
+        total=int(result.get("total") or 0),
+        subscription=AstraOutboundSubscriptionOut(**sub) if sub else None,
+        outbounds=[_out(r) for r in rows],
+    )
+
+
+@router.post(
+    "/api/admin/panels/{panel_id}/outbounds/subscription/sync",
+    response_model=AstraOutboundSubSyncResult,
+)
+async def sync_outbound_subscription(
+    panel_id: int,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    panel = await _astra_panel(db, panel_id)
+    try:
+        result = await ob_sub.refresh_bound_subscription(db, panel, ping=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        await db.commit()  # persist error meta
+        raise HTTPException(
+            status_code=502, detail=f"همگام‌سازی ساب ناموفق بود: {exc}"
+        ) from exc
+    await db.commit()
+    rows = await node.list_outbounds(db, panel_id)
+    sub = result.get("subscription")
+    return AstraOutboundSubSyncResult(
+        ok=True,
+        created=int(result.get("created") or 0),
+        updated=int(result.get("updated") or 0),
+        removed=int(result.get("removed") or 0),
+        total=int(result.get("total") or 0),
+        subscription=AstraOutboundSubscriptionOut(**sub) if sub else None,
+        outbounds=[_out(r) for r in rows],
+    )
+
+
+@router.delete("/api/admin/panels/{panel_id}/outbounds/subscription")
+async def unbind_outbound_subscription(
+    panel_id: int,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """Detach subscription URL metadata (keeps current outbound rows)."""
+    panel = await _astra_panel(db, panel_id)
+    ob_sub.clear_subscription_meta(panel)
+    await db.commit()
+    return {"ok": True}
 
 
 @router.post(
