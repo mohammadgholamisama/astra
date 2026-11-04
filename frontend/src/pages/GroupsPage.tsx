@@ -233,6 +233,8 @@ export default function GroupsPage() {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [configTag, setConfigTag] = useState("");
+  /** Draft text for usage_cost input (empty = unset). */
+  const [usageCost, setUsageCost] = useState("");
   const [picks, setPicks] = useState<PanelPick[]>([]);
   const [catalogs, setCatalogs] = useState<Record<number, PanelCatalog>>({});
   const [confirmGroup, setConfirmGroup] = useState<Group | null>(null);
@@ -424,6 +426,14 @@ export default function GroupsPage() {
           priority: finalized.length - i,
         };
       });
+      const costRaw = usageCost.trim();
+      const costNum =
+        costRaw === ""
+          ? null
+          : Number.parseInt(costRaw.replace(/[^\d]/g, ""), 10);
+      if (costRaw !== "" && (!Number.isFinite(costNum) || (costNum as number) < 0)) {
+        throw new Error("هزینه مصرف باید عدد صحیح صفر یا بزرگ‌تر باشد");
+      }
       const payload: Record<string, unknown> = {
         name,
         description: description || null,
@@ -432,11 +442,14 @@ export default function GroupsPage() {
         panels: bodyPanels,
       };
       if (editingId != null) {
+        if (costNum == null) payload.clear_usage_cost = true;
+        else payload.usage_cost = costNum;
         return api<Group>(`/api/group/${editingId}`, {
           method: "PUT",
           body: JSON.stringify(payload),
         });
       }
+      if (costNum != null) payload.usage_cost = costNum;
       // New groups land in the active tab (null = «همه گروه‌ها»)
       if (activeTab != null) payload.category_id = activeTab;
       return api<Group>("/api/group", {
@@ -665,6 +678,7 @@ export default function GroupsPage() {
     setName("");
     setDescription("");
     setConfigTag("");
+    setUsageCost("");
     setPicks([]);
     setCatalogs({});
     setCoeffDrafts({});
@@ -683,6 +697,11 @@ export default function GroupsPage() {
     setName(group.name);
     setDescription(group.description || "");
     setConfigTag((group.config_tag || "").trim());
+    setUsageCost(
+      group.usage_cost != null && Number.isFinite(group.usage_cost)
+        ? String(group.usage_cost)
+        : ""
+    );
     setCatalogs({});
     attemptedRef.current = new Set();
     loadingRef.current = new Set();
@@ -888,6 +907,14 @@ export default function GroupsPage() {
                       {(g.config_tag || "").trim()}
                     </span>
                   ) : null}
+                  {g.usage_cost != null ? (
+                    <span
+                      className="badge muted"
+                      title="هزینه مصرف این گروه"
+                    >
+                      هزینه {toFaDigits(g.usage_cost)}
+                    </span>
+                  ) : null}
                 </div>
                 <div className="groups-row-chips">
                   {(g.panels || []).map((p) => {
@@ -987,6 +1014,26 @@ export default function GroupsPage() {
                   فقط روی کانفیگ‌های پنل‌های همین گروه اعمال می‌شود — از لحظه ذخیره روی همه
                   ساب‌های قبلی کاربران این گروه هم می‌آید (کلاینت ممکن است تا یک ساعت بعد
                   تازه‌سازی کند).
+                </p>
+              </div>
+
+              <div className="field">
+                <label>هزینه مصرف (اختیاری)</label>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  dir="ltr"
+                  value={usageCost}
+                  onChange={(e) => {
+                    const v = e.target.value.replace(/[^\d]/g, "");
+                    setUsageCost(v);
+                  }}
+                  placeholder="مثلاً ۷"
+                  aria-label="هزینه مصرف گروه"
+                />
+                <p className="field-hint">
+                  عدد دلخواه برای هزینه مصرف کانفیگ این گروه — فقط برای نظم خودت ذخیره
+                  می‌شود و فعلاً روی ساب اثر ندارد.
                 </p>
               </div>
 

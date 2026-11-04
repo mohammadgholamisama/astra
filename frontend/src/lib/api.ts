@@ -202,6 +202,8 @@ export interface Group {
   is_disabled: boolean;
   /** Optional text in real config remarks for this group's panels: `#1. TAG 2.5G | name` */
   config_tag?: string;
+  /** Admin cost unit for this group's traffic (e.g. 7) — for later billing/organize */
+  usage_cost?: number | null;
   /** Optional info messages prepended as first configs in subscription */
   notices?: string[];
   /** null = default bucket «همه گروه‌ها» */

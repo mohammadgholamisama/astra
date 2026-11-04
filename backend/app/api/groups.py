@@ -202,6 +202,20 @@ def _normalize_config_tag(raw: str | None) -> str:
     return text[:200]
 
 
+def _normalize_usage_cost(raw: int | None) -> int | None:
+    if raw is None:
+        return None
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if n < 0:
+        raise ValueError("هزینه مصرف نمی‌تواند منفی باشد")
+    if n > 1_000_000:
+        raise ValueError("هزینه مصرف خیلی بزرگ است")
+    return n
+
+
 def _normalize_category_name(raw: str | None) -> str:
     text = " ".join(str(raw or "").split()).strip()
     return text[:48]
@@ -220,12 +234,18 @@ def _to_out(group: Group) -> GroupOut:
                 panel_is_active=bool(link.panel.is_active) if link.panel else True,
             )
         )
+    cost = getattr(group, "usage_cost", None)
+    try:
+        cost_out = int(cost) if cost is not None else None
+    except (TypeError, ValueError):
+        cost_out = None
     return GroupOut(
         id=group.id,
         name=group.name,
         description=group.description,
         is_disabled=group.is_disabled,
         config_tag=_normalize_config_tag(getattr(group, "config_tag", None) or ""),
+        usage_cost=cost_out,
         notices=list(group.notices or []),
         category_id=getattr(group, "category_id", None),
         inbound_tags=[],
@@ -442,11 +462,16 @@ async def create_group(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Group already exists")
     category_id = await _ensure_category(db, body.category_id)
+    try:
+        usage_cost = _normalize_usage_cost(body.usage_cost)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     group = Group(
         name=body.name,
         description=body.description,
         is_disabled=body.is_disabled,
         config_tag=_normalize_config_tag(body.config_tag),
+        usage_cost=usage_cost,
         notices=normalize_notices(body.notices),
         category_id=category_id,
     )
@@ -538,6 +563,13 @@ async def update_group(
         group.is_disabled = body.is_disabled
     if body.config_tag is not None:
         group.config_tag = _normalize_config_tag(body.config_tag)
+    if body.clear_usage_cost:
+        group.usage_cost = None
+    elif body.usage_cost is not None:
+        try:
+            group.usage_cost = _normalize_usage_cost(body.usage_cost)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if body.notices is not None:
         group.notices = normalize_notices(body.notices)
     old_cat = getattr(group, "category_id", None)

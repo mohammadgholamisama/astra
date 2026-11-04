@@ -29,6 +29,8 @@ class Group(Base):
     is_disabled: Mapped[bool] = mapped_column(Boolean, default=False)
     # Optional text in real config remarks: ``#1. TAG 2.5G | name`` (empty = omitted)
     config_tag: Mapped[str | None] = mapped_column(String(200), nullable=True, default="")
+    # Admin-only cost unit for this group's traffic (e.g. 7) — stored for later billing/organize
+    usage_cost: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     # Optional info messages → fake configs prepended to subscription (first in list)
     notices: Mapped[list | None] = mapped_column(JSONType, nullable=True, default=list)
     # NULL = default bucket «همه گروه‌ها» on the Groups page
