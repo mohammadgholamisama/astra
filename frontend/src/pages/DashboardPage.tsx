@@ -159,23 +159,26 @@ export default function DashboardPage() {
 
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["system"],
-    queryFn: () => api<SystemStats>("/api/system"),
-    staleTime: 0,
-    refetchOnMount: "always",
-    refetchOnWindowFocus: true,
+    queryFn: () => api<SystemStats>("/api/system", { timeoutMs: 12_000 }),
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+    refetchOnMount: true,
+    refetchOnWindowFocus: false,
   });
 
   const {
     data: host,
     isLoading: hostLoading,
     isFetching: hostFetching,
+    isError: hostError,
     refetch: refetchHost,
   } = useQuery({
     queryKey: ["system-host"],
-    queryFn: () => api<HostMetrics>("/api/system/host"),
-    refetchInterval: 5000,
-    staleTime: 2000,
-    refetchOnWindowFocus: true,
+    queryFn: () => api<HostMetrics>("/api/system/host", { timeoutMs: 6_000 }),
+    refetchInterval: 12_000,
+    staleTime: 8_000,
+    refetchOnWindowFocus: false,
+    retry: 1,
   });
 
   const checkUpdate = useMutation({
@@ -515,8 +518,7 @@ export default function DashboardPage() {
           document.body
         )}
 
-      {(host || hostLoading) && (
-        <section className="board-host" aria-label="وضعیت سرور">
+      <section className="board-host" aria-label="وضعیت سرور">
           <div className="board-host-head">
             <div>
               <h2>
@@ -526,7 +528,9 @@ export default function DashboardPage() {
               <p>
                 {host
                   ? `${host.hostname} · ${host.os} · ${host.arch}`
-                  : "در حال دریافت…"}
+                  : hostError
+                    ? "دریافت وضعیت ناموفق بود"
+                    : "در حال دریافت…"}
               </p>
             </div>
             <button
@@ -544,12 +548,22 @@ export default function DashboardPage() {
             </button>
           </div>
 
+          {host?.note ? (
+            <p className="muted" style={{ margin: "0 0 10px", fontSize: "0.85rem" }}>
+              {host.note}
+            </p>
+          ) : null}
+
           {hostLoading && !host ? (
             <div className="board-host-skel" aria-hidden>
               <div className="board-skel-block metric" />
               <div className="board-skel-block metric" />
               <div className="board-skel-block metric" />
             </div>
+          ) : hostError && !host ? (
+            <p className="error" style={{ margin: 0 }}>
+              وضعیت سرور لود نشد — دکمهٔ زنده را بزنید
+            </p>
           ) : host ? (
             <>
               <div className="board-host-gauges">
@@ -716,13 +730,9 @@ export default function DashboardPage() {
                 </div>
               </div>
 
-              {host.note ? (
-                <p className="board-host-note muted">{host.note}</p>
-              ) : null}
             </>
           ) : null}
         </section>
-      )}
 
       {data && (
         <>

@@ -59,17 +59,18 @@ async def _heal_failed_panels_loop() -> None:
     """
     from app.services.orchestrator import heal_failed_panel_accounts_batch
 
-    await asyncio.sleep(20)
+    await asyncio.sleep(60)
     while True:
         try:
-            n = await heal_failed_panel_accounts_batch(limit_users=30)
+            n = await heal_failed_panel_accounts_batch(limit_users=20)
             if n:
                 logger.info("heal loop: recovered panels for %s users", n)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("heal failed panels loop failed")
-        await asyncio.sleep(45)
+        await asyncio.sleep(90)
+
 
 
 async def _outbound_health_loop() -> None:
@@ -81,22 +82,27 @@ async def _outbound_health_loop() -> None:
     from app.models.panel import Panel, PanelType
     from app.services import astra_node as node
 
-    await asyncio.sleep(45)
+    await asyncio.sleep(90)
     while True:
         try:
             async with AsyncSessionLocal() as db:
                 result = await db.execute(
-                    select(Panel).where(
+                    select(Panel.id).where(
                         Panel.type == PanelType.astra,
                         Panel.is_active.is_(True),
                     )
                 )
-                panels = list(result.scalars().all())
-                for panel in panels:
-                    try:
+                panel_ids = [int(r[0]) for r in result.all()]
+            for pid in panel_ids:
+                try:
+                    async with AsyncSessionLocal() as db:
+                        panel = await db.get(Panel, pid)
+                        if panel is None or not panel.is_active:
+                            continue
                         stats = await node.reconcile_outbounds_health(
-                            db, panel, concurrency=3
+                            db, panel, concurrency=2
                         )
+                        await db.commit()
                         if stats.get("changed"):
                             logger.info(
                                 "outbound health: panel=%s pinged=%s changed=%s ok=%s",
@@ -105,34 +111,41 @@ async def _outbound_health_loop() -> None:
                                 stats.get("changed"),
                                 stats.get("ok"),
                             )
-                    except Exception:  # noqa: BLE001
-                        logger.exception(
-                            "outbound health reconcile failed panel=%s", panel.id
-                        )
-                await db.commit()
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "outbound health reconcile failed panel=%s", pid
+                    )
+                await asyncio.sleep(1.5)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("outbound health loop failed")
-        await asyncio.sleep(120)
+        await asyncio.sleep(180)
 
 
 async def _usage_sync_loop() -> None:
-    """Every ~3s: sync Astra traffic, detect quota end, freeze ALL remotes.
+    """Cadenced quota watch: sync Astra traffic, freeze exhausted remotes.
 
-    Exhausted users are disabled on Marzban/PasarGuard/Sanaei/Rebecca/Astra
-    in the same cycle (~1s parallel cut). Does not wait for the admin UI.
+    Important: if a cycle is heavy (thousands of accounts), do NOT immediately
+    re-enter — that was pegging CPU at ~100%. Always cool down at least
+    ``USAGE_REFRESH_SECONDS``, and longer after slow cycles.
     """
     import time as _time
 
     from app.services.orchestrator import run_quota_watch_cycle
 
-    await asyncio.sleep(2)
+    await asyncio.sleep(8)
     while True:
         t0 = _time.monotonic()
         try:
             stats = await run_quota_watch_cycle()
-            if stats.get("flipped") or stats.get("freeze_ok") or stats.get("freeze_fail"):
+            elapsed = _time.monotonic() - t0
+            if (
+                stats.get("flipped")
+                or stats.get("freeze_ok")
+                or stats.get("freeze_fail")
+                or elapsed >= 8
+            ):
                 logger.info(
                     "quota watch: astra=%s checked=%s flipped=%s freeze_ok=%s freeze_fail=%s pulled=%s dt=%.2fs",
                     stats.get("astra_panels"),
@@ -141,15 +154,20 @@ async def _usage_sync_loop() -> None:
                     stats.get("freeze_ok"),
                     stats.get("freeze_fail"),
                     stats.get("usage_pulled"),
-                    _time.monotonic() - t0,
+                    elapsed,
                 )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("quota watch loop failed")
-        interval = max(3, int(settings.USAGE_REFRESH_SECONDS or 3))
-        elapsed = _time.monotonic() - t0
-        await asyncio.sleep(max(0.15, interval - elapsed))
+            elapsed = _time.monotonic() - t0
+        interval = max(8, int(settings.USAGE_REFRESH_SECONDS or 8))
+        # Heavy cycle → proportional cooldown so the event loop / DB can breathe
+        if elapsed > interval:
+            cooldown = min(90.0, max(float(interval), elapsed * 0.75))
+        else:
+            cooldown = max(1.0, float(interval) - elapsed)
+        await asyncio.sleep(cooldown)
 
 
 def _resolve_frontend_dist() -> Path | None:

@@ -80,7 +80,6 @@ async def system_stats(
             select(func.count(User.id)).where(User.status == UserStatus.limited)
         )
     ).scalar() or 0
-    # Distinct users that still have an error on an active panel
     users_with_errors = (
         await db.execute(
             select(func.count(func.distinct(PanelAccount.user_id)))
@@ -99,10 +98,14 @@ async def system_stats(
     groups_total = (await db.execute(select(func.count(Group.id)))).scalar() or 0
     sync_errors = (
         await db.execute(
-            select(func.count(PanelAccount.id)).where(PanelAccount.status == PanelAccountStatus.error)
+            select(func.count(PanelAccount.id)).where(
+                PanelAccount.status == PanelAccountStatus.error
+            )
         )
     ).scalar() or 0
-    traffic = (await db.execute(select(func.coalesce(func.sum(User.used_traffic), 0)))).scalar() or 0
+    traffic = (
+        await db.execute(select(func.coalesce(func.sum(User.used_traffic), 0)))
+    ).scalar() or 0
 
     top_rows = (
         await db.execute(
@@ -151,10 +154,46 @@ async def system_stats(
 
 @router.get("/api/system/host")
 async def system_host(_admin=Depends(get_current_admin)):
-    """CPU / RAM / disk / uptime / systemd services for the dashboard."""
+    """CPU / RAM / disk / uptime / services for the dashboard (cached, non-blocking)."""
     import asyncio
 
-    return await asyncio.to_thread(collect_host_metrics)
+    from app.services import host_metrics as hm
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(collect_host_metrics),
+            timeout=2.5,
+        )
+    except asyncio.TimeoutError:
+        if hm._CACHE:
+            return {**hm._CACHE, "note": "پاسخ کند — آخرین نمونهٔ کش‌شده"}
+        return {
+            "ok": False,
+            "engine": "timeout",
+            "hostname": "",
+            "os": "",
+            "arch": "",
+            "python": "",
+            "collected_at": 0,
+            "cpu_percent": 0,
+            "cpu_count_logical": 0,
+            "cpu_per_core": [],
+            "load_avg": [0, 0, 0],
+            "memory": {"total": 0, "used": 0, "free": 0, "percent": 0},
+            "swap": {"total": 0, "used": 0, "free": 0, "percent": 0},
+            "disks": [],
+            "uptime_seconds": 0,
+            "boot_time": 0,
+            "process_count": 0,
+            "net": {
+                "bytes_sent": 0,
+                "bytes_recv": 0,
+                "packets_sent": 0,
+                "packets_recv": 0,
+            },
+            "services": [],
+            "note": "جمع‌آوری وضعیت سرور طول کشید — دوباره تلاش کنید",
+        }
 
 
 @router.get("/api/system/update")

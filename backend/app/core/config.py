@@ -35,8 +35,8 @@ class Settings(BaseSettings):
     # when a user spans many panels; wall time still ≈ ceil(N/limit)×slowest.
     PANEL_REMOTE_CONCURRENCY: int = 32
     # Background quota watch cadence (seconds). Exhausted users are frozen
-    # on every remote in the same cycle (~1s parallel disable).
-    USAGE_REFRESH_SECONDS: int = 3
+    # on every remote in the same cycle. Keep ≥8 so heavy installs don't peg CPU.
+    USAGE_REFRESH_SECONDS: int = 10
     # Official install helper for SSL / nginx (empty = SSL UI disabled)
     ASTRA_HELPER: str = ""
     ASTRA_APP_PORT: int = 8000

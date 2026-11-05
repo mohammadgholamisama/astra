@@ -1,4 +1,9 @@
-"""Live host metrics for the admin dashboard (CPU / RAM / disk / services)."""
+"""Live host metrics for the admin dashboard (CPU / RAM / disk / services).
+
+Designed to stay fast even when systemd/DBus is wedged: never block on
+``systemctl`` longer than a fraction of a second, prefer /proc + process
+probes, and cache briefly so the  dashboard poll cannot stampede the host.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +19,11 @@ from typing import Any
 logger = logging.getLogger("astra.host")
 
 _cpu_primed = False
+_CACHE: dict[str, Any] | None = None
+_CACHE_AT = 0.0
+_CACHE_TTL = 2.0
+_SYSTEMCTL_OK: bool | None = None
+_SYSTEMCTL_PROBE_AT = 0.0
 
 
 def _bytes_dict(total: int, used: int, free: int, percent: float) -> dict[str, Any]:
@@ -53,14 +63,113 @@ def _load_avg() -> tuple[float, float, float]:
         return 0.0, 0.0, 0.0
 
 
-def _service_active(name: str) -> str:
-    """Return active / inactive / failed / unknown."""
+def _snapshot_cmdlines() -> list[str]:
+    """One cheap /proc pass per metrics collect — reused by service probes."""
+    out: list[str] = []
+    try:
+        for pid in Path("/proc").iterdir():
+            if not pid.name.isdigit():
+                continue
+            try:
+                raw = (pid / "cmdline").read_bytes()
+            except OSError:
+                continue
+            if not raw:
+                continue
+            out.append(raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore"))
+    except OSError:
+        pass
+    return out
+
+
+def _cmd_has(cmds: list[str], *patterns: str) -> bool:
+    for cmd in cmds:
+        for pat in patterns:
+            if pat in cmd:
+                return True
+    return False
+
+
+def _port_listening(port: int) -> bool:
+    """True if anything is LISTENing on this TCP port (IPv4/IPv6)."""
+    needle = f"{int(port):04X}"
+    try:
+        for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+            with open(path, encoding="utf-8") as f:
+                next(f, None)
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 4:
+                        continue
+                    if parts[3] != "0A":  # LISTEN
+                        continue
+                    if parts[1].rsplit(":", 1)[-1].upper() == needle:
+                        return True
+    except OSError:
+        return False
+    return False
+
+
+def _systemctl_usable() -> bool:
+    """Probe once every 30s — if dbus is wedged, skip systemctl entirely."""
+    global _SYSTEMCTL_OK, _SYSTEMCTL_PROBE_AT
+    now = time.monotonic()
+    if _SYSTEMCTL_OK is not None and (now - _SYSTEMCTL_PROBE_AT) < 30:
+        return _SYSTEMCTL_OK
+    _SYSTEMCTL_PROBE_AT = now
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-system-running"],
+            capture_output=True,
+            text=True,
+            timeout=0.35,
+        )
+        out = ((r.stdout or "") + (r.stderr or "")).lower()
+        if "transport endpoint is not connected" in out or r.returncode == 124:
+            _SYSTEMCTL_OK = False
+        else:
+            _SYSTEMCTL_OK = True
+    except Exception:  # noqa: BLE001
+        _SYSTEMCTL_OK = False
+    return bool(_SYSTEMCTL_OK)
+
+
+def _service_active(name: str, cmds: list[str] | None = None) -> str:
+    """Return active / inactive / failed / unknown — never hang."""
+    cmds = cmds if cmds is not None else _snapshot_cmdlines()
+    # Fast process/port heuristics first (work even when dbus is dead)
+    if name == "astra":
+        return (
+            "active"
+            if _cmd_has(cmds, "uvicorn app.main:app", "uvicorn app.main")
+            else "inactive"
+        )
+    if name == "nginx":
+        if _cmd_has(cmds, "nginx: master", "nginx: worker") or _port_listening(80) or _port_listening(443):
+            return "active"
+        return "inactive"
+    if name == "astra-sub-rtunnel" or name.startswith("astra-sub-rtunnel"):
+        return (
+            "active"
+            if _cmd_has(cmds, "18081:127.0.0.1:2086", "astra_sub_rtunnel")
+            else "inactive"
+        )
+    if name.startswith("astra-xray@"):
+        panel_id = name.replace("astra-xray@", "").replace(".service", "")
+        return (
+            "active"
+            if _cmd_has(cmds, f"/opt/astra/xray/panel_{panel_id}")
+            else "inactive"
+        )
+
+    if not _systemctl_usable():
+        return "unknown"
     try:
         r = subprocess.run(
             ["systemctl", "is-active", name],
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=0.4,
         )
         state = (r.stdout or "").strip().lower() or "unknown"
         if state in ("active", "inactive", "failed", "activating", "deactivating"):
@@ -70,45 +179,21 @@ def _service_active(name: str) -> str:
         return "unknown"
 
 
-def _list_xray_units() -> list[dict[str, str]]:
+def _list_xray_units(cmds: list[str]) -> list[dict[str, str]]:
+    """Discover astra-xray units without blocking on systemctl list-units."""
     out: list[dict[str, str]] = []
-    try:
-        r = subprocess.run(
-            [
-                "systemctl",
-                "list-units",
-                "astra-xray@*",
-                "--type=service",
-                "--all",
-                "--no-legend",
-                "--no-pager",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-        for line in (r.stdout or "").splitlines():
-            parts = line.split()
-            if not parts:
+    xdir = Path("/opt/astra/xray")
+    if xdir.is_dir():
+        for p in sorted(xdir.glob("panel_*")):
+            if not p.is_dir():
                 continue
-            unit = parts[0]
-            if not unit.startswith("astra-xray@"):
+            pid = p.name.replace("panel_", "")
+            if not pid.isdigit():
                 continue
-            # columns: UNIT LOAD ACTIVE SUB DESCRIPTION...
-            active = parts[2] if len(parts) > 2 else _service_active(unit)
-            out.append({"name": unit, "state": active})
-    except Exception:  # noqa: BLE001
-        pass
-    if not out:
-        # Fallback: scan unit files / running by panel dirs
-        xdir = Path("/opt/astra/xray")
-        if xdir.is_dir():
-            for p in sorted(xdir.glob("panel_*")):
-                if not p.is_dir():
-                    continue
-                pid = p.name.replace("panel_", "")
-                unit = f"astra-xray@{pid}"
-                out.append({"name": unit, "state": _service_active(unit)})
+            unit = f"astra-xray@{pid}"
+            out.append({"name": unit, "state": _service_active(unit, cmds)})
+            if len(out) >= 12:
+                break
     return out
 
 
@@ -118,8 +203,10 @@ def _collect_with_psutil() -> dict[str, Any]:
     global _cpu_primed
     if not _cpu_primed:
         psutil.cpu_percent(interval=None)
+        psutil.cpu_percent(interval=None, percpu=True)
         _cpu_primed = True
-        time.sleep(0.12)
+        # tiny settle so first dashboard paint isn't always 0%
+        time.sleep(0.05)
     cpu_percent = float(psutil.cpu_percent(interval=None))
     per_cpu = [float(x) for x in psutil.cpu_percent(interval=None, percpu=True)]
     vm = psutil.virtual_memory()
@@ -140,23 +227,25 @@ def _collect_with_psutil() -> dict[str, Any]:
             **_bytes_dict(disk.total, disk.used, disk.free, disk.percent),
         }
     ]
-    for extra in ("/opt/astra", "/var"):
-        try:
-            if Path(extra).is_dir():
-                d = psutil.disk_usage(extra)
-                # skip duplicate same device as root
-                if extra != "/" and abs(d.total - disk.total) < 1024:
-                    continue
+    # Only check /opt/astra if it's a distinct mount — skip /var to keep this cheap
+    try:
+        if Path("/opt/astra").is_dir():
+            d = psutil.disk_usage("/opt/astra")
+            if abs(d.total - disk.total) >= 1024:
                 disks.append(
                     {
-                        "mount": extra,
+                        "mount": "/opt/astra",
                         **_bytes_dict(d.total, d.used, d.free, d.percent),
                     }
                 )
-        except Exception:  # noqa: BLE001
-            pass
+    except Exception:  # noqa: BLE001
+        pass
 
     la1, la5, la15 = _load_avg()
+    try:
+        process_count = int(len(psutil.pids()))
+    except Exception:  # noqa: BLE001
+        process_count = 0
     return {
         "cpu_percent": round(cpu_percent, 1),
         "cpu_count_logical": int(psutil.cpu_count(logical=True) or 0),
@@ -175,7 +264,7 @@ def _collect_with_psutil() -> dict[str, Any]:
         "disks": disks,
         "uptime_seconds": int(uptime),
         "boot_time": int(boot),
-        "process_count": int(len(psutil.pids())),
+        "process_count": process_count,
         "net": {
             "bytes_sent": int(net.bytes_sent if net else 0),
             "bytes_recv": int(net.bytes_recv if net else 0),
@@ -203,7 +292,6 @@ def _collect_fallback() -> dict[str, Any]:
     mem_used = max(0, mem_total - mem_avail)
     mem_pct = round((mem_used / mem_total) * 100, 1) if mem_total else 0.0
 
-    # crude cpu from /proc/stat single snapshot → 0; leave 0 without interval
     cpu_count = os.cpu_count() or 0
     la1, la5, la15 = _load_avg()
     uptime = _read_uptime_seconds()
@@ -250,7 +338,13 @@ def _collect_fallback() -> dict[str, Any]:
     }
 
 
-def collect_host_metrics() -> dict[str, Any]:
+def collect_host_metrics(*, force: bool = False) -> dict[str, Any]:
+    global _CACHE, _CACHE_AT
+    now = time.monotonic()
+    if not force and _CACHE is not None and (now - _CACHE_AT) < _CACHE_TTL:
+        return _CACHE
+
+    t0 = time.monotonic()
     try:
         import psutil  # noqa: F401
 
@@ -270,11 +364,18 @@ def collect_host_metrics() -> dict[str, Any]:
         os_name = platform.system()
         arch = platform.machine()
 
+    cmds = _snapshot_cmdlines()
     services = [
-        {"name": "astra", "label": "پنل Astra", "state": _service_active("astra")},
-        {"name": "nginx", "label": "Nginx", "state": _service_active("nginx")},
+        {"name": "astra", "label": "پنل Astra", "state": _service_active("astra", cmds)},
+        {"name": "nginx", "label": "Nginx", "state": _service_active("nginx", cmds)},
+        {
+            "name": "astra-sub-rtunnel",
+            "label": "تونل ساب",
+            "state": _service_active("astra-sub-rtunnel", cmds),
+        },
     ]
-    for u in _list_xray_units():
+    # Cap xray rows so a huge panel farm cannot bloate the payload / CPU
+    for u in _list_xray_units(cmds):
         panel_id = u["name"].replace("astra-xray@", "").replace(".service", "")
         services.append(
             {
@@ -284,7 +385,12 @@ def collect_host_metrics() -> dict[str, Any]:
             }
         )
 
-    return {
+    note = core.pop("note", None)
+    if not _systemctl_usable():
+        extra = "systemd موقتاً پاسخگو نیست — وضعیت از روی پروسه‌ها"
+        note = f"{note} · {extra}" if note else extra
+
+    payload = {
         "ok": True,
         "engine": engine,
         "hostname": hostname,
@@ -292,6 +398,12 @@ def collect_host_metrics() -> dict[str, Any]:
         "arch": arch,
         "python": platform.python_version(),
         "collected_at": int(time.time()),
+        "collect_ms": int((time.monotonic() - t0) * 1000),
         "services": services,
         **core,
     }
+    if note:
+        payload["note"] = note
+    _CACHE = payload
+    _CACHE_AT = time.monotonic()
+    return payload
