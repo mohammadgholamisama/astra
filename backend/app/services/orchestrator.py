@@ -4019,13 +4019,24 @@ async def resolve_group_panel_claims(db: AsyncSession, user: User) -> list[dict]
         return []
 
     g_rows = await db.execute(
-        select(Group.id, Group.config_tag, Group.name)
+        select(
+            Group.id,
+            Group.config_tag,
+            Group.name,
+            Group.order_kind,
+            Group.usage_cost,
+        )
         .where(Group.id.in_(gids), Group.is_disabled.is_(False))
         .order_by(Group.id.asc())
     )
     meta_by_gid = {
-        int(gid): (_normalize_config_tag(tag), str(name or ""))
-        for gid, tag, name in g_rows.all()
+        int(gid): (
+            _normalize_config_tag(tag),
+            str(name or ""),
+            str(order_kind or "other"),
+            usage_cost,
+        )
+        for gid, tag, name, order_kind, usage_cost in g_rows.all()
     }
     active_gids = list(meta_by_gid.keys())
     if not active_gids:
@@ -4045,13 +4056,17 @@ async def resolve_group_panel_claims(db: AsyncSession, user: User) -> list[dict]
         pid_i = int(pid or 0)
         if not pid_i:
             continue
-        tag, name = meta_by_gid.get(int(gid), ("", ""))
+        tag, name, order_kind, usage_cost = meta_by_gid.get(
+            int(gid), ("", "", "other", None)
+        )
         claims.append(
             {
                 "group_id": int(gid),
                 "panel_id": pid_i,
                 "tag": tag,
                 "name": name,
+                "order_kind": order_kind,
+                "usage_cost": usage_cost,
                 "config": cfg if isinstance(cfg, dict) else {},
             }
         )
@@ -4065,6 +4080,8 @@ def _claims_from_loaded_groups(user: User) -> list[dict]:
         if bool(getattr(group, "is_disabled", False)):
             continue
         tag = _normalize_config_tag(getattr(group, "config_tag", None))
+        order_kind = str(getattr(group, "order_kind", None) or "other")
+        usage_cost = getattr(group, "usage_cost", None)
         for gpl in getattr(group, "panel_links", None) or []:
             pid = int(getattr(gpl, "panel_id", 0) or 0)
             if not pid:
@@ -4079,6 +4096,8 @@ def _claims_from_loaded_groups(user: User) -> list[dict]:
                     "panel_id": pid,
                     "tag": tag,
                     "name": str(getattr(group, "name", "") or ""),
+                    "order_kind": order_kind,
+                    "usage_cost": usage_cost,
                     "config": cfg if isinstance(cfg, dict) else {},
                 }
             )
@@ -4188,12 +4207,25 @@ async def collect_links_detailed(
         claims = loaded_claims
 
     tag_by_gid = {str(c["group_id"]): _normalize_config_tag(c.get("tag")) for c in claims}
+    kind_by_gid: dict[str, str] = {}
+    cost_by_gid: dict[str, object] = {}
     tag_by_panel: dict[int, str] = {}
+    kind_by_panel: dict[int, str] = {}
+    cost_by_panel: dict[int, object] = {}
     for c in claims:
+        gid_s = str(c["group_id"])
         pid_c = int(c.get("panel_id") or 0)
         t = _normalize_config_tag(c.get("tag"))
+        ok = str(c.get("order_kind") or "other")
+        uc = c.get("usage_cost")
+        if gid_s not in kind_by_gid:
+            kind_by_gid[gid_s] = ok
+            cost_by_gid[gid_s] = uc
         if pid_c and t and pid_c not in tag_by_panel:
             tag_by_panel[pid_c] = t
+        if pid_c and pid_c not in kind_by_panel:
+            kind_by_panel[pid_c] = ok
+            cost_by_panel[pid_c] = uc
 
     def _tag_for(gid: object, pid: int) -> str:
         if gid is not None:
@@ -4201,6 +4233,16 @@ async def collect_links_detailed(
             if t:
                 return t
         return tag_by_panel.get(int(pid), "") or ""
+
+    def _kind_cost_for(gid: object, pid: int) -> tuple[str, object]:
+        if gid is not None:
+            gs = str(int(gid))
+            if gs in kind_by_gid:
+                return kind_by_gid[gs], cost_by_gid.get(gs)
+        return (
+            kind_by_panel.get(int(pid), "other"),
+            cost_by_panel.get(int(pid)),
+        )
 
     head: list[dict] = [
         build_status_row(
@@ -4225,11 +4267,25 @@ async def collect_links_detailed(
     by_link: dict[str, dict] = {}
 
     def _emit(text: str, **fields: object) -> None:
+        gid_f = fields.get("group_id")
+        pid_f = int(fields.get("panel_id") or 0)
+        if "order_kind" not in fields or "usage_cost" not in fields:
+            kind, cost = _kind_cost_for(gid_f, pid_f)
+            fields.setdefault("order_kind", kind)
+            fields.setdefault("usage_cost", cost)
         prev = by_link.get(text)
         if prev is not None:
             new_tag = str(fields.get("config_tag") or "").strip()
             if new_tag and not str(prev.get("config_tag") or "").strip():
                 prev["config_tag"] = new_tag
+                if fields.get("group_id") is not None:
+                    prev["group_id"] = fields.get("group_id")
+            # Prefer a real order_kind over leftover "other" on duplicate links
+            new_kind = str(fields.get("order_kind") or "other")
+            old_kind = str(prev.get("order_kind") or "other")
+            if new_kind != "other" and old_kind == "other":
+                prev["order_kind"] = new_kind
+                prev["usage_cost"] = fields.get("usage_cost")
                 if fields.get("group_id") is not None:
                     prev["group_id"] = fields.get("group_id")
             return
@@ -4409,30 +4465,22 @@ async def collect_links_detailed(
         except Exception:  # noqa: BLE001
             pass
 
-    # Global admin order by host:port[+SNI]; unlisted configs stay at the end.
-    # Users missing a panel simply won't have that link — nothing is injected.
+    # Dedupe by endpoint fingerprint, then arrange THIS user's inventory into
+    # order_kind slots (20 direct / tunnel budget / 9 gaming). Global
+    # ConfigLinkOrder alone is wrong here: when a user lacks mid-list tunnels,
+    # leftover directs "compress" forward past slot 20.
     from app.services.config_locations import (
+        extract_link_client_id,
         extract_link_endpoint,
         extract_link_match_host,
+        extract_link_path,
+        extract_link_remark_key,
         try_normalize_endpoint,
     )
     from app.services.config_orders import link_order_index
-
-    rows.sort(
-        key=lambda row: (
-            link_order_index(str(row.get("link") or "")),
-            int(row.get("panel_id") or 0),
-            str(row.get("link") or ""),
-        )
-    )
-
-    # One share-link per endpoint fingerprint so sub #N matches config-order #N.
-    # Same host:port[+SNI] with different UUIDs collapse (multi-panel duplicates).
-    # Distinct CDN paths (Astra WS/XHTTP on one domain:port) must BOTH stay.
-    from app.services.config_locations import (
-        extract_link_client_id,
-        extract_link_path,
-        extract_link_remark_key,
+    from app.services.ping_category_order import (
+        SUB_MAX_CONFIGS,
+        arrange_by_category_slots,
     )
 
     by_fp: dict[tuple, dict] = {}
@@ -4465,16 +4513,29 @@ async def collect_links_detailed(
             prev["config_tag"] = new_tag
             if row.get("group_id") is not None:
                 prev["group_id"] = row.get("group_id")
+        new_kind = str(row.get("order_kind") or "other")
+        old_kind = str(prev.get("order_kind") or "other")
+        if new_kind != "other" and old_kind == "other":
+            prev["order_kind"] = new_kind
+            prev["usage_cost"] = row.get("usage_cost")
+            if row.get("group_id") is not None:
+                prev["group_id"] = row.get("group_id")
     rows = list(by_fp.values()) + no_fp
+
+    # Within each slot, prefer admin ping rank (lower global index = better).
+    rows = arrange_by_category_slots(
+        rows,
+        avg_of=lambda row: float(
+            link_order_index(str(row.get("link") or "")) + 1
+        ),
+        label_of=lambda row: str(row.get("config_tag") or ""),
+        category_of=lambda row: str(row.get("order_kind") or "other"),
+        cost_of=lambda row: row.get("usage_cost"),
+    )
 
     # Normal clients: max SUB_MAX_CONFIGS. Probe/AstraPing (include_hidden): all.
     if not include_hidden:
-        try:
-            from app.services.ping_category_order import SUB_MAX_CONFIGS
-
-            max_n = int(SUB_MAX_CONFIGS)
-        except Exception:  # noqa: BLE001
-            max_n = 99
+        max_n = int(SUB_MAX_CONFIGS)
         if max_n > 0 and len(rows) > max_n:
             rows = rows[:max_n]
 
