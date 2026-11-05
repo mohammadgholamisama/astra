@@ -715,10 +715,11 @@ async def apply_ping_rank(
     hid dead pings (flag file under data/).
 
     Order rules:
-    - Up to 20 best مستقیم (usage_cost↑ then quality)
+    - Up to 20 مستقیم (usage_cost↑ then quality)
     - Tunnel tiers by usage_cost↑ — up to 35 per cost (e.g. ۵ سپس ۷)
     - Up to 9 گیمینگ (usage_cost↑ then quality)
-    - Remaining successful by cost then quality; untested stay after
+    - Remaining by cost then quality
+    Untested configs still fill their order_kind slot (sorted after scored peers).
     """
     from app.services.config_hides import clear_stale_ping_auto_hides_once
     from app.services.ping_category_order import arrange_by_category_slots
@@ -823,41 +824,39 @@ async def apply_ping_rank(
                 packet_loss[empty_key] = packet_loss[key]
         _remember_hp(key)
 
-    if not score:
-        logger.info("apply_ping_rank no scores — order unchanged (no auto-hide)")
+    if not current:
         return await list_workspace(db)
 
-    scored_items: list[ConfigOrderItemOut] = []
-    unscored_rows: list[ConfigOrderItemOut] = []
     item_score_key: dict[int, tuple[str, int, str]] = {}
     for it in current:
         resolved = _resolve_key(it.host, int(it.port), it.match_host or "")
-        if resolved is not None and resolved in score:
-            scored_items.append(it)
+        if resolved is not None:
             item_score_key[id(it)] = resolved
-        else:
-            unscored_rows.append(it)
-
-    if not scored_items:
-        logger.info(
-            "apply_ping_rank skip order — %s scores, 0 panel matches",
-            len(score),
-        )
-        return await list_workspace(db)
 
     def _sk(it: ConfigOrderItemOut) -> tuple[str, int, str]:
         return item_score_key.get(id(it)) or _fp_key(
             it.host, int(it.port), it.match_host or ""
         )
 
+    def _avg(it: ConfigOrderItemOut) -> float:
+        key = _sk(it)
+        if key in score:
+            return float(score[key])
+        try:
+            existing = float(getattr(it, "avg_ping", None) or -1)
+        except (TypeError, ValueError):
+            existing = -1.0
+        return existing if existing > 0 else 1e18
+
+    # All fingerprints fill order_kind slots — ping only ranks inside a slot.
     arranged = arrange_by_category_slots(
-        scored_items,
-        avg_of=lambda it: score.get(_sk(it), 1e18),
+        current,
+        avg_of=_avg,
         label_of=lambda it: it.label
         or labels.get(_sk(it), "")
         or labels.get(_fp_key(it.host, int(it.port), it.match_host or ""), "")
         or "",
-        device_of=lambda it: devices.get(_sk(it), 1),
+        device_of=lambda it: devices.get(_sk(it), getattr(it, "device_count", None) or 1),
         download_of=lambda it: downloads.get(_sk(it), 0),
         upload_of=lambda it: uploads.get(_sk(it), 0),
         packet_of=lambda it: packet_loss.get(_sk(it), 101.0),
@@ -865,15 +864,11 @@ async def apply_ping_rank(
         category_of=lambda it: getattr(it, "category_name", None) or "",
         cost_of=lambda it: getattr(it, "usage_cost", None),
     )
-    # Full order: 20 direct → ≤70 tunnel (35/cost) → 9 gaming → leftover.
-    # User sub caps at SUB_MAX in collect_links; probe/app gets everything.
-    ordered = list(arranged) + unscored_rows
+    ordered = list(arranged)
 
     payload: list[ConfigOrderItemIn] = []
     for it in ordered:
-        key = _sk(it) if id(it) in item_score_key else _fp_key(
-            it.host, int(it.port), it.match_host or ""
-        )
+        key = _sk(it)
         label = it.label or labels.get(key) or labels.get(
             _fp_key(it.host, int(it.port), it.match_host or ""), None
         )
@@ -886,10 +881,10 @@ async def apply_ping_rank(
             )
         )
 
+    scored_n = sum(1 for it in current if _sk(it) in score)
     logger.info(
-        "apply_ping_rank scored=%s unscored=%s total=%s (order only, no hide)",
-        len(arranged),
-        len(unscored_rows),
+        "apply_ping_rank scored=%s total=%s (order_kind slots, no hide)",
+        scored_n,
         len(payload),
     )
     await save_order(db, payload)
@@ -961,7 +956,11 @@ async def seed_order_kind_from_folders_once(db: AsyncSession) -> int:
 
 
 async def relayout_order_from_stored(db: AsyncSession) -> int:
-    """Re-apply 20/35×cost/9 layout from stored pings + group.order_kind/cost."""
+    """Re-apply 20/35×cost/9 layout for ALL fingerprints via group.order_kind/cost.
+
+    Ping only ranks inside a slot — missing ping no longer pushes a config
+    out of its مستقیم/تانل/گیمینگ window.
+    """
     from app.services.ping_category_order import arrange_by_category_slots
 
     try:
@@ -971,22 +970,6 @@ async def relayout_order_from_stored(db: AsyncSession) -> int:
         return 0
     current = list(workspace.items)
     if not current:
-        return 0
-
-    scored: list[ConfigOrderItemOut] = []
-    unscored: list[ConfigOrderItemOut] = []
-    for it in current:
-        avg = getattr(it, "avg_ping", None)
-        try:
-            avg_f = float(avg) if avg is not None else -1.0
-        except (TypeError, ValueError):
-            avg_f = -1.0
-        if avg_f > 0:
-            scored.append(it)
-        else:
-            unscored.append(it)
-
-    if not scored:
         return 0
 
     ping_by_key: dict[tuple[str, int, str], tuple[float, int | None]] = {}
@@ -1013,15 +996,22 @@ async def relayout_order_from_stored(db: AsyncSession) -> int:
             dcount_i = None
         ping_by_key[key] = (avg_f, dcount_i)
 
+    def _avg(it: ConfigOrderItemOut) -> float:
+        try:
+            v = float(getattr(it, "avg_ping", None) or -1)
+        except (TypeError, ValueError):
+            v = -1.0
+        return v if v > 0 else 1e18
+
     arranged = arrange_by_category_slots(
-        scored,
-        avg_of=lambda it: float(getattr(it, "avg_ping", None) or 1e18),
+        current,
+        avg_of=_avg,
         label_of=lambda it: it.label or "",
         device_of=lambda it: getattr(it, "device_count", None) or 1,
         category_of=lambda it: getattr(it, "category_name", None) or "",
         cost_of=lambda it: getattr(it, "usage_cost", None),
     )
-    ordered = list(arranged) + unscored
+    ordered = list(arranged)
     payload = [
         ConfigOrderItemIn(
             host=it.host,
@@ -1065,12 +1055,12 @@ async def relayout_order_from_stored(db: AsyncSession) -> int:
 async def relayout_order_slots_once(db: AsyncSession) -> int:
     """One-shot after order_kind: re-layout with explicit group kinds.
 
-    Flag: ``data/relayout_slots_v155``.
+    Flag: ``data/relayout_slots_v161`` (re-run when slot rules change).
     """
     from pathlib import Path
 
     data_dir = Path(__file__).resolve().parents[3] / "data"
-    flag = data_dir / "relayout_slots_v155"
+    flag = data_dir / "relayout_slots_v161"
     if flag.exists():
         return 0
     n = await relayout_order_from_stored(db)

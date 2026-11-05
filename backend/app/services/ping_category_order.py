@@ -1,16 +1,16 @@
 """Category + usage-cost aware sub order.
 
-Layout (successful / scored configs first):
+Layout (every config participates — ping only affects rank inside a slot):
   1) up to 20 مستقیم — sorted by usage_cost↑ then quality
   2) تانل — ascending usage_cost, up to 35 per cost, within a
      fixed tunnel budget so gaming always fits before leftover
      (budget = SUB_MAX − 20 − 9 = 70 → e.g. گیگ ۵ سپس گیگ ۷)
   3) up to 9 گیمینگ — sorted by usage_cost↑ then quality
-  4) leftover successful by cost then quality (extra of above + other)
-  5) unscored / failed keep relative order at the end
+  4) leftover by cost then quality (extra of above + other)
 
 Category comes ONLY from group.order_kind set by admin — never from
-config remark / label text.
+config remark / label text. Missing ping does NOT eject a config from
+its slot (it just sorts after scored peers in the same tier).
 """
 
 from __future__ import annotations
@@ -92,9 +92,10 @@ def arrange_by_category_slots(
     gaming_slot: int = GAMING_SLOT,
     tunnel_budget: int | None = TUNNEL_BUDGET,
 ) -> list[T]:
-    """Sort successful items into category/cost slots then leftover by quality.
+    """Sort items into category/cost slots then leftover by quality.
 
     ``category_of`` must return group.order_kind (or alias). Labels are ignored.
+    Every item enters its order_kind bucket — no separate «unscored» exile.
     """
 
     def _num(call: Callable[[T], Any] | None, it: T, default: float = 0.0) -> float:
@@ -133,26 +134,13 @@ def arrange_by_category_slots(
         except Exception:  # noqa: BLE001
             return 10**9
 
-    ok: list[T] = []
-    rest: list[T] = []
-    for it in items:
-        try:
-            avg = float(avg_of(it))
-        except (TypeError, ValueError):
-            avg = -1.0
-        dl = _num(download_of, it)
-        ul = _num(upload_of, it)
-        loss = _loss(it)
-        if avg > 0 or dl > 0 or ul > 0 or (0 <= loss < 100):
-            ok.append(it)
-        else:
-            rest.append(it)
-
     def quality_key(it: T) -> tuple:
         try:
             avg = float(avg_of(it))
         except (TypeError, ValueError):
             avg = -1.0
+        # Scored first; missing/failed ping sorts last inside the same cost tier
+        has_score = 0 if avg > 0 else 1
         avg_sort = avg if avg > 0 else 1e18
         dev = 1
         if device_of is not None:
@@ -163,7 +151,8 @@ def arrange_by_category_slots(
         dl = _num(download_of, it)
         ul = _num(upload_of, it)
         loss = _loss(it)
-        return (-dev, loss, -dl, -ul, avg_sort)
+        has_speed = 0 if (dl > 0 or ul > 0 or (0 <= loss < 100)) else 1
+        return (has_score, has_speed, -dev, loss, -dl, -ul, avg_sort)
 
     def segment_key(it: T) -> tuple:
         return (_cost(it),) + quality_key(it)
@@ -174,7 +163,7 @@ def arrange_by_category_slots(
         "gaming": [],
         "other": [],
     }
-    for it in ok:
+    for it in items:
         buckets[_cat(it)].append(it)
     for cat in buckets:
         buckets[cat].sort(key=segment_key)
@@ -219,9 +208,9 @@ def arrange_by_category_slots(
         head.append(it)
         picked.add(id(it))
 
-    leftover = [it for it in ok if id(it) not in picked]
+    leftover = [it for it in items if id(it) not in picked]
     leftover.sort(key=segment_key)
-    return head + leftover + rest
+    return head + leftover
 
 
 def arrange_rank_dicts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:

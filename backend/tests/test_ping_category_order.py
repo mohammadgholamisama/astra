@@ -119,3 +119,26 @@ def test_extra_tunnel_cost_does_not_push_gaming():
     assert all(x["usage_cost"] == 7 for x in head[55:90])
     assert all(x["order_kind"] == "gaming" for x in head[90:99])
     assert any(x["usage_cost"] == 9 for x in out[99:])
+
+
+def test_unscored_still_fills_order_kind_slots():
+    """Missing ping must NOT kick configs out of 20/35/9 windows."""
+    items = []
+    for i in range(20):
+        items.append(_row(f"d-{i}", -1, kind="direct", cost=5))  # no ping
+    for i in range(35):
+        items.append(_row(f"t5-{i}", -1, kind="tunnel", cost=5))
+    for i in range(35):
+        items.append(_row(f"t7-{i}", -1, kind="tunnel", cost=7))
+    for i in range(9):
+        items.append(_row(f"g-{i}", -1, kind="gaming", cost=5))
+    # one scored other should not jump ahead of unscored directs
+    items.append(_row("other-fast", 1, kind="other", cost=1))
+
+    out = _arrange(items)
+    head = out[:SUB_MAX_CONFIGS]
+    assert all(x["order_kind"] == "direct" for x in head[:20])
+    assert all(x["order_kind"] == "tunnel" and x["usage_cost"] == 5 for x in head[20:55])
+    assert all(x["order_kind"] == "tunnel" and x["usage_cost"] == 7 for x in head[55:90])
+    assert all(x["order_kind"] == "gaming" for x in head[90:99])
+    assert out[99]["order_kind"] == "other"
