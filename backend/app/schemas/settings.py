@@ -27,7 +27,7 @@ class SiteSettingsUpdate(BaseModel):
     link_channel: str | None = Field(default=None, max_length=512)
     link_support: str | None = Field(default=None, max_length=512)
     link_app: str | None = Field(default=None, max_length=512)
-    config_brand_tag: str | None = Field(default=None, max_length=24)
+    config_brand_tag: str | None = Field(default=None, max_length=200)
     promo_config_enabled: bool | None = None
     promo_config_text: str | None = Field(default=None, max_length=200)
     promo_config_text_2: str | None = Field(default=None, max_length=200)

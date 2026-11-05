@@ -207,7 +207,8 @@ def build_config_remark(
     # Keep ASCII-ish username; flag is appended separately after the name
     base = re.sub(r"[^\w\s.\-]+", "", base, flags=re.UNICODE).strip() or "config"
     tag = " ".join((brand_tag or "").split()).strip()
-    tag = re.sub(r"[\x00-\x1f\x7f<>\"'`]", "", tag)[:24]
+    # Match groups.config_tag VARCHAR(200) — old [:24] cut mid-token (e.g. 1.5 → 1.)
+    tag = re.sub(r"[\x00-\x1f\x7f<>\"'`]", "", tag)[:200]
     # Country flag from host:port map (regional-indicator pair, e.g. 🇩🇪)
     flag = re.sub(r"[\x00-\x1f\x7f]", "", str(location_flag or "")).strip()
     if flag and not all(0x1F1E6 <= ord(ch) <= 0x1F1FF for ch in flag):

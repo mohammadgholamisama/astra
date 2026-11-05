@@ -237,12 +237,12 @@ def get_public_links() -> dict[str, str]:
 
 
 def normalize_config_brand_tag(raw: str | None) -> str:
-    """Optional short tag inserted in real config remarks (empty = omitted)."""
+    """Optional tag inserted in real config remarks (empty = omitted)."""
     tag = _CTRL.sub("", (raw or "").strip())
     tag = _HTML.sub("", tag)
     tag = re.sub(r"\s+", " ", tag).strip()
-    if len(tag) > 24:
-        raise ValueError("برچسب کانفیگ حداکثر ۲۴ کاراکتر است")
+    if len(tag) > 200:
+        raise ValueError("برچسب کانفیگ حداکثر ۲۰۰ کاراکتر است")
     return tag
 
 
