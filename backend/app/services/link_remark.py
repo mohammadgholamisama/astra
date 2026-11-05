@@ -132,9 +132,15 @@ def sanitize_share_link(link: str) -> str:
 
 
 def rewrite_link_remark(link: str, remark: str) -> str:
-    """Set client-visible name on a share link (fragment / vmess ps)."""
+    """Set client-visible name on a share link (fragment / vmess ps).
+
+    Do **not** run ``to_en_digits`` on the whole remark — that would rewrite
+    Persian decimals the admin typed in ``config_tag`` (۱.۵ → 1.5). The tag
+    must appear exactly as stored; username/remain are already ASCII in
+    ``build_config_remark``.
+    """
     raw = sanitize_share_link((link or "").strip())
-    name = to_en_digits((remark or "").strip())
+    name = " ".join((remark or "").split()).strip()
     if not raw or not name:
         return raw
 
@@ -206,9 +212,8 @@ def build_config_remark(
     base = " ".join(to_en_digits(name or "").split()).strip() or "config"
     # Keep ASCII-ish username; flag is appended separately after the name
     base = re.sub(r"[^\w\s.\-]+", "", base, flags=re.UNICODE).strip() or "config"
-    tag = " ".join((brand_tag or "").split()).strip()
-    # Match groups.config_tag VARCHAR(200) — old [:24] cut mid-token (e.g. 1.5 → 1.)
-    tag = re.sub(r"[\x00-\x1f\x7f<>\"'`]", "", tag)[:200]
+    # config_tag verbatim — never to_en_digits / never cut inside ۱.۵ or 1.5
+    tag = _clip_config_tag(brand_tag)
     # Country flag from host:port map (regional-indicator pair, e.g. 🇩🇪)
     flag = re.sub(r"[\x00-\x1f\x7f]", "", str(location_flag or "")).strip()
     if flag and not all(0x1F1E6 <= ord(ch) <= 0x1F1FF for ch in flag):
@@ -219,6 +224,50 @@ def build_config_remark(
     if tag:
         return f"#{cid}. {tag} {remain} | {name_part}"
     return f"#{cid}. {remain} | {name_part}"
+
+
+_TAG_MAX = 200
+# ASCII / Arabic decimal separators used in coefficients (1.5 / ۱.۵ / ۱٫۵)
+_DECIMAL_SEPS = frozenset(".,٫")
+
+
+def _is_digit_char(ch: str) -> bool:
+    return bool(ch) and (
+        ch.isdigit()
+        or "\u06f0" <= ch <= "\u06f9"  # ۰-۹
+        or "\u0660" <= ch <= "\u0669"  # ٠-٩
+    )
+
+
+def _clip_config_tag(raw: object) -> str:
+    """Keep admin tag exact; only strip controls. Never chop mid-decimal."""
+    tag = " ".join(str(raw or "").split()).strip()
+    tag = re.sub(r"[\x00-\x1f\x7f<>\"'`]", "", tag)
+    if len(tag) <= _TAG_MAX:
+        return tag
+    cut = tag[:_TAG_MAX]
+    # «…1.» + «5»  or  «…1» + «.5»  → keep the full coefficient token
+    i = _TAG_MAX
+    if cut and cut[-1] in _DECIMAL_SEPS and i < len(tag) and _is_digit_char(tag[i]):
+        i += 1
+        while i < len(tag) and _is_digit_char(tag[i]) and i < _TAG_MAX + 8:
+            i += 1
+        cut = tag[:i]
+    elif (
+        cut
+        and _is_digit_char(cut[-1])
+        and i < len(tag)
+        and tag[i] in _DECIMAL_SEPS
+        and i + 1 < len(tag)
+        and _is_digit_char(tag[i + 1])
+    ):
+        i += 2
+        while i < len(tag) and _is_digit_char(tag[i]) and i < _TAG_MAX + 8:
+            i += 1
+        cut = tag[:i]
+    if cut and cut[-1] in _DECIMAL_SEPS:
+        cut = cut[:-1]
+    return cut
 
 
 def apply_display_name(

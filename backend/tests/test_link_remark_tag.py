@@ -1,32 +1,52 @@
-"""Config remark must keep decimal coefficients in group tags (e.g. 1.5)."""
+"""Config remark must keep decimal coefficients exactly as typed (1.5 / ۱.۵)."""
 
-from app.services.link_remark import build_config_remark
+from urllib.parse import unquote
+
+from app.services.link_remark import (
+    build_config_remark,
+    rewrite_link_remark,
+    _clip_config_tag,
+)
 
 
-def test_decimal_in_long_tag_not_truncated_to_one_dot():
-    # Older [:24] cut through «1.5» when Persian prefix filled the budget.
-    tag = "تانل گیگی ضریب1.5تومن"
-    assert len(tag) > 24 or "1.5" in tag
+def test_persian_one_point_five_kept_verbatim():
+    tag = "تانل ضریب۱.۵تومن"
     remark = build_config_remark(
         name="user",
-        config_id=7,
+        config_id=3,
         used=0,
         limit=50 * 1024**3,
         brand_tag=tag,
     )
-    assert "1.5" in remark
-    assert "1." in remark  # still present as part of 1.5
-    # Must not end the tag fragment as bare «1.» before remain
-    assert "ضریب1.5" in remark or "1.5تومن" in remark
+    assert "۱.۵" in remark
+    assert "ضریب۱.۵" in remark
+    # Must not collapse to bare ۱
+    assert "ضریب۱ " not in remark
+    assert "ضریب۱|" not in remark
 
 
-def test_tag_up_to_200_chars_kept():
-    tag = ("الف" * 60) + "1.5"  # well over old 24 limit
+def test_rewrite_does_not_latinize_tag_digits():
+    tag = "گیگی باضریب۱.۵"
     remark = build_config_remark(
-        name="user",
+        name="alice",
         config_id=1,
         used=0,
         limit=0,
         brand_tag=tag,
     )
-    assert "1.5" in remark
+    link = rewrite_link_remark(
+        "vless://00000000-0000-0000-0000-000000000001@1.1.1.1:443?encryption=none",
+        remark,
+    )
+    shown = unquote(link.rsplit("#", 1)[-1])
+    assert "۱.۵" in shown
+    assert "1.5" not in shown  # do not force Latin digits on the tag
+
+
+def test_clip_does_not_cut_decimal_at_boundary():
+    # Force a cut right before «.۵»
+    prefix = "الف" * 66  # 198 chars
+    tag = prefix + "۱.۵"
+    assert len(prefix) == 198
+    out = _clip_config_tag(tag)
+    assert "۱.۵" in out
