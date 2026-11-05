@@ -9,6 +9,7 @@ type Parsed = {
   link_preview: string;
   protocol: string | null;
   remark: string | null;
+  config_tag: string | null;
   host: string;
   port: number;
   match_host: string;
@@ -21,6 +22,8 @@ type Hit = {
   panel_is_active: boolean;
   group_id: number | null;
   group_name: string | null;
+  group_config_tag: string | null;
+  order_kind: string | null;
   source_remark: string | null;
   match_quality: string;
   host: string;
@@ -38,11 +41,19 @@ type LookupOut = {
 };
 
 const QUALITY_LABEL: Record<string, string> = {
+  tag: "تطبیق تگ گروه",
   exact: "تطبیق دقیق",
   uuid: "تطبیق UUID",
   uri: "لینک یکسان",
   sni: "تطبیق SNI",
   host_port: "دامنه و پورت",
+};
+
+const ORDER_KIND_LABEL: Record<string, string> = {
+  direct: "مستقیم",
+  tunnel: "تانل",
+  gaming: "گیمینگ",
+  other: "سایر",
 };
 
 const TYPE_LABEL: Record<string, string> = {
@@ -100,24 +111,27 @@ export default function ConfigLookupPage() {
     <div className="admin-page config-lookup-page">
       <h1 className="page-title">شناسایی کانفیگ</h1>
       <p className="page-sub">
-        لینک کانفیگ را بچسبانید تا مشخص شود مال کدام <b>پنل</b> و <b>گروه</b> در
-        آسترا است.
+        لینک کانفیگ یا <b>نام روی ساب</b> را بچسبانید تا گروه و پنل واقعی مشخص
+        شود — تطبیق اول با «متن روی کانفیگ» همان گروه است، نه حدس از روی تانل/مستقیم.
       </p>
 
       <form className="config-lookup-form" onSubmit={onSubmit}>
         <div className="field">
-          <label>لینک کانفیگ</label>
+          <label>لینک یا نام کانفیگ</label>
           <textarea
             value={text}
             onChange={(e) => setText(e.target.value)}
-            placeholder="vless://… یا vmess://… را اینجا بچسبانید"
+            placeholder={
+              "vless://…\nیا مثلاً:\n#1. (تانل گیگی 5تومن(5)) 8.6G | user"
+            }
             rows={5}
-            dir="ltr"
+            dir="auto"
             spellCheck={false}
             autoFocus
           />
           <p className="field-hint">
-            یک یا چند لینک — اگر چند تا باشد، اولین لینک بررسی می‌شود.
+            اگر چند لینک باشد، اولین لینک بررسی می‌شود. نام روی ساب از روی تگ
+            ذخیره‌شدهٔ گروه پیدا می‌شود.
           </p>
         </div>
         {errText && <p className="error">{errText}</p>}
@@ -167,6 +181,12 @@ export default function ConfigLookupPage() {
                   <div>
                     <span className="muted">نام</span>
                     <strong dir="auto">{result.parsed.remark}</strong>
+                  </div>
+                ) : null}
+                {result.parsed.config_tag ? (
+                  <div>
+                    <span className="muted">تگ گروه (از نام ساب)</span>
+                    <strong dir="auto">{result.parsed.config_tag}</strong>
                   </div>
                 ) : null}
                 {result.parsed.protocol ? (
@@ -262,6 +282,11 @@ export default function ConfigLookupPage() {
                           {TYPE_LABEL[h.panel_type] || h.panel_type}
                         </span>
                       ) : null}
+                      {h.order_kind ? (
+                        <span className="badge muted">
+                          {ORDER_KIND_LABEL[h.order_kind] || h.order_kind}
+                        </span>
+                      ) : null}
                       <span
                         className={`badge ${h.panel_is_active ? "ok" : "err"}`}
                       >
@@ -273,35 +298,44 @@ export default function ConfigLookupPage() {
                     </div>
                   </div>
 
+                  {h.group_config_tag ? (
+                    <p className="config-lookup-remark" dir="auto">
+                      <span className="muted">متن روی کانفیگ این گروه: </span>
+                      {h.group_config_tag}
+                    </p>
+                  ) : null}
+
                   {h.source_remark ? (
                     <p className="config-lookup-remark" dir="auto">
-                      <span className="muted">نام روی پنل: </span>
+                      <span className="muted">نمونه / لیبل: </span>
                       {h.source_remark}
                     </p>
                   ) : null}
 
-                  <div className="config-order-fp" dir="ltr">
-                    <div className="config-order-fp-cell">
-                      <span className="config-order-fp-k">دامنه</span>
-                      <span className="config-order-fp-v">{h.host || "—"}</span>
+                  {(h.host || h.port) ? (
+                    <div className="config-order-fp" dir="ltr">
+                      <div className="config-order-fp-cell">
+                        <span className="config-order-fp-k">دامنه</span>
+                        <span className="config-order-fp-v">{h.host || "—"}</span>
+                      </div>
+                      <div className="config-order-fp-cell port">
+                        <span className="config-order-fp-k">پورت</span>
+                        <span className="config-order-fp-v">
+                          {h.port ? toFaDigits(h.port) : "—"}
+                        </span>
+                      </div>
+                      <div
+                        className={`config-order-fp-cell host${
+                          h.match_host ? "" : " empty"
+                        }`}
+                      >
+                        <span className="config-order-fp-k">هاست / SNI</span>
+                        <span className="config-order-fp-v">
+                          {h.match_host || "—"}
+                        </span>
+                      </div>
                     </div>
-                    <div className="config-order-fp-cell port">
-                      <span className="config-order-fp-k">پورت</span>
-                      <span className="config-order-fp-v">
-                        {h.port ? toFaDigits(h.port) : "—"}
-                      </span>
-                    </div>
-                    <div
-                      className={`config-order-fp-cell host${
-                        h.match_host ? "" : " empty"
-                      }`}
-                    >
-                      <span className="config-order-fp-k">هاست / SNI</span>
-                      <span className="config-order-fp-v">
-                        {h.match_host || "—"}
-                      </span>
-                    </div>
-                  </div>
+                  ) : null}
 
                   {h.accounts_count > 0 ? (
                     <p className="config-lookup-accounts muted">
@@ -312,7 +346,7 @@ export default function ConfigLookupPage() {
                     </p>
                   ) : (
                     <p className="config-lookup-accounts muted">
-                      در استخر اوتباند / نمونه پنل پیدا شد
+                      از روی تگ / نمونه گروه پیدا شد
                     </p>
                   )}
                 </article>

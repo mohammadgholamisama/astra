@@ -1,10 +1,16 @@
-"""Resolve a pasted share-link to Astra panel + sales group (fast path)."""
+"""Resolve a pasted share-link / sub remark to Astra panel + sales group.
+
+Priority: the group's ``config_tag`` (text inside ``#N. TAG … | user``) must
+win over bare host:port / panel-name heuristics — those often point at the
+wrong sales group when the same outbound sits in several groups.
+"""
 
 from __future__ import annotations
 
 import logging
 import re
 from typing import Any
+from urllib.parse import unquote
 
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,7 +18,7 @@ from sqlalchemy.orm import selectinload
 
 from app.adapters.http_utils import is_share_link
 from app.models.astra_outbound import AstraOutbound
-from app.models.group import Group
+from app.models.group import Group, GroupPanel
 from app.models.group_config import GroupConfigItem
 from app.models.user import PanelAccount, PanelAccountStatus
 from app.schemas.config_lookup import (
@@ -41,6 +47,17 @@ _LINK_RE = re.compile(
 _MAX_UUID_ACCOUNTS = 40
 _MAX_LINK_SCAN = 80
 _MAX_OUTBOUNDS = 200
+_MAX_TAG_GROUPS = 40
+
+# ``#1. TAG 8.6G | user 🇦🇱``  or  ``#1. 8.6G | user``
+_ASTRA_REMARK_RE = re.compile(
+    r"^#(?P<cid>\d+)\.\s*(?P<body>.+?)\s*\|\s*(?P<user>.+?)\s*$",
+    re.UNICODE,
+)
+_REMAIN_TOKEN_RE = re.compile(
+    r"(?P<remain>\d+(?:[.,]\d+)?\s*[KMGT]?B?|∞|نامحدود)$",
+    re.IGNORECASE | re.UNICODE,
+)
 
 
 def _extract_links(text: str) -> list[str]:
@@ -82,8 +99,87 @@ def _fp_of_link(link: str) -> tuple[str, int, str] | None:
     return (h, int(p), m or "")
 
 
-def _parse_query(link: str) -> ConfigLookupParsed:
+def _norm_key(s: str) -> str:
+    return re.sub(r"[^a-z0-9\u0600-\u06ff]+", "", (s or "").lower())
+
+
+def _strip_outer_parens(s: str) -> str:
+    t = (s or "").strip()
+    while len(t) >= 2 and t[0] in "([{" and t[-1] in ")]}":
+        t = t[1:-1].strip()
+    return t
+
+
+def parse_astra_remark(remark: str | None) -> dict[str, str]:
+    """Pull config_tag / remain / user from an Astra subscription remark."""
+    raw = unquote((remark or "").strip())
+    if not raw:
+        return {"tag": "", "remain": "", "user": "", "raw": ""}
+    m = _ASTRA_REMARK_RE.match(raw)
+    if not m:
+        # Bare tag paste (admin typed only the name from the sub)
+        tag = _strip_outer_parens(raw)
+        return {"tag": tag, "remain": "", "user": "", "raw": raw}
+    body = " ".join((m.group("body") or "").split()).strip()
+    user = " ".join((m.group("user") or "").split()).strip()
+    # Drop trailing flag emoji from username for display matching
+    remain = ""
+    tag = body
+    rm = _REMAIN_TOKEN_RE.search(body)
+    if rm:
+        remain = (rm.group("remain") or "").strip()
+        tag = body[: rm.start()].strip()
+    tag = _strip_outer_parens(tag)
+    return {"tag": tag, "remain": remain, "user": user, "raw": raw}
+
+
+def _remark_close(a: str | None, b: str | None) -> bool:
+    x = (a or "").strip().lower()
+    y = (b or "").strip().lower()
+    if not x or not y:
+        return False
+    return x == y or x in y or y in x
+
+
+def _tag_score(
+    query_tag: str,
+    *,
+    group_config_tag: str | None = None,
+    group_name: str | None = None,
+    source_remark: str | None = None,
+) -> int:
+    """How well a hit's group matches the remark's config_tag. Higher = better."""
+    q = _norm_key(_strip_outer_parens(query_tag or ""))
+    if not q or len(q) < 2:
+        return 0
+    gtag = _norm_key(_strip_outer_parens(group_config_tag or ""))
+    gname = _norm_key(group_name or "")
+    # Prefer exact group.config_tag — that is what build_config_remark embeds
+    if gtag and gtag == q:
+        return 100
+    if gtag and (q in gtag or gtag in q):
+        return 85
+    if gname and gname == q:
+        return 70
+    if gname and (q in gname or gname in q):
+        return 55
+    # source_remark may be the full ``#N. TAG …`` or just a sample label
+    parsed = parse_astra_remark(source_remark)
+    s_tag = _norm_key(_strip_outer_parens(parsed.get("tag") or ""))
+    if s_tag and s_tag == q:
+        return 90
+    if s_tag and (q in s_tag or s_tag in q):
+        return 75
+    s_raw = _norm_key(source_remark or "")
+    if s_raw and (q in s_raw or s_raw in q):
+        return 40
+    return 0
+
+
+def _parse_query(link: str, *, fallback_remark: str | None = None) -> ConfigLookupParsed:
     proto, remark, _ = _parse_link_meta(link)
+    rem = (remark or "").strip() or (fallback_remark or "").strip() or None
+    parsed_tag = parse_astra_remark(rem).get("tag") or None
     fp = _fp_of_link(link)
     host = ""
     port = 0
@@ -94,7 +190,8 @@ def _parse_query(link: str) -> ConfigLookupParsed:
     return ConfigLookupParsed(
         link_preview=preview,
         protocol=(proto or None),
-        remark=(remark or "").strip() or None,
+        remark=rem,
+        config_tag=parsed_tag or None,
         host=str(host or ""),
         port=int(port or 0),
         match_host=match or "",
@@ -122,28 +219,22 @@ def _quality(
     cs = _sni_core(c_match)
     if qs and cs and qs == cs:
         return "sni"
-    # Bare host:port only when neither side has a discriminating SNI/header
     if not q_match and not c_match:
         return "host_port"
     return None
 
 
-_QUALITY_RANK = {"exact": 0, "uuid": 1, "uri": 1, "sni": 2, "host_port": 3}
+_QUALITY_RANK = {
+    "tag": 0,
+    "exact": 1,
+    "uuid": 2,
+    "uri": 2,
+    "sni": 3,
+    "host_port": 4,
+}
 
 # Keep letter+digit units together: Hajmi6, Tunnel (not Hajmi / 6 separately)
 _STEM_RE = re.compile(r"[A-Za-z\u0600-\u06FF]+\d*", re.UNICODE)
-
-
-def _remark_close(a: str | None, b: str | None) -> bool:
-    x = (a or "").strip().lower()
-    y = (b or "").strip().lower()
-    if not x or not y:
-        return False
-    return x == y or x in y or y in x
-
-
-def _norm_key(s: str) -> str:
-    return re.sub(r"[^a-z0-9\u0600-\u06ff]+", "", (s or "").lower())
 
 
 def _panel_stems(panel_name: str) -> list[str]:
@@ -151,10 +242,7 @@ def _panel_stems(panel_name: str) -> list[str]:
 
 
 def _group_fit(panel_name: str, group_name: str | None) -> tuple[int, int, int]:
-    """Higher is better: how closely the sales-group name matches the panel.
-
-    Hajmi6-Tunnel → prefers Hajmi6x…-Tunnel… over Hajmi5x…-Tunnel…
-    """
+    """Last-resort tie-break only — never overrides config_tag match."""
     gn = (group_name or "").strip()
     if not gn:
         return (0, 0, 0)
@@ -162,19 +250,16 @@ def _group_fit(panel_name: str, group_name: str | None) -> tuple[int, int, int]:
     if not stems:
         return (0, 0, 0)
     gkey = _norm_key(gn)
-    # Exact stem hits (hajmi6 in group key beats hajmi5)
     hits = sum(1 for s in stems if s in gkey)
-    # Full normalized panel blob inside group (hajmi6tunnel ⊂ …)
     pkey = _norm_key(panel_name)
     blob = 1 if pkey and pkey in gkey else 0
     return (hits, blob, -abs(len(gn) - len(panel_name or "")))
 
 
-def _pick_best_group_hits(pool: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """One panel + same fingerprint in several groups → keep the best-fitting group."""
+def _pick_best_group_hits(pool: list[dict[str, Any]], query_tag: str) -> list[dict[str, Any]]:
+    """One panel + same fingerprint in several groups → keep the best group."""
     if len(pool) <= 1:
         return pool
-    # Same host:port:match → treat as duplicate samples across groups
     by_fp: dict[tuple[str, int, str], list[dict[str, Any]]] = {}
     for h in pool:
         key = (
@@ -191,9 +276,14 @@ def _pick_best_group_hits(pool: list[dict[str, Any]]) -> list[dict[str, Any]]:
         best = max(
             group,
             key=lambda h: (
-                _group_fit(str(h.get("panel_name") or ""), h.get("group_name")),
+                _tag_score(
+                    query_tag,
+                    group_config_tag=h.get("group_config_tag"),
+                    group_name=h.get("group_name"),
+                    source_remark=h.get("source_remark"),
+                ),
                 int(h.get("accounts_count") or 0),
-                # stable tie-break: prefer smaller group id
+                _group_fit(str(h.get("panel_name") or ""), h.get("group_name")),
                 -(int(h["group_id"]) if h.get("group_id") is not None else 10**9),
             ),
         )
@@ -210,18 +300,59 @@ def _panel_type_str(panel: Any) -> str | None:
     return t.value if hasattr(t, "value") else str(t or "") or None
 
 
+def _group_meta(group: Group | None) -> tuple[str | None, str | None, str | None]:
+    if group is None:
+        return None, None, None
+    name = (str(getattr(group, "name", "") or "") or None)
+    tag = (str(getattr(group, "config_tag", "") or "").strip() or None)
+    kind = (str(getattr(group, "order_kind", "") or "").strip().lower() or None)
+    return name, tag, kind
+
+
 async def lookup_config(db: AsyncSession, text: str) -> ConfigLookupOut:
-    links = _extract_links(text)
+    raw_text = (text or "").strip()
+    links = _extract_links(raw_text)
+
+    # Remark / tag paste without a share link
     if not links:
-        return ConfigLookupOut(
-            links_found=0,
-            detail="لینک کانفیگ معتبری پیدا نشد — یک vless/vmess/… کامل بچسبانید",
+        tag_info = parse_astra_remark(raw_text)
+        q_tag = (tag_info.get("tag") or "").strip()
+        if not q_tag:
+            return ConfigLookupOut(
+                links_found=0,
+                detail="لینک کانفیگ یا نام روی ساب (مثل #1. تگ … | user) بچسبانید",
+            )
+        parsed = ConfigLookupParsed(
+            link_preview=raw_text[:120],
+            remark=tag_info.get("raw") or raw_text,
+            config_tag=q_tag,
         )
+        buckets: dict[tuple[int, int | None], dict[str, Any]] = {}
+        await _add_hits_by_config_tag(db, buckets, q_tag)
+        return _finalize(buckets, parsed, links=[], query_tag=q_tag)
 
     query_link = links[0]
-    parsed = _parse_query(query_link)
+    # Remark may sit next to the link in the paste
+    side_remark = None
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if line and not is_share_link(line) and "://" not in line:
+            side_remark = line
+            break
+    parsed = _parse_query(query_link, fallback_remark=side_remark)
+    q_tag = (parsed.config_tag or "").strip()
+    if not q_tag and side_remark:
+        q_tag = (parse_astra_remark(side_remark).get("tag") or "").strip()
+        if q_tag:
+            parsed.config_tag = q_tag
+
     q_fp = _fp_of_link(query_link)
     if not q_fp:
+        # Still try tag-only if remark is present
+        if q_tag:
+            buckets = {}
+            await _add_hits_by_config_tag(db, buckets, q_tag)
+            return _finalize(buckets, parsed, links, query_tag=q_tag)
         return ConfigLookupOut(
             parsed=parsed,
             links_found=len(links),
@@ -231,7 +362,7 @@ async def lookup_config(db: AsyncSession, text: str) -> ConfigLookupOut:
     q_host, q_port, _q_match = q_fp
     raw_ep = extract_link_endpoint(query_link)
 
-    buckets: dict[tuple[int, int | None], dict[str, Any]] = {}
+    buckets = {}
 
     def _add_hit(
         *,
@@ -241,6 +372,8 @@ async def lookup_config(db: AsyncSession, text: str) -> ConfigLookupOut:
         panel_is_active: bool,
         group_id: int | None,
         group_name: str | None,
+        group_config_tag: str | None = None,
+        order_kind: str | None = None,
         quality: str,
         source_remark: str | None,
         host: str,
@@ -259,6 +392,8 @@ async def lookup_config(db: AsyncSession, text: str) -> ConfigLookupOut:
                 "panel_is_active": bool(panel_is_active),
                 "group_id": int(group_id) if group_id is not None else None,
                 "group_name": group_name,
+                "group_config_tag": group_config_tag,
+                "order_kind": order_kind,
                 "match_quality": quality,
                 "source_remark": source_remark,
                 "host": host,
@@ -278,6 +413,12 @@ async def lookup_config(db: AsyncSession, text: str) -> ConfigLookupOut:
             cur["match_host"] = match_host
         elif source_remark and not cur.get("source_remark"):
             cur["source_remark"] = source_remark
+        if group_config_tag and not cur.get("group_config_tag"):
+            cur["group_config_tag"] = group_config_tag
+        if order_kind and not cur.get("order_kind"):
+            cur["order_kind"] = order_kind
+        if group_name and not cur.get("group_name"):
+            cur["group_name"] = group_name
         if sample_user or bump_account:
             cur["accounts_count"] = int(cur.get("accounts_count") or 0) + 1
             if sample_user:
@@ -291,6 +432,8 @@ async def lookup_config(db: AsyncSession, text: str) -> ConfigLookupOut:
         *,
         group_id: int | None,
         group_name: str | None,
+        group_config_tag: str | None = None,
+        order_kind: str | None = None,
         quality: str,
         source_remark: str | None,
         c_fp: tuple[str, int, str],
@@ -306,6 +449,8 @@ async def lookup_config(db: AsyncSession, text: str) -> ConfigLookupOut:
             panel_is_active=bool(getattr(panel, "is_active", True)),
             group_id=group_id,
             group_name=group_name,
+            group_config_tag=group_config_tag,
+            order_kind=order_kind,
             quality=quality,
             source_remark=source_remark,
             host=c_fp[0],
@@ -315,7 +460,7 @@ async def lookup_config(db: AsyncSession, text: str) -> ConfigLookupOut:
             bump_account=bump_account,
         )
 
-    # ── 1) UUID → PanelAccount (indexed column, tiny result set) ────────────
+    # ── 1) UUID → PanelAccount ──────────────────────────────────────────────
     if q_uuid:
         uuid_rows = await db.execute(
             select(PanelAccount)
@@ -346,6 +491,7 @@ async def lookup_config(db: AsyncSession, text: str) -> ConfigLookupOut:
                 continue
             gid = getattr(account, "group_id", None)
             group = groups_by_id.get(int(gid)) if gid is not None else None
+            g_name, g_tag, g_kind = _group_meta(group)
             uname = ""
             user = account.__dict__.get("user")
             if user is not None:
@@ -354,7 +500,6 @@ async def lookup_config(db: AsyncSession, text: str) -> ConfigLookupOut:
             quality = "uuid"
             remark: str | None = None
             c_fp = q_fp
-            # Prefer remark/quality from a stored link that matches host:port
             for raw in account.links or []:
                 link = str(raw or "").strip()
                 if not link or not is_share_link(link):
@@ -371,22 +516,49 @@ async def lookup_config(db: AsyncSession, text: str) -> ConfigLookupOut:
                 remark = (rem or "").strip() or None
                 break
 
+            # Never paste the query remark as "نام روی پنل" — that hides mismatches
             _hit_from_panel(
                 panel,
                 group_id=int(gid) if gid is not None else None,
-                group_name=(str(getattr(group, "name", "") or "") or None),
+                group_name=g_name,
+                group_config_tag=g_tag,
+                order_kind=g_kind,
                 quality=quality,
-                source_remark=remark or parsed.remark,
+                source_remark=remark,
                 c_fp=c_fp,
                 sample_user=uname or None,
                 bump_account=True,
             )
 
-        # UUID hit is definitive for panel+group — skip heavy scans when found
-        if buckets:
-            return _finalize(buckets, parsed, links)
+        # UUID is definitive only when no config_tag is known, OR the account's
+        # group actually carries that tag. Otherwise keep scanning.
+        if buckets and not q_tag:
+            return _finalize(buckets, parsed, links, query_tag=q_tag)
+        if buckets and q_tag:
+            tagged_ok = any(
+                _tag_score(
+                    q_tag,
+                    group_config_tag=h.get("group_config_tag"),
+                    group_name=h.get("group_name"),
+                    source_remark=h.get("source_remark"),
+                )
+                >= 55
+                for h in buckets.values()
+            )
+            if tagged_ok:
+                return _finalize(buckets, parsed, links, query_tag=q_tag)
 
-    # ── 2) GroupConfigItem sample links (one row per config type — small) ───
+    # ── 1b) Groups whose config_tag matches the sub remark ──────────────────
+    if q_tag:
+        await _add_hits_by_config_tag(
+            db,
+            buckets,
+            q_tag,
+            prefer_fp=q_fp,
+            add_hit=_add_hit,
+        )
+
+    # ── 2) GroupConfigItem sample links ─────────────────────────────────────
     item_like = [
         cast(GroupConfigItem.sample_link, String).contains(f"{q_host}:{q_port}"),
     ]
@@ -416,24 +588,27 @@ async def lookup_config(db: AsyncSession, text: str) -> ConfigLookupOut:
             continue
         panel = item.__dict__.get("panel")
         group = item.__dict__.get("group")
+        g_name, g_tag, g_kind = _group_meta(group)
         rem = (item.label or "").strip() or None
         if not rem:
             _p, rem2, _ = _parse_link_meta(sample)
             rem = (rem2 or "").strip() or None
+        # Boost to tag quality when this group's tag matches the query
+        if q_tag and _tag_score(q_tag, group_config_tag=g_tag, group_name=g_name, source_remark=rem) >= 55:
+            quality = "tag"
         _hit_from_panel(
             panel,
             group_id=int(item.group_id) if item.group_id is not None else None,
-            group_name=(
-                str(getattr(group, "name", "") or "") or None if group else None
-            ),
+            group_name=g_name,
+            group_config_tag=g_tag,
+            order_kind=g_kind,
             quality=quality,
             source_remark=rem,
             c_fp=c_fp,
         )
 
-    # ── 3) Astra outbound pool — filter by port (and host when stored) ──────
+    # ── 3) Astra outbound pool ──────────────────────────────────────────────
     host_variants = {q_host, q_host.lower()}
-    # raw authority host before normalize (helps when outbound.host is unnormalized)
     if raw_ep:
         host_variants.add(str(raw_ep[0] or "").strip().lower())
         host_variants.add(str(raw_ep[0] or "").strip())
@@ -485,8 +660,16 @@ async def lookup_config(db: AsyncSession, text: str) -> ConfigLookupOut:
             c_fp=c_fp,
         )
 
-    # ── 4) Fallback: SQL prefilter on account.links containing host:port ────
-    if not buckets:
+    # ── 4) Fallback: SQL prefilter on account.links ─────────────────────────
+    if not buckets or (q_tag and not any(
+        _tag_score(
+            q_tag,
+            group_config_tag=h.get("group_config_tag"),
+            group_name=h.get("group_name"),
+            source_remark=h.get("source_remark"),
+        )
+        for h in buckets.values()
+    )):
         needles = [f"{q_host}:{q_port}"]
         if raw_ep:
             rh, rp = raw_ep
@@ -530,6 +713,7 @@ async def lookup_config(db: AsyncSession, text: str) -> ConfigLookupOut:
                     continue
                 gid = getattr(account, "group_id", None)
                 group = groups_by_id.get(int(gid)) if gid is not None else None
+                g_name, g_tag, g_kind = _group_meta(group)
                 uname = ""
                 user = account.__dict__.get("user")
                 if user is not None:
@@ -547,29 +731,206 @@ async def lookup_config(db: AsyncSession, text: str) -> ConfigLookupOut:
                     if not quality:
                         continue
                     _p, rem, _ = _parse_link_meta(link)
+                    if q_tag and _tag_score(
+                        q_tag,
+                        group_config_tag=g_tag,
+                        group_name=g_name,
+                        source_remark=(rem or "").strip() or None,
+                    ) >= 55:
+                        quality = "tag"
                     _hit_from_panel(
                         panel,
                         group_id=int(gid) if gid is not None else None,
-                        group_name=(
-                            str(getattr(group, "name", "") or "") or None
-                        ),
+                        group_name=g_name,
+                        group_config_tag=g_tag,
+                        order_kind=g_kind,
                         quality=quality,
                         source_remark=(rem or "").strip() or None,
                         c_fp=c_fp,
                         sample_user=uname or None,
                         bump_account=True,
                     )
-                    break  # one matching link per account is enough
+                    break
 
-    return _finalize(buckets, parsed, links)
+    return _finalize(buckets, parsed, links, query_tag=q_tag)
+
+
+async def _add_hits_by_config_tag(
+    db: AsyncSession,
+    buckets: dict[tuple[int, int | None], dict[str, Any]],
+    q_tag: str,
+    *,
+    prefer_fp: tuple[str, int, str] | None = None,
+    add_hit: Any | None = None,
+) -> None:
+    """Find sales groups whose config_tag / name matches the sub remark tag."""
+    tag = _strip_outer_parens((q_tag or "").strip())
+    if not tag or len(tag) < 2:
+        return
+    needle = tag[:80]
+    rows = await db.execute(
+        select(Group)
+        .where(
+            or_(
+                Group.config_tag.ilike(f"%{needle}%"),
+                Group.name.ilike(f"%{needle}%"),
+            )
+        )
+        .limit(_MAX_TAG_GROUPS)
+    )
+    groups = list(rows.scalars().all())
+    # Also try without spaces / with normalized compare in Python for Persian
+    if not groups:
+        all_g = await db.execute(
+            select(Group).where(
+                or_(Group.config_tag.isnot(None), Group.name.isnot(None))
+            ).limit(500)
+        )
+        groups = [
+            g
+            for g in all_g.scalars().all()
+            if _tag_score(
+                tag,
+                group_config_tag=getattr(g, "config_tag", None),
+                group_name=getattr(g, "name", None),
+            )
+            >= 55
+        ][:_MAX_TAG_GROUPS]
+
+    scored: list[tuple[int, Group]] = []
+    for g in groups:
+        sc = _tag_score(
+            tag,
+            group_config_tag=getattr(g, "config_tag", None),
+            group_name=getattr(g, "name", None),
+        )
+        if sc >= 55:
+            scored.append((sc, g))
+    scored.sort(key=lambda x: -x[0])
+    if not scored:
+        return
+
+    gids = [int(g.id) for _sc, g in scored]
+    gp_rows = await db.execute(
+        select(GroupPanel)
+        .where(GroupPanel.group_id.in_(gids))
+        .options(selectinload(GroupPanel.panel))
+    )
+    panels_by_gid: dict[int, list[Any]] = {}
+    for gp in gp_rows.scalars().unique().all():
+        panels_by_gid.setdefault(int(gp.group_id), []).append(gp)
+
+    # Optional: sample item label under these groups
+    item_rows = await db.execute(
+        select(GroupConfigItem)
+        .where(GroupConfigItem.group_id.in_(gids))
+        .limit(200)
+    )
+    label_by_gid: dict[int, str] = {}
+    for item in item_rows.scalars().all():
+        gid = int(item.group_id)
+        if gid in label_by_gid:
+            continue
+        lab = (item.label or "").strip()
+        if lab:
+            label_by_gid[gid] = lab
+
+    def _default_add(**kwargs: Any) -> None:
+        key = (
+            int(kwargs["panel_id"]),
+            int(kwargs["group_id"]) if kwargs.get("group_id") is not None else None,
+        )
+        if key in buckets:
+            cur = buckets[key]
+            if not cur.get("group_config_tag"):
+                cur["group_config_tag"] = kwargs.get("group_config_tag")
+            if not cur.get("order_kind"):
+                cur["order_kind"] = kwargs.get("order_kind")
+            if _QUALITY_RANK.get(str(kwargs.get("quality") or ""), 9) < _QUALITY_RANK.get(
+                str(cur.get("match_quality") or ""), 9
+            ):
+                cur["match_quality"] = kwargs["quality"]
+            return
+        buckets[key] = {
+            "panel_id": int(kwargs["panel_id"]),
+            "panel_name": kwargs["panel_name"],
+            "panel_type": kwargs.get("panel_type"),
+            "panel_is_active": bool(kwargs.get("panel_is_active", True)),
+            "group_id": kwargs.get("group_id"),
+            "group_name": kwargs.get("group_name"),
+            "group_config_tag": kwargs.get("group_config_tag"),
+            "order_kind": kwargs.get("order_kind"),
+            "match_quality": kwargs.get("quality") or "tag",
+            "source_remark": kwargs.get("source_remark"),
+            "host": kwargs.get("host") or (prefer_fp[0] if prefer_fp else ""),
+            "port": int(kwargs.get("port") or (prefer_fp[1] if prefer_fp else 0)),
+            "match_host": kwargs.get("match_host")
+            or (prefer_fp[2] if prefer_fp else ""),
+            "accounts_count": 0,
+            "sample_users": [],
+        }
+
+    put = add_hit or _default_add
+
+    for sc, group in scored:
+        g_name, g_tag, g_kind = _group_meta(group)
+        gps = panels_by_gid.get(int(group.id), [])
+        src = label_by_gid.get(int(group.id)) or (
+            f"{g_tag}" if g_tag else g_name
+        )
+        if not gps:
+            # Group with matching tag but no panels yet — still surface it
+            # via a synthetic placeholder only if we have nothing else for it
+            continue
+        for gp in gps:
+            panel = gp.__dict__.get("panel")
+            if panel is None:
+                continue
+            if add_hit is not None:
+                # Prefer_fp host used so finalize can still collapse by fp
+                host = prefer_fp[0] if prefer_fp else ""
+                port = prefer_fp[1] if prefer_fp else 0
+                match = prefer_fp[2] if prefer_fp else ""
+                add_hit(
+                    panel_id=int(panel.id),
+                    panel_name=str(panel.name or f"#{panel.id}"),
+                    panel_type=_panel_type_str(panel),
+                    panel_is_active=bool(getattr(panel, "is_active", True)),
+                    group_id=int(group.id),
+                    group_name=g_name,
+                    group_config_tag=g_tag,
+                    order_kind=g_kind,
+                    quality="tag",
+                    source_remark=src,
+                    host=host,
+                    port=port,
+                    match_host=match,
+                )
+            else:
+                put(
+                    panel_id=int(panel.id),
+                    panel_name=str(panel.name or f"#{panel.id}"),
+                    panel_type=_panel_type_str(panel),
+                    panel_is_active=bool(getattr(panel, "is_active", True)),
+                    group_id=int(group.id),
+                    group_name=g_name,
+                    group_config_tag=g_tag,
+                    order_kind=g_kind,
+                    quality="tag",
+                    source_remark=src,
+                )
 
 
 def _finalize(
     buckets: dict[tuple[int, int | None], dict[str, Any]],
     parsed: ConfigLookupParsed,
     links: list[str],
+    *,
+    query_tag: str = "",
 ) -> ConfigLookupOut:
     raw_hits = list(buckets.values())
+    q_tag = (query_tag or parsed.config_tag or "").strip()
+    q_remark = (parsed.remark or "").strip()
 
     # Same panel with/without group → keep rows that name a sales group
     by_panel: dict[int, list[dict[str, Any]]] = {}
@@ -579,6 +940,21 @@ def _finalize(
     for _pid, lst in by_panel.items():
         with_group = [x for x in lst if x.get("group_id") is not None]
         pool = with_group or lst
+        # If query has a config_tag, prefer groups that carry it before quality
+        if q_tag:
+            tagged = [
+                x
+                for x in pool
+                if _tag_score(
+                    q_tag,
+                    group_config_tag=x.get("group_config_tag"),
+                    group_name=x.get("group_name"),
+                    source_remark=x.get("source_remark"),
+                )
+                >= 55
+            ]
+            if tagged:
+                pool = tagged
         best_local = min(
             (_QUALITY_RANK.get(str(x.get("match_quality") or ""), 9) for x in pool),
             default=9,
@@ -588,10 +964,25 @@ def _finalize(
             for x in pool
             if _QUALITY_RANK.get(str(x.get("match_quality") or ""), 9) == best_local
         ]
-        # Same sample link often sits in several groups of one panel — pick one
-        collapsed.extend(_pick_best_group_hits(tier))
+        collapsed.extend(_pick_best_group_hits(tier, q_tag))
 
-    # Keep only the strongest match tier globally (exact beats host_port, …)
+    # Global: if any hit matches the remark tag, drop the rest
+    if q_tag and collapsed:
+        tagged = [
+            h
+            for h in collapsed
+            if _tag_score(
+                q_tag,
+                group_config_tag=h.get("group_config_tag"),
+                group_name=h.get("group_name"),
+                source_remark=h.get("source_remark"),
+            )
+            >= 55
+        ]
+        if tagged:
+            collapsed = tagged
+
+    # Keep strongest match-quality tier among survivors
     if collapsed:
         best = min(
             _QUALITY_RANK.get(str(h.get("match_quality") or ""), 9) for h in collapsed
@@ -602,20 +993,28 @@ def _finalize(
             if _QUALITY_RANK.get(str(h.get("match_quality") or ""), 9) == best
         ]
 
-    # If several panels still tie, prefer remark / panel-name closeness
-    q_remark = (parsed.remark or "").strip()
+    # Remark closeness as secondary filter when still ambiguous
     if q_remark and len(collapsed) > 1:
         remarked = [
             h
             for h in collapsed
             if _remark_close(str(h.get("source_remark") or ""), q_remark)
-            or _remark_close(str(h.get("panel_name") or ""), q_remark)
+            or _remark_close(str(h.get("group_config_tag") or ""), q_remark)
             or _remark_close(str(h.get("group_name") or ""), q_remark)
+            or (
+                q_tag
+                and _tag_score(
+                    q_tag,
+                    group_config_tag=h.get("group_config_tag"),
+                    group_name=h.get("group_name"),
+                    source_remark=h.get("source_remark"),
+                )
+                >= 55
+            )
         ]
         if remarked:
             collapsed = remarked
 
-    # Prefer rows that actually saw live accounts when still ambiguous
     if len(collapsed) > 1:
         with_acc = [h for h in collapsed if int(h.get("accounts_count") or 0) > 0]
         if with_acc:
@@ -624,6 +1023,12 @@ def _finalize(
     hits = sorted(
         collapsed,
         key=lambda h: (
+            -_tag_score(
+                q_tag,
+                group_config_tag=h.get("group_config_tag"),
+                group_name=h.get("group_name"),
+                source_remark=h.get("source_remark"),
+            ),
             _QUALITY_RANK.get(str(h.get("match_quality") or ""), 9),
             -int(h.get("accounts_count") or 0),
             str(h.get("panel_name") or ""),
@@ -638,6 +1043,8 @@ def _finalize(
             panel_is_active=bool(h.get("panel_is_active", True)),
             group_id=h.get("group_id"),
             group_name=h.get("group_name"),
+            group_config_tag=h.get("group_config_tag"),
+            order_kind=h.get("order_kind"),
             source_remark=h.get("source_remark"),
             match_quality=str(h.get("match_quality") or "exact"),
             host=str(h.get("host") or ""),
@@ -657,6 +1064,14 @@ def _finalize(
         )
     elif len(links) > 1:
         detail = f"{len(links)} لینک در متن بود — نتیجه برای اولین لینک است"
+    elif q_tag and out_hits:
+        top = out_hits[0]
+        top_tag = (top.group_config_tag or "").strip()
+        if top_tag and _norm_key(top_tag) != _norm_key(q_tag):
+            detail = (
+                f"نزدیک‌ترین گروه با تگ «{top_tag}» — "
+                f"تگ جستجو شده «{q_tag}»"
+            )
 
     return ConfigLookupOut(
         parsed=parsed,
