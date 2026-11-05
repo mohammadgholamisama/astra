@@ -697,7 +697,11 @@ def _migrate_group_config_hide_nullable_group_id(connection: Connection) -> list
 
 
 def _migrate_group_config_tag_widen(connection: Connection) -> list[str]:
-    """Widen groups.config_tag from VARCHAR(24) → VARCHAR(200) (UI no longer truncates)."""
+    """Widen groups.config_tag from VARCHAR(24) → VARCHAR(200) (UI no longer truncates).
+
+    Must be a no-op when already wide — unconditional ALTER took ACCESS EXCLUSIVE
+    on every boot and froze the whole panel behind a lock queue.
+    """
     changed: list[str] = []
     inspector = inspect(connection)
     if "groups" not in set(inspector.get_table_names()):
@@ -707,17 +711,48 @@ def _migrate_group_config_tag_widen(connection: Connection) -> list[str]:
     if not col:
         return changed
     dialect = connection.dialect.name
-    try:
-        if dialect == "postgresql":
-            connection.execute(
-                text(
-                    'ALTER TABLE "groups" '
-                    "ALTER COLUMN config_tag TYPE VARCHAR(200)"
-                )
-            )
-            changed.append("groups.config_tag.varchar200")
-            logger.info("Widened groups.config_tag to VARCHAR(200)")
+    if dialect != "postgresql":
         # SQLite ignores VARCHAR length — no ALTER needed
+        return changed
+
+    # Prefer information_schema length — sqlalchemy inspector may omit it
+    need_widen = True
+    try:
+        row = connection.execute(
+            text(
+                """
+                SELECT character_maximum_length
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'groups'
+                  AND column_name = 'config_tag'
+                """
+            )
+        ).first()
+        if row is not None and row[0] is not None and int(row[0]) >= 200:
+            need_widen = False
+        elif row is not None and row[0] is None:
+            # TEXT / unbounded — already fine
+            need_widen = False
+    except Exception:  # noqa: BLE001
+        # Fall back to inspector length if present
+        typ = col.get("type")
+        length = getattr(typ, "length", None) if typ is not None else None
+        if length is not None and int(length) >= 200:
+            need_widen = False
+
+    if not need_widen:
+        return changed
+
+    try:
+        connection.execute(
+            text(
+                'ALTER TABLE "groups" '
+                "ALTER COLUMN config_tag TYPE VARCHAR(200)"
+            )
+        )
+        changed.append("groups.config_tag.varchar200")
+        logger.info("Widened groups.config_tag to VARCHAR(200)")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not widen groups.config_tag: %s", exc)
     return changed
@@ -731,14 +766,23 @@ def _migrate_group_order_kind(connection: Connection) -> list[str]:
         return changed
     cols = {c["name"] for c in inspector.get_columns("groups")}
     if "order_kind" in cols:
-        # Backfill nulls if a previous broken migration left NULLs
+        # Backfill nulls only when needed — avoid rewriting the table every boot
         try:
-            connection.execute(
+            n = connection.execute(
                 text(
-                    "UPDATE groups SET order_kind = 'other' "
-                    "WHERE order_kind IS NULL OR TRIM(order_kind) = ''"
+                    "SELECT 1 FROM groups "
+                    "WHERE order_kind IS NULL OR TRIM(order_kind) = '' "
+                    "LIMIT 1"
                 )
-            )
+            ).first()
+            if n is not None:
+                connection.execute(
+                    text(
+                        "UPDATE groups SET order_kind = 'other' "
+                        "WHERE order_kind IS NULL OR TRIM(order_kind) = ''"
+                    )
+                )
+                changed.append("groups.order_kind.backfill")
         except Exception as exc:  # noqa: BLE001
             logger.warning("order_kind backfill skipped: %s", exc)
         return changed
