@@ -13,11 +13,14 @@ if settings.DATABASE_URL.startswith("sqlite"):
     # 60s busy wait — usage sync + admin writes compete on one WAL writer
     _engine_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 60}
 else:
+    # Keep well under Postgres max_connections (shared host). Large pools
+    # previously exhausted slots → /sub 502 via tunnel when DB refused connects.
     _engine_kwargs.update(
         pool_pre_ping=True,
-        pool_size=20,
-        max_overflow=40,
-        pool_recycle=1800,
+        pool_size=10,
+        max_overflow=15,
+        pool_timeout=8,
+        pool_recycle=600,
     )
 
 engine = create_async_engine(settings.DATABASE_URL, **_engine_kwargs)

@@ -1,0 +1,24 @@
+#!/bin/bash
+set -euo pipefail
+export AUTOSSH_GATETIME=0
+export AUTOSSH_PORT=0
+export AUTOSSH_POLL=5
+KEY=/root/.ssh/astra_sub_rtunnel
+EDGE=5.202.8.221
+timeout 12 ssh -o ConnectTimeout=6 -o BatchMode=yes -o StrictHostKeyChecking=yes \
+  -i "$KEY" "root@$EDGE" "fuser -k 18081/tcp >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+sleep 1
+exec /usr/bin/autossh -M 0 -N \
+  -i "$KEY" \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=15 \
+  -o ServerAliveCountMax=4 \
+  -o ConnectTimeout=20 \
+  -o TCPKeepAlive=yes \
+  -o StrictHostKeyChecking=yes \
+  -o UserKnownHostsFile=/root/.ssh/known_hosts \
+  -o BatchMode=yes \
+  -o IPQoS=throughput \
+  -o Compression=no \
+  -R 127.0.0.1:18081:127.0.0.1:2086 \
+  "root@$EDGE"
