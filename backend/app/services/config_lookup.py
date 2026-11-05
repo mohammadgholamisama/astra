@@ -256,39 +256,78 @@ def _group_fit(panel_name: str, group_name: str | None) -> tuple[int, int, int]:
     return (hits, blob, -abs(len(gn) - len(panel_name or "")))
 
 
-def _pick_best_group_hits(pool: list[dict[str, Any]], query_tag: str) -> list[dict[str, Any]]:
-    """One panel + same fingerprint in several groups → keep the best group."""
-    if len(pool) <= 1:
-        return pool
-    by_fp: dict[tuple[str, int, str], list[dict[str, Any]]] = {}
-    for h in pool:
-        key = (
-            str(h.get("host") or ""),
-            int(h.get("port") or 0),
-            str(h.get("match_host") or ""),
+def _hit_owner_key(h: dict[str, Any]) -> tuple:
+    """Rank for picking the single owning sales group (higher = better)."""
+    return (
+        _tag_score(
+            str(h.get("_query_tag") or ""),
+            group_config_tag=h.get("group_config_tag"),
+            group_name=h.get("group_name"),
+            source_remark=h.get("source_remark"),
         )
-        by_fp.setdefault(key, []).append(h)
-    out: list[dict[str, Any]] = []
-    for group in by_fp.values():
-        if len(group) == 1:
-            out.append(group[0])
-            continue
-        best = max(
-            group,
-            key=lambda h: (
+        if h.get("_query_tag") is not None
+        else 0,
+        int(h.get("accounts_count") or 0),
+        -_QUALITY_RANK.get(str(h.get("match_quality") or ""), 9),
+        _group_fit(str(h.get("panel_name") or ""), h.get("group_name")),
+        # Prefer a named group over panel-only rows
+        1 if h.get("group_id") is not None else 0,
+        -(int(h["group_id"]) if h.get("group_id") is not None else 10**9),
+    )
+
+
+def _pick_owning_group(
+    pool: list[dict[str, Any]], query_tag: str
+) -> list[dict[str, Any]]:
+    """A pasted config belongs to exactly one sales group — return that one.
+
+    Same panel may sit in many groups; host:port alone is not ownership.
+    Prefer exact ``group.config_tag`` (what the sub remark embeds), then
+    accounts that already carry ``group_id``, then match quality.
+    """
+    if not pool:
+        return []
+    if len(pool) == 1:
+        return pool
+
+    q = (query_tag or "").strip()
+    annotated: list[dict[str, Any]] = []
+    for h in pool:
+        row = dict(h)
+        row["_query_tag"] = q
+        annotated.append(row)
+
+    if q:
+        scored = [
+            (
                 _tag_score(
-                    query_tag,
+                    q,
                     group_config_tag=h.get("group_config_tag"),
                     group_name=h.get("group_name"),
                     source_remark=h.get("source_remark"),
                 ),
-                int(h.get("accounts_count") or 0),
-                _group_fit(str(h.get("panel_name") or ""), h.get("group_name")),
-                -(int(h["group_id"]) if h.get("group_id") is not None else 10**9),
-            ),
-        )
-        out.append(best)
-    return out
+                h,
+            )
+            for h in annotated
+        ]
+        max_sc = max(s for s, _ in scored)
+        # Exact tag (100) or strong substring/name (≥55) — never keep weaker noise
+        if max_sc >= 55:
+            top = [h for s, h in scored if s == max_sc]
+            best = max(top, key=_hit_owner_key)
+            best.pop("_query_tag", None)
+            return [best]
+
+    with_group = [h for h in annotated if h.get("group_id") is not None]
+    cand = with_group or annotated
+    best = max(cand, key=_hit_owner_key)
+    best.pop("_query_tag", None)
+    return [best]
+
+
+def _pick_best_group_hits(pool: list[dict[str, Any]], query_tag: str) -> list[dict[str, Any]]:
+    """Backward-compat name — always collapses to the single owning group."""
+    return _pick_owning_group(pool, query_tag)
 
 
 def _panel_type_str(panel: Any) -> str | None:
@@ -763,39 +802,45 @@ async def _add_hits_by_config_tag(
     prefer_fp: tuple[str, int, str] | None = None,
     add_hit: Any | None = None,
 ) -> None:
-    """Find sales groups whose config_tag / name matches the sub remark tag."""
+    """Find the sales group whose config_tag matches the sub remark tag.
+
+    Exact ``groups.config_tag`` wins. Soft name/ILIKE matches are only used
+    when nothing exact exists — and even then finalize keeps a single owner.
+    """
     tag = _strip_outer_parens((q_tag or "").strip())
     if not tag or len(tag) < 2:
         return
     needle = tag[:80]
+
+    # 1) Exact / near-exact on config_tag first (case-insensitive)
     rows = await db.execute(
         select(Group)
-        .where(
-            or_(
-                Group.config_tag.ilike(f"%{needle}%"),
-                Group.name.ilike(f"%{needle}%"),
-            )
-        )
-        .limit(_MAX_TAG_GROUPS)
+        .where(Group.config_tag.isnot(None), Group.config_tag != "")
+        .limit(500)
     )
-    groups = list(rows.scalars().all())
-    # Also try without spaces / with normalized compare in Python for Persian
-    if not groups:
-        all_g = await db.execute(
-            select(Group).where(
-                or_(Group.config_tag.isnot(None), Group.name.isnot(None))
-            ).limit(500)
+    all_tagged = list(rows.scalars().all())
+    exact: list[Group] = []
+    soft: list[Group] = []
+    for g in all_tagged:
+        sc = _tag_score(
+            tag,
+            group_config_tag=getattr(g, "config_tag", None),
+            group_name=None,
         )
-        groups = [
-            g
-            for g in all_g.scalars().all()
-            if _tag_score(
-                tag,
-                group_config_tag=getattr(g, "config_tag", None),
-                group_name=getattr(g, "name", None),
-            )
-            >= 55
-        ][:_MAX_TAG_GROUPS]
+        if sc >= 100:
+            exact.append(g)
+        elif sc >= 85:
+            soft.append(g)
+
+    groups: list[Group] = exact or soft
+    if not groups:
+        # Last resort: SQL ILIKE on tag only (not name — too many false hits)
+        rows2 = await db.execute(
+            select(Group)
+            .where(Group.config_tag.ilike(f"%{needle}%"))
+            .limit(_MAX_TAG_GROUPS)
+        )
+        groups = list(rows2.scalars().all())
 
     scored: list[tuple[int, Group]] = []
     for g in groups:
@@ -810,6 +855,11 @@ async def _add_hits_by_config_tag(
     if not scored:
         return
 
+    # Only keep the top tag-score tier (exact beats soft substring)
+    top_sc = scored[0][0]
+    scored = [(sc, g) for sc, g in scored if sc == top_sc]
+    # Cap flood: if many groups share an identical tag, still list their
+    # panels — finalize will pick one owner by accounts/quality.
     gids = [int(g.id) for _sc, g in scored]
     gp_rows = await db.execute(
         select(GroupPanel)
@@ -932,16 +982,26 @@ def _finalize(
     q_tag = (query_tag or parsed.config_tag or "").strip()
     q_remark = (parsed.remark or "").strip()
 
-    # Same panel with/without group → keep rows that name a sales group
-    by_panel: dict[int, list[dict[str, Any]]] = {}
-    for h in raw_hits:
-        by_panel.setdefault(int(h["panel_id"]), []).append(h)
-    collapsed: list[dict[str, Any]] = []
-    for _pid, lst in by_panel.items():
-        with_group = [x for x in lst if x.get("group_id") is not None]
-        pool = with_group or lst
-        # If query has a config_tag, prefer groups that carry it before quality
-        if q_tag:
+    # Prefer rows that already name a sales group (panel-only is last resort)
+    with_group = [x for x in raw_hits if x.get("group_id") is not None]
+    pool = with_group or raw_hits
+
+    # Tag on the sub remark is ownership — soft/host matches must not dilute it
+    if q_tag and pool:
+        exact = [
+            x
+            for x in pool
+            if _tag_score(
+                q_tag,
+                group_config_tag=x.get("group_config_tag"),
+                group_name=None,
+                source_remark=None,
+            )
+            >= 100
+        ]
+        if exact:
+            pool = exact
+        else:
             tagged = [
                 x
                 for x in pool
@@ -955,52 +1015,13 @@ def _finalize(
             ]
             if tagged:
                 pool = tagged
-        best_local = min(
-            (_QUALITY_RANK.get(str(x.get("match_quality") or ""), 9) for x in pool),
-            default=9,
-        )
-        tier = [
-            x
-            for x in pool
-            if _QUALITY_RANK.get(str(x.get("match_quality") or ""), 9) == best_local
-        ]
-        collapsed.extend(_pick_best_group_hits(tier, q_tag))
 
-    # Global: if any hit matches the remark tag, drop the rest
-    if q_tag and collapsed:
-        tagged = [
-            h
-            for h in collapsed
-            if _tag_score(
-                q_tag,
-                group_config_tag=h.get("group_config_tag"),
-                group_name=h.get("group_name"),
-                source_remark=h.get("source_remark"),
-            )
-            >= 55
-        ]
-        if tagged:
-            collapsed = tagged
-
-    # Keep strongest match-quality tier among survivors
-    if collapsed:
-        best = min(
-            _QUALITY_RANK.get(str(h.get("match_quality") or ""), 9) for h in collapsed
-        )
-        collapsed = [
-            h
-            for h in collapsed
-            if _QUALITY_RANK.get(str(h.get("match_quality") or ""), 9) == best
-        ]
-
-    # Remark closeness as secondary filter when still ambiguous
-    if q_remark and len(collapsed) > 1:
+    if q_remark and len(pool) > 1:
         remarked = [
             h
-            for h in collapsed
+            for h in pool
             if _remark_close(str(h.get("source_remark") or ""), q_remark)
             or _remark_close(str(h.get("group_config_tag") or ""), q_remark)
-            or _remark_close(str(h.get("group_name") or ""), q_remark)
             or (
                 q_tag
                 and _tag_score(
@@ -1013,28 +1034,11 @@ def _finalize(
             )
         ]
         if remarked:
-            collapsed = remarked
+            pool = remarked
 
-    if len(collapsed) > 1:
-        with_acc = [h for h in collapsed if int(h.get("accounts_count") or 0) > 0]
-        if with_acc:
-            collapsed = with_acc
+    # One config → one owning group (other groups may share the panel)
+    collapsed = _pick_owning_group(pool, q_tag)
 
-    hits = sorted(
-        collapsed,
-        key=lambda h: (
-            -_tag_score(
-                q_tag,
-                group_config_tag=h.get("group_config_tag"),
-                group_name=h.get("group_name"),
-                source_remark=h.get("source_remark"),
-            ),
-            _QUALITY_RANK.get(str(h.get("match_quality") or ""), 9),
-            -int(h.get("accounts_count") or 0),
-            str(h.get("panel_name") or ""),
-            str(h.get("group_name") or ""),
-        ),
-    )
     out_hits = [
         ConfigLookupHit(
             panel_id=int(h["panel_id"]),
@@ -1053,7 +1057,7 @@ def _finalize(
             accounts_count=int(h.get("accounts_count") or 0),
             sample_users=list(h.get("sample_users") or []),
         )
-        for h in hits
+        for h in collapsed
     ]
 
     detail = None
@@ -1064,14 +1068,22 @@ def _finalize(
         )
     elif len(links) > 1:
         detail = f"{len(links)} لینک در متن بود — نتیجه برای اولین لینک است"
-    elif q_tag and out_hits:
+    elif out_hits:
         top = out_hits[0]
-        top_tag = (top.group_config_tag or "").strip()
-        if top_tag and _norm_key(top_tag) != _norm_key(q_tag):
-            detail = (
-                f"نزدیک‌ترین گروه با تگ «{top_tag}» — "
-                f"تگ جستجو شده «{q_tag}»"
-            )
+        kind = (top.order_kind or "").strip()
+        gname = (top.group_name or "").strip() or "—"
+        tag = (top.group_config_tag or "").strip()
+        kind_fa = {
+            "direct": "مستقیم",
+            "tunnel": "تانل",
+            "gaming": "گیمینگ",
+            "other": "سایر",
+        }.get(kind, kind or "—")
+        detail = f"گروه سازنده: {gname} — ترتیب: {kind_fa}"
+        if tag:
+            detail += f" — تگ: {tag}"
+        if q_tag and tag and _norm_key(tag) != _norm_key(q_tag):
+            detail += f" (تگ جستجو: {q_tag})"
 
     return ConfigLookupOut(
         parsed=parsed,

@@ -111,8 +111,9 @@ export default function ConfigLookupPage() {
     <div className="admin-page config-lookup-page">
       <h1 className="page-title">شناسایی کانفیگ</h1>
       <p className="page-sub">
-        لینک کانفیگ یا <b>نام روی ساب</b> را بچسبانید تا گروه و پنل واقعی مشخص
-        شود — تطبیق اول با «متن روی کانفیگ» همان گروه است، نه حدس از روی تانل/مستقیم.
+        لینک یا نام روی ساب را بچسبانید تا <b>همان گروهی که کانفیگ از آن ساخته
+        شده</b> مشخص شود (نه همه گروه‌هایی که همان پنل را دارند) — همراه نوع
+        ترتیب (مستقیم / تانل / گیمینگ).
       </p>
 
       <form className="config-lookup-form" onSubmit={onSubmit}>
@@ -231,9 +232,6 @@ export default function ConfigLookupPage() {
             </div>
           ) : (
             <div className="config-lookup-hits">
-              <p className="muted config-lookup-hits-count">
-                {toFaDigits(result.hits.length)} نتیجه
-              </p>
               {result.hits.map((h) => (
                 <article
                   key={`${h.panel_id}-${h.group_id ?? "x"}-${h.match_quality}`}
@@ -244,23 +242,9 @@ export default function ConfigLookupPage() {
                   <div className="config-lookup-hit-top">
                     <div className="config-lookup-hit-main">
                       <div className="config-lookup-hit-row">
-                        <Server size={16} />
-                        <div>
-                          <span className="muted">پنل</span>
-                          <strong>
-                            <Link
-                              to={`/panels?panel=${h.panel_id}`}
-                              title="باز کردن این پنل"
-                            >
-                              {h.panel_name}
-                            </Link>
-                          </strong>
-                        </div>
-                      </div>
-                      <div className="config-lookup-hit-row">
                         <Layers size={16} />
                         <div>
-                          <span className="muted">گروه</span>
+                          <span className="muted">گروه سازنده</span>
                           <strong>
                             {h.group_id != null && h.group_name ? (
                               <Link
@@ -272,6 +256,20 @@ export default function ConfigLookupPage() {
                             ) : (
                               <span className="muted">— بدون گروه مشخص</span>
                             )}
+                          </strong>
+                        </div>
+                      </div>
+                      <div className="config-lookup-hit-row">
+                        <Server size={16} />
+                        <div>
+                          <span className="muted">پنل</span>
+                          <strong>
+                            <Link
+                              to={`/panels?panel=${h.panel_id}`}
+                              title="باز کردن این پنل"
+                            >
+                              {h.panel_name}
+                            </Link>
                           </strong>
                         </div>
                       </div>
