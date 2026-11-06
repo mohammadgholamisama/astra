@@ -471,10 +471,28 @@ list_node_domains() {
   fi
 }
 
+reload_nginx_best_effort() {
+  # Prefer systemctl; if dbus/systemd is wedged, fall back to nginx signal.
+  # Never abort apply-update solely because reload failed.
+  if nginx -t; then
+    if systemctl reload nginx 2>/dev/null; then
+      return 0
+    fi
+    if systemctl restart nginx 2>/dev/null; then
+      return 0
+    fi
+    if nginx -s reload 2>/dev/null; then
+      echo "astra-helper: WARNING — nginx reloaded via signal (systemctl unavailable)" >&2
+      return 0
+    fi
+  fi
+  echo "astra-helper: WARNING — nginx reload failed; continuing" >&2
+  return 0
+}
+
 cmd_reload_nginx() {
   need_root
-  nginx -t
-  systemctl reload nginx
+  reload_nginx_best_effort
   echo "nginx reloaded"
 }
 
@@ -501,8 +519,7 @@ cmd_write_nginx() {
     fi
   fi
 
-  nginx -t
-  systemctl reload nginx || systemctl restart nginx
+  reload_nginx_best_effort
   echo "nginx config written → $NGINX_SITE (share=$(is_share_mode && echo yes || echo no))"
 }
 
@@ -645,9 +662,27 @@ cmd_set_env() {
 
 cmd_restart_astra() {
   need_root
-  systemctl daemon-reload
-  systemctl restart astra
-  echo "astra restarted"
+  systemctl daemon-reload 2>/dev/null || true
+  if systemctl restart astra 2>/dev/null; then
+    echo "astra restarted"
+    return 0
+  fi
+  # Fallback when systemctl/dbus is wedged: SIGTERM MainPID (Restart=always).
+  local pid=""
+  pid="$(systemctl show -p MainPID --value astra 2>/dev/null || true)"
+  if [[ ! "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    pid="$(pgrep -u astra -f 'uvicorn app.main:app' | head -n1 || true)"
+  fi
+  if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    echo "astra-helper: WARNING — systemctl restart failed; SIGTERM pid $pid" >&2
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 3
+    if pgrep -u astra -f 'uvicorn app.main:app' >/dev/null 2>&1; then
+      echo "astra restarted (signal)"
+      return 0
+    fi
+  fi
+  die "failed to restart astra (systemctl unavailable)"
 }
 
 cmd_xray_restart() {
