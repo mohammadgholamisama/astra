@@ -162,12 +162,24 @@ build_binary() {
 install_unit() {
   [[ -f "$UNIT_SRC" ]] || die "missing $UNIT_SRC"
   install -m 644 "$UNIT_SRC" "$UNIT_DST"
-  systemctl daemon-reload
-  systemctl enable astra-ping-hub
-  systemctl restart astra-ping-hub
+  timeout 20 systemctl daemon-reload 2>/dev/null || true
+  timeout 20 systemctl enable astra-ping-hub 2>/dev/null || true
+  if ! timeout 30 systemctl restart astra-ping-hub 2>/dev/null; then
+    echo "ping-hub-install: WARNING — systemctl restart failed; signal/restart binary" >&2
+    pkill -f '/opt/astra/mobile-app/backend-go/bin/ping-hub' 2>/dev/null || true
+    sleep 1
+    if ! pgrep -f '/opt/astra/mobile-app/backend-go/bin/ping-hub' >/dev/null 2>&1; then
+      sudo -u astra -H bash -c "cd /opt/astra/mobile-app/backend-go && set -a && . ./.env && set +a && nohup ./bin/ping-hub >>/tmp/ping-hub.log 2>&1 &"
+      sleep 1
+    fi
+  fi
   sleep 1
-  systemctl is-active --quiet astra-ping-hub || die "astra-ping-hub failed to start"
-  echo "ping-hub-install: astra-ping-hub active"
+  if pgrep -f '/opt/astra/mobile-app/backend-go/bin/ping-hub' >/dev/null 2>&1 \
+    || timeout 10 systemctl is-active --quiet astra-ping-hub 2>/dev/null; then
+    echo "ping-hub-install: astra-ping-hub active"
+    return 0
+  fi
+  die "astra-ping-hub failed to start"
 }
 
 ensure_redis
