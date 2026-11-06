@@ -231,8 +231,11 @@ class XrayPingModule(
     promise: Promise,
   ) {
     val myGen = generation.get()
-    val dl = downloadBudgetMs.toLong().coerceIn(800L, 5_000L)
-    val ul = uploadBudgetMs.toLong().coerceIn(800L, 5_000L)
+    // 0 = skip that direction; otherwise clamp to a sensible burst window
+    val dlRaw = downloadBudgetMs.toLong()
+    val ulRaw = uploadBudgetMs.toLong()
+    val dl = if (dlRaw <= 0L) 0L else dlRaw.coerceIn(800L, 5_000L)
+    val ul = if (ulRaw <= 0L) 0L else ulRaw.coerceIn(800L, 5_000L)
     val pool = measurePool
     val future: Future<Pair<Double, Double>> =
       try {
@@ -269,7 +272,8 @@ class XrayPingModule(
             future.cancel(true)
             -1.0 to -1.0
           } else {
-            future.get(dl + ul + 4_000L, TimeUnit.MILLISECONDS)
+            val wait = (dl + ul + 4_000L).coerceAtLeast(4_000L)
+            future.get(wait, TimeUnit.MILLISECONDS)
           }
         } catch (_: Throwable) {
           future.cancel(true)

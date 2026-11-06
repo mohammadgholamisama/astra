@@ -78,12 +78,15 @@ export async function pingRealDelay(
   return -1;
 }
 
-/** Short download+upload burst through the config (kbps). */
+/** Short download+upload burst through the config (kbps). Pass 0 to skip a direction. */
 export async function measureSpeed(
   shareLink: string,
   downloadBudgetMs = 1600,
   uploadBudgetMs = 1400,
 ): Promise<{ downloadKbps: number; uploadKbps: number }> {
+  if (downloadBudgetMs <= 0 && uploadBudgetMs <= 0) {
+    return { downloadKbps: -1, uploadKbps: -1 };
+  }
   if (Platform.OS === 'android' && Native?.measureSpeed) {
     try {
       const r = await Native.measureSpeed(

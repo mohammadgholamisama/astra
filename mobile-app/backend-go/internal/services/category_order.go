@@ -41,15 +41,30 @@ func lossSortKey(it models.FingerprintRank) float64 {
 	return it.PacketLossPct
 }
 
+func jitterSortKey(it models.FingerprintRank) float64 {
+	if it.JitterMs < 0 {
+		return 1e18
+	}
+	return it.JitterMs
+}
+
+func stabilitySortKey(it models.FingerprintRank) float64 {
+	if it.StabilityPct < 0 {
+		return -1
+	}
+	return it.StabilityPct
+}
+
 // arrangeFingerprintSlots: 5 مستقیم → 5 تانل → 5 گیمینگ → rest by quality.
-// Success = positive ping OR speed OR packet loss < 100%.
-// Quality: devices → packet loss ↑ → download ↓ → upload ↓ → ping ↑
+// Success = positive ping OR speed OR packet loss < 100% OR stability > 0.
+// Quality: stability ↓ → loss ↑ → jitter ↑ → ping ↑ → download ↓ → upload ↓
 func arrangeFingerprintSlots(items []models.FingerprintRank) []models.FingerprintRank {
 	ok := make([]models.FingerprintRank, 0, len(items))
 	rest := make([]models.FingerprintRank, 0)
 	for _, it := range items {
 		packetOk := it.HasPacketLoss && it.PacketLossPct >= 0 && it.PacketLossPct < 100
-		if it.AvgPing > 0 || it.DownloadKbps > 0 || it.UploadKbps > 0 || packetOk {
+		stabOk := it.StabilityPct > 0
+		if it.AvgPing > 0 || it.DownloadKbps > 0 || it.UploadKbps > 0 || packetOk || stabOk {
 			ok = append(ok, it)
 		} else {
 			rest = append(rest, it)
@@ -64,6 +79,28 @@ func arrangeFingerprintSlots(items []models.FingerprintRank) []models.Fingerprin
 	}
 
 	quality := func(a, b models.FingerprintRank) bool {
+		sa, sb := stabilitySortKey(a), stabilitySortKey(b)
+		if sa != sb {
+			return sa > sb
+		}
+		la, lb := lossSortKey(a), lossSortKey(b)
+		if la != lb {
+			return la < lb
+		}
+		ja, jb := jitterSortKey(a), jitterSortKey(b)
+		if ja != jb {
+			return ja < jb
+		}
+		pa, pb := pingKey(a.AvgPing), pingKey(b.AvgPing)
+		if pa != pb {
+			return pa < pb
+		}
+		if a.DownloadKbps != b.DownloadKbps {
+			return a.DownloadKbps > b.DownloadKbps
+		}
+		if a.UploadKbps != b.UploadKbps {
+			return a.UploadKbps > b.UploadKbps
+		}
 		da, db := a.DeviceCount, b.DeviceCount
 		if da < 1 {
 			da = 1
@@ -73,20 +110,6 @@ func arrangeFingerprintSlots(items []models.FingerprintRank) []models.Fingerprin
 		}
 		if da != db {
 			return da > db
-		}
-		la, lb := lossSortKey(a), lossSortKey(b)
-		if la != lb {
-			return la < lb
-		}
-		if a.DownloadKbps != b.DownloadKbps {
-			return a.DownloadKbps > b.DownloadKbps
-		}
-		if a.UploadKbps != b.UploadKbps {
-			return a.UploadKbps > b.UploadKbps
-		}
-		pa, pb := pingKey(a.AvgPing), pingKey(b.AvgPing)
-		if pa != pb {
-			return pa < pb
 		}
 		if a.Host != b.Host {
 			return a.Host < b.Host

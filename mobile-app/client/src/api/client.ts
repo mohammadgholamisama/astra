@@ -74,6 +74,12 @@ export function buildPingSamples(
           : undefined,
       has_packet_loss:
         r?.packetLossPct != null && r.packetLossPct >= 0 ? true : undefined,
+      jitter_ms:
+        r?.jitterMs != null && r.jitterMs >= 0 ? r.jitterMs : undefined,
+      stability_pct:
+        r?.stabilityPct != null && r.stabilityPct >= 0
+          ? r.stabilityPct
+          : undefined,
       remark: c.remark,
       protocol: c.protocol,
       transport: c.transport,
@@ -116,6 +122,8 @@ export type FingerprintRankPayload = {
   upload_kbps?: number;
   packet_loss_pct?: number;
   has_packet_loss?: boolean;
+  jitter_ms?: number;
+  stability_pct?: number;
   sample_count?: number;
   device_count?: number;
 };

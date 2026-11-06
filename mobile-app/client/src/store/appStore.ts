@@ -21,6 +21,8 @@ import {
 import { isDeviceVpnActive, watchDeviceVpn } from '../native/VpnGuard';
 import {
   DEFAULT_TEST_FLAGS,
+  latencySampleCount,
+  needsLatencyPass,
   testFlagsFromSettings,
   testFlagsHint,
   testFlagsToLegacyMode,
@@ -350,7 +352,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     await saveSettings({
       testFlags: flags,
       testMode: testFlagsToLegacyMode(flags),
-      speedRankEnabled: flags.speed || flags.packet,
+      speedRankEnabled:
+        flags.download || flags.upload || flags.packet,
     });
   },
 
@@ -570,11 +573,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       const flags = get().testFlags;
       const live = new Map<string, LocalPingResult>();
       const inFlight = new Set<string>();
-      const startHint = flags.packet
-        ? 'پکت…'
-        : flags.speed
-          ? 'سرعت…'
-          : 'پینگ…';
+      const startHint = needsLatencyPass(flags)
+        ? flags.jitter || flags.stability
+          ? 'پینگ چندنمونه‌ای…'
+          : 'پینگ…'
+        : flags.packet
+          ? 'پکت…'
+          : flags.download || flags.upload
+            ? 'سرعت…'
+            : 'تست…';
       set({
         progressTotal: configs.length,
         status: startHint,
@@ -642,107 +649,16 @@ export const useAppStore = create<AppState>((set, get) => ({
       };
 
       let results: LocalPingResult[] = [];
+      const samples = latencySampleCount(flags);
 
-      // —— 1) Packet loss (first priority) ——
-      if (flags.packet && !ac.signal.aborted && get().testing) {
+      // —— 1) Latency (ping / jitter / stability) ——
+      if (needsLatencyPass(flags) && !ac.signal.aborted && get().testing) {
+        const label =
+          flags.jitter || flags.stability
+            ? `پینگ×${samples}`
+            : 'پینگ';
         set({
-          status: `پکت · همه ${configs.length}…`,
-          progressDone: 0,
-          progressTotal: configs.length,
-          testingHashes: [],
-        });
-        lastLight = 0;
-        lastRank = 0;
-        results = await runPacketQueue(configs, results, {
-          concurrency: 2,
-          probes: 10,
-          perProbeTimeoutMs: 1500,
-          scope: 'all',
-          signal: ac.signal,
-          onProgress: (done, total, latest) => {
-            const loss =
-              latest.packetLossPct != null && latest.packetLossPct >= 0
-                ? `${latest.packetLossPct}٪`
-                : '—';
-            onMetricProgress('پکت', done, total, latest, loss);
-          },
-        });
-        results.forEach((r) => live.set(r.configHash, r));
-        if (ac.signal.aborted || !get().testing) {
-          persistAbort();
-          return;
-        }
-        set({ ranked: rankLocally(configs, live), testingHashes: [] });
-      }
-
-      // —— 2) Speed ——
-      if (flags.speed && !ac.signal.aborted && get().testing) {
-        // After packet: only configs that aren't total loss; else all
-        const packetFiltered = flags.packet
-          ? results.filter(
-              (r) =>
-                r.packetLossPct != null &&
-                r.packetLossPct >= 0 &&
-                r.packetLossPct < 100,
-            )
-          : null;
-        const scope: 'all' | 'alive' = 'all';
-        const speedConfigs =
-          packetFiltered && packetFiltered.length > 0
-            ? configs.filter((c) =>
-                packetFiltered.some((r) => r.configHash === c.configHash),
-              )
-            : configs;
-        const targetN = speedConfigs.length;
-        set({
-          status: `سرعت · ${targetN}…`,
-          progressDone: 0,
-          progressTotal: Math.max(1, targetN),
-          testingHashes: [],
-        });
-        lastLight = 0;
-        lastRank = 0;
-        const speedResults = await runSpeedQueue(speedConfigs, results, {
-          concurrency: 2,
-          downloadBudgetMs: 1600,
-          uploadBudgetMs: 1400,
-          scope,
-          signal: ac.signal,
-          onProgress: (done, total, latest) => {
-            const dl =
-              latest.downloadKbps != null && latest.downloadKbps > 0
-                ? `دان ${Math.round(latest.downloadKbps)}`
-                : 'دان —';
-            const ul =
-              latest.uploadKbps != null && latest.uploadKbps > 0
-                ? `آپ ${Math.round(latest.uploadKbps)}`
-                : 'آپ —';
-            onMetricProgress('سرعت', done, total, latest, `${dl} · ${ul}`);
-          },
-        });
-        // Merge subset speed rows back into full results
-        const mergedSpeed = new Map(results.map((r) => [r.configHash, r]));
-        for (const r of speedResults) mergedSpeed.set(r.configHash, r);
-        results = configs.map(
-          (c) =>
-            mergedSpeed.get(c.configHash) ?? {
-              configHash: c.configHash,
-              pingMs: 0,
-              measuredAt: Date.now(),
-            },
-        );
-        results.forEach((r) => live.set(r.configHash, r));
-        if (ac.signal.aborted || !get().testing) {
-          persistAbort();
-          return;
-        }
-        set({ ranked: rankLocally(configs, live), testingHashes: [] });
-      }
-
-      // —— 3) Ping (last) ——
-      if (flags.ping && !ac.signal.aborted && get().testing) {
-        set({
-          status: `پینگ · ${configs.length}…`,
+          status: `${label} · ${configs.length}…`,
           progressDone: 0,
           progressTotal: configs.length,
           testingHashes: [],
@@ -750,9 +666,12 @@ export const useAppStore = create<AppState>((set, get) => ({
         lastLight = 0;
         lastRank = 0;
         results = await runPingQueue(configs, {
-          concurrency: 5,
-          timeoutMs: 12_000,
-          retries: 1,
+          concurrency: samples > 1 ? 3 : 5,
+          timeoutMs: samples > 1 ? 10_000 : 12_000,
+          retries: samples > 1 ? 0 : 1,
+          samples,
+          wantJitter: flags.jitter,
+          wantStability: flags.stability,
           signal: ac.signal,
           onStart: (cfg) => {
             if (ac.signal.aborted || !get().testing) return;
@@ -761,22 +680,33 @@ export const useAppStore = create<AppState>((set, get) => ({
           onProgress: (done, total, latest) => {
             if (ac.signal.aborted || !get().testing) return;
             inFlight.delete(latest.configHash);
-            // Merge with prior packet/speed fields
             const prev = live.get(latest.configHash);
             const merged: LocalPingResult = prev
               ? {
                   ...prev,
                   pingMs: latest.pingMs,
+                  jitterMs: latest.jitterMs ?? prev.jitterMs,
+                  stabilityPct: latest.stabilityPct ?? prev.stabilityPct,
                   measuredAt: latest.measuredAt,
                 }
               : latest;
             live.set(latest.configHash, merged);
             latestDone = done;
             latestTotal = total;
-            latestHint =
-              latest.pingMs > 0
-                ? `پینگ · ${done}/${total} · ${Math.round(latest.pingMs)}ms`
-                : `پینگ · ${done}/${total} · قطع`;
+            const bits: string[] = [];
+            if (latest.pingMs > 0) bits.push(`${Math.round(latest.pingMs)}ms`);
+            else bits.push('قطع');
+            if (flags.jitter && latest.jitterMs != null && latest.jitterMs >= 0) {
+              bits.push(`J${Math.round(latest.jitterMs)}`);
+            }
+            if (
+              flags.stability &&
+              latest.stabilityPct != null &&
+              latest.stabilityPct >= 0
+            ) {
+              bits.push(`S${Math.round(latest.stabilityPct)}٪`);
+            }
+            latestHint = `${label} · ${done}/${total} · ${bits.join(' · ')}`;
 
             const now = Date.now();
             const nearEnd = total > 0 && done >= Math.max(1, total - 3);
@@ -805,7 +735,13 @@ export const useAppStore = create<AppState>((set, get) => ({
             live.set(
               r.configHash,
               prev
-                ? { ...prev, pingMs: r.pingMs, measuredAt: r.measuredAt }
+                ? {
+                    ...prev,
+                    pingMs: r.pingMs,
+                    jitterMs: r.jitterMs ?? prev.jitterMs,
+                    stabilityPct: r.stabilityPct ?? prev.stabilityPct,
+                    measuredAt: r.measuredAt,
+                  }
                 : r,
             );
           });
@@ -813,11 +749,16 @@ export const useAppStore = create<AppState>((set, get) => ({
           return;
         }
 
-        // Merge ping into existing packet/speed rows
         results = results.map((r) => {
           const prev = live.get(r.configHash);
           const merged = prev
-            ? { ...prev, pingMs: r.pingMs, measuredAt: r.measuredAt }
+            ? {
+                ...prev,
+                pingMs: r.pingMs,
+                jitterMs: r.jitterMs ?? prev.jitterMs,
+                stabilityPct: r.stabilityPct ?? prev.stabilityPct,
+                measuredAt: r.measuredAt,
+              }
             : r;
           live.set(r.configHash, merged);
           return merged;
@@ -828,6 +769,137 @@ export const useAppStore = create<AppState>((set, get) => ({
           progressDone: configs.length,
           progressTotal: configs.length,
         });
+      }
+
+      // —— 2) Packet loss ——
+      if (flags.packet && !ac.signal.aborted && get().testing) {
+        const aliveAfterPing = needsLatencyPass(flags)
+          ? results.filter((r) => r.pingMs > 0)
+          : null;
+        const packetConfigs =
+          aliveAfterPing && aliveAfterPing.length > 0
+            ? configs.filter((c) =>
+                aliveAfterPing.some((r) => r.configHash === c.configHash),
+              )
+            : configs;
+        set({
+          status: `پکت · ${packetConfigs.length}…`,
+          progressDone: 0,
+          progressTotal: Math.max(1, packetConfigs.length),
+          testingHashes: [],
+        });
+        lastLight = 0;
+        lastRank = 0;
+        const packetResults = await runPacketQueue(packetConfigs, results, {
+          concurrency: 2,
+          probes: 10,
+          perProbeTimeoutMs: 1500,
+          scope: 'all',
+          signal: ac.signal,
+          onProgress: (done, total, latest) => {
+            const loss =
+              latest.packetLossPct != null && latest.packetLossPct >= 0
+                ? `${latest.packetLossPct}٪`
+                : '—';
+            onMetricProgress('پکت', done, total, latest, loss);
+          },
+        });
+        const mergedPkt = new Map(results.map((r) => [r.configHash, r]));
+        for (const r of packetResults) mergedPkt.set(r.configHash, r);
+        results = configs.map(
+          (c) =>
+            mergedPkt.get(c.configHash) ?? {
+              configHash: c.configHash,
+              pingMs: -1,
+              measuredAt: Date.now(),
+            },
+        );
+        results.forEach((r) => live.set(r.configHash, r));
+        if (ac.signal.aborted || !get().testing) {
+          persistAbort();
+          return;
+        }
+        set({ ranked: rankLocally(configs, live), testingHashes: [] });
+      }
+
+      // —— 3) Download / Upload (independent) ——
+      if (
+        (flags.download || flags.upload) &&
+        !ac.signal.aborted &&
+        get().testing
+      ) {
+        const filtered = flags.packet
+          ? results.filter(
+              (r) =>
+                r.packetLossPct != null &&
+                r.packetLossPct >= 0 &&
+                r.packetLossPct < 100,
+            )
+          : needsLatencyPass(flags)
+            ? results.filter((r) => r.pingMs > 0)
+            : null;
+        const speedConfigs =
+          filtered && filtered.length > 0
+            ? configs.filter((c) =>
+                filtered.some((r) => r.configHash === c.configHash),
+              )
+            : configs;
+        const targetN = speedConfigs.length;
+        const spdLabel =
+          flags.download && flags.upload
+            ? 'سرعت'
+            : flags.download
+              ? 'دانلود'
+              : 'آپلود';
+        set({
+          status: `${spdLabel} · ${targetN}…`,
+          progressDone: 0,
+          progressTotal: Math.max(1, targetN),
+          testingHashes: [],
+        });
+        lastLight = 0;
+        lastRank = 0;
+        const speedResults = await runSpeedQueue(speedConfigs, results, {
+          concurrency: 2,
+          downloadBudgetMs: flags.download ? 1600 : 0,
+          uploadBudgetMs: flags.upload ? 1400 : 0,
+          scope: 'all',
+          signal: ac.signal,
+          onProgress: (done, total, latest) => {
+            const parts: string[] = [];
+            if (flags.download) {
+              parts.push(
+                latest.downloadKbps != null && latest.downloadKbps > 0
+                  ? `دان ${Math.round(latest.downloadKbps)}`
+                  : 'دان —',
+              );
+            }
+            if (flags.upload) {
+              parts.push(
+                latest.uploadKbps != null && latest.uploadKbps > 0
+                  ? `آپ ${Math.round(latest.uploadKbps)}`
+                  : 'آپ —',
+              );
+            }
+            onMetricProgress(spdLabel, done, total, latest, parts.join(' · '));
+          },
+        });
+        const mergedSpeed = new Map(results.map((r) => [r.configHash, r]));
+        for (const r of speedResults) mergedSpeed.set(r.configHash, r);
+        results = configs.map(
+          (c) =>
+            mergedSpeed.get(c.configHash) ?? {
+              configHash: c.configHash,
+              pingMs: 0,
+              measuredAt: Date.now(),
+            },
+        );
+        results.forEach((r) => live.set(r.configHash, r));
+        if (ac.signal.aborted || !get().testing) {
+          persistAbort();
+          return;
+        }
+        set({ ranked: rankLocally(configs, live), testingHashes: [] });
       }
 
       if (ac.signal.aborted || !get().testing) {
@@ -859,10 +931,20 @@ export const useAppStore = create<AppState>((set, get) => ({
       const withPacket = results.filter(
         (r) => r.packetLossPct != null && r.packetLossPct >= 0,
       ).length;
+      const withJitter = results.filter(
+        (r) => r.jitterMs != null && r.jitterMs >= 0,
+      ).length;
+      const withStab = results.filter(
+        (r) => r.stabilityPct != null && r.stabilityPct >= 0,
+      ).length;
       const parts: string[] = [];
+      if (flags.stability) parts.push(`${withStab} پایداری`);
       if (flags.packet) parts.push(`${withPacket} پکت`);
-      if (flags.speed) parts.push(`${withSpeed} سرعت`);
-      if (flags.ping) parts.push(`${pingOk} پینگ`);
+      if (flags.jitter) parts.push(`${withJitter} جیتر`);
+      if (flags.ping || flags.jitter || flags.stability) {
+        parts.push(`${pingOk} پینگ`);
+      }
+      if (flags.download || flags.upload) parts.push(`${withSpeed} سرعت`);
       const baseStatus = `تمام · ${parts.join(' · ') || configs.length}`;
       set({
         testing: false,
@@ -879,7 +961,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         cycleIntervalMs: intervalOf(get),
         testFlags: flags,
         testMode: testFlagsToLegacyMode(flags),
-        speedRankEnabled: flags.speed || flags.packet,
+        speedRankEnabled:
+        flags.download || flags.upload || flags.packet,
       });
 
       // Upload → multi-device 15m avg → reorder panel (auto)

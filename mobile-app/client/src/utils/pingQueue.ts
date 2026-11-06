@@ -1,5 +1,6 @@
 import { cancelAllPings, pingRealDelay } from '../native/XrayPing';
 import type { LocalPingResult, ParsedConfig } from '../types';
+import { computeLatencyStats } from './latencyStats';
 
 export interface PingQueueOptions {
   concurrency?: number;
@@ -7,6 +8,14 @@ export interface PingQueueOptions {
   timeoutMs?: number;
   /** Extra full measure after a miss (native already retries HTTP twice). */
   retries?: number;
+  /**
+   * Independent Real-Delay samples for avg / jitter / stability.
+   * 1 = classic single ping (+ retries on miss).
+   */
+  samples?: number;
+  /** Include jitterMs / stabilityPct on results (default true when samples>1). */
+  wantJitter?: boolean;
+  wantStability?: boolean;
   onStart?: (config: ParsedConfig) => void;
   onProgress?: (done: number, total: number, latest: LocalPingResult) => void;
   signal?: AbortSignal;
@@ -82,6 +91,9 @@ export async function runPingQueue(
   // Match LibXray measureInstDelay (12s client) + small slack
   const timeoutMs = options.timeoutMs ?? 12_000;
   const retries = Math.max(0, options.retries ?? 1);
+  const samples = Math.max(1, Math.min(options.samples ?? 1, 5));
+  const wantJitter = options.wantJitter ?? samples > 1;
+  const wantStability = options.wantStability ?? samples > 1;
   const total = configs.length;
   const results: LocalPingResult[] = new Array(total);
   let nextIndex = 0;
@@ -107,20 +119,39 @@ export async function runPingQueue(
     );
   }
 
-  async function measureOne(cfg: ParsedConfig): Promise<number> {
+  async function measureOne(cfg: ParsedConfig): Promise<LocalPingResult> {
     if (stopped || options.signal?.aborted) throw abortedError();
     options.onStart?.(cfg);
     if (stopped || options.signal?.aborted) throw abortedError();
 
-    let best = await realDelayOnce(cfg.raw);
-    for (let attempt = 0; attempt < retries && best <= 0; attempt++) {
+    const taken: number[] = [];
+    for (let s = 0; s < samples; s++) {
       if (stopped || options.signal?.aborted) throw abortedError();
-      await new Promise<void>((r) => setTimeout(r, 150));
-      if (stopped || options.signal?.aborted) throw abortedError();
-      const again = await realDelayOnce(cfg.raw);
-      if (again > 0) best = again;
+      let ms = await realDelayOnce(cfg.raw);
+      // Single-sample mode: one retry on miss (legacy behavior)
+      if (samples === 1) {
+        for (let attempt = 0; attempt < retries && ms <= 0; attempt++) {
+          if (stopped || options.signal?.aborted) throw abortedError();
+          await new Promise<void>((r) => setTimeout(r, 150));
+          if (stopped || options.signal?.aborted) throw abortedError();
+          ms = await realDelayOnce(cfg.raw);
+        }
+      }
+      taken.push(ms);
+      if (s + 1 < samples) {
+        await new Promise<void>((r) => setTimeout(r, 80));
+      }
     }
-    return best;
+
+    const stats = computeLatencyStats(taken);
+    const latest: LocalPingResult = {
+      configHash: cfg.configHash,
+      pingMs: stats.pingMs,
+      measuredAt: Date.now(),
+    };
+    if (wantJitter) latest.jitterMs = stats.jitterMs;
+    if (wantStability) latest.stabilityPct = stats.stabilityPct;
+    return latest;
   }
 
   async function worker(): Promise<void> {
@@ -129,17 +160,17 @@ export async function runPingQueue(
       const i = nextIndex++;
       if (i >= total) return;
       const cfg = configs[i]!;
-      let pingMs = -1;
+      let latest: LocalPingResult = {
+        configHash: cfg.configHash,
+        pingMs: -1,
+        measuredAt: Date.now(),
+      };
       try {
-        pingMs = await measureOne(cfg);
+        latest = await measureOne(cfg);
       } catch (e) {
         if (isAbort(e) || stopped) {
           if (!results[i]) {
-            results[i] = {
-              configHash: cfg.configHash,
-              pingMs: -1,
-              measuredAt: Date.now(),
-            };
+            results[i] = latest;
             completed += 1;
             try {
               options.onProgress?.(completed, total, results[i]!);
@@ -149,15 +180,10 @@ export async function runPingQueue(
           }
           return;
         }
-        pingMs = -1;
       }
       if (stopped || options.signal?.aborted) {
         if (!results[i]) {
-          results[i] = {
-            configHash: cfg.configHash,
-            pingMs: -1,
-            measuredAt: Date.now(),
-          };
+          results[i] = latest;
           completed += 1;
           try {
             options.onProgress?.(completed, total, results[i]!);
@@ -167,11 +193,6 @@ export async function runPingQueue(
         }
         return;
       }
-      const latest: LocalPingResult = {
-        configHash: cfg.configHash,
-        pingMs,
-        measuredAt: Date.now(),
-      };
       results[i] = latest;
       completed += 1;
       options.onProgress?.(completed, total, latest);

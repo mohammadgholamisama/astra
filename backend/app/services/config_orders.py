@@ -734,6 +734,8 @@ async def apply_ping_rank(
     downloads: dict[tuple[str, int, str], float] = {}
     uploads: dict[tuple[str, int, str], float] = {}
     packet_loss: dict[tuple[str, int, str], float] = {}
+    jitters: dict[tuple[str, int, str], float] = {}
+    stabilities: dict[tuple[str, int, str], float] = {}
     devices: dict[tuple[str, int, str], int] = {}
     labels: dict[tuple[str, int, str], str] = {}
     # host:port → best exact key (fallback when match_host differs app↔panel)
@@ -775,6 +777,18 @@ async def apply_ping_rank(
                 pkt = 0.0
             if not has_pkt and pkt >= 0:
                 has_pkt = True
+            try:
+                jit = float(raw.get("jitter_ms")) if raw.get("jitter_ms") is not None else -1.0
+            except (TypeError, ValueError):
+                jit = -1.0
+            try:
+                stab = (
+                    float(raw.get("stability_pct"))
+                    if raw.get("stability_pct") is not None
+                    else -1.0
+                )
+            except (TypeError, ValueError):
+                stab = -1.0
             dcount = int(raw.get("device_count") or 0)
         except (TypeError, ValueError):
             continue
@@ -788,8 +802,9 @@ async def apply_ping_rank(
 
         speed_ok = dl > 0 or ul > 0
         packet_ok = has_pkt and 0 <= pkt < 100
+        stab_ok = stab > 0
         # Failures are ignored for ordering — never scored, never hidden
-        if not (avg > 0 or speed_ok or packet_ok):
+        if not (avg > 0 or speed_ok or packet_ok or stab_ok):
             continue
 
         if avg > 0:
@@ -811,6 +826,14 @@ async def apply_ping_rank(
             prev_pkt = packet_loss.get(key)
             if prev_pkt is None or pkt < prev_pkt:
                 packet_loss[key] = pkt
+        if jit >= 0:
+            prev_jit = jitters.get(key)
+            if prev_jit is None or jit < prev_jit:
+                jitters[key] = jit
+        if stab >= 0:
+            prev_stab = stabilities.get(key)
+            if prev_stab is None or stab > prev_stab:
+                stabilities[key] = stab
         # Also index empty-match alias so panel rows without SNI still hit
         empty_key = _fp_key(key[0], key[1], "")
         if empty_key not in score:
@@ -822,6 +845,10 @@ async def apply_ping_rank(
                 uploads[empty_key] = uploads[key]
             if key in packet_loss:
                 packet_loss[empty_key] = packet_loss[key]
+            if key in jitters:
+                jitters[empty_key] = jitters[key]
+            if key in stabilities:
+                stabilities[empty_key] = stabilities[key]
         _remember_hp(key)
 
     if not current:
@@ -860,6 +887,8 @@ async def apply_ping_rank(
         download_of=lambda it: downloads.get(_sk(it), 0),
         upload_of=lambda it: uploads.get(_sk(it), 0),
         packet_of=lambda it: packet_loss.get(_sk(it), 101.0),
+        jitter_of=lambda it: jitters.get(_sk(it), -1.0),
+        stability_of=lambda it: stabilities.get(_sk(it), -1.0),
         # Only group.order_kind (exposed as category_name on workspace items)
         category_of=lambda it: getattr(it, "category_name", None) or "",
         cost_of=lambda it: getattr(it, "usage_cost", None),

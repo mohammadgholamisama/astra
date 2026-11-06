@@ -174,7 +174,7 @@ export function TestActionBar({
       ) : null}
 
       <View style={styles.modeBlock}>
-        <Text style={styles.modeTitle}>تست‌ها (چندتایی)</Text>
+        <Text style={styles.modeTitle}>تست‌ها — هر کدام را روشن/خاموش کن</Text>
         <View style={styles.modeSeg}>
           {TEST_FLAG_OPTIONS.map((opt) => {
             const active = testFlags[opt.id as keyof TestFlags];
@@ -192,6 +192,7 @@ export function TestActionBar({
                 accessibilityRole="button"
                 accessibilityState={{ selected: active }}
                 accessibilityLabel={opt.title}
+                accessibilityHint={opt.hint}
               >
                 <Text
                   style={[
@@ -417,12 +418,15 @@ const styles = StyleSheet.create({
   },
   modeSeg: {
     flexDirection: 'row-reverse',
+    flexWrap: 'wrap',
     gap: 6,
   },
   modeChip: {
-    flex: 1,
+    flexGrow: 1,
+    flexBasis: '30%',
+    minWidth: '30%',
     paddingVertical: 10,
-    paddingHorizontal: 6,
+    paddingHorizontal: 4,
     borderRadius: radii.md,
     borderWidth: 1,
     borderColor: colors.lineStrong,

@@ -37,6 +37,10 @@ export interface LocalPingResult {
   uploadKbps?: number;
   /** 0–100; −1 = not measured / fail */
   packetLossPct?: number;
+  /** ms; mean absolute deviation of samples; −1 = n/a */
+  jitterMs?: number;
+  /** 0–100 success rate across latency samples; −1 = n/a */
+  stabilityPct?: number;
 }
 
 export interface OperatorPing {
@@ -63,6 +67,10 @@ export interface RankedConfig {
   upload_kbps?: number;
   /** 0–100; −1 = fail / unset */
   packet_loss_pct?: number;
+  /** ms jitter; −1 / omit = unset */
+  jitter_ms?: number;
+  /** 0–100 stability; −1 / omit = unset */
+  stability_pct?: number;
   /** True after a ping attempt finished (success or fail). */
   measured?: boolean;
   raw?: string;
@@ -88,6 +96,8 @@ export interface PingSamplePayload {
   upload_kbps?: number;
   packet_loss_pct?: number;
   has_packet_loss?: boolean;
+  jitter_ms?: number;
+  stability_pct?: number;
   remark?: string;
   protocol?: string;
   transport?: string;

@@ -4,7 +4,9 @@ import type { LocalPingResult, ParsedConfig } from '../types';
 export interface SpeedQueueOptions {
   /** Parallel SOCKS cores — keep low (bandwidth contention). */
   concurrency?: number;
+  /** 0 = skip download */
   downloadBudgetMs?: number;
+  /** 0 = skip upload */
   uploadBudgetMs?: number;
   /**
    * alive = only ping>0 (after ping pass)
@@ -32,9 +34,15 @@ async function measureWithRetry(
   ulBudget: number,
   signal?: AbortSignal,
 ): Promise<{ downloadKbps: number; uploadKbps: number }> {
+  if (dlBudget <= 0 && ulBudget <= 0) {
+    return { downloadKbps: -1, uploadKbps: -1 };
+  }
   let last = await measureSpeed(raw, dlBudget, ulBudget);
   if (signal?.aborted) throw abortedError();
-  if (!(last.downloadKbps > 0)) {
+  const needRetry =
+    (dlBudget > 0 && !(last.downloadKbps > 0)) ||
+    (ulBudget > 0 && dlBudget <= 0 && !(last.uploadKbps > 0));
+  if (needRetry) {
     last = await measureSpeed(raw, dlBudget, ulBudget);
   }
   return last;
@@ -72,8 +80,11 @@ export async function runSpeedQueue(
   if (targets.length === 0) return pingResults.map((r) => ({ ...r }));
 
   const concurrency = Math.max(1, Math.min(options.concurrency ?? 2, 3));
-  const dlBudget = options.downloadBudgetMs ?? 1600;
-  const ulBudget = options.uploadBudgetMs ?? 1400;
+  const dlBudget = Math.max(0, options.downloadBudgetMs ?? 1600);
+  const ulBudget = Math.max(0, options.uploadBudgetMs ?? 1400);
+  if (dlBudget <= 0 && ulBudget <= 0) {
+    return pingResults.map((r) => ({ ...r }));
+  }
   const total = targets.length;
   let nextIndex = 0;
   let completed = 0;

@@ -12,11 +12,22 @@ function lossSortKey(v: number | undefined): number {
   return v;
 }
 
+function jitterSortKey(v: number | undefined): number {
+  if (v == null || v < 0) return 1e18;
+  return v;
+}
+
+/** Higher stability first; missing → last among peers. */
+function stabilitySortKey(v: number | undefined): number {
+  if (v == null || v < 0) return -1;
+  return v;
+}
+
 /**
  * In-app list order.
- * Alive = ping>0 OR download/upload>0 OR packet loss measured with <100%.
- * Rank priority: packet loss ↑ → download ↓ → upload ↓ → ping ↑
- * Buckets: alive → testing → pending → failed
+ * Alive = ping>0 OR download/upload>0 OR packet loss measured with <100%
+ *   OR stability>0.
+ * Rank: stability ↓ → packet loss ↑ → jitter ↑ → ping ↑ → download ↓ → upload ↓
  */
 export function rankLocally(
   configs: ParsedConfig[],
@@ -34,8 +45,6 @@ export function rankLocally(
         ? new Set([testingHashes])
         : new Set<string>();
 
-  let anySpeed = false;
-  let anyPacket = false;
   const rows: RankedConfig[] = configs.map((c) => {
     const r = byHash.get(c.configHash);
     const measured = !!r;
@@ -46,23 +55,25 @@ export function rankLocally(
       measured && r!.uploadKbps != null ? r!.uploadKbps : undefined;
     const packetLossPct =
       measured && r!.packetLossPct != null ? r!.packetLossPct : undefined;
-    if (downloadKbps != null || uploadKbps != null) anySpeed = true;
-    if (packetLossPct != null) anyPacket = true;
+    const jitterMs =
+      measured && r!.jitterMs != null ? r!.jitterMs : undefined;
+    const stabilityPct =
+      measured && r!.stabilityPct != null ? r!.stabilityPct : undefined;
 
     const pingOk = measured && ping > 0;
     const speedOk =
       positiveKbps(downloadKbps) > 0 || positiveKbps(uploadKbps) > 0;
     const packetOk =
       packetLossPct != null && packetLossPct >= 0 && packetLossPct < 100;
-    const ok = pingOk || speedOk || packetOk;
+    const stabOk = stabilityPct != null && stabilityPct > 0;
+    const ok = pingOk || speedOk || packetOk || stabOk;
     const testing = !measured && testingSet.has(c.configHash);
-    // ping === 0 → skipped (speed/packet-only); keep 0 for UI "—"
     const avgPing = measured
       ? pingOk
         ? ping
         : ping === 0
           ? 0
-          : speedOk || packetOk
+          : speedOk || packetOk || stabOk
             ? 0
             : -1
       : testing
@@ -84,6 +95,8 @@ export function rankLocally(
       download_kbps: downloadKbps,
       upload_kbps: uploadKbps,
       packet_loss_pct: packetLossPct,
+      jitter_ms: jitterMs,
+      stability_pct: stabilityPct,
       measured,
       raw: c.raw,
       uuid: c.uuid,
@@ -101,22 +114,30 @@ export function rankLocally(
   const pending = rows.filter((r) => !r.measured && r.avg_ping !== -2);
 
   ok.sort((a, b) => {
-    if (anyPacket) {
-      const lossA = lossSortKey(a.packet_loss_pct);
-      const lossB = lossSortKey(b.packet_loss_pct);
-      if (lossA !== lossB) return lossA - lossB;
-    }
-    if (anySpeed || anyPacket) {
-      const dlA = positiveKbps(a.download_kbps);
-      const dlB = positiveKbps(b.download_kbps);
-      if (dlA !== dlB) return dlB - dlA;
-      const ulA = positiveKbps(a.upload_kbps);
-      const ulB = positiveKbps(b.upload_kbps);
-      if (ulA !== ulB) return ulB - ulA;
-    }
+    const stabA = stabilitySortKey(a.stability_pct);
+    const stabB = stabilitySortKey(b.stability_pct);
+    if (stabA !== stabB) return stabB - stabA;
+
+    const lossA = lossSortKey(a.packet_loss_pct);
+    const lossB = lossSortKey(b.packet_loss_pct);
+    if (lossA !== lossB) return lossA - lossB;
+
+    const jitA = jitterSortKey(a.jitter_ms);
+    const jitB = jitterSortKey(b.jitter_ms);
+    if (jitA !== jitB) return jitA - jitB;
+
     const pingA = a.avg_ping > 0 ? a.avg_ping : Number.POSITIVE_INFINITY;
     const pingB = b.avg_ping > 0 ? b.avg_ping : Number.POSITIVE_INFINITY;
     if (pingA !== pingB) return pingA - pingB;
+
+    const dlA = positiveKbps(a.download_kbps);
+    const dlB = positiveKbps(b.download_kbps);
+    if (dlA !== dlB) return dlB - dlA;
+
+    const ulA = positiveKbps(a.upload_kbps);
+    const ulB = positiveKbps(b.upload_kbps);
+    if (ulA !== ulB) return ulB - ulA;
+
     return a.remark.localeCompare(b.remark, 'fa');
   });
 

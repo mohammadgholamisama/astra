@@ -33,8 +33,12 @@ object XraySpeedHelper {
     uploadBudgetMs: Long,
     isCancelled: () -> Boolean,
   ): Result {
-    val dlBudget = downloadBudgetMs.coerceIn(800L, 5_000L)
-    val ulBudget = uploadBudgetMs.coerceIn(800L, 5_000L)
+    // 0 = skip that direction (app can toggle download / upload independently)
+    val wantDl = downloadBudgetMs > 0
+    val wantUl = uploadBudgetMs > 0
+    if (!wantDl && !wantUl) return Result(-1.0, -1.0)
+    val dlBudget = if (wantDl) downloadBudgetMs.coerceIn(800L, 5_000L) else 0L
+    val ulBudget = if (wantUl) uploadBudgetMs.coerceIn(800L, 5_000L) else 0L
     val port = nextPort()
     val configJson =
       XrayConfigBuilder.fromShareLinkWithSocks(shareLink, port)
@@ -62,8 +66,10 @@ object XraySpeedHelper {
         return Result(-1.0, -1.0)
       }
 
-      downloadKbps = downloadBurst(port, dlBudget, isCancelled)
-      if (!isCancelled()) {
+      if (wantDl) {
+        downloadKbps = downloadBurst(port, dlBudget, isCancelled)
+      }
+      if (wantUl && !isCancelled()) {
         uploadKbps = uploadBurst(port, ulBudget, isCancelled)
       }
     } catch (t: Throwable) {

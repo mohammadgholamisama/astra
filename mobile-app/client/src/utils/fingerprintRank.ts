@@ -11,6 +11,8 @@ export type FingerprintRankItem = {
   upload_kbps?: number;
   packet_loss_pct?: number;
   has_packet_loss?: boolean;
+  jitter_ms?: number;
+  stability_pct?: number;
   sample_count: number;
   device_count: number;
 };
@@ -26,6 +28,7 @@ function rowOk(row: RankedConfig): boolean {
   ) {
     return true;
   }
+  if (row.stability_pct != null && row.stability_pct > 0) return true;
   if (row.success_rate > 0) return true;
   return false;
 }
@@ -50,6 +53,10 @@ export function buildFingerprintRanksFromPage(
     ulN: number;
     lossSum: number;
     lossN: number;
+    jitSum: number;
+    jitN: number;
+    stabSum: number;
+    stabN: number;
     samples: number;
   };
   const map = new Map<string, Acc>();
@@ -78,6 +85,12 @@ export function buildFingerprintRanksFromPage(
       row.packet_loss_pct != null && row.packet_loss_pct >= 0
         ? row.packet_loss_pct
         : -1;
+    const jit =
+      row.jitter_ms != null && row.jitter_ms >= 0 ? row.jitter_ms : -1;
+    const stab =
+      row.stability_pct != null && row.stability_pct >= 0
+        ? row.stability_pct
+        : -1;
     if (!prev) {
       map.set(key, {
         host,
@@ -92,6 +105,10 @@ export function buildFingerprintRanksFromPage(
         ulN: ul > 0 ? 1 : 0,
         lossSum: loss >= 0 ? loss : 0,
         lossN: loss >= 0 ? 1 : 0,
+        jitSum: jit >= 0 ? jit : 0,
+        jitN: jit >= 0 ? 1 : 0,
+        stabSum: stab >= 0 ? stab : 0,
+        stabN: stab >= 0 ? 1 : 0,
         samples: 1,
       });
     } else {
@@ -111,6 +128,14 @@ export function buildFingerprintRanksFromPage(
       if (loss >= 0) {
         prev.lossSum += loss;
         prev.lossN += 1;
+      }
+      if (jit >= 0) {
+        prev.jitSum += jit;
+        prev.jitN += 1;
+      }
+      if (stab >= 0) {
+        prev.stabSum += stab;
+        prev.stabN += 1;
       }
       if (!prev.label && row.remark) {
         prev.label = row.remark.trim().slice(0, 128);
@@ -139,6 +164,14 @@ export function buildFingerprintRanksFromPage(
           ? Math.round((acc.lossSum / acc.lossN) * 10) / 10
           : undefined,
       has_packet_loss: acc.lossN > 0 ? true : undefined,
+      jitter_ms:
+        acc.jitN > 0
+          ? Math.round((acc.jitSum / acc.jitN) * 10) / 10
+          : undefined,
+      stability_pct:
+        acc.stabN > 0
+          ? Math.round((acc.stabSum / acc.stabN) * 10) / 10
+          : undefined,
       sample_count: acc.samples,
       device_count: 1,
     });

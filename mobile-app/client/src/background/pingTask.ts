@@ -19,6 +19,8 @@ import {
   normalizeCycleMs,
 } from '../utils/cycleInterval';
 import {
+  latencySampleCount,
+  needsLatencyPass,
   testFlagsFromSettings,
   testFlagsToLegacyMode,
 } from '../utils/testFlags';
@@ -79,164 +81,211 @@ export default async function backgroundPingTask(): Promise<void> {
 
   const live = new Map<string, LocalPingResult>();
   let results: LocalPingResult[] = [];
+  const samples = latencySampleCount(flags);
 
   try {
-  // Order: packet → speed → ping
-  if (flags.packet && !ac.signal.aborted) {
-    results = await runPacketQueue(configs, results, {
-      concurrency: 2,
-      probes: 10,
-      perProbeTimeoutMs: 1500,
-      scope: 'all',
-      signal: ac.signal,
-      onProgress: (_d, _t, latest) => {
-        live.set(latest.configHash, latest);
-      },
-    });
-    results.forEach((r) => live.set(r.configHash, r));
-  }
+    // Order: latency → packet → download/upload
+    if (needsLatencyPass(flags) && !ac.signal.aborted) {
+      results = await runPingQueue(configs, {
+        concurrency: samples > 1 ? 3 : 5,
+        timeoutMs: samples > 1 ? 10_000 : 12_000,
+        retries: samples > 1 ? 0 : 1,
+        samples,
+        wantJitter: flags.jitter,
+        wantStability: flags.stability,
+        signal: ac.signal,
+        onProgress: (_d, _t, latest) => {
+          const prev = live.get(latest.configHash);
+          live.set(
+            latest.configHash,
+            prev
+              ? {
+                  ...prev,
+                  pingMs: latest.pingMs,
+                  jitterMs: latest.jitterMs ?? prev.jitterMs,
+                  stabilityPct: latest.stabilityPct ?? prev.stabilityPct,
+                  measuredAt: latest.measuredAt,
+                }
+              : latest,
+          );
+        },
+      });
+      results = results.map((r) => {
+        const prev = live.get(r.configHash);
+        const merged = prev
+          ? {
+              ...prev,
+              pingMs: r.pingMs,
+              jitterMs: r.jitterMs ?? prev.jitterMs,
+              stabilityPct: r.stabilityPct ?? prev.stabilityPct,
+              measuredAt: r.measuredAt,
+            }
+          : r;
+        live.set(r.configHash, merged);
+        return merged;
+      });
+    }
 
-  if (flags.speed && !ac.signal.aborted) {
-    const packetOk = flags.packet
-      ? results.filter(
-          (r) =>
-            r.packetLossPct != null &&
-            r.packetLossPct >= 0 &&
-            r.packetLossPct < 100,
-        )
-      : null;
-    const speedConfigs =
-      packetOk && packetOk.length > 0
-        ? configs.filter((c) =>
-            packetOk.some((r) => r.configHash === c.configHash),
+    if (flags.packet && !ac.signal.aborted) {
+      const alive = needsLatencyPass(flags)
+        ? results.filter((r) => r.pingMs > 0)
+        : null;
+      const packetConfigs =
+        alive && alive.length > 0
+          ? configs.filter((c) =>
+              alive.some((r) => r.configHash === c.configHash),
+            )
+          : configs;
+      const packetResults = await runPacketQueue(packetConfigs, results, {
+        concurrency: 2,
+        probes: 10,
+        perProbeTimeoutMs: 1500,
+        scope: 'all',
+        signal: ac.signal,
+        onProgress: (_d, _t, latest) => {
+          live.set(latest.configHash, latest);
+        },
+      });
+      const mergedPkt = new Map(results.map((r) => [r.configHash, r]));
+      for (const r of packetResults) mergedPkt.set(r.configHash, r);
+      results = configs.map(
+        (c) =>
+          mergedPkt.get(c.configHash) ?? {
+            configHash: c.configHash,
+            pingMs: -1,
+            measuredAt: Date.now(),
+          },
+      );
+      results.forEach((r) => live.set(r.configHash, r));
+    }
+
+    if ((flags.download || flags.upload) && !ac.signal.aborted) {
+      const filtered = flags.packet
+        ? results.filter(
+            (r) =>
+              r.packetLossPct != null &&
+              r.packetLossPct >= 0 &&
+              r.packetLossPct < 100,
           )
-        : configs;
-    const speedResults = await runSpeedQueue(speedConfigs, results, {
-      concurrency: 2,
-      downloadBudgetMs: 1600,
-      uploadBudgetMs: 1400,
-      scope: 'all',
-      signal: ac.signal,
-      onProgress: (_d, _t, latest) => {
-        live.set(latest.configHash, latest);
-      },
-    });
-    const mergedSpeed = new Map(results.map((r) => [r.configHash, r]));
-    for (const r of speedResults) mergedSpeed.set(r.configHash, r);
-    results = configs.map(
-      (c) =>
-        mergedSpeed.get(c.configHash) ?? {
-          configHash: c.configHash,
-          pingMs: 0,
-          measuredAt: Date.now(),
+        : needsLatencyPass(flags)
+          ? results.filter((r) => r.pingMs > 0)
+          : null;
+      const speedConfigs =
+        filtered && filtered.length > 0
+          ? configs.filter((c) =>
+              filtered.some((r) => r.configHash === c.configHash),
+            )
+          : configs;
+      const speedResults = await runSpeedQueue(speedConfigs, results, {
+        concurrency: 2,
+        downloadBudgetMs: flags.download ? 1600 : 0,
+        uploadBudgetMs: flags.upload ? 1400 : 0,
+        scope: 'all',
+        signal: ac.signal,
+        onProgress: (_d, _t, latest) => {
+          live.set(latest.configHash, latest);
         },
-    );
-    results.forEach((r) => live.set(r.configHash, r));
-  }
+      });
+      const mergedSpeed = new Map(results.map((r) => [r.configHash, r]));
+      for (const r of speedResults) mergedSpeed.set(r.configHash, r);
+      results = configs.map(
+        (c) =>
+          mergedSpeed.get(c.configHash) ?? {
+            configHash: c.configHash,
+            pingMs: 0,
+            measuredAt: Date.now(),
+          },
+      );
+      results.forEach((r) => live.set(r.configHash, r));
+    }
 
-  if (flags.ping && !ac.signal.aborted) {
-    results = await runPingQueue(configs, {
-      concurrency: 5,
-      timeoutMs: 12_000,
-      retries: 1,
-      signal: ac.signal,
-      onProgress: (_d, _t, latest) => {
-        const prev = live.get(latest.configHash);
-        live.set(
-          latest.configHash,
-          prev
-            ? { ...prev, pingMs: latest.pingMs, measuredAt: latest.measuredAt }
-            : latest,
-        );
-      },
-    });
-    results = results.map((r) => {
-      const prev = live.get(r.configHash);
-      const merged = prev
-        ? { ...prev, pingMs: r.pingMs, measuredAt: r.measuredAt }
-        : r;
-      live.set(r.configHash, merged);
-      return merged;
-    });
-  }
+    if (ac.signal.aborted) {
+      await saveSettings({
+        lastBackgroundStatus: 'قطع شد — وی‌پی‌ان روشن شد',
+        nextRunAt: Date.now() + cycleMs,
+        cycleIntervalMs: cycleMs,
+      });
+      return;
+    }
 
-  if (ac.signal.aborted) {
-    await saveSettings({
-      lastBackgroundStatus: 'قطع شد — وی‌پی‌ان روشن شد',
-      nextRunAt: Date.now() + cycleMs,
+    if (results.length === 0) {
+      results = [...live.values()];
+    } else {
+      const byH = new Map(results.map((r) => [r.configHash, r]));
+      for (const [h, r] of live) byH.set(h, r);
+      results = configs.map(
+        (c) =>
+          byH.get(c.configHash) ?? {
+            configHash: c.configHash,
+            pingMs: -1,
+            measuredAt: Date.now(),
+          },
+      );
+    }
+
+    const ranked: RankedConfig[] = rankLocally(configs, live);
+    const now = Date.now();
+    const pingOk = results.filter((r) => r.pingMs > 0).length;
+    const speedOk = results.filter(
+      (r) => (r.downloadKbps ?? 0) > 0 || (r.uploadKbps ?? 0) > 0,
+    ).length;
+    const packetOkN = results.filter(
+      (r) => r.packetLossPct != null && r.packetLossPct >= 0,
+    ).length;
+    const parts: string[] = [];
+    if (flags.stability) {
+      parts.push(
+        `${results.filter((r) => (r.stabilityPct ?? -1) >= 0).length} پایداری`,
+      );
+    }
+    if (flags.packet) parts.push(`${packetOkN} پکت`);
+    if (flags.jitter) {
+      parts.push(
+        `${results.filter((r) => (r.jitterMs ?? -1) >= 0).length} جیتر`,
+      );
+    }
+    if (needsLatencyPass(flags)) parts.push(`${pingOk} پینگ`);
+    if (flags.download || flags.upload) parts.push(`${speedOk} سرعت`);
+    const summary = `پس‌زمینه · ${parts.join(' · ') || configs.length}`;
+    const nextRunAt = now + cycleMs;
+    const legacyMode = testFlagsToLegacyMode(flags);
+
+    await saveSnapshot(configs, ranked, {
+      operator,
+      subUrl: saved.subUrl,
+      backgroundEnabled: true,
       cycleIntervalMs: cycleMs,
+      nextRunAt,
+      testFlags: flags,
+      testMode: legacyMode,
+      speedRankEnabled:
+        flags.download || flags.upload || flags.packet,
+      lastBackgroundStatus: summary,
     });
-    return;
-  }
+    await saveSettings({
+      nextRunAt,
+      cycleIntervalMs: cycleMs,
+      testFlags: flags,
+      testMode: legacyMode,
+      lastBackgroundStatus: summary,
+    });
 
-  if (results.length === 0) {
-    results = [...live.values()];
-  } else {
-    const byH = new Map(results.map((r) => [r.configHash, r]));
-    for (const [h, r] of live) byH.set(h, r);
-    results = configs.map(
-      (c) =>
-        byH.get(c.configHash) ?? {
-          configHash: c.configHash,
-          pingMs: -1,
-          measuredAt: Date.now(),
-        },
-    );
-  }
-
-  const ranked: RankedConfig[] = rankLocally(configs, live);
-  const now = Date.now();
-  const pingOk = results.filter((r) => r.pingMs > 0).length;
-  const speedOk = results.filter(
-    (r) => (r.downloadKbps ?? 0) > 0 || (r.uploadKbps ?? 0) > 0,
-  ).length;
-  const packetOkN = results.filter(
-    (r) => r.packetLossPct != null && r.packetLossPct >= 0,
-  ).length;
-  const parts: string[] = [];
-  if (flags.packet) parts.push(`${packetOkN} پکت`);
-  if (flags.speed) parts.push(`${speedOk} سرعت`);
-  if (flags.ping) parts.push(`${pingOk} پینگ`);
-  const summary = `پس‌زمینه · ${parts.join(' · ') || configs.length}`;
-  const nextRunAt = now + cycleMs;
-  const legacyMode = testFlagsToLegacyMode(flags);
-
-  await saveSnapshot(configs, ranked, {
-    operator,
-    subUrl: saved.subUrl,
-    backgroundEnabled: true,
-    cycleIntervalMs: cycleMs,
-    nextRunAt,
-    testFlags: flags,
-    testMode: legacyMode,
-    speedRankEnabled: flags.speed || flags.packet,
-    lastBackgroundStatus: summary,
-  });
-  await saveSettings({
-    nextRunAt,
-    cycleIntervalMs: cycleMs,
-    testFlags: flags,
-    testMode: legacyMode,
-    lastBackgroundStatus: summary,
-  });
-
-  await uploadCyclePings(operator, configs, results);
-  await new Promise<void>((r) => setTimeout(r, 300));
-  const items = buildFingerprintRanksFromPage(ranked);
-  // Live successes → hub merges 1h window → panel reorder (never hide)
-  const sync =
-    items.length > 0
-      ? await pushPanelOrderNow(items)
-      : { ok: true, count: 0 };
-  const panelHint =
-    sync.ok && sync.count > 0
-      ? ` · پنل ${sync.count}`
-      : sync.ok
-        ? ' · پینگ ارسال شد'
-        : ' · پنل ناموفق';
-  await saveSettings({
-    lastBackgroundStatus: `${summary}${panelHint}`,
-  });
+    await uploadCyclePings(operator, configs, results);
+    await new Promise<void>((r) => setTimeout(r, 300));
+    const items = buildFingerprintRanksFromPage(ranked);
+    const sync =
+      items.length > 0
+        ? await pushPanelOrderNow(items)
+        : { ok: true, count: 0 };
+    const panelHint =
+      sync.ok && sync.count > 0
+        ? ` · پنل ${sync.count}`
+        : sync.ok
+          ? ' · پینگ ارسال شد'
+          : ' · پنل ناموفق';
+    await saveSettings({
+      lastBackgroundStatus: `${summary}${panelHint}`,
+    });
   } catch (e) {
     const aborted =
       ac.signal.aborted ||

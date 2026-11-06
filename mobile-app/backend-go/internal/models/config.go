@@ -48,6 +48,8 @@ type PingSample struct {
 	UploadKbps    float64  `json:"upload_kbps,omitempty"`
 	PacketLossPct float64  `json:"packet_loss_pct,omitempty"` // 0..100
 	HasPacketLoss bool     `json:"has_packet_loss,omitempty"` // true when packet was measured (incl. 0%)
+	JitterMs      float64  `json:"jitter_ms,omitempty"`
+	StabilityPct  float64  `json:"stability_pct,omitempty"`
 	Remark        string   `json:"remark,omitempty"`
 	Protocol      string   `json:"protocol,omitempty"`
 	Transport     string   `json:"transport,omitempty"`
@@ -104,6 +106,8 @@ type FingerprintRank struct {
 	UploadKbps      float64 `json:"upload_kbps,omitempty"`
 	PacketLossPct   float64 `json:"packet_loss_pct,omitempty"` // 0..100 avg; 0 may mean unset
 	HasPacketLoss   bool    `json:"has_packet_loss,omitempty"`
+	JitterMs        float64 `json:"jitter_ms,omitempty"`
+	StabilityPct    float64 `json:"stability_pct,omitempty"`
 	SampleCount     int     `json:"sample_count"`
 	DeviceCount     int     `json:"device_count"`
 	FailDeviceCount int     `json:"fail_device_count,omitempty"`

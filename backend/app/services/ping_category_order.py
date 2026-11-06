@@ -85,6 +85,8 @@ def arrange_by_category_slots(
     download_of: Callable[[T], Any] | None = None,
     upload_of: Callable[[T], Any] | None = None,
     packet_of: Callable[[T], Any] | None = None,
+    jitter_of: Callable[[T], Any] | None = None,
+    stability_of: Callable[[T], Any] | None = None,
     category_of: Callable[[T], Any] | None = None,
     cost_of: Callable[[T], Any] | None = None,
     direct_slot: int = DIRECT_SLOT,
@@ -151,8 +153,25 @@ def arrange_by_category_slots(
         dl = _num(download_of, it)
         ul = _num(upload_of, it)
         loss = _loss(it)
-        has_speed = 0 if (dl > 0 or ul > 0 or (0 <= loss < 100)) else 1
-        return (has_score, has_speed, -dev, loss, -dl, -ul, avg_sort)
+        stab = _num(stability_of, it, default=-1.0)
+        has_stab = 0 if stab >= 0 else 1
+        stab_key = -stab if stab >= 0 else 0.0
+        jit = _num(jitter_of, it, default=-1.0)
+        jit_key = jit if jit >= 0 else 1e18
+        has_metric = 0 if (dl > 0 or ul > 0 or (0 <= loss < 100) or stab >= 0) else 1
+        # Stability → loss → jitter → ping → download → upload → devices
+        return (
+            has_score,
+            has_metric,
+            has_stab,
+            stab_key,
+            loss,
+            jit_key,
+            avg_sort,
+            -dl,
+            -ul,
+            -dev,
+        )
 
     def segment_key(it: T) -> tuple:
         return (_cost(it),) + quality_key(it)
@@ -225,6 +244,24 @@ def arrange_rank_dicts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 return 101.0
         return 101.0
 
+    def _jitter(d: dict[str, Any]) -> float:
+        try:
+            v = float(d.get("jitter_ms")) if d.get("jitter_ms") is not None else -1.0
+        except (TypeError, ValueError):
+            return -1.0
+        return v
+
+    def _stability(d: dict[str, Any]) -> float:
+        try:
+            v = (
+                float(d.get("stability_pct"))
+                if d.get("stability_pct") is not None
+                else -1.0
+            )
+        except (TypeError, ValueError):
+            return -1.0
+        return v
+
     return arrange_by_category_slots(
         items,
         avg_of=lambda d: d.get("avg_ping", -1),
@@ -233,6 +270,8 @@ def arrange_rank_dicts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         download_of=lambda d: d.get("download_kbps") or 0,
         upload_of=lambda d: d.get("upload_kbps") or 0,
         packet_of=_packet,
+        jitter_of=_jitter,
+        stability_of=_stability,
         category_of=lambda d: d.get("order_kind")
         or d.get("category_name")
         or d.get("category")

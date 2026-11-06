@@ -59,6 +59,8 @@ type Rankable = {
   download_kbps?: number;
   upload_kbps?: number;
   packet_loss_pct?: number;
+  jitter_ms?: number;
+  stability_pct?: number;
   label?: string;
   remark?: string;
   category_name?: string | null;
@@ -80,6 +82,18 @@ function lossKey(it: Rankable): number {
   return v;
 }
 
+function jitterKey(it: Rankable): number {
+  const v = it.jitter_ms;
+  if (v == null || v < 0) return 1e18;
+  return v;
+}
+
+function stabilityKey(it: Rankable): number {
+  const v = it.stability_pct;
+  if (v == null || v < 0) return -1;
+  return v;
+}
+
 function costKey(it: Rankable): number {
   const c = it.usage_cost;
   if (c == null || !Number.isFinite(c)) return 1e9;
@@ -87,31 +101,36 @@ function costKey(it: Rankable): number {
 }
 
 /**
- * Quality: more devices → lower packet loss → higher download → higher upload → lower ping.
+ * Quality: stability ↓ → loss ↑ → jitter ↑ → ping ↑ → download ↓ → upload ↓
+ * (devices as weak tie-break).
  */
 function quality(a: Rankable, b: Rankable): number {
+  const sa = stabilityKey(a);
+  const sb = stabilityKey(b);
+  if (sa !== sb) return sb - sa;
+
+  const la = lossKey(a);
+  const lb = lossKey(b);
+  if (la !== lb) return la - lb;
+
+  const ja = jitterKey(a);
+  const jb = jitterKey(b);
+  if (ja !== jb) return ja - jb;
+
+  const pingA = a.avg_ping > 0 ? a.avg_ping : 1e18;
+  const pingB = b.avg_ping > 0 ? b.avg_ping : 1e18;
+  if (pingA !== pingB) return pingA - pingB;
+
+  const dlA = a.download_kbps ?? 0;
+  const dlB = b.download_kbps ?? 0;
+  if (dlA !== dlB) return dlB - dlA;
+  const ulA = a.upload_kbps ?? 0;
+  const ulB = b.upload_kbps ?? 0;
+  if (ulA !== ulB) return ulB - ulA;
+
   const da = a.device_count ?? 1;
   const db = b.device_count ?? 1;
   if (da !== db) return db - da;
-
-  const packetAware = hasPacket(a) || hasPacket(b);
-  if (packetAware) {
-    const la = lossKey(a);
-    const lb = lossKey(b);
-    if (la !== lb) return la - lb;
-  }
-
-  const speedAware = hasSpeed(a) || hasSpeed(b) || packetAware;
-  if (speedAware) {
-    const dlA = a.download_kbps ?? 0;
-    const dlB = b.download_kbps ?? 0;
-    if (dlA !== dlB) return dlB - dlA;
-    const ulA = a.upload_kbps ?? 0;
-    const ulB = b.upload_kbps ?? 0;
-    if (ulA !== ulB) return ulB - ulA;
-  }
-
-  if (a.avg_ping !== b.avg_ping) return a.avg_ping - b.avg_ping;
   return 0;
 }
 
@@ -138,10 +157,12 @@ export function arrangeByCategorySlots<T extends Rankable>(items: T[]): T[] {
   const ok: T[] = [];
   const rest: T[] = [];
   for (const it of items) {
+    const stab = it.stability_pct;
     if (
       it.avg_ping > 0 ||
       hasSpeed(it) ||
-      (hasPacket(it) && (it.packet_loss_pct as number) < 100)
+      (hasPacket(it) && (it.packet_loss_pct as number) < 100) ||
+      (stab != null && stab > 0)
     ) {
       ok.push(it);
     } else {
