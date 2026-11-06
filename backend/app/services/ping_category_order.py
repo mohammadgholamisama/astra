@@ -159,17 +159,18 @@ def arrange_by_category_slots(
         jit = _num(jitter_of, it, default=-1.0)
         jit_key = jit if jit >= 0 else 1e18
         has_metric = 0 if (dl > 0 or ul > 0 or (0 <= loss < 100) or stab >= 0) else 1
-        # Stability → loss → jitter → ping → download → upload → devices
+        # Stability → jitter → ping → upload → download → packet loss → devices
+        # (packet last: tunnels/IR nets often share loss; UL matters more than DL)
         return (
             has_score,
             has_metric,
             has_stab,
             stab_key,
-            loss,
             jit_key,
             avg_sort,
-            -dl,
             -ul,
+            -dl,
+            loss,
             -dev,
         )
 

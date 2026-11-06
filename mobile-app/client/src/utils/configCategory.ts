@@ -101,17 +101,13 @@ function costKey(it: Rankable): number {
 }
 
 /**
- * Quality: stability ↓ → loss ↑ → jitter ↑ → ping ↑ → download ↓ → upload ↓
+ * Quality: stability ↓ → jitter ↑ → ping ↑ → upload ↓ → download ↓ → loss ↑
  * (devices as weak tie-break).
  */
 function quality(a: Rankable, b: Rankable): number {
   const sa = stabilityKey(a);
   const sb = stabilityKey(b);
   if (sa !== sb) return sb - sa;
-
-  const la = lossKey(a);
-  const lb = lossKey(b);
-  if (la !== lb) return la - lb;
 
   const ja = jitterKey(a);
   const jb = jitterKey(b);
@@ -121,12 +117,16 @@ function quality(a: Rankable, b: Rankable): number {
   const pingB = b.avg_ping > 0 ? b.avg_ping : 1e18;
   if (pingA !== pingB) return pingA - pingB;
 
-  const dlA = a.download_kbps ?? 0;
-  const dlB = b.download_kbps ?? 0;
-  if (dlA !== dlB) return dlB - dlA;
   const ulA = a.upload_kbps ?? 0;
   const ulB = b.upload_kbps ?? 0;
   if (ulA !== ulB) return ulB - ulA;
+  const dlA = a.download_kbps ?? 0;
+  const dlB = b.download_kbps ?? 0;
+  if (dlA !== dlB) return dlB - dlA;
+
+  const la = lossKey(a);
+  const lb = lossKey(b);
+  if (la !== lb) return la - lb;
 
   const da = a.device_count ?? 1;
   const db = b.device_count ?? 1;

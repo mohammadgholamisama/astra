@@ -8,8 +8,12 @@ buildscript {
         kotlinVersion = "1.9.24"
     }
     repositories {
-        google()
+        // Local cache first (Google Maven often blocked / slow).
+        maven { url uri("${rootDir}/local-maven") }
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://repo.huaweicloud.com/repository/maven' }
         mavenCentral()
+        google()
     }
     dependencies {
         classpath("com.android.tools.build:gradle")

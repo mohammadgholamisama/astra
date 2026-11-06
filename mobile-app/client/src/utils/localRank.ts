@@ -27,7 +27,7 @@ function stabilitySortKey(v: number | undefined): number {
  * In-app list order.
  * Alive = ping>0 OR download/upload>0 OR packet loss measured with <100%
  *   OR stability>0.
- * Rank: stability ↓ → packet loss ↑ → jitter ↑ → ping ↑ → download ↓ → upload ↓
+ * Rank: stability ↓ → jitter ↑ → ping ↑ → upload ↓ → download ↓ → packet loss ↑
  */
 export function rankLocally(
   configs: ParsedConfig[],
@@ -118,10 +118,6 @@ export function rankLocally(
     const stabB = stabilitySortKey(b.stability_pct);
     if (stabA !== stabB) return stabB - stabA;
 
-    const lossA = lossSortKey(a.packet_loss_pct);
-    const lossB = lossSortKey(b.packet_loss_pct);
-    if (lossA !== lossB) return lossA - lossB;
-
     const jitA = jitterSortKey(a.jitter_ms);
     const jitB = jitterSortKey(b.jitter_ms);
     if (jitA !== jitB) return jitA - jitB;
@@ -130,13 +126,17 @@ export function rankLocally(
     const pingB = b.avg_ping > 0 ? b.avg_ping : Number.POSITIVE_INFINITY;
     if (pingA !== pingB) return pingA - pingB;
 
+    const ulA = positiveKbps(a.upload_kbps);
+    const ulB = positiveKbps(b.upload_kbps);
+    if (ulA !== ulB) return ulB - ulA;
+
     const dlA = positiveKbps(a.download_kbps);
     const dlB = positiveKbps(b.download_kbps);
     if (dlA !== dlB) return dlB - dlA;
 
-    const ulA = positiveKbps(a.upload_kbps);
-    const ulB = positiveKbps(b.upload_kbps);
-    if (ulA !== ulB) return ulB - ulA;
+    const lossA = lossSortKey(a.packet_loss_pct);
+    const lossB = lossSortKey(b.packet_loss_pct);
+    if (lossA !== lossB) return lossA - lossB;
 
     return a.remark.localeCompare(b.remark, 'fa');
   });
