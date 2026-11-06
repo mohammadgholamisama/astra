@@ -124,6 +124,7 @@ export interface AstraOutbound {
   id: number;
   panel_id: number;
   uri: string;
+  uri_hash?: string;
   remark: string;
   protocol: string;
   host: string;
@@ -147,6 +148,32 @@ export interface AstraOutboundSubscription {
   synced_at: string | null;
   error: string | null;
   count: number;
+  selected_hash?: string | null;
+}
+
+/** One pickable share-link inside a subscription preview. */
+export interface AstraOutboundSubConfig {
+  index: number;
+  uri: string;
+  uri_hash: string;
+  remark: string;
+  protocol: string;
+  host: string;
+  port: number;
+  used: boolean;
+  used_by_panel_id: number | null;
+  used_by_panel_name: string | null;
+}
+
+export interface AstraOutboundSubPreview {
+  url: string;
+  title: string | null;
+  upload: number;
+  download: number;
+  total: number;
+  expire: number;
+  count: number;
+  configs: AstraOutboundSubConfig[];
 }
 
 export interface AstraNodeClient {

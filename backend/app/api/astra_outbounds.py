@@ -17,6 +17,9 @@ from app.schemas.astra_outbound import (
     AstraOutboundEnable,
     AstraOutboundOut,
     AstraOutboundSubBind,
+    AstraOutboundSubConfigOut,
+    AstraOutboundSubPreview,
+    AstraOutboundSubPreviewOut,
     AstraOutboundSubscriptionOut,
     AstraOutboundSubSyncResult,
 )
@@ -40,6 +43,7 @@ def _out(row) -> AstraOutboundOut:
         id=row.id,
         panel_id=row.panel_id,
         uri=row.uri,
+        uri_hash=str(getattr(row, "uri_hash", "") or ""),
         remark=row.remark,
         protocol=row.protocol,
         host=row.host,
@@ -107,6 +111,42 @@ async def get_outbound_subscription(
 
 
 @router.post(
+    "/api/admin/panels/{panel_id}/outbounds/subscription/preview",
+    response_model=AstraOutboundSubPreviewOut,
+)
+async def preview_outbound_subscription(
+    panel_id: int,
+    body: AstraOutboundSubPreview,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """Fetch the sub live and list configs to pick (dims ones used on other panels)."""
+    await _astra_panel(db, panel_id)
+    try:
+        result = await ob_sub.preview_subscription(
+            db, body.url.strip(), exclude_panel_id=panel_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502, detail=f"دریافت ساب ناموفق بود: {exc}"
+        ) from exc
+    return AstraOutboundSubPreviewOut(
+        url=str(result["url"]),
+        title=result.get("title"),
+        upload=int(result.get("upload") or 0),
+        download=int(result.get("download") or 0),
+        total=int(result.get("total") or 0),
+        expire=int(result.get("expire") or 0),
+        count=int(result.get("count") or 0),
+        configs=[
+            AstraOutboundSubConfigOut(**c) for c in (result.get("configs") or [])
+        ],
+    )
+
+
+@router.post(
     "/api/admin/panels/{panel_id}/outbounds/subscription",
     response_model=AstraOutboundSubSyncResult,
 )
@@ -118,8 +158,12 @@ async def bind_outbound_subscription(
 ):
     panel = await _astra_panel(db, panel_id)
     try:
-        result = await ob_sub.sync_outbounds_from_subscription(
-            db, panel, body.url.strip(), ping=bool(body.ping)
+        result = await ob_sub.bind_outbound_from_subscription(
+            db,
+            panel,
+            body.url.strip(),
+            uri_hash=body.uri_hash.strip(),
+            ping=bool(body.ping),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -150,6 +194,7 @@ async def sync_outbound_subscription(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
+    """Fresh title / usage / expire from the bound sub; keep the picked outbound."""
     panel = await _astra_panel(db, panel_id)
     try:
         result = await ob_sub.refresh_bound_subscription(db, panel, ping=False)
@@ -261,6 +306,9 @@ async def remove_outbound(
     ok = await node.delete_outbound(db, panel, outbound_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Outbound not found")
+    # Free the hash for other panels; keep sub URL so admin can re-pick
+    if ob_sub.subscription_info(panel):
+        ob_sub.clear_selected_hash(panel)
     await db.commit()
     return {"ok": True}
 

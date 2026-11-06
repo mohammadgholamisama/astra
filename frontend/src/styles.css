@@ -8571,11 +8571,139 @@ html[dir="rtl"] .configs-switch input:checked + .configs-switch-track::after,
   color: var(--danger);
   font-size: 0.84rem;
 }
+.ob-sub-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.ob-sub-picked {
+  margin: 0;
+  font-size: 0.88rem;
+  color: var(--muted);
+}
+.ob-sub-picked strong {
+  color: var(--text);
+  font-weight: 600;
+}
 .ob-sub-rebind {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
   align-items: center;
+}
+.ob-pick-card {
+  padding: 18px;
+  border-radius: calc(var(--radius) + 2px);
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--line));
+  background: var(--card);
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.ob-pick-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.ob-pick-head h2 {
+  margin: 0 0 4px;
+  font-size: 1.05rem;
+}
+.ob-pick-head p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.84rem;
+  line-height: 1.5;
+}
+.ob-pick-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: min(52vh, 420px);
+  overflow: auto;
+}
+.ob-pick-item {
+  width: 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  text-align: start;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--card) 92%, var(--bg, transparent));
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 0.15s ease, opacity 0.15s ease, background 0.15s ease;
+}
+.ob-pick-item:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+}
+.ob-pick-item.on {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  background: color-mix(in srgb, var(--accent) 10%, var(--card));
+}
+.ob-pick-item.used {
+  opacity: 0.42;
+  cursor: not-allowed;
+  filter: grayscale(0.25);
+}
+.ob-pick-idx {
+  flex-shrink: 0;
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  padding-top: 2px;
+  min-width: 2.2rem;
+}
+.ob-pick-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.ob-pick-body strong {
+  font-size: 0.92rem;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ob-pick-body small {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+.ob-pick-body em {
+  font-style: normal;
+  font-size: 0.76rem;
+  color: var(--warn, #c47b2b);
+}
+.ob-pick-check {
+  flex-shrink: 0;
+  color: var(--accent);
+  margin-top: 2px;
+}
+.ob-pick-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.ob-pick-foot p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.45;
 }
 .ob-sub-url {
   flex: 1 1 220px;

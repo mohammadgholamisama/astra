@@ -9,6 +9,7 @@ class AstraOutboundOut(BaseModel):
     id: int
     panel_id: int
     uri: str
+    uri_hash: str = ""
     remark: str
     protocol: str
     host: str
@@ -34,10 +35,41 @@ class AstraOutboundBulkResult(BaseModel):
 
 
 class AstraOutboundSubBind(BaseModel):
-    """Bind an upstream subscription URL and import all share-links as outbounds."""
+    """Bind a subscription and attach **one** chosen share-link as this panel's outbound."""
 
     url: str = Field(..., min_length=8, max_length=2000)
-    ping: bool = False
+    uri_hash: str = Field(..., min_length=16, max_length=64)
+    ping: bool = True
+
+
+class AstraOutboundSubPreview(BaseModel):
+    """Fetch a subscription URL and list pickable configs (no write)."""
+
+    url: str = Field(..., min_length=8, max_length=2000)
+
+
+class AstraOutboundSubConfigOut(BaseModel):
+    index: int
+    uri: str
+    uri_hash: str
+    remark: str
+    protocol: str
+    host: str
+    port: int
+    used: bool = False
+    used_by_panel_id: int | None = None
+    used_by_panel_name: str | None = None
+
+
+class AstraOutboundSubPreviewOut(BaseModel):
+    url: str
+    title: str | None = None
+    upload: int = 0
+    download: int = 0
+    total: int = 0
+    expire: int = 0
+    count: int = 0
+    configs: list[AstraOutboundSubConfigOut] = Field(default_factory=list)
 
 
 class AstraOutboundSubscriptionOut(BaseModel):
@@ -50,6 +82,7 @@ class AstraOutboundSubscriptionOut(BaseModel):
     synced_at: str | None = None
     error: str | None = None
     count: int = 0
+    selected_hash: str | None = None
 
 
 class AstraOutboundSubSyncResult(BaseModel):

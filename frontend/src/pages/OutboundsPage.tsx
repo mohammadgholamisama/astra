@@ -29,6 +29,7 @@ import {
   api,
   AstraNodeClient,
   AstraOutbound,
+  AstraOutboundSubPreview,
   AstraOutboundSubscription,
   formatBytes,
   Panel,
@@ -165,6 +166,8 @@ export default function OutboundsPage() {
   const [confirmId, setConfirmId] = useState<number | null>(null);
   const [pingingId, setPingingId] = useState<number | null>(null);
   const [subOpenId, setSubOpenId] = useState<number | null>(null);
+  const [subPreview, setSubPreview] = useState<AstraOutboundSubPreview | null>(null);
+  const [pickedHash, setPickedHash] = useState<string | null>(null);
   const autoSynced = useRef(false);
 
   const { data: panels = [] } = useQuery({
@@ -249,11 +252,37 @@ export default function OutboundsPage() {
     onError: (e: Error) => flash(false, e.message),
   });
 
-  const bindSub = useMutation({
+  const previewSub = useMutation({
     mutationFn: (url: string) =>
+      api<AstraOutboundSubPreview>(
+        `/api/admin/panels/${id}/outbounds/subscription/preview`,
+        {
+          method: "POST",
+          body: JSON.stringify({ url }),
+          timeoutMs: 90_000,
+        }
+      ),
+    onSuccess: (res) => {
+      setSubPreview(res);
+      const preferred =
+        res.configs.find(
+          (c) => c.uri_hash === boundSub?.selected_hash && !c.used
+        ) || res.configs.find((c) => !c.used);
+      setPickedHash(preferred?.uri_hash || null);
+      flash(
+        true,
+        `ساب خوانده شد — ${toFaDigits(res.count)} کانفیگ` +
+          (res.title ? ` · ${res.title}` : "")
+      );
+    },
+    onError: (e: Error) => flash(false, e.message),
+  });
+
+  const bindSub = useMutation({
+    mutationFn: ({ url, uri_hash }: { url: string; uri_hash: string }) =>
       api<SubSyncResult>(`/api/admin/panels/${id}/outbounds/subscription`, {
         method: "POST",
-        body: JSON.stringify({ url, ping: false }),
+        body: JSON.stringify({ url, uri_hash, ping: true }),
         timeoutMs: 90_000,
       }),
     onSuccess: (res) => {
@@ -268,10 +297,14 @@ export default function OutboundsPage() {
         qc.invalidateQueries({ queryKey: ["astra-outbound-sub", id] });
       }
       qc.invalidateQueries({ queryKey: ["astra-health", id] });
+      setSubPreview(null);
+      setPickedHash(null);
       setSubUrl("");
+      const name = res.outbounds?.[0]?.remark || "";
       flash(
         true,
-        `ساب همگام شد — ${toFaDigits(res.total)} کانفیگ` +
+        `اوتباند از ساب ست شد` +
+          (name ? ` · ${name}` : "") +
           (res.subscription?.title ? ` · ${res.subscription.title}` : "")
       );
     },
@@ -296,23 +329,29 @@ export default function OutboundsPage() {
         void refetchSub();
       }
       qc.invalidateQueries({ queryKey: ["astra-health", id] });
-      flash(
-        true,
-        `بروزرسانی ساب — ${toFaDigits(res.total)} کانفیگ` +
-          (res.created || res.removed
-            ? ` (جدید ${toFaDigits(res.created)} · حذف ${toFaDigits(res.removed)})`
-            : "")
-      );
     },
     onError: (e: Error) => flash(false, e.message),
   });
 
-  // Auto-refresh bound subscription once when opening the page
+  // Always pull fresh title/usage from the bound sub when opening this page
+  useEffect(() => {
+    autoSynced.current = false;
+  }, [id]);
+
   useEffect(() => {
     if (!boundSub?.url || autoSynced.current) return;
-    if (syncSub.isPending || bindSub.isPending) return;
+    if (syncSub.isPending || bindSub.isPending || previewSub.isPending) return;
     autoSynced.current = true;
-    syncSub.mutate();
+    syncSub.mutate(undefined, {
+      onSuccess: (res) => {
+        if (res.outbounds) {
+          qc.setQueryData(["astra-outbounds", id], res.outbounds);
+        }
+        if (res.subscription) {
+          qc.setQueryData(["astra-outbound-sub", id], res.subscription);
+        }
+      },
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [boundSub?.url]);
 
@@ -376,9 +415,12 @@ export default function OutboundsPage() {
       api(`/api/admin/panels/${id}/outbounds/${oid}`, { method: "DELETE" }),
     onSuccess: (_d, oid) => {
       setConfirmId(null);
+      setSubPreview(null);
+      setPickedHash(null);
       qc.setQueryData<AstraOutbound[]>(["astra-outbounds", id], (cur) =>
         (cur || []).filter((r) => r.id !== oid)
       );
+      qc.invalidateQueries({ queryKey: ["astra-outbound-sub", id] });
       flash(true, "اوتباند حذف شد — می‌توانید اوتباند جدید اضافه کنید");
     },
     onError: (e: Error) => flash(false, e.message),
@@ -462,17 +504,29 @@ export default function OutboundsPage() {
 
   function onAdd(e: FormEvent) {
     e.preventDefault();
-    if (addMode === "sub") {
-      const u = subUrl.trim();
+    if (addMode === "sub" || (hasOutbound && boundSub)) {
+      const u = (subUrl.trim() || boundSub?.url || "").trim();
       if (!u) return;
-      bindSub.mutate(u);
+      // Step 1: fetch configs. Step 2 (picker confirm) calls bindSub.
+      if (subPreview && pickedHash && subPreview.url === u) {
+        bindSub.mutate({ url: u, uri_hash: pickedHash });
+        return;
+      }
+      previewSub.mutate(u);
       return;
     }
     if (!text.trim() || (hasOutbound && !boundSub)) return;
     add.mutate();
   }
 
-  const subBusy = bindSub.isPending || syncSub.isPending;
+  function onConfirmPick() {
+    const u = (subPreview?.url || subUrl.trim() || boundSub?.url || "").trim();
+    if (!u || !pickedHash) return;
+    bindSub.mutate({ url: u, uri_hash: pickedHash });
+  }
+
+  const subBusy =
+    bindSub.isPending || syncSub.isPending || previewSub.isPending;
   const usedTraffic =
     (boundSub?.upload || 0) + (boundSub?.download || 0);
   const subLimit = boundSub?.total || 0;
@@ -724,18 +778,36 @@ export default function OutboundsPage() {
                     </p>
                   </div>
                 </div>
-                <button
-                  type="button"
-                  className="ob-btn accent"
-                  disabled={subBusy}
-                  onClick={() => syncSub.mutate()}
-                >
-                  <RefreshCw
-                    size={15}
-                    className={syncSub.isPending ? "configs-spin" : undefined}
-                  />
-                  {syncSub.isPending ? "در حال بروزرسانی…" : "بروزرسانی از ساب"}
-                </button>
+                <div className="ob-sub-actions">
+                  <button
+                    type="button"
+                    className="ob-btn ghost"
+                    disabled={subBusy}
+                    onClick={() => {
+                      setSubUrl(boundSub.url);
+                      previewSub.mutate(boundSub.url);
+                    }}
+                  >
+                    تعویض کانفیگ
+                  </button>
+                  <button
+                    type="button"
+                    className="ob-btn accent"
+                    disabled={subBusy}
+                    onClick={() =>
+                      syncSub.mutate(undefined, {
+                        onSuccess: () =>
+                          flash(true, "مصرف و مشخصات ساب تازه شد"),
+                      })
+                    }
+                  >
+                    <RefreshCw
+                      size={15}
+                      className={syncSub.isPending ? "configs-spin" : undefined}
+                    />
+                    {syncSub.isPending ? "در حال بروزرسانی…" : "بروزرسانی از ساب"}
+                  </button>
+                </div>
               </div>
               <div className="ob-sub-meta">
                 <div>
@@ -755,8 +827,8 @@ export default function OutboundsPage() {
                   <strong>{subExpireLabel(boundSub.expire)}</strong>
                 </div>
                 <div>
-                  <span className="muted">کانفیگ‌ها</span>
-                  <strong>{toFaDigits(boundSub.count || rows.length)}</strong>
+                  <span className="muted">کانفیگ‌های ساب</span>
+                  <strong>{toFaDigits(boundSub.count || 0)}</strong>
                 </div>
                 <div>
                   <span className="muted">آخرین همگام‌سازی</span>
@@ -767,6 +839,12 @@ export default function OutboundsPage() {
                   </strong>
                 </div>
               </div>
+              {rows[0] ? (
+                <p className="ob-sub-picked">
+                  کانفیگ این اوتباند:{" "}
+                  <strong dir="auto">{rows[0].remark || "—"}</strong>
+                </p>
+              ) : null}
               {boundSub.error ? (
                 <p className="ob-sub-err">{boundSub.error}</p>
               ) : null}
@@ -776,7 +854,7 @@ export default function OutboundsPage() {
                   e.preventDefault();
                   const u = subUrl.trim() || boundSub.url;
                   if (!u || subBusy) return;
-                  bindSub.mutate(u);
+                  previewSub.mutate(u);
                 }}
               >
                 <input
@@ -784,7 +862,11 @@ export default function OutboundsPage() {
                   dir="ltr"
                   placeholder="تعویض آدرس ساب…"
                   value={subUrl}
-                  onChange={(e) => setSubUrl(e.target.value)}
+                  onChange={(e) => {
+                    setSubUrl(e.target.value);
+                    setSubPreview(null);
+                    setPickedHash(null);
+                  }}
                   autoComplete="off"
                   spellCheck={false}
                 />
@@ -793,7 +875,7 @@ export default function OutboundsPage() {
                   className="ob-btn ghost"
                   disabled={subBusy || !(subUrl.trim() || boundSub.url)}
                 >
-                  {bindSub.isPending ? "…" : "ثبت آدرس جدید"}
+                  {previewSub.isPending ? "…" : "لیست کانفیگ‌ها"}
                 </button>
               </form>
             </section>
@@ -810,7 +892,7 @@ export default function OutboundsPage() {
                     <h2>افزودن اوتباند</h2>
                     <p>
                       {addMode === "sub"
-                        ? "لینک ساب را بدهید — کانفیگ‌ها با نام و حجم ساب اضافه و هر بار همگام می‌شوند"
+                        ? "لینک ساب را بدهید، از لیست یک کانفیگ برای این اوتباند انتخاب کنید"
                         : "یک لینک share برای این پنل — بعد از افزودن، تست خودکار زده می‌شود"}
                     </p>
                   </div>
@@ -829,7 +911,11 @@ export default function OutboundsPage() {
                     role="tab"
                     aria-selected={addMode === "link"}
                     className={`ob-add-mode${addMode === "link" ? " on" : ""}`}
-                    onClick={() => setAddMode("link")}
+                    onClick={() => {
+                      setAddMode("link");
+                      setSubPreview(null);
+                      setPickedHash(null);
+                    }}
                   >
                     لینک کانفیگ
                   </button>
@@ -863,7 +949,11 @@ export default function OutboundsPage() {
                     dir="ltr"
                     placeholder="https://example.com/sub/xxxx"
                     value={subUrl}
-                    onChange={(e) => setSubUrl(e.target.value)}
+                    onChange={(e) => {
+                      setSubUrl(e.target.value);
+                      setSubPreview(null);
+                      setPickedHash(null);
+                    }}
                     autoComplete="off"
                     spellCheck={false}
                   />
@@ -880,7 +970,7 @@ export default function OutboundsPage() {
                 <div className="ob-compose-foot">
                   <p>
                     {addMode === "sub" || hasOutbound
-                      ? "نام و حجم از هدر ساب خوانده می‌شود و با هر ورود به صفحه بروز می‌شود"
+                      ? "مصرف و اسم ساب با هر بار ورود به این صفحه تازه می‌شود"
                       : "vless · vmess · trojan · ss — افزودن تکی یک اوتباند"}
                   </p>
                   <button
@@ -894,18 +984,104 @@ export default function OutboundsPage() {
                         : !text.trim())
                     }
                   >
-                    {bindSub.isPending
-                      ? "در حال دریافت ساب…"
-                      : add.isPending
+                    {previewSub.isPending
+                      ? "در حال خواندن ساب…"
+                      : bindSub.isPending
                         ? "در حال افزودن…"
-                        : addMode === "sub" || hasOutbound
-                          ? "افزودن از ساب"
-                          : "افزودن اوتباند"}
+                        : add.isPending
+                          ? "در حال افزودن…"
+                          : addMode === "sub" || hasOutbound
+                            ? "نمایش کانفیگ‌های ساب"
+                            : "افزودن اوتباند"}
                   </button>
                 </div>
               </form>
             </section>
           )}
+
+          {subPreview ? (
+            <section className="ob-pick-card" aria-label="انتخاب کانفیگ از ساب">
+              <div className="ob-pick-head">
+                <div>
+                  <h2>انتخاب کانفیگ برای این اوتباند</h2>
+                  <p>
+                    {subPreview.title ? `${subPreview.title} · ` : ""}
+                    {toFaDigits(subPreview.count)} کانفیگ — موارد استفاده‌شده در
+                    اوتباند دیگر کمرنگ‌اند
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="ob-btn ghost"
+                  onClick={() => {
+                    setSubPreview(null);
+                    setPickedHash(null);
+                  }}
+                >
+                  بستن
+                </button>
+              </div>
+              <ul className="ob-pick-list">
+                {subPreview.configs.map((c) => {
+                  const selected = pickedHash === c.uri_hash;
+                  const dimmed = c.used;
+                  return (
+                    <li key={c.uri_hash}>
+                      <button
+                        type="button"
+                        className={`ob-pick-item${selected ? " on" : ""}${
+                          dimmed ? " used" : ""
+                        }`}
+                        disabled={dimmed}
+                        onClick={() => {
+                          if (dimmed) return;
+                          setPickedHash(c.uri_hash);
+                        }}
+                        title={
+                          dimmed
+                            ? `روی پنل «${c.used_by_panel_name || "دیگر"}» استفاده شده`
+                            : c.remark
+                        }
+                      >
+                        <span className="ob-pick-idx">#{toFaDigits(c.index)}</span>
+                        <span className="ob-pick-body">
+                          <strong dir="auto">{c.remark}</strong>
+                          <small dir="ltr">
+                            {c.protocol} · {c.host}:{c.port}
+                          </small>
+                          {dimmed ? (
+                            <em>
+                              استفاده‌شده
+                              {c.used_by_panel_name
+                                ? ` · ${c.used_by_panel_name}`
+                                : ""}
+                            </em>
+                          ) : null}
+                        </span>
+                        {selected ? (
+                          <CheckCircle2 size={18} className="ob-pick-check" />
+                        ) : null}
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+              <div className="ob-pick-foot">
+                <p>
+                  بعداً می‌توانید همین ساب را روی اوتباند دیگر با کانفیگ دیگری
+                  بزنید.
+                </p>
+                <button
+                  type="button"
+                  className="ob-btn accent"
+                  disabled={subBusy || !pickedHash}
+                  onClick={onConfirmPick}
+                >
+                  {bindSub.isPending ? "در حال ثبت…" : "ثبت روی این اوتباند"}
+                </button>
+              </div>
+            </section>
+          ) : null}
 
           {hasOutbound && !boundSub ? (
             <p className="ob-slot-note">
