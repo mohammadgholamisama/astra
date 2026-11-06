@@ -239,3 +239,47 @@ def arrange_rank_dicts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         or "",
         cost_of=lambda d: d.get("usage_cost"),
     )
+
+
+def arrange_subscription_rows(
+    rows: list[dict[str, Any]],
+    *,
+    ping_rank_of: Callable[[dict[str, Any]], Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Order one user's sub feed by group.order_kind slots.
+
+    Layout is fixed whether or not AstraPing has scores:
+      20 direct → tunnel (≤35/cost, budget 70) → 9 gaming → leftover
+
+    ``ping_rank_of`` only ranks *inside* a slot (lower positive = better).
+    Missing / non-positive rank → still stays in its order_kind slot.
+    """
+
+    def _kind(row: dict[str, Any]) -> str:
+        return normalize_order_kind(
+            str(row.get("order_kind") or row.get("category_name") or "")
+        )
+
+    def _avg(row: dict[str, Any]) -> float:
+        if ping_rank_of is None:
+            return -1.0
+        try:
+            v = float(ping_rank_of(row))
+        except (TypeError, ValueError):
+            return -1.0
+        # Non-positive / huge sentinel = unscored (slot still filled)
+        if v <= 0 or v >= 10**6:
+            return -1.0
+        return v
+
+    # Stamp canonical order_kind so remarks / debug see the same bucket
+    for row in rows:
+        row["order_kind"] = _kind(row)
+
+    return arrange_by_category_slots(
+        rows,
+        avg_of=_avg,
+        label_of=lambda row: str(row.get("config_tag") or ""),
+        category_of=_kind,
+        cost_of=lambda row: row.get("usage_cost"),
+    )

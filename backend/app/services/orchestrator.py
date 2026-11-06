@@ -4029,11 +4029,13 @@ async def resolve_group_panel_claims(db: AsyncSession, user: User) -> list[dict]
         .where(Group.id.in_(gids), Group.is_disabled.is_(False))
         .order_by(Group.id.asc())
     )
+    from app.services.ping_category_order import normalize_order_kind as _nok_claim
+
     meta_by_gid = {
         int(gid): (
             _normalize_config_tag(tag),
             str(name or ""),
-            str(order_kind or "other"),
+            _nok_claim(str(order_kind or "other")),
             usage_cost,
         )
         for gid, tag, name, order_kind, usage_cost in g_rows.all()
@@ -4080,7 +4082,9 @@ def _claims_from_loaded_groups(user: User) -> list[dict]:
         if bool(getattr(group, "is_disabled", False)):
             continue
         tag = _normalize_config_tag(getattr(group, "config_tag", None))
-        order_kind = str(getattr(group, "order_kind", None) or "other")
+        from app.services.ping_category_order import normalize_order_kind as _nok
+
+        order_kind = _nok(str(getattr(group, "order_kind", None) or "other"))
         usage_cost = getattr(group, "usage_cost", None)
         for gpl in getattr(group, "panel_links", None) or []:
             pid = int(getattr(gpl, "panel_id", 0) or 0)
@@ -4197,14 +4201,20 @@ async def collect_links_detailed(
             expire_ts = int(time.time()) + hold_dur
     groups = list(getattr(user, "groups", None) or user.__dict__.get("groups") or [])
 
-    # Prefer already-loaded group→panel graph (no extra SQL) on the hot sub path.
+    # Prefer fresh order_kind/usage_cost from DB when available so admin
+    # «نوع ترتیب ساب» changes apply on the next /sub hit (not a stale graph).
     loaded_claims = _claims_from_loaded_groups(user)
-    if loaded_claims:
-        claims = loaded_claims
-    elif db is not None:
-        claims = await resolve_group_panel_claims(db, user)
+    if db is not None:
+        try:
+            claims = await resolve_group_panel_claims(db, user)
+        except Exception:  # noqa: BLE001
+            claims = loaded_claims
+        if not claims:
+            claims = loaded_claims
     else:
         claims = loaded_claims
+
+    from app.services.ping_category_order import normalize_order_kind
 
     tag_by_gid = {str(c["group_id"]): _normalize_config_tag(c.get("tag")) for c in claims}
     kind_by_gid: dict[str, str] = {}
@@ -4216,16 +4226,21 @@ async def collect_links_detailed(
         gid_s = str(c["group_id"])
         pid_c = int(c.get("panel_id") or 0)
         t = _normalize_config_tag(c.get("tag"))
-        ok = str(c.get("order_kind") or "other")
+        ok = normalize_order_kind(str(c.get("order_kind") or "other"))
         uc = c.get("usage_cost")
         if gid_s not in kind_by_gid:
             kind_by_gid[gid_s] = ok
             cost_by_gid[gid_s] = uc
         if pid_c and t and pid_c not in tag_by_panel:
             tag_by_panel[pid_c] = t
-        if pid_c and pid_c not in kind_by_panel:
-            kind_by_panel[pid_c] = ok
-            cost_by_panel[pid_c] = uc
+        # Prefer a real bucket over «other» when several groups share a panel
+        if pid_c:
+            prev_k = kind_by_panel.get(pid_c)
+            if prev_k is None or (
+                prev_k == "other" and ok != "other"
+            ):
+                kind_by_panel[pid_c] = ok
+                cost_by_panel[pid_c] = uc
 
     def _tag_for(gid: object, pid: int) -> str:
         if gid is not None:
@@ -4465,10 +4480,9 @@ async def collect_links_detailed(
         except Exception:  # noqa: BLE001
             pass
 
-    # Dedupe by endpoint fingerprint, then arrange THIS user's inventory into
-    # order_kind slots (20 direct / tunnel budget / 9 gaming). Global
-    # ConfigLinkOrder alone is wrong here: when a user lacks mid-list tunnels,
-    # leftover directs "compress" forward past slot 20.
+    # Dedupe by endpoint fingerprint, then arrange THIS user's inventory by
+    # group.order_kind (20 direct → tunnel budget → 9 gaming). Ping/app scores
+    # only reorder inside a slot — never move a config across buckets.
     from app.services.config_locations import (
         extract_link_client_id,
         extract_link_endpoint,
@@ -4480,12 +4494,16 @@ async def collect_links_detailed(
     from app.services.config_orders import link_order_index
     from app.services.ping_category_order import (
         SUB_MAX_CONFIGS,
-        arrange_by_category_slots,
+        arrange_subscription_rows,
+        normalize_order_kind,
     )
 
     by_fp: dict[tuple, dict] = {}
     no_fp: list[dict] = []
     for row in rows:
+        row["order_kind"] = normalize_order_kind(
+            str(row.get("order_kind") or "other")
+        )
         link = str(row.get("link") or "")
         ep = extract_link_endpoint(link)
         key: tuple | None = None
@@ -4513,8 +4531,8 @@ async def collect_links_detailed(
             prev["config_tag"] = new_tag
             if row.get("group_id") is not None:
                 prev["group_id"] = row.get("group_id")
-        new_kind = str(row.get("order_kind") or "other")
-        old_kind = str(prev.get("order_kind") or "other")
+        new_kind = normalize_order_kind(str(row.get("order_kind") or "other"))
+        old_kind = normalize_order_kind(str(prev.get("order_kind") or "other"))
         if new_kind != "other" and old_kind == "other":
             prev["order_kind"] = new_kind
             prev["usage_cost"] = row.get("usage_cost")
@@ -4522,18 +4540,13 @@ async def collect_links_detailed(
                 prev["group_id"] = row.get("group_id")
     rows = list(by_fp.values()) + no_fp
 
-    # Within each slot, prefer admin ping rank (lower global index = better).
-    rows = arrange_by_category_slots(
+    rows = arrange_subscription_rows(
         rows,
-        avg_of=lambda row: float(
-            link_order_index(str(row.get("link") or "")) + 1
-        ),
-        label_of=lambda row: str(row.get("config_tag") or ""),
-        category_of=lambda row: str(row.get("order_kind") or "other"),
-        cost_of=lambda row: row.get("usage_cost"),
+        ping_rank_of=lambda row: link_order_index(str(row.get("link") or "")),
     )
 
-    # Normal clients: max SUB_MAX_CONFIGS. Probe/AstraPing (include_hidden): all.
+    # Normal clients: max SUB_MAX_CONFIGS. Probe/AstraPing (include_hidden): all
+    # configs, still in the same order_kind slot layout.
     if not include_hidden:
         max_n = int(SUB_MAX_CONFIGS)
         if max_n > 0 and len(rows) > max_n:
