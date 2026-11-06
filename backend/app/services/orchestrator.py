@@ -4169,9 +4169,10 @@ async def collect_links_detailed(
 
     Order (every sub — client feed + HTML):
       1) status row (✨ user - remain - days ✨) — always, live values
-      2) promo rows — up to 2 when enabled in settings
-      3) group notices (کانفیگ اضافه) — optional, unchanged text
-      4) real configs — ``#N. 2.5G | name`` or ``#N. text 2.5G | name``
+      2) group notices (کانفیگ اضافه) — optional, unchanged text
+      3) up to 20 مستقیم real configs (promo/status do **not** reduce this)
+      4) promo rows — up to 2 when enabled (after the direct block)
+      5) تانل / گیمینگ / leftover real configs
 
     Each real config gets the ``config_tag`` of the Astra group that owns it:
     protocol split for Marzban, remote_group_ids partition for PasarGuard.
@@ -4262,6 +4263,10 @@ async def collect_links_detailed(
             cost_by_panel.get(int(pid)),
         )
 
+    # Status/volume stays at the very top (1 row). Promo ads are NOT prepended
+    # here — they used to sit before the 20 directs so clients that look at the
+    # first ~20 lines only saw ~17 directs. Promos are injected after the
+    # direct slot below.
     head: list[dict] = [
         build_status_row(
             username=status_name,
@@ -4272,12 +4277,13 @@ async def collect_links_detailed(
             panel_label=get_status_panel_label(),
         )
     ]
+    promo_rows: list[dict] = []
     for promo_text in get_promo_config_texts_for_user(
         include_first=bool(getattr(user, "include_promo_first", True))
     ):
         promo = build_promo_row(promo_text)
         if promo:
-            head.append(promo)
+            promo_rows.append(promo)
 
     notices = notice_rows_from_groups(groups) if include_notices else []
     rows: list[dict] = []
@@ -4496,6 +4502,7 @@ async def collect_links_detailed(
     )
     from app.services.config_orders import link_order_index
     from app.services.ping_category_order import (
+        DIRECT_SLOT,
         SUB_MAX_CONFIGS,
         arrange_subscription_rows,
         normalize_order_kind,
@@ -4562,7 +4569,25 @@ async def collect_links_detailed(
         limit=limit,
         username=getattr(user, "username", None),
     )
-    return head + notices + renamed
+    # Feed layout:
+    #   status (+ optional group notices)
+    #   → up to 20 مستقیم (promo/status never eat this quota)
+    #   → promo ads
+    #   → تانل / گیمینگ / leftover
+    direct_end = 0
+    for idx, row in enumerate(renamed):
+        if normalize_order_kind(str(row.get("order_kind") or "")) != "direct":
+            break
+        direct_end = idx + 1
+        if direct_end >= int(DIRECT_SLOT):
+            break
+    return (
+        head
+        + notices
+        + renamed[:direct_end]
+        + promo_rows
+        + renamed[direct_end:]
+    )
 
 
 async def hydrate_share_links(db: AsyncSession, user: User) -> int:
