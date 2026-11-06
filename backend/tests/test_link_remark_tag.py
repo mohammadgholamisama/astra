@@ -50,3 +50,20 @@ def test_clip_does_not_cut_decimal_at_boundary():
     assert len(prefix) == 198
     out = _clip_config_tag(tag)
     assert "۱.۵" in out
+
+
+def test_user_coefficient_x1_2_not_sliced_like_old_24():
+    """Live bug: old tag[:24] turned «…باضریبx1.2]» into «…باضریبx1»."""
+    tag = "[گیگی5,000تومانTباضریبx1.2]"
+    assert len(tag) > 24
+    assert tag[:24] == "[گیگی5,000تومانTباضریبx1"  # what clients used to see
+    remark = build_config_remark(
+        name="dfgfdfddf",
+        config_id=99,
+        used=0,
+        limit=50 * 1024**3,
+        brand_tag=tag,
+    )
+    assert "باضریبx1.2]" in remark
+    assert "باضریبx1 50G" not in remark
+    assert remark.startswith("#99.")

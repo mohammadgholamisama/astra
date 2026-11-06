@@ -1030,8 +1030,9 @@ export default function GroupsPage() {
                 <label>متن روی کانفیگ‌های این گروه در ساب (اختیاری)</label>
                 <input
                   value={configTag}
+                  maxLength={200}
                   onChange={(e) => setConfigTag(e.target.value)}
-                  placeholder="مثلاً VIP — خالی = بدون متن اضافه"
+                  placeholder="مثلاً گیگی باضریبx1.2 — خالی = بدون متن اضافه"
                 />
                 <p className="field-hint" dir="ltr">
                   {configTag.trim()
@@ -1039,9 +1040,10 @@ export default function GroupsPage() {
                     : "#1. 2.5G | user"}
                 </p>
                 <p className="field-hint">
-                  فقط روی کانفیگ‌های پنل‌های همین گروه اعمال می‌شود — از لحظه ذخیره روی همه
-                  ساب‌های قبلی کاربران این گروه هم می‌آید (کلاینت ممکن است تا یک ساعت بعد
-                  تازه‌سازی کند).
+                  ضریب اعشاری (x1.2 / ۱.۵) کامل می‌ماند — حداکثر ۲۰۰ کاراکتر
+                  {configTag.trim() ? ` (${configTag.trim().length}/200)` : ""}.
+                  فقط روی کانفیگ‌های همین گروه است؛ بعد از ذخیره، ساب را یک‌بار
+                  Force Update کنید (کلاینت ممکن است تا یک ساعت کش کند).
                 </p>
               </div>
 

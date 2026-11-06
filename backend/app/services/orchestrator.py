@@ -3702,7 +3702,10 @@ async def heal_failed_panel_accounts_batch(
 
 
 def _normalize_config_tag(raw: object) -> str:
-    return " ".join(str(raw or "").split()).strip()[:200]
+    # Shared with link_remark — never mid-cut coefficients like x1.2 → x1
+    from app.services.link_remark import _clip_config_tag
+
+    return _clip_config_tag(raw)
 
 
 def _link_protocol(link: str) -> str:

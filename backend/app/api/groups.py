@@ -197,9 +197,10 @@ async def _bg_recount_group_users(group_id: int) -> None:
 
 
 def _normalize_config_tag(raw: str | None) -> str:
-    text = " ".join(str(raw or "").split()).strip()
-    text = "".join(ch for ch in text if ord(ch) >= 32 and ch not in "<>\"'`")
-    return text[:200]
+    # Same clip as sub remarks — keep x1.2 / ۱.۵ intact (never silent [:24]).
+    from app.services.link_remark import _clip_config_tag
+
+    return _clip_config_tag(raw)
 
 
 def _normalize_usage_cost(raw: int | None) -> int | None:
