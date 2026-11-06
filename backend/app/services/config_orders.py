@@ -736,6 +736,7 @@ async def apply_ping_rank(
     packet_loss: dict[tuple[str, int, str], float] = {}
     jitters: dict[tuple[str, int, str], float] = {}
     stabilities: dict[tuple[str, int, str], float] = {}
+    uptimes: dict[tuple[str, int, str], float] = {}
     devices: dict[tuple[str, int, str], int] = {}
     labels: dict[tuple[str, int, str], str] = {}
     # host:port → best exact key (fallback when match_host differs app↔panel)
@@ -789,6 +790,14 @@ async def apply_ping_rank(
                 )
             except (TypeError, ValueError):
                 stab = -1.0
+            try:
+                up = (
+                    float(raw.get("uptime_pct"))
+                    if raw.get("uptime_pct") is not None
+                    else -1.0
+                )
+            except (TypeError, ValueError):
+                up = -1.0
             dcount = int(raw.get("device_count") or 0)
         except (TypeError, ValueError):
             continue
@@ -803,8 +812,9 @@ async def apply_ping_rank(
         speed_ok = dl > 0 or ul > 0
         packet_ok = has_pkt and 0 <= pkt < 100
         stab_ok = stab > 0
+        up_ok = up > 0
         # Failures are ignored for ordering — never scored, never hidden
-        if not (avg > 0 or speed_ok or packet_ok or stab_ok):
+        if not (avg > 0 or speed_ok or packet_ok or stab_ok or up_ok):
             continue
 
         if avg > 0:
@@ -834,6 +844,10 @@ async def apply_ping_rank(
             prev_stab = stabilities.get(key)
             if prev_stab is None or stab > prev_stab:
                 stabilities[key] = stab
+        if up >= 0:
+            prev_up = uptimes.get(key)
+            if prev_up is None or up > prev_up:
+                uptimes[key] = up
         # Also index empty-match alias so panel rows without SNI still hit
         empty_key = _fp_key(key[0], key[1], "")
         if empty_key not in score:
@@ -849,6 +863,8 @@ async def apply_ping_rank(
                 jitters[empty_key] = jitters[key]
             if key in stabilities:
                 stabilities[empty_key] = stabilities[key]
+            if key in uptimes:
+                uptimes[empty_key] = uptimes[key]
         _remember_hp(key)
 
     if not current:
@@ -889,6 +905,7 @@ async def apply_ping_rank(
         packet_of=lambda it: packet_loss.get(_sk(it), 101.0),
         jitter_of=lambda it: jitters.get(_sk(it), -1.0),
         stability_of=lambda it: stabilities.get(_sk(it), -1.0),
+        uptime_of=lambda it: uptimes.get(_sk(it), -1.0),
         # Only group.order_kind (exposed as category_name on workspace items)
         category_of=lambda it: getattr(it, "category_name", None) or "",
         cost_of=lambda it: getattr(it, "usage_cost", None),

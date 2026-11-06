@@ -58,6 +58,7 @@ class PingRankItemIn(BaseModel):
     has_packet_loss: bool = False
     jitter_ms: float = -1
     stability_pct: float = -1
+    uptime_pct: float = -1
     sample_count: int = 0
     device_count: int = 0
     # Legacy field — ignored by apply_ping_rank (tests never auto-hide)

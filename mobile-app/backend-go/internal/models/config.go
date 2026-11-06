@@ -108,6 +108,7 @@ type FingerprintRank struct {
 	HasPacketLoss   bool    `json:"has_packet_loss,omitempty"`
 	JitterMs        float64 `json:"jitter_ms,omitempty"`
 	StabilityPct    float64 `json:"stability_pct,omitempty"`
+	UptimePct       float64 `json:"uptime_pct,omitempty"`
 	SampleCount     int     `json:"sample_count"`
 	DeviceCount     int     `json:"device_count"`
 	FailDeviceCount int     `json:"fail_device_count,omitempty"`

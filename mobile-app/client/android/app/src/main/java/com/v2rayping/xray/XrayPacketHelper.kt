@@ -32,8 +32,9 @@ object XrayPacketHelper {
     perProbeTimeoutMs: Long,
     isCancelled: () -> Boolean,
   ): Result {
-    val n = probes.coerceIn(5, 30)
-    val timeout = perProbeTimeoutMs.coerceIn(600L, 4_000L)
+    // Up to 100 probes → 1% resolution (e.g. 97% not snapped to 100/90)
+    val n = probes.coerceIn(5, 100)
+    val timeout = perProbeTimeoutMs.coerceIn(400L, 4_000L)
     val port = nextPort()
     val configJson =
       XrayConfigBuilder.fromShareLinkWithSocks(shareLink, port)
@@ -67,7 +68,7 @@ object XrayPacketHelper {
         if (probeOnce(proxy, timeout)) ok += 1
         // Tiny gap so path isn't perfectly pipelined
         if (i < n - 1 && !isCancelled()) {
-          Thread.sleep(40)
+          Thread.sleep(15)
         }
       }
     } catch (t: Throwable) {
@@ -80,8 +81,10 @@ object XrayPacketHelper {
     }
 
     if (sent < 1) return Result(-1.0, 0, 0)
+    // Exact percent from counts — keep 1 decimal, never snap to 0/100 wrongly
     val loss = ((sent - ok).toDouble() / sent.toDouble()) * 100.0
-    return Result((loss * 10.0).roundToInt() / 10.0, sent, ok)
+    val precise = (loss * 10.0).roundToInt() / 10.0
+    return Result(precise.coerceIn(0.0, 100.0), sent, ok)
   }
 
   private fun probeOnce(proxy: Proxy, timeoutMs: Long): Boolean {

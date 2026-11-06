@@ -64,7 +64,7 @@ class PingMonitorService : Service() {
   }
 
   private fun fireHeadless() {
-    // Never start a background test while system VPN is up
+    // Skip only if THIS app's traffic is through VPN (excluded apps OK)
     if (NetworkGuardModule.checkVpnActive(applicationContext)) {
       return
     }

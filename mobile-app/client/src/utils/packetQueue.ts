@@ -52,8 +52,8 @@ export async function runPacketQueue(
   if (targets.length === 0) return pingResults.map((r) => ({ ...r }));
 
   const concurrency = Math.max(1, Math.min(options.concurrency ?? 2, 3));
-  const probes = options.probes ?? 10;
-  const perMs = options.perProbeTimeoutMs ?? 1500;
+  const probes = options.probes ?? 100;
+  const perMs = options.perProbeTimeoutMs ?? 800;
   const total = targets.length;
   let nextIndex = 0;
   let completed = 0;

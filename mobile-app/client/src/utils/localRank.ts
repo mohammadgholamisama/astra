@@ -1,6 +1,20 @@
 import type { LocalPingResult, ParsedConfig, RankedConfig } from '../types';
+import {
+  entrySeen,
+  type UptimeMap,
+  uptimePct,
+  uptimeRankKey,
+} from './uptimeHistory';
 
 type LiveMap = Map<string, LocalPingResult>;
+
+export type RankLocallyOptions = {
+  testingHashes?: Set<string> | string | null;
+  /** Cross-cycle history; always attached to rows when present. */
+  uptimeMap?: UptimeMap;
+  /** When true, sort by uptime (2nd after stability). */
+  useUptime?: boolean;
+};
 
 function positiveKbps(v: number | undefined): number {
   return v != null && v > 0 ? v : 0;
@@ -27,23 +41,33 @@ function stabilitySortKey(v: number | undefined): number {
  * In-app list order.
  * Alive = ping>0 OR download/upload>0 OR packet loss measured with <100%
  *   OR stability>0.
- * Rank: stability ↓ → jitter ↑ → ping ↑ → upload ↓ → download ↓ → packet loss ↑
+ * Rank: stability ↓ → uptime ↓ → jitter ↑ → ping ↑ → upload ↓ → download ↓ → loss ↑
  */
 export function rankLocally(
   configs: ParsedConfig[],
   results: LocalPingResult[] | LiveMap,
-  testingHashes?: Set<string> | string | null,
+  testingHashesOrOpts?: Set<string> | string | null | RankLocallyOptions,
 ): RankedConfig[] {
+  const opts: RankLocallyOptions =
+    testingHashesOrOpts != null &&
+    typeof testingHashesOrOpts === 'object' &&
+    !(testingHashesOrOpts instanceof Set) &&
+    !Array.isArray(testingHashesOrOpts)
+      ? (testingHashesOrOpts as RankLocallyOptions)
+      : { testingHashes: testingHashesOrOpts as Set<string> | string | null };
+
   const byHash: LiveMap =
     results instanceof Map
       ? results
       : new Map(results.map((r) => [r.configHash, r]));
   const testingSet =
-    testingHashes instanceof Set
-      ? testingHashes
-      : testingHashes
-        ? new Set([testingHashes])
+    opts.testingHashes instanceof Set
+      ? opts.testingHashes
+      : opts.testingHashes
+        ? new Set([opts.testingHashes])
         : new Set<string>();
+  const uptimeMap = opts.uptimeMap ?? {};
+  const useUptime = !!opts.useUptime;
 
   const rows: RankedConfig[] = configs.map((c) => {
     const r = byHash.get(c.configHash);
@@ -80,6 +104,10 @@ export function rankLocally(
         ? -2
         : -1;
 
+    const uEntry = uptimeMap[c.configHash];
+    const uPct = uptimePct(uEntry);
+    const uSamples = entrySeen(uEntry);
+
     return {
       rank: 0,
       config_hash: c.configHash,
@@ -97,6 +125,8 @@ export function rankLocally(
       packet_loss_pct: packetLossPct,
       jitter_ms: jitterMs,
       stability_pct: stabilityPct,
+      uptime_pct: uPct,
+      uptime_samples: uSamples > 0 ? uSamples : undefined,
       measured,
       raw: c.raw,
       uuid: c.uuid,
@@ -117,6 +147,12 @@ export function rankLocally(
     const stabA = stabilitySortKey(a.stability_pct);
     const stabB = stabilitySortKey(b.stability_pct);
     if (stabA !== stabB) return stabB - stabA;
+
+    if (useUptime) {
+      const ua = uptimeRankKey(uptimeMap[a.config_hash]);
+      const ub = uptimeRankKey(uptimeMap[b.config_hash]);
+      if (ua !== ub) return ub - ua;
+    }
 
     const jitA = jitterSortKey(a.jitter_ms);
     const jitB = jitterSortKey(b.jitter_ms);
@@ -167,4 +203,20 @@ export function configsAsPending(configs: ParsedConfig[]): RankedConfig[] {
     operator_pings: [],
     updated_at: new Date().toISOString(),
   }));
+}
+
+/** Alive this cycle? Same rule as success_rate in rankLocally. */
+export function isCycleAlive(r: LocalPingResult | undefined): boolean {
+  if (!r) return false;
+  if (r.pingMs > 0) return true;
+  if ((r.downloadKbps ?? 0) > 0 || (r.uploadKbps ?? 0) > 0) return true;
+  if (
+    r.packetLossPct != null &&
+    r.packetLossPct >= 0 &&
+    r.packetLossPct < 100
+  ) {
+    return true;
+  }
+  if (r.stabilityPct != null && r.stabilityPct > 0) return true;
+  return false;
 }

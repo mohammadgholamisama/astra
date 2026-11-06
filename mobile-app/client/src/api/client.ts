@@ -124,6 +124,7 @@ export type FingerprintRankPayload = {
   has_packet_loss?: boolean;
   jitter_ms?: number;
   stability_pct?: number;
+  uptime_pct?: number;
   sample_count?: number;
   device_count?: number;
 };

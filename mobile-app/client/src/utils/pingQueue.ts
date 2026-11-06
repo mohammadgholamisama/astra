@@ -13,6 +13,11 @@ export interface PingQueueOptions {
    * 1 = classic single ping (+ retries on miss).
    */
   samples?: number;
+  /**
+   * Optional per-sample destination URLs (stability: 6 services).
+   * Index i is used for sample i; missing → default multi-URL fallback.
+   */
+  probeUrls?: readonly string[];
   /** Include jitterMs / stabilityPct on results (default true when samples>1). */
   wantJitter?: boolean;
   wantStability?: boolean;
@@ -88,10 +93,14 @@ export async function runPingQueue(
 ): Promise<LocalPingResult[]> {
   // v2rayNG runs several workers; too many cores thrash phones
   const concurrency = Math.max(1, Math.min(options.concurrency ?? 5, 8));
-  // Match LibXray measureInstDelay (12s client) + small slack
+  // Match LibXray measureInstDelay window; JS race must not cut it short
   const timeoutMs = options.timeoutMs ?? 12_000;
   const retries = Math.max(0, options.retries ?? 1);
-  const samples = Math.max(1, Math.min(options.samples ?? 1, 5));
+  const probeUrls = options.probeUrls ?? [];
+  const samples = Math.max(
+    1,
+    Math.min(options.samples ?? (probeUrls.length > 0 ? probeUrls.length : 1), 8),
+  );
   const wantJitter = options.wantJitter ?? samples > 1;
   const wantStability = options.wantStability ?? samples > 1;
   const total = configs.length;
@@ -111,10 +120,12 @@ export async function runPingQueue(
     else options.signal.addEventListener('abort', stop, { once: true });
   }
 
-  async function realDelayOnce(raw: string): Promise<number> {
-    // Native wait ≥12s; JS race must stay above that or we invent «قطع»
+  async function realDelayOnce(
+    raw: string,
+    destUrl?: string,
+  ): Promise<number> {
     return raceAbort(
-      raceMs(pingRealDelay(raw, timeoutMs), timeoutMs + 3_000),
+      raceMs(pingRealDelay(raw, timeoutMs, destUrl), timeoutMs + 3_000),
       options.signal,
     );
   }
@@ -127,20 +138,18 @@ export async function runPingQueue(
     const taken: number[] = [];
     for (let s = 0; s < samples; s++) {
       if (stopped || options.signal?.aborted) throw abortedError();
-      let ms = await realDelayOnce(cfg.raw);
+      const dest = probeUrls[s]?.trim() || undefined;
+      let ms = await realDelayOnce(cfg.raw, dest);
       // Single-sample mode: one retry on miss (legacy behavior)
       if (samples === 1) {
         for (let attempt = 0; attempt < retries && ms <= 0; attempt++) {
           if (stopped || options.signal?.aborted) throw abortedError();
           await new Promise<void>((r) => setTimeout(r, 150));
           if (stopped || options.signal?.aborted) throw abortedError();
-          ms = await realDelayOnce(cfg.raw);
+          ms = await realDelayOnce(cfg.raw, dest);
         }
       }
       taken.push(ms);
-      if (s + 1 < samples) {
-        await new Promise<void>((r) => setTimeout(r, 80));
-      }
     }
 
     const stats = computeLatencyStats(taken);

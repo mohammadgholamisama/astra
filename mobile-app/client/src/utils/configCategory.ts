@@ -61,6 +61,9 @@ type Rankable = {
   packet_loss_pct?: number;
   jitter_ms?: number;
   stability_pct?: number;
+  /** Cross-cycle uptime 0–100; missing/new → treated as 100 in sort */
+  uptime_pct?: number;
+  uptime_samples?: number;
   label?: string;
   remark?: string;
   category_name?: string | null;
@@ -100,14 +103,27 @@ function costKey(it: Rankable): number {
   return Number(c);
 }
 
+function uptimeKey(it: Rankable): number {
+  // New / thin history → 100 (no penalty)
+  const samples = it.uptime_samples ?? 0;
+  if (samples < 2) return 100;
+  const v = it.uptime_pct;
+  if (v == null || v < 0) return 100;
+  return v;
+}
+
 /**
- * Quality: stability ↓ → jitter ↑ → ping ↑ → upload ↓ → download ↓ → loss ↑
+ * Quality: stability ↓ → uptime ↓ → jitter ↑ → ping ↑ → upload ↓ → download ↓ → loss ↑
  * (devices as weak tie-break).
  */
 function quality(a: Rankable, b: Rankable): number {
   const sa = stabilityKey(a);
   const sb = stabilityKey(b);
   if (sa !== sb) return sb - sa;
+
+  const ua = uptimeKey(a);
+  const ub = uptimeKey(b);
+  if (ua !== ub) return ub - ua;
 
   const ja = jitterKey(a);
   const jb = jitterKey(b);

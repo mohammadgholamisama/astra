@@ -13,6 +13,7 @@ export type FingerprintRankItem = {
   has_packet_loss?: boolean;
   jitter_ms?: number;
   stability_pct?: number;
+  uptime_pct?: number;
   sample_count: number;
   device_count: number;
 };
@@ -57,6 +58,8 @@ export function buildFingerprintRanksFromPage(
     jitN: number;
     stabSum: number;
     stabN: number;
+    upSum: number;
+    upN: number;
     samples: number;
   };
   const map = new Map<string, Acc>();
@@ -91,6 +94,12 @@ export function buildFingerprintRanksFromPage(
       row.stability_pct != null && row.stability_pct >= 0
         ? row.stability_pct
         : -1;
+    const up =
+      row.uptime_pct != null &&
+      row.uptime_pct >= 0 &&
+      (row.uptime_samples ?? 0) >= 2
+        ? row.uptime_pct
+        : -1;
     if (!prev) {
       map.set(key, {
         host,
@@ -109,6 +118,8 @@ export function buildFingerprintRanksFromPage(
         jitN: jit >= 0 ? 1 : 0,
         stabSum: stab >= 0 ? stab : 0,
         stabN: stab >= 0 ? 1 : 0,
+        upSum: up >= 0 ? up : 0,
+        upN: up >= 0 ? 1 : 0,
         samples: 1,
       });
     } else {
@@ -136,6 +147,10 @@ export function buildFingerprintRanksFromPage(
       if (stab >= 0) {
         prev.stabSum += stab;
         prev.stabN += 1;
+      }
+      if (up >= 0) {
+        prev.upSum += up;
+        prev.upN += 1;
       }
       if (!prev.label && row.remark) {
         prev.label = row.remark.trim().slice(0, 128);
@@ -171,6 +186,10 @@ export function buildFingerprintRanksFromPage(
       stability_pct:
         acc.stabN > 0
           ? Math.round((acc.stabSum / acc.stabN) * 10) / 10
+          : undefined,
+      uptime_pct:
+        acc.upN > 0
+          ? Math.round((acc.upSum / acc.upN) * 10) / 10
           : undefined,
       sample_count: acc.samples,
       device_count: 1,

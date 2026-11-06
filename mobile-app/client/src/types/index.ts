@@ -71,6 +71,10 @@ export interface RankedConfig {
   jitter_ms?: number;
   /** 0–100 stability; −1 / omit = unset */
   stability_pct?: number;
+  /** 0–100 cross-cycle uptime; omit = new / unset */
+  uptime_pct?: number;
+  /** How many cycles contribute to uptime_pct */
+  uptime_samples?: number;
   /** True after a ping attempt finished (success or fail). */
   measured?: boolean;
   raw?: string;
@@ -98,6 +102,7 @@ export interface PingSamplePayload {
   has_packet_loss?: boolean;
   jitter_ms?: number;
   stability_pct?: number;
+  uptime_pct?: number;
   remark?: string;
   protocol?: string;
   transport?: string;

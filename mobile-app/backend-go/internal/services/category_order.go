@@ -55,16 +55,25 @@ func stabilitySortKey(it models.FingerprintRank) float64 {
 	return it.StabilityPct
 }
 
+// New / missing uptime → 100 (no penalty). Higher is better.
+func uptimeSortKey(it models.FingerprintRank) float64 {
+	if it.UptimePct < 0 {
+		return 100
+	}
+	return it.UptimePct
+}
+
 // arrangeFingerprintSlots: 5 مستقیم → 5 تانل → 5 گیمینگ → rest by quality.
 // Success = positive ping OR speed OR packet loss < 100% OR stability > 0.
-// Quality: stability ↓ → jitter ↑ → ping ↑ → upload ↓ → download ↓ → loss ↑
+// Quality: stability ↓ → uptime ↓ → jitter ↑ → ping ↑ → upload ↓ → download ↓ → loss ↑
 func arrangeFingerprintSlots(items []models.FingerprintRank) []models.FingerprintRank {
 	ok := make([]models.FingerprintRank, 0, len(items))
 	rest := make([]models.FingerprintRank, 0)
 	for _, it := range items {
 		packetOk := it.HasPacketLoss && it.PacketLossPct >= 0 && it.PacketLossPct < 100
 		stabOk := it.StabilityPct > 0
-		if it.AvgPing > 0 || it.DownloadKbps > 0 || it.UploadKbps > 0 || packetOk || stabOk {
+		upOk := it.UptimePct > 0
+		if it.AvgPing > 0 || it.DownloadKbps > 0 || it.UploadKbps > 0 || packetOk || stabOk || upOk {
 			ok = append(ok, it)
 		} else {
 			rest = append(rest, it)
@@ -82,6 +91,10 @@ func arrangeFingerprintSlots(items []models.FingerprintRank) []models.Fingerprin
 		sa, sb := stabilitySortKey(a), stabilitySortKey(b)
 		if sa != sb {
 			return sa > sb
+		}
+		ua, ub := uptimeSortKey(a), uptimeSortKey(b)
+		if ua != ub {
+			return ua > ub
 		}
 		ja, jb := jitterSortKey(a), jitterSortKey(b)
 		if ja != jb {

@@ -2,6 +2,12 @@ import { NativeModules, Platform } from 'react-native';
 
 type NativeXrayPing = {
   pingRealDelay: (shareLink: string, timeoutMs: number) => Promise<number>;
+  /** Real Delay to one fixed URL (stability destinations). */
+  pingRealDelayUrl?: (
+    shareLink: string,
+    destUrl: string,
+    timeoutMs: number,
+  ) => Promise<number>;
   pingTcp: (host: string, port: number, timeoutMs: number) => Promise<number>;
   measureSpeed?: (
     shareLink: string,
@@ -63,17 +69,24 @@ export async function pingTcp(
 
 /**
  * Real Xray outbound delay (Reality / VLESS / …) via LibXray.
+ * Optional destUrl pins the probe to one host (stability multi-destination).
  */
 export async function pingRealDelay(
   shareLink: string,
   timeoutMs = 12_000,
+  destUrl?: string,
 ): Promise<number> {
-  if (Platform.OS === 'android' && Native?.pingRealDelay) {
-    try {
-      return normalize(await Native.pingRealDelay(shareLink, timeoutMs));
-    } catch {
-      return -1;
+  if (Platform.OS !== 'android' || !Native) return -1;
+  try {
+    const url = destUrl?.trim();
+    if (url && Native.pingRealDelayUrl) {
+      return normalize(await Native.pingRealDelayUrl(shareLink, url, timeoutMs));
     }
+    if (Native.pingRealDelay) {
+      return normalize(await Native.pingRealDelay(shareLink, timeoutMs));
+    }
+  } catch {
+    return -1;
   }
   return -1;
 }
@@ -105,11 +118,14 @@ export async function measureSpeed(
   return { downloadKbps: -1, uploadKbps: -1 };
 }
 
-/** Packet loss % (0–100) via N short HTTP probes through the config. */
+/**
+ * Packet loss % (0–100) via N short HTTP probes through the config.
+ * Default 100 probes → 1% resolution (e.g. 97% stays 97, not 90/100).
+ */
 export async function measurePacketLoss(
   shareLink: string,
-  probes = 10,
-  perProbeTimeoutMs = 1500,
+  probes = 100,
+  perProbeTimeoutMs = 800,
 ): Promise<{ lossPct: number; sent: number; ok: number }> {
   if (Platform.OS === 'android' && Native?.measurePacketLoss) {
     try {
@@ -122,10 +138,17 @@ export async function measurePacketLoss(
         typeof r?.loss_pct === 'number' && Number.isFinite(r.loss_pct)
           ? r.loss_pct
           : -1;
+      if (loss < 0) return { lossPct: -1, sent: 0, ok: 0 };
+      const sent = Number(r?.sent) || 0;
+      const ok = Number(r?.ok) || 0;
+      // Prefer exact ratio from counts when available
+      const fromCounts =
+        sent > 0 ? ((sent - ok) / sent) * 100 : loss;
+      const precise = Math.round(fromCounts * 10) / 10;
       return {
-        lossPct: loss < 0 ? -1 : Math.min(100, Math.max(0, Math.round(loss * 10) / 10)),
-        sent: Number(r?.sent) || 0,
-        ok: Number(r?.ok) || 0,
+        lossPct: Math.min(100, Math.max(0, precise)),
+        sent,
+        ok,
       };
     } catch {
       return { lossPct: -1, sent: 0, ok: 0 };

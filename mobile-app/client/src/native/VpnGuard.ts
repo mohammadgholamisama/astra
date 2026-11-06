@@ -14,7 +14,11 @@ type NativeVpn = {
 const Native = NativeModules.NetworkGuard as NativeVpn | undefined;
 const EVENT = Native?.VPN_EVENT || 'vpnStateChanged';
 
-/** True when any system VPN / tunnel interface is up. */
+/**
+ * True only when **this app's traffic** is routed through a system VPN.
+ * VPN on but this app excluded → false (tests OK).
+ * VPN on and this app included → true (block tests).
+ */
 export async function isDeviceVpnActive(): Promise<boolean> {
   if (Platform.OS !== 'android' || !Native?.isVpnActive) return false;
   try {
@@ -25,8 +29,8 @@ export async function isDeviceVpnActive(): Promise<boolean> {
 }
 
 /**
- * Subscribe to VPN up/down. Returns unsubscribe.
- * onChange only fires when the active flag actually changes.
+ * Subscribe to "app uses VPN" up/down. Returns unsubscribe.
+ * onChange only fires when the flag actually changes.
  */
 export function watchDeviceVpn(onChange: (active: boolean) => void): () => void {
   if (Platform.OS !== 'android' || !Native?.startWatching) {
@@ -53,7 +57,7 @@ export function watchDeviceVpn(onChange: (active: boolean) => void): () => void 
   const poll = setInterval(() => {
     if (!alive) return;
     void isDeviceVpnActive().then(push);
-  }, 2000);
+  }, 1500);
 
   return () => {
     alive = false;

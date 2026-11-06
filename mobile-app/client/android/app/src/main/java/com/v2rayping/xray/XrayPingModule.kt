@@ -77,6 +77,28 @@ class XrayPingModule(
 
   @ReactMethod
   fun pingRealDelay(shareLink: String, timeoutMs: Double, promise: Promise) {
+    enqueueRealDelay(shareLink, timeoutMs, destUrl = null, promise = promise)
+  }
+
+  /**
+   * Real Delay to one fixed destination (stability: gstatic/google/cf/tg/yt/ig).
+   */
+  @ReactMethod
+  fun pingRealDelayUrl(
+    shareLink: String,
+    destUrl: String,
+    timeoutMs: Double,
+    promise: Promise,
+  ) {
+    enqueueRealDelay(shareLink, timeoutMs, destUrl = destUrl.trim(), promise = promise)
+  }
+
+  private fun enqueueRealDelay(
+    shareLink: String,
+    timeoutMs: Double,
+    destUrl: String?,
+    promise: Promise,
+  ) {
     // LibXray measureInstDelay uses 12s HTTP client + 2 attempts — do not cut earlier
     val waitMs = timeoutMs.toLong().coerceIn(8_000L, 20_000L)
     val myGen = generation.get()
@@ -98,7 +120,11 @@ class XrayPingModule(
               -1L
             } else {
               if (generation.get() != myGen) return@submit -1L
-              measureLikeV2ray(configJson)
+              if (!destUrl.isNullOrBlank()) {
+                measureOneUrl(configJson, destUrl)
+              } else {
+                measureLikeV2ray(configJson)
+              }
             }
           }
         } catch (t: Throwable) {
@@ -136,6 +162,17 @@ class XrayPingModule(
     }
   }
 
+  /** Single destination — used for per-service stability samples. */
+  private fun measureOneUrl(configJson: String, url: String): Long {
+    return try {
+      val delay = Libv2ray.measureOutboundDelay(configJson, url)
+      if (delay > 0L && delay <= ACCEPT_MAX_MS) delay else -1L
+    } catch (t: Throwable) {
+      Log.w(TAG, "probe $url: ${t.message}")
+      -1L
+    }
+  }
+
   /**
    * Same URLs v2rayNG / v2box try — gstatic first (Iran-friendly), then google.
    */
@@ -164,7 +201,7 @@ class XrayPingModule(
     promise: Promise,
   ) {
     val myGen = generation.get()
-    val n = probes.toInt().coerceIn(5, 30)
+    val n = probes.toInt().coerceIn(5, 100)
     val per = perProbeTimeoutMs.toLong().coerceIn(600L, 4_000L)
     val pool = measurePool
     val future: Future<Triple<Double, Int, Int>> =
@@ -203,7 +240,8 @@ class XrayPingModule(
             future.cancel(true)
             Triple(-1.0, 0, 0)
           } else {
-            val budget = (n * (per + 80L) + 4_000L).coerceAtMost(90_000L)
+            // 100×800ms probes need headroom (gaps + SOCKS settle)
+            val budget = (n * (per + 40L) + 6_000L).coerceAtMost(120_000L)
             future.get(budget, TimeUnit.MILLISECONDS)
           }
         } catch (_: Throwable) {

@@ -3,7 +3,12 @@ import { loadConfigsFromSubUrl } from '../utils/subParser';
 import { runPingQueue } from '../utils/pingQueue';
 import { runSpeedQueue } from '../utils/speedQueue';
 import { runPacketQueue } from '../utils/packetQueue';
-import { rankLocally } from '../utils/localRank';
+import { isCycleAlive, rankLocally } from '../utils/localRank';
+import {
+  loadUptimeMap,
+  recordUptimeCycle,
+  saveUptimeMap,
+} from '../utils/uptimeHistory';
 import { buildFingerprintRanksFromPage } from '../utils/fingerprintRank';
 import { uploadCyclePings } from '../api/uploadPings';
 import { pushPanelOrderNow } from '../api/syncPanel';
@@ -20,10 +25,12 @@ import {
 } from '../utils/cycleInterval';
 import {
   latencySampleCount,
+  latencyTimeoutMs,
   needsLatencyPass,
   testFlagsFromSettings,
   testFlagsToLegacyMode,
 } from '../utils/testFlags';
+import { STABILITY_PROBE_URLS } from '../utils/stabilityProbes';
 import { isDeviceVpnActive, watchDeviceVpn } from '../native/VpnGuard';
 import { cancelAllPings } from '../native/XrayPing';
 import type { LocalPingResult, ParsedConfig, RankedConfig } from '../types';
@@ -51,9 +58,10 @@ export default async function backgroundPingTask(): Promise<void> {
     return;
   }
 
+  // Only block when this app is routed through VPN (excluded apps may test)
   if (await isDeviceVpnActive()) {
     await saveSettings({
-      lastBackgroundStatus: 'رد شد — وی‌پی‌ان روشن است',
+      lastBackgroundStatus: 'رد شد — وی‌پی‌ان روی این اپ فعال است',
       nextRunAt: Date.now() + cycleMs,
       cycleIntervalMs: cycleMs,
     });
@@ -63,11 +71,16 @@ export default async function backgroundPingTask(): Promise<void> {
   const operator = saved.operator ?? DEFAULT_OPERATOR;
 
   let configs: ParsedConfig[] = await loadConfigs();
-  if (configs.length === 0) {
+  // Always refresh sub before background test
+  if (saved.subUrl?.trim()) {
     try {
-      configs = await loadConfigsFromSubUrl(saved.subUrl!.trim());
+      configs = await loadConfigsFromSubUrl(saved.subUrl.trim());
+      await saveSnapshot(configs, rankLocally(configs, [], {
+        uptimeMap: await loadUptimeMap(),
+        useUptime: flags.uptime,
+      }));
     } catch {
-      return;
+      if (configs.length === 0) return;
     }
   }
   if (configs.length === 0) return;
@@ -82,15 +95,17 @@ export default async function backgroundPingTask(): Promise<void> {
   const live = new Map<string, LocalPingResult>();
   let results: LocalPingResult[] = [];
   const samples = latencySampleCount(flags);
+  const latTimeout = latencyTimeoutMs(flags);
 
   try {
     // Order: latency → packet → download/upload
     if (needsLatencyPass(flags) && !ac.signal.aborted) {
       results = await runPingQueue(configs, {
-        concurrency: samples > 1 ? 3 : 5,
-        timeoutMs: samples > 1 ? 10_000 : 12_000,
+        concurrency: 5,
+        timeoutMs: latTimeout,
         retries: samples > 1 ? 0 : 1,
         samples,
+        probeUrls: flags.stability ? STABILITY_PROBE_URLS : undefined,
         wantJitter: flags.jitter,
         wantStability: flags.stability,
         signal: ac.signal,
@@ -138,8 +153,8 @@ export default async function backgroundPingTask(): Promise<void> {
           : configs;
       const packetResults = await runPacketQueue(packetConfigs, results, {
         concurrency: 2,
-        probes: 10,
-        perProbeTimeoutMs: 1500,
+        probes: 100,
+        perProbeTimeoutMs: 800,
         scope: 'all',
         signal: ac.signal,
         onProgress: (_d, _t, latest) => {
@@ -201,7 +216,7 @@ export default async function backgroundPingTask(): Promise<void> {
 
     if (ac.signal.aborted) {
       await saveSettings({
-        lastBackgroundStatus: 'قطع شد — وی‌پی‌ان روشن شد',
+        lastBackgroundStatus: 'قطع شد — وی‌پی‌ان روی این اپ فعال شد',
         nextRunAt: Date.now() + cycleMs,
         cycleIntervalMs: cycleMs,
       });
@@ -223,7 +238,19 @@ export default async function backgroundPingTask(): Promise<void> {
       );
     }
 
-    const ranked: RankedConfig[] = rankLocally(configs, live);
+    const outcomes = new Map<string, boolean>();
+    for (const c of configs) {
+      outcomes.set(c.configHash, isCycleAlive(live.get(c.configHash)));
+    }
+    const keep = new Set(configs.map((c) => c.configHash));
+    const prevUp = await loadUptimeMap();
+    const nextUp = recordUptimeCycle(prevUp, outcomes, keep);
+    await saveUptimeMap(nextUp);
+
+    const ranked: RankedConfig[] = rankLocally(configs, live, {
+      uptimeMap: nextUp,
+      useUptime: flags.uptime,
+    });
     const now = Date.now();
     const pingOk = results.filter((r) => r.pingMs > 0).length;
     const speedOk = results.filter(
@@ -293,7 +320,7 @@ export default async function backgroundPingTask(): Promise<void> {
       (e instanceof Error && /abort/i.test(e.message));
     if (aborted) {
       await saveSettings({
-        lastBackgroundStatus: 'قطع شد — وی‌پی‌ان روشن شد',
+        lastBackgroundStatus: 'قطع شد — وی‌پی‌ان روی این اپ فعال شد',
         nextRunAt: Date.now() + cycleMs,
         cycleIntervalMs: cycleMs,
       });

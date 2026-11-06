@@ -87,6 +87,7 @@ def arrange_by_category_slots(
     packet_of: Callable[[T], Any] | None = None,
     jitter_of: Callable[[T], Any] | None = None,
     stability_of: Callable[[T], Any] | None = None,
+    uptime_of: Callable[[T], Any] | None = None,
     category_of: Callable[[T], Any] | None = None,
     cost_of: Callable[[T], Any] | None = None,
     direct_slot: int = DIRECT_SLOT,
@@ -156,16 +157,19 @@ def arrange_by_category_slots(
         stab = _num(stability_of, it, default=-1.0)
         has_stab = 0 if stab >= 0 else 1
         stab_key = -stab if stab >= 0 else 0.0
+        # Uptime: missing/new → 100 (no penalty); higher better
+        up = _num(uptime_of, it, default=-1.0)
+        up_key = -(up if up >= 0 else 100.0)
         jit = _num(jitter_of, it, default=-1.0)
         jit_key = jit if jit >= 0 else 1e18
-        has_metric = 0 if (dl > 0 or ul > 0 or (0 <= loss < 100) or stab >= 0) else 1
-        # Stability → jitter → ping → upload → download → packet loss → devices
-        # (packet last: tunnels/IR nets often share loss; UL matters more than DL)
+        has_metric = 0 if (dl > 0 or ul > 0 or (0 <= loss < 100) or stab >= 0 or up >= 0) else 1
+        # Stability → uptime → jitter → ping → upload → download → packet → devices
         return (
             has_score,
             has_metric,
             has_stab,
             stab_key,
+            up_key,
             jit_key,
             avg_sort,
             -ul,
@@ -263,6 +267,17 @@ def arrange_rank_dicts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             return -1.0
         return v
 
+    def _uptime(d: dict[str, Any]) -> float:
+        try:
+            v = (
+                float(d.get("uptime_pct"))
+                if d.get("uptime_pct") is not None
+                else -1.0
+            )
+        except (TypeError, ValueError):
+            return -1.0
+        return v
+
     return arrange_by_category_slots(
         items,
         avg_of=lambda d: d.get("avg_ping", -1),
@@ -273,6 +288,7 @@ def arrange_rank_dicts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         packet_of=_packet,
         jitter_of=_jitter,
         stability_of=_stability,
+        uptime_of=_uptime,
         category_of=lambda d: d.get("order_kind")
         or d.get("category_name")
         or d.get("category")

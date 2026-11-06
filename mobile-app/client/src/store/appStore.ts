@@ -3,7 +3,19 @@ import { loadConfigsFromSubUrl } from '../utils/subParser';
 import { runPingQueue } from '../utils/pingQueue';
 import { runSpeedQueue } from '../utils/speedQueue';
 import { runPacketQueue } from '../utils/packetQueue';
-import { configsAsPending, rankLocally } from '../utils/localRank';
+import {
+  configsAsPending,
+  isCycleAlive,
+  rankLocally,
+} from '../utils/localRank';
+import {
+  entrySeen,
+  loadUptimeMap,
+  recordUptimeCycle,
+  saveUptimeMap,
+  uptimePct,
+  type UptimeMap,
+} from '../utils/uptimeHistory';
 import {
   ensureBackgroundPermissions,
   startBackgroundMonitor,
@@ -22,6 +34,7 @@ import { isDeviceVpnActive, watchDeviceVpn } from '../native/VpnGuard';
 import {
   DEFAULT_TEST_FLAGS,
   latencySampleCount,
+  latencyTimeoutMs,
   needsLatencyPass,
   testFlagsFromSettings,
   testFlagsHint,
@@ -29,6 +42,7 @@ import {
   toggleTestFlag as flipTestFlag,
   type TestFlags,
 } from '../utils/testFlags';
+import { STABILITY_PROBE_URLS } from '../utils/stabilityProbes';
 import {
   loadConfigs,
   loadRanked,
@@ -54,8 +68,10 @@ interface AppState {
   error: string | null;
   hydrated: boolean;
   backgroundEnabled: boolean;
-  /** Multi-select: packet / speed / ping */
+  /** Multi-select: packet / speed / ping / uptime… */
   testFlags: TestFlags;
+  /** Cross-cycle alive history keyed by configHash */
+  uptimeMap: UptimeMap;
   syncingPanel: boolean;
   /** Short result line under «اعمال ترتیب» */
   panelSyncHint: string;
@@ -80,6 +96,25 @@ let cancelCooldownUntil = 0;
 
 function intervalOf(get: () => AppState): number {
   return normalizeCycleMs(get().cycleIntervalMs);
+}
+
+function rankNow(
+  configs: ParsedConfig[],
+  results: Parameters<typeof rankLocally>[1],
+  get: () => AppState,
+  testingHashes?: Set<string> | string[] | null,
+): RankedConfig[] {
+  const th =
+    testingHashes instanceof Set
+      ? testingHashes
+      : testingHashes
+        ? new Set(testingHashes)
+        : null;
+  return rankLocally(configs, results, {
+    testingHashes: th,
+    uptimeMap: get().uptimeMap,
+    useUptime: get().testFlags.uptime,
+  });
 }
 
 async function armTimer(
@@ -136,7 +171,7 @@ async function uploadThenSyncPanel(
     }
 
     // Live page ranks — never wait on 15m hub average (that caused «ناکافی»)
-    const liveRanked = rankLocally(configs, results);
+    const liveRanked = rankNow(configs, results, get);
     const items = buildFingerprintRanksFromPage(liveRanked);
 
     set({
@@ -206,6 +241,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   hydrated: false,
   backgroundEnabled: false,
   testFlags: { ...DEFAULT_TEST_FLAGS },
+  uptimeMap: {},
   syncingPanel: false,
   panelSyncHint: '',
   permissionsReady: false,
@@ -218,10 +254,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     cancelAllPings();
 
     try {
-      const [saved, configs, ranked] = await Promise.all([
+      const [saved, configs, ranked, uptimeMap] = await Promise.all([
         loadSettings(),
         loadConfigs(),
         loadRanked(),
+        loadUptimeMap(),
       ]);
 
       const cycleIntervalMs = normalizeCycleMs(saved.cycleIntervalMs);
@@ -229,16 +266,27 @@ export const useAppStore = create<AppState>((set, get) => ({
       const hasCache = configs.length > 0;
       const overdue =
         !!nextRunAt && nextRunAt <= Date.now() && hasCache;
+      const flags = testFlagsFromSettings(saved);
+      const baseRanked =
+        ranked.length > 0
+          ? ranked
+          : hasCache
+            ? configsAsPending(configs)
+            : [];
+      const rankedWithUptime = baseRanked.map((r) => {
+        const e = uptimeMap[r.config_hash];
+        const seen = entrySeen(e);
+        return {
+          ...r,
+          uptime_pct: uptimePct(e),
+          uptime_samples: seen > 0 ? seen : undefined,
+        };
+      });
 
       set({
         subUrl: saved.subUrl ?? '',
         configs,
-        ranked:
-          ranked.length > 0
-            ? ranked
-            : hasCache
-              ? configsAsPending(configs)
-              : [],
+        ranked: rankedWithUptime,
         cycleIntervalMs,
         nextRunAt,
         remainingMs: nextRunAt
@@ -255,7 +303,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         hydrated: true,
         permissionsReady: true,
         backgroundEnabled: saved.backgroundEnabled === true,
-        testFlags: testFlagsFromSettings(saved),
+        testFlags: flags,
+        uptimeMap,
       });
 
       void saveSettings({
@@ -345,8 +394,33 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   toggleTestFlag: async (id) => {
     const flags = flipTestFlag(get().testFlags, id);
+    const { configs, ranked } = get();
+    // Re-apply list order when uptime (or any rank-affecting) flag flips
+    const nextRanked =
+      configs.length > 0
+        ? rankLocally(
+            configs,
+            ranked
+              .filter((r) => r.measured)
+              .map((r) => ({
+                configHash: r.config_hash,
+                pingMs: r.avg_ping,
+                measuredAt: Date.parse(r.updated_at) || Date.now(),
+                downloadKbps: r.download_kbps,
+                uploadKbps: r.upload_kbps,
+                packetLossPct: r.packet_loss_pct,
+                jitterMs: r.jitter_ms,
+                stabilityPct: r.stability_pct,
+              })),
+            {
+              uptimeMap: get().uptimeMap,
+              useUptime: flags.uptime,
+            },
+          )
+        : ranked;
     set({
       testFlags: flags,
+      ranked: nextRanked,
       status: testFlagsHint(flags),
     });
     await saveSettings({
@@ -512,15 +586,17 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (next != null && next > Date.now() + 1500) return;
     }
 
-    // VPN must be off — otherwise Real Delay measures the tunnel, not the line
+    // Block only if THIS app's traffic goes through VPN.
+    // VPN on + this app excluded → allowed (uses real line).
     if (await isDeviceVpnActive()) {
       if (manual) {
         set({
-          error: 'وی‌پی‌ان دستگاه روشن است — برای تست خاموشش کن',
-          status: 'وی‌پی‌ان فعال',
+          error:
+            'ترافیک این اپ از وی‌پی‌ان رد می‌شود — وی‌پی‌ان را خاموش کن یا این برنامه را از لیست وی‌پی‌ان خارج کن',
+          status: 'وی‌پی‌ان روی این اپ',
         });
       } else {
-        set({ status: 'چرخه رد شد — وی‌پی‌ان روشن است' });
+        set({ status: 'چرخه رد شد — وی‌پی‌ان روی این اپ فعال است' });
         void armTimer(set, get);
       }
       return;
@@ -535,7 +611,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     const stopVpnWatch = watchDeviceVpn((active) => {
       if (!active) return;
       if (!get().testing && !cycleStarting) return;
-      get().cancelCycle('وی‌پی‌ان روشن شد — تست قطع شد');
+      get().cancelCycle(
+        'ترافیک این اپ به وی‌پی‌ان رفت — تست قطع شد',
+      );
     });
 
     set({
@@ -551,20 +629,34 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       if (ac.signal.aborted || !get().testing) return;
 
+      // Always refresh sub before testing so the list is complete/current
       let configs = state.configs;
-      if (configs.length === 0) {
-        if (!state.subUrl.trim()) throw new Error('ساب خالی است');
-        set({ status: 'دریافت ساب…' });
-        configs = await loadConfigsFromSubUrl(state.subUrl.trim(), {
-          signal: ac.signal,
-          onStatus: (msg) => {
-            if (!ac.signal.aborted && get().testing) set({ status: msg });
-          },
-        });
-        if (ac.signal.aborted || !get().testing) return;
-        const pending = configsAsPending(configs);
-        set({ configs, ranked: pending, progressTotal: configs.length });
-        void saveSnapshot(configs, pending);
+      if (state.subUrl.trim()) {
+        set({ status: 'به‌روزرسانی ساب…' });
+        try {
+          configs = await loadConfigsFromSubUrl(state.subUrl.trim(), {
+            signal: ac.signal,
+            onStatus: (msg) => {
+              if (!ac.signal.aborted && get().testing) set({ status: msg });
+            },
+          });
+          if (ac.signal.aborted || !get().testing) return;
+          const pending = configsAsPending(configs);
+          set({
+            configs,
+            ranked: rankNow(configs, [], get),
+            progressTotal: configs.length,
+          });
+          void saveSnapshot(configs, pending);
+        } catch (e) {
+          if (ac.signal.aborted || !get().testing) return;
+          if (!configs.length) throw e;
+          // Auto cycle: keep last list if refresh fails
+          if (manual) throw e;
+          set({
+            status: `ساب آپدیت نشد — ادامه با ${configs.length} قبلی`,
+          });
+        }
       }
       if (configs.length === 0) {
         throw new Error('ساب خالی است');
@@ -599,7 +691,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         lastRank = Date.now();
         if (ac.signal.aborted || !get().testing) return;
         set({
-          ranked: rankLocally(configs, live, inFlight),
+          ranked: rankNow(configs, live, get, inFlight),
           testingHashes: [...inFlight].slice(0, 6),
           progressDone: latestDone,
           progressTotal: latestTotal,
@@ -610,7 +702,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       const persistAbort = () => {
         setTimeout(() => {
           try {
-            const ranked = rankLocally(configs, live);
+            const ranked = rankNow(configs, live, get);
             set({ ranked, testingHashes: [], testing: false });
             void saveSnapshot(configs, ranked, {
               lastBackgroundStatus: 'تست متوقف شد — آخرین ترتیب ذخیره شد',
@@ -640,16 +732,17 @@ export const useAppStore = create<AppState>((set, get) => ({
             progressDone: done,
             progressTotal: total,
             status: hint,
-            ranked: rankLocally(configs, live),
+            ranked: rankNow(configs, live, get),
           });
         } else if (now - lastRank >= 400) {
           lastRank = now;
-          set({ ranked: rankLocally(configs, live) });
+          set({ ranked: rankNow(configs, live, get) });
         }
       };
 
       let results: LocalPingResult[] = [];
       const samples = latencySampleCount(flags);
+      const latTimeout = latencyTimeoutMs(flags);
 
       // —— 1) Latency (ping / jitter / stability) ——
       if (needsLatencyPass(flags) && !ac.signal.aborted && get().testing) {
@@ -666,10 +759,12 @@ export const useAppStore = create<AppState>((set, get) => ({
         lastLight = 0;
         lastRank = 0;
         results = await runPingQueue(configs, {
-          concurrency: samples > 1 ? 3 : 5,
-          timeoutMs: samples > 1 ? 10_000 : 12_000,
+          // More parallel workers = faster wall time; each sample stays full budget.
+          concurrency: 5,
+          timeoutMs: latTimeout,
           retries: samples > 1 ? 0 : 1,
           samples,
+          probeUrls: flags.stability ? STABILITY_PROBE_URLS : undefined,
           wantJitter: flags.jitter,
           wantStability: flags.stability,
           signal: ac.signal,
@@ -764,7 +859,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           return merged;
         });
         set({
-          ranked: rankLocally(configs, live),
+          ranked: rankNow(configs, live, get),
           testingHashes: [],
           progressDone: configs.length,
           progressTotal: configs.length,
@@ -792,8 +887,9 @@ export const useAppStore = create<AppState>((set, get) => ({
         lastRank = 0;
         const packetResults = await runPacketQueue(packetConfigs, results, {
           concurrency: 2,
-          probes: 10,
-          perProbeTimeoutMs: 1500,
+          // 100 probes → 1% steps (97 stays 97, not 90/100)
+          probes: 100,
+          perProbeTimeoutMs: 800,
           scope: 'all',
           signal: ac.signal,
           onProgress: (done, total, latest) => {
@@ -819,7 +915,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           persistAbort();
           return;
         }
-        set({ ranked: rankLocally(configs, live), testingHashes: [] });
+        set({ ranked: rankNow(configs, live, get), testingHashes: [] });
       }
 
       // —— 3) Download / Upload (independent) ——
@@ -899,7 +995,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           persistAbort();
           return;
         }
-        set({ ranked: rankLocally(configs, live), testingHashes: [] });
+        set({ ranked: rankNow(configs, live, get), testingHashes: [] });
       }
 
       if (ac.signal.aborted || !get().testing) {
@@ -923,7 +1019,17 @@ export const useAppStore = create<AppState>((set, get) => ({
         );
       }
 
-      const ranked = rankLocally(configs, live);
+      // Record cross-cycle uptime (alive this round) before final rank
+      const outcomes = new Map<string, boolean>();
+      for (const c of configs) {
+        outcomes.set(c.configHash, isCycleAlive(live.get(c.configHash)));
+      }
+      const keep = new Set(configs.map((c) => c.configHash));
+      const nextUptime = recordUptimeCycle(get().uptimeMap, outcomes, keep);
+      set({ uptimeMap: nextUptime });
+      void saveUptimeMap(nextUptime);
+
+      const ranked = rankNow(configs, live, get);
       const pingOk = results.filter((r) => r.pingMs > 0).length;
       const withSpeed = results.filter(
         (r) => (r.downloadKbps ?? 0) > 0 || (r.uploadKbps ?? 0) > 0,
@@ -937,11 +1043,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       const withStab = results.filter(
         (r) => r.stabilityPct != null && r.stabilityPct >= 0,
       ).length;
+      const withUp = ranked.filter(
+        (r) => r.uptime_samples != null && r.uptime_samples >= 2,
+      ).length;
       const parts: string[] = [];
       if (flags.stability) parts.push(`${withStab} پایداری`);
+      if (flags.uptime) parts.push(`${withUp} آپ‌تایم`);
       if (flags.packet) parts.push(`${withPacket} پکت`);
       if (flags.jitter) parts.push(`${withJitter} جیتر`);
-      if (flags.ping || flags.jitter || flags.stability) {
+      if (flags.ping || flags.jitter || flags.stability || flags.uptime) {
         parts.push(`${pingOk} پینگ`);
       }
       if (flags.download || flags.upload) parts.push(`${withSpeed} سرعت`);
@@ -962,7 +1072,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         testFlags: flags,
         testMode: testFlagsToLegacyMode(flags),
         speedRankEnabled:
-        flags.download || flags.upload || flags.packet,
+          flags.download || flags.upload || flags.packet,
       });
 
       // Upload → multi-device 15m avg → reorder panel (auto)

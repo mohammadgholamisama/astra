@@ -10,9 +10,9 @@ import {
   cycleOptionOf,
 } from '../utils/cycleInterval';
 import {
+  RANK_PRIORITY_LABEL,
   TEST_FLAG_OPTIONS,
   testFlagsButtonHint,
-  testFlagsHint,
   type TestFlags,
 } from '../utils/testFlags';
 import { useAppStore } from '../store/appStore';
@@ -68,7 +68,6 @@ export function TestActionBar({
     }, 900);
   };
 
-  const modeHint = testFlagsHint(testFlags);
   const testBtnHint = testFlagsButtonHint(testFlags);
 
   return (
@@ -207,9 +206,12 @@ export function TestActionBar({
             );
           })}
         </View>
-        <Text style={styles.modeHint} numberOfLines={2}>
-          {modeHint}
-        </Text>
+        <View style={styles.priorityBox}>
+          <Text style={styles.priorityLabel}>اولویت ترتیب</Text>
+          <Text style={styles.priorityValue} numberOfLines={2}>
+            {RANK_PRIORITY_LABEL}
+          </Text>
+        </View>
       </View>
 
       <View style={styles.intervalBlock}>
@@ -448,12 +450,28 @@ const styles = StyleSheet.create({
     color: colors.accent,
     fontFamily: fonts.extraBold,
   },
-  modeHint: {
+  priorityBox: {
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: 'rgba(42,212,197,0.2)',
+    backgroundColor: colors.accentSoft,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    gap: 4,
+  },
+  priorityLabel: {
     textAlign: 'right',
-    color: colors.textMute,
-    fontSize: 11,
+    color: colors.accent,
+    fontSize: 10,
+    fontFamily: fonts.bold,
+  },
+  priorityValue: {
+    textAlign: 'right',
+    writingDirection: 'rtl',
+    color: colors.textSoft,
+    fontSize: 12,
     fontFamily: fonts.medium,
-    lineHeight: 16,
+    lineHeight: 18,
   },
   progressCard: {
     borderRadius: radii.lg,

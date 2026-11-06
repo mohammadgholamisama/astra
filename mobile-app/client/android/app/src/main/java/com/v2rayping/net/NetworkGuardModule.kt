@@ -5,6 +5,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import com.facebook.react.bridge.Arguments
@@ -15,7 +16,13 @@ import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.modules.core.DeviceEventManagerModule
 
 /**
- * Detects system VPN (any app tunnel). Tests must not run while VPN is up.
+ * Detects whether **this app's traffic** is routed through a system VPN.
+ *
+ * - VPN on + this app excluded from VPN → false → tests allowed
+ * - VPN on + this app included → true → tests blocked
+ * - VPN off → false
+ *
+ * Uses the process active/bound network only — never "any VPN on device".
  */
 class NetworkGuardModule(
   private val reactContext: ReactApplicationContext,
@@ -33,7 +40,7 @@ class NetworkGuardModule(
   @ReactMethod
   fun isVpnActive(promise: Promise) {
     try {
-      promise.resolve(checkVpnActive(reactContext.applicationContext))
+      promise.resolve(isAppTrafficThroughVpn(reactContext.applicationContext))
     } catch (t: Throwable) {
       promise.reject("VPN_CHECK", t)
     }
@@ -61,8 +68,13 @@ class NetworkGuardModule(
             network: Network,
             networkCapabilities: NetworkCapabilities,
           ) = emitVpnState()
+
+          override fun onLinkPropertiesChanged(
+            network: Network,
+            linkProperties: android.net.LinkProperties,
+          ) = emitVpnState()
         }
-      // All networks — VPN up/down shows up here
+      // Any network change → re-evaluate *this process* routing
       val req = NetworkRequest.Builder().build()
       cm.registerNetworkCallback(req, cb)
       callback = cb
@@ -115,7 +127,7 @@ class NetworkGuardModule(
 
   private fun emitVpnState() {
     mainHandler.post {
-      val active = checkVpnActive(reactContext.applicationContext)
+      val active = isAppTrafficThroughVpn(reactContext.applicationContext)
       if (lastEmitted == active) return@post
       lastEmitted = active
       if (!reactContext.hasActiveReactInstance()) return@post
@@ -129,18 +141,34 @@ class NetworkGuardModule(
   companion object {
     const val EVENT_NAME = "vpnStateChanged"
 
-    fun checkVpnActive(context: Context): Boolean {
+    /** @see isAppTrafficThroughVpn */
+    @JvmStatic
+    fun checkVpnActive(context: Context): Boolean = isAppTrafficThroughVpn(context)
+
+    /**
+     * True only if this process's default/bound network is a VPN tunnel.
+     * If the VPN app excludes this package, activeNetwork is Wi‑Fi/cell → false.
+     */
+    @JvmStatic
+    fun isAppTrafficThroughVpn(context: Context): Boolean {
       val cm =
         context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
           ?: return false
       return try {
-        cm.allNetworks.any { net ->
-          val caps = cm.getNetworkCapabilities(net) ?: return@any false
-          caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
-        }
+        val network = processNetwork(cm) ?: return false
+        val caps = cm.getNetworkCapabilities(network) ?: return false
+        caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
       } catch (_: Throwable) {
         false
       }
+    }
+
+    /** Network this process currently uses (honours bindProcessToNetwork). */
+    private fun processNetwork(cm: ConnectivityManager): Network? {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        cm.boundNetworkForProcess?.let { return it }
+      }
+      return cm.activeNetwork
     }
   }
 }

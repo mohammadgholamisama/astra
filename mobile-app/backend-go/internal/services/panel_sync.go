@@ -81,12 +81,13 @@ func (s *PanelSyncService) SyncPingRanks(ctx context.Context, ranks []models.Fin
 			HasPacketLoss:   r.HasPacketLoss,
 			JitterMs:        r.JitterMs,
 			StabilityPct:    r.StabilityPct,
+			UptimePct:       r.UptimePct,
 			SampleCount:     sampleN,
 			DeviceCount:     devN,
 			FailDeviceCount: r.FailDeviceCount,
 		}
 		candPacketOK := cand.HasPacketLoss && cand.PacketLossPct >= 0 && cand.PacketLossPct < 100
-		candOK := cand.AvgPing > 0 || cand.DownloadKbps > 0 || cand.UploadKbps > 0 || candPacketOK || cand.StabilityPct > 0
+		candOK := cand.AvgPing > 0 || cand.DownloadKbps > 0 || cand.UploadKbps > 0 || candPacketOK || cand.StabilityPct > 0 || cand.UptimePct > 0
 		if !candOK {
 			continue
 		}
@@ -116,6 +117,9 @@ func (s *PanelSyncService) SyncPingRanks(ctx context.Context, ranks []models.Fin
 		}
 		if cand.StabilityPct > merged.StabilityPct {
 			merged.StabilityPct = cand.StabilityPct
+		}
+		if cand.UptimePct > merged.UptimePct {
+			merged.UptimePct = cand.UptimePct
 		}
 		if cand.DeviceCount > merged.DeviceCount {
 			merged.DeviceCount = cand.DeviceCount
