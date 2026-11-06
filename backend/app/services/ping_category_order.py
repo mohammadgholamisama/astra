@@ -1,7 +1,6 @@
 """Category + usage-cost aware sub order.
 
-Layout for **real** configs (status / promo / notices are outside this module
-and must not shrink the 20-direct quota):
+Layout (every config participates — ping only affects rank inside a slot):
   1) up to 20 مستقیم — sorted by usage_cost↑ then quality
   2) تانل — ascending usage_cost, up to 35 per cost, within a
      fixed tunnel budget so gaming always fits before leftover
