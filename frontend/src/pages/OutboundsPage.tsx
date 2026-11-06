@@ -300,10 +300,18 @@ export default function OutboundsPage() {
   }
 
   const bindSub = useMutation({
-    mutationFn: ({ url, uri_hash }: { url: string; uri_hash: string }) =>
+    mutationFn: ({
+      url,
+      uri_hash,
+      uri,
+    }: {
+      url: string;
+      uri_hash: string;
+      uri?: string;
+    }) =>
       api<SubSyncResult>(`/api/admin/panels/${id}/outbounds/subscription`, {
         method: "POST",
-        body: JSON.stringify({ url, uri_hash, ping: true }),
+        body: JSON.stringify({ url, uri_hash, uri: uri || undefined, ping: true }),
         timeoutMs: 90_000,
       }),
     onSuccess: (res) => {
@@ -321,12 +329,19 @@ export default function OutboundsPage() {
       setSubPreview(null);
       setPickedHash(null);
       setSubUrl("");
-      const name = res.outbounds?.[0]?.remark || "";
+      const row = res.outbounds?.[0];
+      const name = row?.remark || "";
+      const pingBit =
+        row?.last_ping_ok === true
+          ? ` · پینگ ${toFaDigits(row.last_ping_ms ?? 0)} ms`
+          : row?.last_ping_ok === false
+            ? " · پینگ ناموفق"
+            : "";
       flash(
-        true,
+        row?.last_ping_ok !== false,
         (boundSub ? "کانفیگ اوتباند عوض شد" : "اوتباند از ساب ست شد") +
           (name ? ` · ${name}` : "") +
-          (res.subscription?.title ? ` · ${res.subscription.title}` : "")
+          pingBit
       );
     },
     onError: (e: Error) => flash(false, e.message),
@@ -530,7 +545,12 @@ export default function OutboundsPage() {
       if (!u) return;
       // Step 1: fetch configs. Step 2 (picker confirm) calls bindSub.
       if (subPreview && pickedHash && subPreview.url === u) {
-        bindSub.mutate({ url: u, uri_hash: pickedHash });
+        const cfg = subPreview.configs.find((c) => c.uri_hash === pickedHash);
+        bindSub.mutate({
+          url: u,
+          uri_hash: pickedHash,
+          uri: cfg?.uri,
+        });
         return;
       }
       previewSub.mutate(u);
@@ -543,7 +563,12 @@ export default function OutboundsPage() {
   function onConfirmPick() {
     const u = (subPreview?.url || subUrl.trim() || boundSub?.url || "").trim();
     if (!u || !pickedHash) return;
-    bindSub.mutate({ url: u, uri_hash: pickedHash });
+    const cfg = subPreview?.configs.find((c) => c.uri_hash === pickedHash);
+    bindSub.mutate({
+      url: u,
+      uri_hash: pickedHash,
+      uri: cfg?.uri,
+    });
   }
 
   const subBusy =

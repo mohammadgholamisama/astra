@@ -163,6 +163,7 @@ async def bind_outbound_subscription(
             panel,
             body.url.strip(),
             uri_hash=body.uri_hash.strip(),
+            uri=(body.uri.strip() if body.uri else None),
             ping=bool(body.ping),
         )
     except ValueError as exc:

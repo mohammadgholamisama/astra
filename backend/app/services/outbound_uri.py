@@ -28,6 +28,13 @@ class ParsedOutbound:
         norm = re.sub(r"#.*$", "", self.uri.strip())
         return hashlib.sha256(norm.encode("utf-8")).hexdigest()
 
+    @property
+    def fingerprint(self) -> str:
+        """Stable id across UA/format differences (query order, encoding, …)."""
+        host = (self.host or "").strip().lower().strip("[]")
+        ident = (self.uuid or self.password or "").strip().lower()
+        return f"{(self.protocol or '').lower()}|{host}|{int(self.port or 0)}|{ident}"
+
 
 def _qs(params: dict[str, list[str]]) -> dict[str, str]:
     return {k: (v[0] if v else "") for k, v in params.items()}

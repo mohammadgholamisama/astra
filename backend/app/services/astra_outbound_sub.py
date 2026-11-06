@@ -275,10 +275,10 @@ def _parse_link_safe(link: str) -> ParsedOutbound | None:
         return None
 
 
-async def _used_hashes_by_panel(
+async def _used_configs_by_panel(
     db: AsyncSession, *, exclude_panel_id: int | None = None
-) -> dict[str, dict[str, Any]]:
-    """Map uri_hash → {panel_id, panel_name, outbound_id, remark} for all Astra outbounds."""
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Return (by_hash, by_fingerprint) maps for configs already bound on Astra panels."""
     q = (
         select(AstraOutbound)
         .options(selectinload(AstraOutbound.panel))
@@ -288,28 +288,35 @@ async def _used_hashes_by_panel(
     if exclude_panel_id is not None:
         q = q.where(AstraOutbound.panel_id != int(exclude_panel_id))
     rows = list((await db.execute(q)).scalars().all())
-    out: dict[str, dict[str, Any]] = {}
+    by_hash: dict[str, dict[str, Any]] = {}
+    by_fp: dict[str, dict[str, Any]] = {}
     for row in rows:
-        h = str(row.uri_hash or "").strip()
-        if not h:
-            continue
         panel = getattr(row, "panel", None)
-        out[h] = {
+        info = {
             "panel_id": int(row.panel_id),
             "panel_name": str(getattr(panel, "name", None) or f"پنل #{row.panel_id}"),
             "outbound_id": int(row.id),
             "remark": str(row.remark or ""),
         }
-    return out
+        h = str(row.uri_hash or "").strip()
+        if h:
+            by_hash[h] = info
+        fp = _fingerprint_from_row(row)
+        if fp and not fp.endswith("|0|"):
+            by_fp[fp] = info
+    return by_hash, by_fp
 
 
 def _config_item(
     p: ParsedOutbound,
     *,
     index: int,
-    used: dict[str, dict[str, Any]] | None = None,
+    used_by_hash: dict[str, dict[str, Any]] | None = None,
+    used_by_fp: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    hit = (used or {}).get(p.uri_hash)
+    hit = (used_by_hash or {}).get(p.uri_hash) or (used_by_fp or {}).get(
+        _fingerprint_of(p)
+    )
     return {
         "index": index,
         "uri": p.uri,
@@ -332,7 +339,9 @@ async def preview_subscription(
 ) -> dict[str, Any]:
     """Fetch sub freshly and list pickable configs (no DB writes)."""
     links, meta = await fetch_subscription(url)
-    used = await _used_hashes_by_panel(db, exclude_panel_id=exclude_panel_id)
+    used_by_hash, used_by_fp = await _used_configs_by_panel(
+        db, exclude_panel_id=exclude_panel_id
+    )
     configs: list[dict[str, Any]] = []
     seen: set[str] = set()
     for link in links:
@@ -346,7 +355,14 @@ async def preview_subscription(
         if p.uri_hash in seen:
             continue
         seen.add(p.uri_hash)
-        configs.append(_config_item(p, index=len(configs) + 1, used=used))
+        configs.append(
+            _config_item(
+                p,
+                index=len(configs) + 1,
+                used_by_hash=used_by_hash,
+                used_by_fp=used_by_fp,
+            )
+        )
 
     if not configs:
         # Fallback: parse via bulk helper (may include borderline rows)
@@ -358,7 +374,14 @@ async def preview_subscription(
             if p.uri_hash in seen:
                 continue
             seen.add(p.uri_hash)
-            configs.append(_config_item(p, index=len(configs) + 1, used=used))
+            configs.append(
+                _config_item(
+                    p,
+                    index=len(configs) + 1,
+                    used_by_hash=used_by_hash,
+                    used_by_fp=used_by_fp,
+                )
+            )
 
     if not configs:
         raise ValueError("داخل این ساب کانفیگ قابل‌انتخابی پیدا نشد")
@@ -402,41 +425,101 @@ async def _apply_meta(
     )
 
 
+def _fingerprint_of(p: ParsedOutbound) -> str:
+    return p.fingerprint
+
+
+def _fingerprint_from_row(row: AstraOutbound) -> str:
+    host = str(row.host or "").strip().lower().strip("[]")
+    ident = ""
+    parsed = row.parsed if isinstance(row.parsed, dict) else {}
+    ident = str(
+        parsed.get("user")
+        or parsed.get("uuid")
+        or parsed.get("id")
+        or parsed.get("password")
+        or ""
+    ).strip().lower()
+    if not ident:
+        # Best-effort from URI
+        try:
+            p = parse_outbound_uri(str(row.uri or ""))
+            return p.fingerprint
+        except Exception:  # noqa: BLE001
+            pass
+    return f"{str(row.protocol or '').lower()}|{host}|{int(row.port or 0)}|{ident}"
+
+
+def _pick_from_links(
+    links: list[str],
+    *,
+    uri_hash: str | None = None,
+    fingerprint: str | None = None,
+    prefer_uri: str | None = None,
+) -> tuple[ParsedOutbound | None, list[ParsedOutbound]]:
+    """Match by exact hash, then fingerprint; optionally seed from prefer_uri."""
+    parsed_list: list[ParsedOutbound] = []
+    by_hash: dict[str, ParsedOutbound] = {}
+    by_fp: dict[str, ParsedOutbound] = {}
+    for link in links:
+        p = _parse_link_safe(link)
+        if p is None:
+            continue
+        parsed_list.append(p)
+        by_hash[p.uri_hash.lower()] = p
+        by_fp[_fingerprint_of(p)] = p
+
+    picked: ParsedOutbound | None = None
+    want = (uri_hash or "").strip().lower()
+    if want and want in by_hash:
+        picked = by_hash[want]
+    if picked is None and fingerprint and fingerprint in by_fp:
+        picked = by_fp[fingerprint]
+    if picked is None and prefer_uri:
+        seed = _parse_link_safe(prefer_uri)
+        if seed is not None:
+            picked = by_fp.get(_fingerprint_of(seed)) or seed
+    return picked, parsed_list
+
+
 async def bind_outbound_from_subscription(
     db: AsyncSession,
     panel: Panel,
     url: str,
     *,
     uri_hash: str,
+    uri: str | None = None,
     ping: bool = True,
 ) -> dict[str, Any]:
-    """Fetch sub, pick one config by uri_hash, replace this panel's single outbound."""
+    """Attach one chosen share-link as this panel's outbound (with ping)."""
     from app.services import astra_node as node
 
     want = (uri_hash or "").strip().lower()
-    if not want:
+    prefer = (uri or "").strip() or None
+    if not want and not prefer:
         raise ValueError("کانفیگ انتخاب نشده")
 
+    # Fast path: trust the URI from the preview list, then refresh meta from sub
+    seed = _parse_link_safe(prefer) if prefer else None
     links, meta = await fetch_subscription(url)
-    picked: ParsedOutbound | None = None
-    all_hashes: list[str] = []
-    for link in links:
-        p = _parse_link_safe(link)
-        if p is None:
-            continue
-        all_hashes.append(p.uri_hash)
-        if p.uri_hash.lower() == want:
-            picked = p
-            break
+    picked, parsed_list = _pick_from_links(
+        links,
+        uri_hash=want or None,
+        fingerprint=_fingerprint_of(seed) if seed else None,
+        prefer_uri=prefer,
+    )
     if picked is None:
         raise ValueError("کانفیگ انتخاب‌شده داخل این ساب پیدا نشد — دوباره لیست را بگیرید")
 
-    # Conflict: same hash already on another Astra panel
-    used = await _used_hashes_by_panel(db, exclude_panel_id=int(panel.id))
-    if picked.uri_hash in used:
-        other = used[picked.uri_hash]
+    used_by_hash, used_by_fp = await _used_configs_by_panel(
+        db, exclude_panel_id=int(panel.id)
+    )
+    conflict = used_by_hash.get(picked.uri_hash) or used_by_fp.get(
+        _fingerprint_of(picked)
+    )
+    if conflict:
         raise ValueError(
-            f"این کانفیگ الان روی پنل «{other['panel_name']}» است — "
+            f"این کانفیگ الان روی پنل «{conflict['panel_name']}» است — "
             "اول آنجا حذف کنید یا کانفیگ دیگری بردارید"
         )
 
@@ -445,10 +528,15 @@ async def bind_outbound_from_subscription(
     updated = 0
     removed = 0
     remark = (picked.remark or "").strip()[:255] or f"{picked.protocol}-{picked.host}"
+    picked_fp = _fingerprint_of(picked)
 
     keep: AstraOutbound | None = None
     for row in existing:
-        if str(row.uri_hash).lower() == picked.uri_hash.lower():
+        same = (
+            str(row.uri_hash).lower() == picked.uri_hash.lower()
+            or _fingerprint_from_row(row) == picked_fp
+        )
+        if same and keep is None:
             keep = row
         else:
             await db.delete(row)
@@ -485,19 +573,19 @@ async def bind_outbound_from_subscription(
         panel,
         url=url.strip(),
         meta=meta,
-        count=len(set(all_hashes)) or 1,
+        count=len(parsed_list) or 1,
         selected_hash=picked.uri_hash,
         error=None,
     )
     await db.flush()
 
+    # Rebuild first so the node is ready, then measure ping for the UI
+    await node.rebuild_xray_config(db, panel)
     if ping:
         try:
             await node.ping_outbound(db, keep)
         except Exception:  # noqa: BLE001
             pass
-
-    await node.rebuild_xray_config(db, panel)
     try:
         await node.refresh_panel_account_links(db, panel)
     except Exception:  # noqa: BLE001
@@ -533,24 +621,24 @@ async def refresh_bound_subscription(
         await db.flush()
         raise
 
-    # Resolve selected hash from meta or current outbound row
     existing = await node.list_outbounds(db, panel.id)
     if not selected and existing:
         selected = str(existing[0].uri_hash or "").strip()
 
-    parsed_by_hash: dict[str, ParsedOutbound] = {}
-    for link in links:
-        p = _parse_link_safe(link)
-        if p is not None:
-            parsed_by_hash[p.uri_hash.lower()] = p
+    row_fp = _fingerprint_from_row(existing[0]) if existing else None
+    picked, parsed_list = _pick_from_links(
+        links,
+        uri_hash=selected or None,
+        fingerprint=row_fp,
+        prefer_uri=str(existing[0].uri) if existing else None,
+    )
 
     updated = 0
-    if selected and selected.lower() in parsed_by_hash:
-        picked = parsed_by_hash[selected.lower()]
+    if picked is not None:
         remark = (picked.remark or "").strip()[:255] or f"{picked.protocol}-{picked.host}"
+        selected = picked.uri_hash
         if existing:
             row = existing[0]
-            # Drop extras if any leftover from old multi-import
             for extra in existing[1:]:
                 await db.delete(extra)
             row.uri = picked.uri
@@ -568,7 +656,6 @@ async def refresh_bound_subscription(
                 except Exception:  # noqa: BLE001
                     pass
         else:
-            # Outbound was deleted — recreate from selected hash
             row = AstraOutbound(
                 panel_id=panel.id,
                 uri=picked.uri,
@@ -584,15 +671,19 @@ async def refresh_bound_subscription(
             db.add(row)
             updated = 1
 
+    # Only warn when we have a selection but nothing matches AND no outbound left
+    err: str | None = None
+    if picked is None and selected and not existing:
+        err = "کانفیگ انتخاب‌شده دیگر در ساب نیست — یک کانفیگ دیگر انتخاب کنید"
+    # If outbound still exists but encoding drifted, keep it and clear stale error
+
     await _apply_meta(
         panel,
         url=url,
         meta=meta,
-        count=len(parsed_by_hash),
-        selected_hash=selected or None,
-        error=None
-        if (not selected or selected.lower() in parsed_by_hash)
-        else "کانفیگ انتخاب‌شده دیگر در ساب نیست — یک کانفیگ دیگر انتخاب کنید",
+        count=len(parsed_list),
+        selected_hash=(picked.uri_hash if picked else (selected or None)),
+        error=err,
     )
     await db.flush()
 

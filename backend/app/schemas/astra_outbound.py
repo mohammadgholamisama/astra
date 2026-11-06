@@ -39,6 +39,8 @@ class AstraOutboundSubBind(BaseModel):
 
     url: str = Field(..., min_length=8, max_length=2000)
     uri_hash: str = Field(..., min_length=16, max_length=64)
+    # Prefer the exact URI from preview so we don't re-match a volatile hash
+    uri: str | None = Field(default=None, max_length=8000)
     ping: bool = True
 
 
