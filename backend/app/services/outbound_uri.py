@@ -302,3 +302,229 @@ def to_xray_outbound(outbound_id: int, parsed: dict[str, Any], protocol: str) ->
 
     # Fallback direct (should not happen)
     return {"tag": tag, "protocol": "freedom", "settings": {}}
+
+
+def _host_port_for_uri(host: str, port: int) -> str:
+    h = (host or "").strip()
+    if ":" in h and not h.startswith("["):
+        h = f"[{h}]"
+    return f"{h}:{int(port)}"
+
+
+def xray_outbound_to_share_link(
+    outbound: dict[str, Any], *, remark: str = ""
+) -> str | None:
+    """Best-effort reverse of to_xray_outbound for common VLESS/Trojan/VMess/SS."""
+    from urllib.parse import quote, urlencode
+
+    if not isinstance(outbound, dict):
+        return None
+    proto = str(outbound.get("protocol") or "").lower().strip()
+    settings = outbound.get("settings") if isinstance(outbound.get("settings"), dict) else {}
+    stream = (
+        outbound.get("streamSettings")
+        if isinstance(outbound.get("streamSettings"), dict)
+        else {}
+    )
+    network = str(stream.get("network") or "tcp")
+    security = str(stream.get("security") or "none")
+    name = (remark or str(outbound.get("tag") or "")).strip() or f"{proto}-node"
+
+    if proto == "vless":
+        vnext = (settings.get("vnext") or [{}])[0] if isinstance(settings.get("vnext"), list) else {}
+        users = (vnext.get("users") or [{}])[0] if isinstance(vnext.get("users"), list) else {}
+        host = str(vnext.get("address") or "")
+        port = int(vnext.get("port") or 0)
+        uid = str(users.get("id") or "")
+        if not host or port <= 0 or not uid:
+            return None
+        q: dict[str, str] = {
+            "encryption": str(users.get("encryption") or "none"),
+            "security": security,
+            "type": network,
+        }
+        flow = str(users.get("flow") or "").strip()
+        if flow:
+            q["flow"] = flow
+        if network == "ws":
+            ws = stream.get("wsSettings") if isinstance(stream.get("wsSettings"), dict) else {}
+            q["path"] = str(ws.get("path") or "/")
+            headers = ws.get("headers") if isinstance(ws.get("headers"), dict) else {}
+            host_h = headers.get("Host") or headers.get("host")
+            if isinstance(host_h, list):
+                host_h = host_h[0] if host_h else ""
+            if host_h:
+                q["host"] = str(host_h)
+        elif network == "grpc":
+            grpc = stream.get("grpcSettings") if isinstance(stream.get("grpcSettings"), dict) else {}
+            q["serviceName"] = str(grpc.get("serviceName") or "")
+            q["mode"] = str(grpc.get("multiMode") and "multi" or "gun")
+        elif network == "tcp":
+            tcp = stream.get("tcpSettings") if isinstance(stream.get("tcpSettings"), dict) else {}
+            header = tcp.get("header") if isinstance(tcp.get("header"), dict) else {}
+            if str(header.get("type") or "") == "http":
+                q["headerType"] = "http"
+                req = header.get("request") if isinstance(header.get("request"), dict) else {}
+                path = req.get("path")
+                if isinstance(path, list) and path:
+                    q["path"] = str(path[0])
+                elif path:
+                    q["path"] = str(path)
+                hdrs = req.get("headers") if isinstance(req.get("headers"), dict) else {}
+                host_h = hdrs.get("Host") or hdrs.get("host")
+                if isinstance(host_h, list):
+                    host_h = host_h[0] if host_h else ""
+                if host_h:
+                    q["host"] = str(host_h)
+        if security == "tls":
+            tls = stream.get("tlsSettings") if isinstance(stream.get("tlsSettings"), dict) else {}
+            sni = str(tls.get("serverName") or "")
+            if sni:
+                q["sni"] = sni
+            fp = str(tls.get("fingerprint") or "")
+            if fp:
+                q["fp"] = fp
+            alpn = tls.get("alpn")
+            if isinstance(alpn, list) and alpn:
+                q["alpn"] = ",".join(str(x) for x in alpn)
+            elif alpn:
+                q["alpn"] = str(alpn)
+        elif security == "reality":
+            rs = (
+                stream.get("realitySettings")
+                if isinstance(stream.get("realitySettings"), dict)
+                else {}
+            )
+            if rs.get("serverName"):
+                q["sni"] = str(rs["serverName"])
+            if rs.get("fingerprint"):
+                q["fp"] = str(rs["fingerprint"])
+            if rs.get("publicKey"):
+                q["pbk"] = str(rs["publicKey"])
+            if rs.get("shortId"):
+                q["sid"] = str(rs["shortId"])
+            spx = str(rs.get("spiderX") or "")
+            if spx:
+                q["spx"] = spx
+        return (
+            f"vless://{uid}@{_host_port_for_uri(host, port)}?{urlencode(q)}#{quote(name)}"
+        )
+
+    if proto == "trojan":
+        servers = settings.get("servers") if isinstance(settings.get("servers"), list) else []
+        srv = servers[0] if servers else {}
+        host = str(srv.get("address") or "")
+        port = int(srv.get("port") or 0)
+        password = str(srv.get("password") or "")
+        if not host or port <= 0 or not password:
+            return None
+        q = {"security": security or "tls", "type": network}
+        tls = stream.get("tlsSettings") if isinstance(stream.get("tlsSettings"), dict) else {}
+        if tls.get("serverName"):
+            q["sni"] = str(tls["serverName"])
+        return (
+            f"trojan://{quote(password, safe='')}@{_host_port_for_uri(host, port)}"
+            f"?{urlencode(q)}#{quote(name)}"
+        )
+
+    if proto == "vmess":
+        import base64
+
+        vnext = (settings.get("vnext") or [{}])[0] if isinstance(settings.get("vnext"), list) else {}
+        users = (vnext.get("users") or [{}])[0] if isinstance(vnext.get("users"), list) else {}
+        host = str(vnext.get("address") or "")
+        port = int(vnext.get("port") or 0)
+        uid = str(users.get("id") or "")
+        if not host or port <= 0 or not uid:
+            return None
+        tls_flag = "tls" if security in ("tls", "reality") else ""
+        obj = {
+            "v": "2",
+            "ps": name,
+            "add": host,
+            "port": port,
+            "id": uid,
+            "aid": int(users.get("alterId") or 0),
+            "scy": str(users.get("security") or "auto"),
+            "net": network,
+            "type": "none",
+            "host": "",
+            "path": "",
+            "tls": tls_flag,
+        }
+        if network == "ws":
+            ws = stream.get("wsSettings") if isinstance(stream.get("wsSettings"), dict) else {}
+            obj["path"] = str(ws.get("path") or "/")
+            headers = ws.get("headers") if isinstance(ws.get("headers"), dict) else {}
+            host_h = headers.get("Host") or headers.get("host") or ""
+            if isinstance(host_h, list):
+                host_h = host_h[0] if host_h else ""
+            obj["host"] = str(host_h)
+        raw = base64.urlsafe_b64encode(
+            json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        return f"vmess://{raw}"
+
+    if proto in ("shadowsocks", "ss"):
+        servers = settings.get("servers") if isinstance(settings.get("servers"), list) else []
+        srv = servers[0] if servers else {}
+        host = str(srv.get("address") or "")
+        port = int(srv.get("port") or 0)
+        method = str(srv.get("method") or "")
+        password = str(srv.get("password") or "")
+        if not host or port <= 0 or not method or not password:
+            return None
+        userinfo = quote(f"{method}:{password}", safe="")
+        return f"ss://{userinfo}@{_host_port_for_uri(host, port)}#{quote(name)}"
+
+    return None
+
+
+def share_links_from_xray_json(text: str) -> list[str]:
+    """Parse Xray / v2rayN JSON subscription bodies into share-links."""
+    raw = (text or "").strip()
+    if not raw or raw[0] not in "[{":
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+
+    configs: list[dict[str, Any]] = []
+    if isinstance(data, list):
+        configs = [x for x in data if isinstance(x, dict)]
+    elif isinstance(data, dict):
+        if isinstance(data.get("outbounds"), list):
+            configs = [data]
+        elif isinstance(data.get("configs"), list):
+            configs = [x for x in data["configs"] if isinstance(x, dict)]
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for cfg in configs:
+        remark = str(cfg.get("remarks") or cfg.get("ps") or cfg.get("remark") or "")
+        outs = cfg.get("outbounds") if isinstance(cfg.get("outbounds"), list) else None
+        if outs:
+            for ob in outs:
+                if not isinstance(ob, dict):
+                    continue
+                tag = str(ob.get("tag") or "").lower()
+                proto = str(ob.get("protocol") or "").lower()
+                if proto in ("freedom", "blackhole", "dns", "block"):
+                    continue
+                if tag in ("direct", "block", "dns-out", "api"):
+                    continue
+                link = xray_outbound_to_share_link(ob, remark=remark)
+                if link and link not in seen:
+                    seen.add(link)
+                    out.append(link)
+                # Only first proxy outbound per config object
+                if link:
+                    break
+        else:
+            # Already a single outbound-shaped object
+            link = xray_outbound_to_share_link(cfg, remark=remark)
+            if link and link not in seen:
+                seen.add(link)
+                out.append(link)
+    return out

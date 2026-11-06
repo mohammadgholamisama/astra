@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -152,27 +153,59 @@ def _decode_sub_body(text: str) -> str:
     if not raw:
         return ""
     # Already plain share links / multi-line
-    if any(line.strip().lower().startswith(SHARE_LINK_PREFIXES) for line in raw.replace("\r", "\n").split("\n")):
+    if any(
+        line.strip().lower().startswith(SHARE_LINK_PREFIXES)
+        for line in raw.replace("\r", "\n").split("\n")
+    ):
         return raw
-    pad = "=" * (-len(raw) % 4)
-    for decoder in (base64.b64decode, base64.urlsafe_b64decode):
-        try:
-            return decoder(raw + pad).decode("utf-8", errors="ignore")
-        except Exception:
-            continue
+    # Some panels wrap base64 with whitespace / newlines
+    candidates = [raw, re.sub(r"\s+", "", raw)]
+    for blob in candidates:
+        pad = "=" * (-len(blob) % 4)
+        for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+            try:
+                dec = decoder(blob + pad).decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+            if not dec:
+                continue
+            # Prefer decoded text that actually looks like share links
+            if any(
+                line.strip().lower().startswith(SHARE_LINK_PREFIXES)
+                for line in dec.replace("\r", "\n").split("\n")
+            ) or "://" in dec:
+                return dec
     return raw
 
 
+_SHARE_LINK_RE = re.compile(
+    r"(?:vless|vmess|trojan|ss|shadowsocks|tuic|hysteria2?|hy2)://[^\s<>\"']+",
+    re.IGNORECASE,
+)
+
+
 def extract_share_links(text: str) -> list[str]:
+    """Unwrap plain / base64 / embedded share-links from a subscription body."""
     decoded = _decode_sub_body(text)
     out: list[str] = []
     seen: set[str] = set()
-    for line in decoded.replace("\r", "\n").split("\n"):
-        line = line.strip()
+
+    def _add(link: str) -> None:
+        line = (link or "").strip().rstrip("\",;")
         if not line or not is_share_link(line) or line in seen:
-            continue
+            return
         seen.add(line)
         out.append(line)
+
+    for line in decoded.replace("\r", "\n").split("\n"):
+        _add(line.strip())
+    # Fallback: links embedded in HTML / JSON strings / one long line
+    if not out:
+        for m in _SHARE_LINK_RE.finditer(decoded):
+            _add(m.group(0))
+    if not out and text and text is not decoded:
+        for m in _SHARE_LINK_RE.finditer(text):
+            _add(m.group(0))
     return out
 
 
@@ -208,7 +241,8 @@ async def expand_subscription_links(
             seen.add(line)
             out.append(line)
     req_headers = {
-        "User-Agent": "v2rayNG/1.8 (AstraPanel)",
+        # Prefer share-link body (base64); some panels give JSON for v2rayNG UA
+        "User-Agent": "v2rayN/6.23",
         "Accept": "text/plain, */*",
         **(headers or {}),
     }
@@ -229,7 +263,17 @@ async def expand_subscription_links(
                 if resp.status_code >= 400:
                     return []
                 text = (resp.text or "").strip()
-                return extract_share_links(text) if text else []
+                if not text:
+                    return []
+                found = extract_share_links(text)
+                if found:
+                    return found
+                try:
+                    from app.services.outbound_uri import share_links_from_xray_json
+
+                    return share_links_from_xray_json(text)
+                except Exception:
+                    return []
         except Exception:
             return []
 
@@ -248,7 +292,15 @@ async def expand_subscription_links(
             text = (resp.text or "").strip()
             if not text:
                 return []
-            return extract_share_links(text)
+            found = extract_share_links(text)
+            if found:
+                return found
+            try:
+                from app.services.outbound_uri import share_links_from_xray_json
+
+                return share_links_from_xray_json(text)
+            except Exception:
+                return []
         except Exception:
             return []
 

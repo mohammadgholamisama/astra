@@ -23,7 +23,12 @@ from sqlalchemy.orm import selectinload
 from app.adapters.http_utils import extract_share_links, is_share_link
 from app.models.astra_outbound import AstraOutbound
 from app.models.panel import Panel, PanelType
-from app.services.outbound_uri import ParsedOutbound, parse_outbound_lines, parse_outbound_uri
+from app.services.outbound_uri import (
+    ParsedOutbound,
+    parse_outbound_lines,
+    parse_outbound_uri,
+    share_links_from_xray_json,
+)
 
 logger = logging.getLogger("astra.outbound_sub")
 
@@ -158,6 +163,29 @@ def _is_real_config_remark(remark: str) -> bool:
     return True
 
 
+# Panels often switch response format by User-Agent:
+# v2rayNG → Xray JSON array, v2rayN/Shadowrocket → base64 share-links, Clash → YAML.
+_SUB_USER_AGENTS = (
+    "v2rayN/6.23",
+    "shadowrocket",
+    "SagerNet/2.0.2",
+    "v2rayNG/1.8.5",
+    "ClashMetaForAndroid/2.11.1",
+)
+
+
+def _links_from_sub_body(body: str) -> list[str]:
+    text = (body or "").strip()
+    if not text:
+        return []
+    links = extract_share_links(text)
+    if not links and is_share_link(text.splitlines()[0] if text else ""):
+        links = [text.splitlines()[0].strip()]
+    if not links:
+        links = share_links_from_xray_json(text)
+    return links
+
+
 async def fetch_subscription(url: str) -> tuple[list[str], dict[str, Any]]:
     """Return (share_links, meta) from a subscription URL."""
     u = (url or "").strip()
@@ -166,23 +194,54 @@ async def fetch_subscription(url: str) -> tuple[list[str], dict[str, Any]]:
     if not (u.startswith("http://") or u.startswith("https://")):
         raise ValueError("آدرس ساب باید با http یا https شروع شود")
 
-    headers = {
-        "User-Agent": "v2rayNG/1.8.5 (AstraOutboundSync)",
+    timeout = httpx.Timeout(25.0, connect=8.0)
+    base_headers = {
         "Accept": "text/plain,*/*",
         "Cache-Control": "no-cache",
     }
-    timeout = httpx.Timeout(25.0, connect=8.0)
+
+    body = ""
+    rh: dict[str, str] = {}
+    links: list[str] = []
+    last_status = 0
+
     async with httpx.AsyncClient(
         timeout=timeout,
         verify=False,
         follow_redirects=True,
-        headers=headers,
     ) as client:
-        resp = await client.get(u)
-        if resp.status_code >= 400:
-            raise ValueError(f"دریافت ساب ناموفق بود ({resp.status_code})")
-        body = (resp.text or "").strip()
-        rh = {k.lower(): v for k, v in resp.headers.items()}
+        for ua in _SUB_USER_AGENTS:
+            try:
+                resp = await client.get(
+                    u, headers={**base_headers, "User-Agent": ua}
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("sub fetch ua=%s failed: %s", ua, exc)
+                continue
+            last_status = int(resp.status_code or 0)
+            if last_status >= 400:
+                continue
+            cand = (resp.text or "").strip()
+            if not cand:
+                continue
+            # Prefer the first UA that yields real share-links
+            found = _links_from_sub_body(cand)
+            if found:
+                body = cand
+                rh = {k.lower(): v for k, v in resp.headers.items()}
+                links = found
+                break
+            # Keep first non-empty body as fallback for meta / JSON retry
+            if not body:
+                body = cand
+                rh = {k.lower(): v for k, v in resp.headers.items()}
+
+    if last_status >= 400 and not body:
+        raise ValueError(f"دریافت ساب ناموفق بود ({last_status})")
+    if not links:
+        links = _links_from_sub_body(body)
+    if not links:
+        raise ValueError("داخل این ساب لینک کانفیگ معتبری پیدا نشد")
 
     title = _decode_header_title(
         rh.get("profile-title") or rh.get("content-disposition") or ""
@@ -199,11 +258,6 @@ async def fetch_subscription(url: str) -> tuple[list[str], dict[str, Any]]:
                 title = title[:-4]
 
     info = _parse_userinfo(rh.get("subscription-userinfo") or "")
-    links = extract_share_links(body)
-    if not links and is_share_link(body.splitlines()[0] if body else ""):
-        links = [body.splitlines()[0].strip()]
-    if not links:
-        raise ValueError("داخل این ساب لینک کانفیگ معتبری پیدا نشد")
 
     return links[:_MAX_LINKS], {
         "title": title or None,
