@@ -45,6 +45,118 @@ async def _close_adapter(adapter) -> None:
             pass
 
 
+def _clear_adapter_auth_cache(adapter) -> None:
+    """Drop stale JWT so a live test doesn't reuse a dead token."""
+    cached = getattr(adapter, "_token", None)
+    if cached is not None and not callable(cached):
+        try:
+            adapter._token = None  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+    cache_key = getattr(adapter, "_cache_key", None)
+    if callable(cache_key):
+        try:
+            from app.adapters import marzban as marz_mod
+
+            marz_mod._TOKEN_CACHE.pop(cache_key(), None)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+_HARD_AUTH_MARKERS = (
+    "401",
+    "403",
+    "unauthorized",
+    "forbidden",
+    "رمز",
+    "ورود",
+    "credential",
+    "invalid token",
+    "authentication",
+)
+
+
+def _is_hard_auth_fail(err: str | None) -> bool:
+    if not err:
+        return False
+    low = err.lower()
+    return any(m in low for m in _HARD_AUTH_MARKERS)
+
+
+async def _live_test_panel(
+    panel: Panel,
+    *,
+    overall_timeout: float = 9.0,
+) -> dict:
+    """Accurate + fast connectivity probe for the admin Test button.
+
+    Clears cached tokens, retries once on soft failures, and hard-caps wall time
+    so a slow remote cannot hang the UI — without false «قطع» when the panel
+    answers after a brief JWT refresh.
+    """
+    import time as _time
+
+    from app.adapters.base import AdapterResult
+
+    t0 = _time.monotonic()
+    last_err = "اتصال ناموفق"
+    # Marzban-family: one quick retry after cache clear. Others: single attempt.
+    tries = (
+        2
+        if panel.type
+        in (PanelType.marzban, PanelType.rebecca, PanelType.guard, PanelType.pasarguard)
+        else 1
+    )
+    if panel.type == PanelType.sanaei:
+        tries = 2
+
+    for attempt in range(tries):
+        remaining = overall_timeout - (_time.monotonic() - t0)
+        if remaining < 0.6:
+            break
+        per_try = min(6.5 if attempt == 0 else remaining, remaining)
+        adapter = get_adapter(panel)
+        result: AdapterResult | None = None
+        try:
+            _clear_adapter_auth_cache(adapter)
+            result = await asyncio.wait_for(
+                adapter.test_connection(), timeout=per_try
+            )
+        except asyncio.TimeoutError:
+            last_err = "پاسخ پنل طول کشید — دوباره تست کنید"
+            result = None
+        except Exception as exc:  # noqa: BLE001
+            last_err = str(exc).strip() or exc.__class__.__name__
+            result = None
+        finally:
+            await _close_adapter(adapter)
+
+        if result is not None and result.success:
+            ms = int((_time.monotonic() - t0) * 1000)
+            return {
+                "success": True,
+                "error": None,
+                "latency_ms": ms,
+                "raw": result.raw if isinstance(result.raw, dict) else {},
+            }
+
+        last_err = (
+            (result.error if result else None) or last_err or "اتصال ناموفق"
+        ).strip()
+        if _is_hard_auth_fail(last_err):
+            break
+        if attempt + 1 < tries:
+            await asyncio.sleep(0.2)
+
+    ms = int((_time.monotonic() - t0) * 1000)
+    return {
+        "success": False,
+        "error": last_err,
+        "latency_ms": ms,
+        "raw": {},
+    }
+
+
 async def _fetch_sanaei_inbounds(panel: Panel) -> list[InboundOut]:
     if panel.type != PanelType.sanaei:
         raise HTTPException(status_code=400, detail="فقط برای پنل سنایی لیست اینباند در دسترس است")
@@ -798,21 +910,14 @@ async def test_all_panels(
     if not panels:
         return PanelTestAllOut(results=[], ok=0, fail=0)
 
+    # Bound concurrency so a flood of remotes doesn't stall the event loop.
+    sem = asyncio.Semaphore(12)
+
     async def _one(panel: Panel) -> PanelTestOut:
-        if panel.type == PanelType.astra:
-            ok = True
-            err = None
-        else:
-            adapter = get_adapter(panel)
-            try:
-                result = await asyncio.wait_for(adapter.test_connection(), timeout=4.5)
-                ok = bool(result.success)
-                err = None if ok else (result.error or "اتصال ناموفق")
-            except Exception as exc:  # noqa: BLE001
-                ok = False
-                err = str(exc).strip() or exc.__class__.__name__
-            finally:
-                await _close_adapter(adapter)
+        async with sem:
+            probe = await _live_test_panel(panel, overall_timeout=8.0)
+        ok = bool(probe.get("success"))
+        err = None if ok else (probe.get("error") or "اتصال ناموفق")
         if ok:
             panel.last_ok_at = datetime.now(timezone.utc)
         return PanelTestOut(
@@ -837,18 +942,20 @@ async def test_panel(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
+    """Live test one panel — accurate, capped, token-cache cleared."""
     panel = await db.get(Panel, panel_id)
     if not panel:
         raise HTTPException(status_code=404, detail="Panel not found")
-    adapter = get_adapter(panel)
-    try:
-        result = await adapter.test_connection()
-    finally:
-        await _close_adapter(adapter)
-    if result.success:
+    probe = await _live_test_panel(panel, overall_timeout=9.0)
+    if probe.get("success"):
         panel.last_ok_at = datetime.now(timezone.utc)
         await db.commit()
-    return {"success": result.success, "error": result.error, "raw": result.raw}
+    return {
+        "success": bool(probe.get("success")),
+        "error": probe.get("error"),
+        "latency_ms": probe.get("latency_ms"),
+        "raw": probe.get("raw") or {},
+    }
 
 
 @router.get("/api/admin/panels/{panel_id}/inbounds", response_model=list[InboundOut])

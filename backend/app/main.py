@@ -56,31 +56,87 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("astra")
 
 
-async def _heal_failed_panels_loop() -> None:
-    """Periodically recreate users on panels that were unreachable at create time.
+async def _auto_retry_errors_loop() -> None:
+    """Every 3 minutes: same as admin «تلاش مجدد همه خطاها».
 
-    When a dead panel comes back, error/pending accounts become active and
-    their share links show up on the subscription automatically.
+    When panels come back, error/pending accounts are retried automatically
+    without waiting for someone to open the Users page.
     """
-    from app.core.database import background_db_sem
-    from app.services.orchestrator import heal_failed_panel_accounts_batch
+    from sqlalchemy import func, select
 
-    await asyncio.sleep(60)
+    from app.core.database import AsyncSessionLocal, background_db_sem
+    from app.models.panel import Panel
+    from app.models.user import PanelAccount, PanelAccountStatus
+    from app.services.orchestrator import (
+        heal_users_missing_panel_accounts,
+        retry_all_failed_accounts,
+    )
+
+    await asyncio.sleep(75)
     while True:
-        sem = background_db_sem()
         try:
-            await sem.acquire()
-            try:
-                n = await heal_failed_panel_accounts_batch(limit_users=20)
-            finally:
-                sem.release()
-            if n:
-                logger.info("heal loop: recovered panels for %s users", n)
+            async with AsyncSessionLocal() as db:
+                n_err = int(
+                    (
+                        await db.scalar(
+                            select(func.count(PanelAccount.id))
+                            .select_from(PanelAccount)
+                            .join(Panel, Panel.id == PanelAccount.panel_id)
+                            .where(
+                                PanelAccount.status.in_(
+                                    (
+                                        PanelAccountStatus.error,
+                                        PanelAccountStatus.pending,
+                                    )
+                                ),
+                                Panel.is_active.is_(True),
+                            )
+                        )
+                    )
+                    or 0
+                )
+            if n_err > 0:
+                logger.info(
+                    "auto retry-errors: %s error/pending accounts — starting",
+                    n_err,
+                )
+                sem = background_db_sem()
+                await sem.acquire()
+                try:
+                    async with AsyncSessionLocal() as db:
+                        stats = await retry_all_failed_accounts(
+                            db,
+                            overall_timeout=160.0,
+                            per_remote_timeout=20.0,
+                            probe_timeout=10.0,
+                            concurrency=18,
+                            limit_accounts=None,
+                        )
+                        try:
+                            await db.commit()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        logger.info(
+                            "auto retry-errors done attempted=%s recovered=%s remaining=%s down=%s",
+                            stats.get("attempted"),
+                            stats.get("recovered"),
+                            stats.get("remaining"),
+                            (stats.get("panels_down") or [])[:5],
+                        )
+                    try:
+                        await heal_users_missing_panel_accounts(limit_users=60)
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "auto retry-errors heal-coverage skipped",
+                            exc_info=True,
+                        )
+                finally:
+                    sem.release()
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
-            logger.exception("heal failed panels loop failed")
-        await asyncio.sleep(90)
+            logger.exception("auto retry-errors loop failed")
+        await asyncio.sleep(180)
 
 
 
@@ -232,8 +288,8 @@ async def lifespan(_app: FastAPI):
             logging.getLogger("astra").exception("order_kind boot task failed")
 
     usage_task = asyncio.create_task(_usage_sync_loop(), name="astra-usage-sync")
-    heal_task = asyncio.create_task(
-        _heal_failed_panels_loop(), name="astra-heal-panels"
+    retry_errors_task = asyncio.create_task(
+        _auto_retry_errors_loop(), name="astra-auto-retry-errors"
     )
     outbound_task = asyncio.create_task(
         _outbound_health_loop(), name="astra-outbound-health"
@@ -246,13 +302,13 @@ async def lifespan(_app: FastAPI):
         yield
     finally:
         usage_task.cancel()
-        heal_task.cancel()
+        retry_errors_task.cancel()
         outbound_task.cancel()
         order_boot_task.cancel()
         pool_task.cancel()
         for task in (
             usage_task,
-            heal_task,
+            retry_errors_task,
             outbound_task,
             order_boot_task,
             pool_task,

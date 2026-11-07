@@ -764,6 +764,21 @@ export default function UsersPage() {
     onError: (e: Error) => setActionMsg({ type: "err", text: e.message }),
   });
 
+  const retryAllPendingRef = useRef(false);
+  retryAllPendingRef.current = retryAll.isPending;
+  const errorCountRef = useRef(0);
+
+  // Auto «تلاش مجدد همه» every 3 minutes while errors remain (server also does this).
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      if (errorCountRef.current <= 0) return;
+      if (retryAllPendingRef.current) return;
+      retryAll.mutate();
+    }, 180_000);
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- stable mutate; gated by refs
+  }, []);
+
   const togglePower = useMutation({
     mutationFn: ({ username, enable }: { username: string; enable: boolean }) =>
       api<User>(`/api/user/${encodeURIComponent(username)}`, {
@@ -1245,6 +1260,7 @@ export default function UsersPage() {
       loaded: users.length,
     };
   }, [users, totalUsers, counts]);
+  errorCountRef.current = stats.withError;
 
   // Server already filters by chip — list is the current page of that filter
   const filtered = users;
@@ -1462,8 +1478,9 @@ export default function UsersPage() {
         <div className="users-retry-banner">
           <AlertTriangle size={16} />
           <p>
-            {toFaDigits(stats.withError)} کاربر با خطای پنل — بعد از وصل شدن پنل، همه را یک‌جا تلاش
-            مجدد کنید. خطاهایی که هنوز پنل‌شان پاسخ ندهد باقی می‌مانند.
+            {toFaDigits(stats.withError)} کاربر با خطای پنل — پنل هر ۳ دقیقه خودش تلاش مجدد
+            می‌کند؛ می‌توانید همین حالا هم بزنید. خطاهایی که هنوز پنل‌شان پاسخ ندهد باقی
+            می‌مانند.
           </p>
           <button
             type="button"

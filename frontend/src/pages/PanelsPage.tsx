@@ -680,18 +680,25 @@ export default function PanelsPage() {
 
   const test = useMutation({
     mutationFn: (id: number) =>
-      api<{ success: boolean; error?: string }>(`/api/admin/panels/${id}/test`, {
-        method: "POST",
-        timeoutMs: 12_000,
-      }),
+      api<{ success: boolean; error?: string; latency_ms?: number }>(
+        `/api/admin/panels/${id}/test`,
+        {
+          method: "POST",
+          timeoutMs: 22_000,
+        }
+      ),
     onSuccess: (res, id) => {
       const panelName = data.find((p) => p.id === id)?.name;
+      const ms =
+        typeof res.latency_ms === "number" && res.latency_ms >= 0
+          ? ` · ${toFaDigits(res.latency_ms)}ms`
+          : "";
       showTestToast(
         !!res.success,
         res.success
           ? panelName
-            ? `تست «${panelName}» موفق بود`
-            : "اتصال موفق بود"
+            ? `تست «${panelName}» موفق بود${ms}`
+            : `اتصال موفق بود${ms}`
           : res.error || "اتصال ناموفق"
       );
       qc.invalidateQueries({ queryKey: ["panels"] });
@@ -718,7 +725,7 @@ export default function PanelsPage() {
     mutationFn: () =>
       api<PanelTestAll>("/api/admin/panels/test-all", {
         method: "POST",
-        timeoutMs: 25_000,
+        timeoutMs: 90_000,
       }),
     onSuccess: (res) => {
       setTestAllOpen(true);
