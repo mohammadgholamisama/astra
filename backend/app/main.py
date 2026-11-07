@@ -38,7 +38,12 @@ from app.models import group_config_hide as _group_config_hide_model  # noqa: F4
 from app.models import site_setting as _site_setting_model  # noqa: F401
 from app.models.user import PanelAccount, User, UserStatus
 from app.core.config import get_settings
-from app.core.database import AsyncSessionLocal
+from app.core.database import (
+    AsyncSessionLocal,
+    dispose_engine,
+    pool_guardian_loop,
+    session_scope,
+)
 from app.core.schema_sync import ensure_schema
 from app.seed import seed_admin
 from app.services.config_hides import refresh_cache as refresh_config_hides
@@ -57,12 +62,18 @@ async def _heal_failed_panels_loop() -> None:
     When a dead panel comes back, error/pending accounts become active and
     their share links show up on the subscription automatically.
     """
+    from app.core.database import background_db_sem
     from app.services.orchestrator import heal_failed_panel_accounts_batch
 
     await asyncio.sleep(60)
     while True:
+        sem = background_db_sem()
         try:
-            n = await heal_failed_panel_accounts_batch(limit_users=20)
+            await sem.acquire()
+            try:
+                n = await heal_failed_panel_accounts_batch(limit_users=20)
+            finally:
+                sem.release()
             if n:
                 logger.info("heal loop: recovered panels for %s users", n)
         except asyncio.CancelledError:
@@ -78,6 +89,7 @@ async def _outbound_health_loop() -> None:
 
     When an outbound fails ping it is dropped from share-links; without this
     loop it stayed missing until an admin clicked Ping even after recovery.
+    Uses background DB slots so this never starves login/API.
     """
     from app.models.panel import Panel, PanelType
     from app.services import astra_node as node
@@ -85,7 +97,7 @@ async def _outbound_health_loop() -> None:
     await asyncio.sleep(90)
     while True:
         try:
-            async with AsyncSessionLocal() as db:
+            async with session_scope(background=True) as db:
                 result = await db.execute(
                     select(Panel.id).where(
                         Panel.type == PanelType.astra,
@@ -95,22 +107,17 @@ async def _outbound_health_loop() -> None:
                 panel_ids = [int(r[0]) for r in result.all()]
             for pid in panel_ids:
                 try:
-                    async with AsyncSessionLocal() as db:
-                        panel = await db.get(Panel, pid)
-                        if panel is None or not panel.is_active:
-                            continue
-                        stats = await node.reconcile_outbounds_health(
-                            db, panel, concurrency=2
+                    stats = await node.reconcile_outbounds_health_released(
+                        pid, concurrency=2
+                    )
+                    if stats.get("changed"):
+                        logger.info(
+                            "outbound health: panel=%s pinged=%s changed=%s ok=%s",
+                            pid,
+                            stats.get("pinged"),
+                            stats.get("changed"),
+                            stats.get("ok"),
                         )
-                        await db.commit()
-                        if stats.get("changed"):
-                            logger.info(
-                                "outbound health: panel=%s pinged=%s changed=%s ok=%s",
-                                panel.id,
-                                stats.get("pinged"),
-                                stats.get("changed"),
-                                stats.get("ok"),
-                            )
                 except Exception:  # noqa: BLE001
                     logger.exception(
                         "outbound health reconcile failed panel=%s", pid
@@ -132,13 +139,19 @@ async def _usage_sync_loop() -> None:
     """
     import time as _time
 
+    from app.core.database import background_db_sem
     from app.services.orchestrator import run_quota_watch_cycle
 
     await asyncio.sleep(8)
     while True:
         t0 = _time.monotonic()
         try:
-            stats = await run_quota_watch_cycle()
+            sem = background_db_sem()
+            await sem.acquire()
+            try:
+                stats = await run_quota_watch_cycle()
+            finally:
+                sem.release()
             elapsed = _time.monotonic() - t0
             if (
                 stats.get("flipped")
@@ -228,6 +241,7 @@ async def lifespan(_app: FastAPI):
     order_boot_task = asyncio.create_task(
         _bg_order_kind_boot(), name="astra-order-kind-boot"
     )
+    pool_task = asyncio.create_task(pool_guardian_loop(), name="astra-db-pool-guard")
     try:
         yield
     finally:
@@ -235,11 +249,19 @@ async def lifespan(_app: FastAPI):
         heal_task.cancel()
         outbound_task.cancel()
         order_boot_task.cancel()
-        for task in (usage_task, heal_task, outbound_task, order_boot_task):
+        pool_task.cancel()
+        for task in (
+            usage_task,
+            heal_task,
+            outbound_task,
+            order_boot_task,
+            pool_task,
+        ):
             try:
                 await task
             except asyncio.CancelledError:
                 pass
+        await dispose_engine()
 
 
 app = FastAPI(

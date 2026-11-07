@@ -21,6 +21,11 @@ class Settings(BaseSettings):
     )
 
     DATABASE_URL: str = "sqlite+aiosqlite:///./astra.db"
+    # Postgres pool (ignored for SQLite NullPool). Keep headroom for login/API.
+    DB_POOL_SIZE: int = 8
+    DB_MAX_OVERFLOW: int = 12
+    DB_POOL_TIMEOUT: float = 3.0
+    DB_POOL_RECYCLE: int = 300
     SECRET_KEY: str = "astra-dev-secret-key-change-in-production-32chars"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     SUB_BASE_URL: str = "http://localhost:8000"

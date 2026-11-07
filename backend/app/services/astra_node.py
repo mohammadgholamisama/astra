@@ -568,6 +568,7 @@ async def _tcp_fallback(
 
 
 async def ping_outbound(db: AsyncSession, row: AstraOutbound) -> AstraOutbound:
+    """Probe one outbound then persist — network I/O does not need the DB conn."""
     ok, ms = await protocol_ping(row)
     row.last_ping_ok = ok
     row.last_ping_ms = ms
@@ -579,16 +580,24 @@ async def ping_outbound(db: AsyncSession, row: AstraOutbound) -> AstraOutbound:
 async def ping_outbounds_batch(
     db: AsyncSession, rows: list[AstraOutbound], *, concurrency: int = 4
 ) -> list[AstraOutbound]:
-    """Ping many outbounds with limited parallel Xray probes."""
-    sem = asyncio.Semaphore(max(1, min(8, int(concurrency))))
-
-    async def _one(r: AstraOutbound) -> AstraOutbound:
-        async with sem:
-            return await ping_outbound(db, r)
-
+    """Ping many outbounds; hold DB only while writing results (not during TCP)."""
     if not rows:
         return []
-    return list(await asyncio.gather(*[_one(r) for r in rows]))
+    sem = asyncio.Semaphore(max(1, min(8, int(concurrency))))
+
+    async def _probe(r: AstraOutbound) -> tuple[AstraOutbound, bool, int | None]:
+        async with sem:
+            ok, ms = await protocol_ping(r)
+            return r, ok, ms
+
+    probed = await asyncio.gather(*[_probe(r) for r in rows])
+    now = datetime.now(timezone.utc)
+    for r, ok, ms in probed:
+        r.last_ping_ok = ok
+        r.last_ping_ms = ms
+        r.last_ping_at = now
+    await db.flush()
+    return [r for r, _, _ in probed]
 
 
 async def reconcile_outbounds_health(
@@ -602,6 +611,9 @@ async def reconcile_outbounds_health(
 
     When an outbound was down (removed from sub) and comes back, this puts its
     share-link back into PanelAccount.links / live sub generation.
+
+    Prefer ``reconcile_outbounds_health_released`` from background loops so the
+    DB connection is not held during TCP probes.
     """
     rows = await list_outbounds(db, panel.id)
     if not rows:
@@ -621,6 +633,66 @@ async def reconcile_outbounds_health(
         await rebuild_xray_config(db, panel)
         await refresh_panel_account_links(db, panel)
     return {"pinged": len(rows), "changed": changed, "ok": ok_n}
+
+
+async def reconcile_outbounds_health_released(
+    panel_id: int,
+    *,
+    concurrency: int = 2,
+    force_refresh: bool = False,
+) -> dict[str, int]:
+    """Background-safe reconcile: DB → probe without pool → DB write.
+
+    Guarantees the connection is returned to the pool while TCP/Xray probes run.
+    """
+    from app.core.database import session_scope
+
+    async with session_scope(background=True) as db:
+        panel = await db.get(Panel, panel_id)
+        if panel is None or not panel.is_active:
+            return {"pinged": 0, "changed": 0, "ok": 0}
+        rows = await list_outbounds(db, panel.id)
+        if not rows:
+            return {"pinged": 0, "changed": 0, "ok": 0}
+        before = {int(r.id): r.last_ping_ok for r in rows}
+        # Snapshot ORM state needed for protocol_ping after session closes
+        snap = list(rows)
+
+    sem = asyncio.Semaphore(max(1, min(8, int(concurrency))))
+
+    async def _probe(r: AstraOutbound) -> tuple[int, bool, int | None]:
+        async with sem:
+            ok, ms = await protocol_ping(r)
+            return int(r.id), ok, ms
+
+    probed = await asyncio.gather(*[_probe(r) for r in snap])
+    by_id = {oid: (ok, ms) for oid, ok, ms in probed}
+
+    async with session_scope(background=True) as db:
+        panel = await db.get(Panel, panel_id)
+        if panel is None or not panel.is_active:
+            return {"pinged": 0, "changed": 0, "ok": 0}
+        rows = await list_outbounds(db, panel.id)
+        now = datetime.now(timezone.utc)
+        changed = 0
+        ok_n = 0
+        for r in rows:
+            key = int(r.id)
+            if key not in by_id:
+                continue
+            ok, ms = by_id[key]
+            prev = before.get(key)
+            r.last_ping_ok = ok
+            r.last_ping_ms = ms
+            r.last_ping_at = now
+            if prev != ok:
+                changed += 1
+            if r.is_enabled and ok is True:
+                ok_n += 1
+        if changed or force_refresh:
+            await rebuild_xray_config(db, panel)
+            await refresh_panel_account_links(db, panel)
+        return {"pinged": len(by_id), "changed": changed, "ok": ok_n}
 
 
 def outbound_in_share_links(ob: AstraOutbound) -> bool:

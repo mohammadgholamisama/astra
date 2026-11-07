@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_admin, oauth2_scheme
 from app.core.config import get_settings
-from app.core.database import get_db
+from app.core.database import get_db, pool_status
 from app.core.security import decode_token
 from app.models.admin import Admin
 from app.models.group import Group
@@ -152,6 +152,12 @@ async def system_stats(
     }
 
 
+@router.get("/api/system/db-pool")
+async def system_db_pool(_admin=Depends(get_current_admin)):
+    """Live SQLAlchemy pool pressure — for ops / debugging panel freezes."""
+    return {"ok": True, "pool": pool_status()}
+
+
 @router.get("/api/system/host")
 async def system_host(_admin=Depends(get_current_admin)):
     """CPU / RAM / disk / uptime / services for the dashboard (cached, non-blocking)."""
@@ -160,13 +166,20 @@ async def system_host(_admin=Depends(get_current_admin)):
     from app.services import host_metrics as hm
 
     try:
-        return await asyncio.wait_for(
+        data = await asyncio.wait_for(
             asyncio.to_thread(collect_host_metrics),
             timeout=2.5,
         )
+        if isinstance(data, dict):
+            data = {**data, "db_pool": pool_status()}
+        return data
     except asyncio.TimeoutError:
         if hm._CACHE:
-            return {**hm._CACHE, "note": "پاسخ کند — آخرین نمونهٔ کش‌شده"}
+            return {
+                **hm._CACHE,
+                "db_pool": pool_status(),
+                "note": "پاسخ کند — آخرین نمونهٔ کش‌شده",
+            }
         return {
             "ok": False,
             "engine": "timeout",
@@ -182,6 +195,7 @@ async def system_host(_admin=Depends(get_current_admin)):
             "memory": {"total": 0, "used": 0, "free": 0, "percent": 0},
             "swap": {"total": 0, "used": 0, "free": 0, "percent": 0},
             "disks": [],
+            "db_pool": pool_status(),
             "uptime_seconds": 0,
             "boot_time": 0,
             "process_count": 0,
