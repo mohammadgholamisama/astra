@@ -1,12 +1,13 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
   ArrowDownRight,
   ArrowUpRight,
   BookOpen,
   Gauge,
+  Loader2,
   Minus,
   Radio,
   RefreshCw,
@@ -27,8 +28,10 @@ type PanelRow = {
   name: string;
   type: string;
   is_active: boolean;
+  accounts?: number;
   online: number;
   raw: {
+    current_total?: number;
     hour: number;
     day: number;
     week: number;
@@ -76,7 +79,12 @@ type Overview = {
       brands: Record<string, number>;
     }[];
   };
-  totals: { raw_hour: number; raw_day: number; panels: number };
+  totals: {
+    raw_current?: number;
+    raw_hour: number;
+    raw_day: number;
+    panels: number;
+  };
   global_hourly: { hour_ts: number; raw_bytes: number }[];
   hour_of_day: { bytes: number[]; peak_hour: number | null; peak_bytes: number };
   panels: PanelRow[];
@@ -95,6 +103,7 @@ type Detail = {
   };
   peak_bps_label: string;
   lifetime_raw: number;
+  current_total?: number;
   compare: Record<
     string,
     { current: number; previous: number; change_pct: number | null }
@@ -201,9 +210,12 @@ function DistChips({
 }
 
 export default function PanelAnalyticsPage() {
+  const qc = useQueryClient();
   const [focusId, setFocusId] = useState<number | null>(null);
   const [q, setQ] = useState("");
-  const [sortKey, setSortKey] = useState<"hour" | "online" | "day">("hour");
+  const [sortKey, setSortKey] = useState<"total" | "hour" | "online" | "day">(
+    "total"
+  );
   const [guideOpen, setGuideOpen] = useState(false);
 
   const overview = useQuery({
@@ -219,14 +231,35 @@ export default function PanelAnalyticsPage() {
     refetchInterval: focusId != null ? 45_000 : false,
   });
 
+  const liveRefresh = useMutation({
+    mutationFn: () =>
+      api<{ ok: boolean; stats: Record<string, number>; overview: Overview }>(
+        "/api/analytics/panels/refresh",
+        { method: "POST", timeoutMs: 180_000 }
+      ),
+    onSuccess: (res) => {
+      if (res.overview) {
+        qc.setQueryData(["analytics-panels"], res.overview);
+      } else {
+        void qc.invalidateQueries({ queryKey: ["analytics-panels"] });
+      }
+      if (focusId != null) {
+        void qc.invalidateQueries({ queryKey: ["analytics-panel", focusId] });
+      }
+    },
+  });
+
   const data = overview.data;
   const maxHour = useMemo(() => {
     if (!data?.global_hourly?.length) return 1;
     return Math.max(1, ...data.global_hourly.map((h) => h.raw_bytes));
   }, [data]);
-  const maxPanelHour = useMemo(() => {
+  const maxPanelTotal = useMemo(() => {
     if (!data?.panels?.length) return 1;
-    return Math.max(1, ...data.panels.map((p) => p.raw.hour));
+    return Math.max(
+      1,
+      ...data.panels.map((p) => Number(p.raw.current_total || p.raw.hour || 0))
+    );
   }, [data]);
 
   const opItems = useMemo(() => {
@@ -256,12 +289,16 @@ export default function PanelAnalyticsPage() {
     list.sort((a, b) => {
       if (sortKey === "online") return b.online - a.online;
       if (sortKey === "day") return b.raw.day - a.raw.day;
-      return b.raw.hour - a.raw.hour;
+      if (sortKey === "hour") return b.raw.hour - a.raw.hour;
+      return (
+        Number(b.raw.current_total || 0) - Number(a.raw.current_total || 0)
+      );
     });
     return list;
   }, [data, q, sortKey]);
 
   const d = detail.data;
+  const refreshing = liveRefresh.isPending;
 
   return (
     <div className="an-page">
@@ -288,15 +325,17 @@ export default function PanelAnalyticsPage() {
             </Link>
             <button
               type="button"
-              className="btn ghost sm"
-              disabled={overview.isFetching}
-              onClick={() => void overview.refetch()}
+              className="btn sm"
+              disabled={refreshing}
+              onClick={() => liveRefresh.mutate()}
+              title="مصرف زنده از پنل‌ها خوانده و آمار از نو ساخته می‌شود"
             >
-              <RefreshCw
-                size={14}
-                className={overview.isFetching ? "configs-spin" : undefined}
-              />
-              بروزرسانی
+              {refreshing ? (
+                <Loader2 size={14} className="configs-spin" />
+              ) : (
+                <RefreshCw size={14} />
+              )}
+              {refreshing ? "در حال خواندن زنده…" : "تازه‌سازی زنده"}
             </button>
             {data?.generated_at ? (
               <span className="an-updated">
@@ -305,6 +344,11 @@ export default function PanelAnalyticsPage() {
               </span>
             ) : null}
           </div>
+          {liveRefresh.isError ? (
+            <p className="an-sub" style={{ color: "var(--danger)" }}>
+              تازه‌سازی ناموفق بود — دوباره تلاش کنید
+            </p>
+          ) : null}
         </div>
       </header>
 
@@ -333,37 +377,63 @@ export default function PanelAnalyticsPage() {
             </div>
           </div>
 
+          <div className="an-hero-actions" style={{ marginBottom: 12 }}>
+            <button
+              type="button"
+              className="btn sm"
+              disabled={refreshing}
+              onClick={() => liveRefresh.mutate()}
+            >
+              {refreshing ? (
+                <Loader2 size={14} className="configs-spin" />
+              ) : (
+                <RefreshCw size={14} />
+              )}
+              تازه‌سازی زنده
+            </button>
+          </div>
+
           {detail.isLoading ? (
             <div className="admin-skel">
               <div className="admin-skel-card" />
             </div>
           ) : d ? (
             <>
-              <div className="an-cards">
-                <article className="an-card">
-                  <p className="an-card-label">مصرف این ساعت</p>
-                  <p className="an-card-big">{formatTraffic(d.compare.hour.current)}</p>
-                  <ChangePill pct={d.compare.hour.change_pct} />
+              <div className="an-stat-grid">
+                <article className="an-stat" title="جمع خام اکانت‌های همین پنل">
+                  <span>
+                    <Zap size={13} /> مصرف فعلی
+                  </span>
+                  <strong>
+                    {formatTraffic(Number(d.current_total ?? d.lifetime_raw ?? 0))}
+                  </strong>
+                  <small>همیشه از اکانت‌ها</small>
                 </article>
-                <article className="an-card">
-                  <p className="an-card-label">نرخ تقریبی</p>
-                  <p className="an-card-big" dir="ltr">
-                    {d.rate_now.hour_label}
-                  </p>
-                  <p className="an-card-hint">پیک عمری: {d.peak_bps_label}</p>
+                <article className="an-stat">
+                  <span>
+                    <Activity size={13} /> این ساعت
+                  </span>
+                  <strong>{formatTraffic(d.compare.hour.current)}</strong>
+                  <small>
+                    <ChangePill pct={d.compare.hour.change_pct} />
+                  </small>
                 </article>
-                <article className="an-card">
-                  <p className="an-card-label">آنلاین این پنل</p>
-                  <p className="an-card-big">{toFaDigits(d.online.online)}</p>
+                <article className="an-stat">
+                  <span>
+                    <Radio size={13} /> آنلاین
+                  </span>
+                  <strong>{toFaDigits(d.online.online)}</strong>
+                  <small dir="ltr">نرخ {d.rate_now.hour_label}</small>
                 </article>
-                <article className="an-card">
-                  <p className="an-card-label">تست‌های ثبت‌شده</p>
-                  <p className="an-card-big">{toFaDigits(d.tests.runs)}</p>
-                  <p className="an-card-hint">
-                    top100: {toFaDigits(d.tests.top100)} · خوب:{" "}
-                    {toFaDigits(d.tests.good)} · همه اپراتور:{" "}
-                    {toFaDigits(d.tests.all_ops_ok)}
-                  </p>
+                <article className="an-stat">
+                  <span>
+                    <Gauge size={13} /> تست‌ها
+                  </span>
+                  <strong>{toFaDigits(d.tests.runs)}</strong>
+                  <small>
+                    top100 {toFaDigits(d.tests.top100)} · خوب{" "}
+                    {toFaDigits(d.tests.good)}
+                  </small>
                 </article>
               </div>
 
@@ -522,42 +592,53 @@ export default function PanelAnalyticsPage() {
         </div>
       ) : data ? (
         <>
-          <div className="an-cards">
-            <article className="an-card" title="کاربران با مصرف اخیر (سطح کاربر)">
-              <p className="an-card-label">
-                <Radio size={14} /> آنلاین کل
-              </p>
-              <p className="an-card-big">
-                {toFaDigits(data.online.total_online)}
-              </p>
-              <p className="an-card-hint">
-                جمع اسلات پنل: {toFaDigits(data.online.panel_online_total)}
-              </p>
+          {refreshing ? (
+            <div className="an-fresh-loading">
+              <Loader2 size={22} className="configs-spin" />
+              <div>
+                <b>در حال خواندن مصرف زنده از پنل‌ها…</b>
+                <p>بعد از اتمام، جدول و نمودارها با دیتای تازه پر می‌شوند</p>
+              </div>
+            </div>
+          ) : null}
+
+          <div className="an-stat-grid">
+            <article className="an-stat">
+              <span>
+                <Radio size={13} /> آنلاین کل
+              </span>
+              <strong>{toFaDigits(data.online.total_online)}</strong>
+              <small>
+                اسلات پنل: {toFaDigits(data.online.panel_online_total)}
+              </small>
             </article>
-            <article className="an-card" title="بدون ضریب">
-              <p className="an-card-label">
-                <Zap size={14} /> مصرف خام این ساعت
-              </p>
-              <p className="an-card-big">{formatTraffic(data.totals.raw_hour)}</p>
-              <p className="an-card-hint">جمع همه پنل‌ها</p>
+            <article className="an-stat" title="جمع خام همه اکانت‌ها روی همه پنل‌ها">
+              <span>
+                <Zap size={13} /> مصرف فعلی کل
+              </span>
+              <strong>
+                {formatTraffic(Number(data.totals.raw_current || 0))}
+              </strong>
+              <small>همیشه از اکانت‌ها — دقیق</small>
             </article>
-            <article className="an-card">
-              <p className="an-card-label">
-                <Activity size={14} /> مصرف امروز
-              </p>
-              <p className="an-card-big">{formatTraffic(data.totals.raw_day)}</p>
+            <article className="an-stat">
+              <span>
+                <Activity size={13} /> این ساعت / امروز
+              </span>
+              <strong>{formatTraffic(data.totals.raw_hour)}</strong>
+              <small>امروز: {formatTraffic(data.totals.raw_day)}</small>
             </article>
-            <article className="an-card">
-              <p className="an-card-label">
-                <Server size={14} /> پنل‌ها
-              </p>
-              <p className="an-card-big">{toFaDigits(data.totals.panels)}</p>
-              <p className="an-card-hint">
+            <article className="an-stat">
+              <span>
+                <Server size={13} /> پنل‌ها
+              </span>
+              <strong>{toFaDigits(data.totals.panels)}</strong>
+              <small>
                 اوج روز:{" "}
                 {data.hour_of_day.peak_hour != null
                   ? `ساعت ${toFaDigits(data.hour_of_day.peak_hour)}`
                   : "—"}
-              </p>
+              </small>
             </article>
           </div>
 
@@ -599,30 +680,36 @@ export default function PanelAnalyticsPage() {
             <section className="an-block">
               <div className="an-block-head">
                 <h3>
-                  <Gauge size={16} /> سهم مصرف این ساعت
+                  <Gauge size={16} /> سهم مصرف فعلی پنل‌ها
                 </h3>
-                <span className="muted">کلیک = جزئیات پنل</span>
+                <span className="muted">کلیک = جزئیات</span>
               </div>
               <div className="an-bars">
-                {panelsView.map((p) => (
+                {panelsView
+                  .filter((p) => Number(p.raw.current_total || 0) > 0 || p.raw.hour > 0)
+                  .map((p) => (
                   <button
                     key={p.panel_id}
                     type="button"
                     className="pan-bar-btn"
                     onClick={() => setFocusId(p.panel_id)}
+                    title={`${p.name} — مصرف فعلی ${formatTraffic(Number(p.raw.current_total || 0))} · این ساعت ${formatTraffic(p.raw.hour)}`}
                   >
                     <BarRow
                       label={`${p.name} · ${toFaDigits(p.online)} آنلاین`}
-                      value={p.raw.hour}
-                      max={maxPanelHour}
-                      sub={`${p.rate.hour_label}${
-                        p.rate.per_online_label
-                          ? ` · سرانه ${p.rate.per_online_label}`
-                          : ""
-                      }`}
+                      value={Number(p.raw.current_total || p.raw.hour || 0)}
+                      max={maxPanelTotal}
+                      sub={`فعلی ${formatTraffic(Number(p.raw.current_total || 0))} · ساعت ${formatTraffic(p.raw.hour)}`}
                     />
                   </button>
                 ))}
+                {panelsView.every(
+                  (p) => Number(p.raw.current_total || 0) <= 0 && p.raw.hour <= 0
+                ) ? (
+                  <p className="muted">
+                    هنوز مصرفی نیست — «تازه‌سازی زنده» را بزنید
+                  </p>
+                ) : null}
               </div>
             </section>
           </div>
@@ -642,6 +729,7 @@ export default function PanelAnalyticsPage() {
               <div className="an-sort-pills">
                 {(
                   [
+                    ["total", "مصرف فعلی"],
                     ["hour", "ساعت"],
                     ["day", "امروز"],
                     ["online", "آنلاین"],
@@ -664,7 +752,10 @@ export default function PanelAnalyticsPage() {
                   <tr>
                     <th>پنل</th>
                     <th title="آنلاین روی همین پنل">آنلاین</th>
-                    <th title="مصرف خام این ساعت">ساعت</th>
+                    <th title="جمع خام فعلی همه اکانت‌های این پنل — همیشه دقیق">
+                      مصرف فعلی
+                    </th>
+                    <th title="دلتای نمونه‌برداری این ساعت">ساعت</th>
                     <th>امروز</th>
                     <th>هفته</th>
                     <th>ماه</th>
@@ -688,10 +779,16 @@ export default function PanelAnalyticsPage() {
                         </button>
                         <div className="muted" style={{ fontSize: "0.75rem" }}>
                           {p.type}
+                          {p.accounts != null
+                            ? ` · ${toFaDigits(p.accounts)} اکانت`
+                            : ""}
                           {!p.is_active ? " · خاموش" : ""}
                         </div>
                       </td>
                       <td>{toFaDigits(p.online)}</td>
+                      <td>
+                        <b>{formatTraffic(Number(p.raw.current_total || 0))}</b>
+                      </td>
                       <td>
                         {formatTraffic(p.raw.hour)}{" "}
                         <ChangePill pct={p.compare_hour_pct} />

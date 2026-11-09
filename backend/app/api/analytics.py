@@ -161,12 +161,33 @@ async def analytics_panels(
     return await panel_analytics_svc.build_panel_overview(db)
 
 
+@router.post("/api/analytics/panels/refresh")
+async def analytics_panels_refresh(
+    _admin=Depends(get_current_admin),
+):
+    """Live-pull remotes, resample analytics, return fresh overview."""
+    from app.core.database import AsyncSessionLocal
+
+    stats = await panel_analytics_svc.refresh_panels_live(pull_remotes=True)
+    try:
+        await analytics_svc.sample_all_users_once()
+    except Exception:  # noqa: BLE001
+        logger.debug("user sample after panel refresh failed", exc_info=True)
+    # Fresh session so we see commits from the live-pull session
+    async with AsyncSessionLocal() as db:
+        overview = await panel_analytics_svc.build_panel_overview(db)
+    return {"ok": True, "stats": stats, "overview": overview}
+
+
 @router.get("/api/analytics/panels/{panel_id}")
 async def analytics_panel_detail(
     panel_id: int,
+    refresh: bool = Query(False),
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
+    if refresh:
+        await panel_analytics_svc.refresh_panels_live(pull_remotes=True)
     try:
         return await panel_analytics_svc.build_panel_detail(db, panel_id)
     except KeyError:
@@ -179,5 +200,5 @@ async def analytics_sample_now(
 ):
     """Force one analytics sample cycle (admin/debug)."""
     stats = await analytics_svc.sample_all_users_once()
-    panel_stats = await panel_analytics_svc.sample_all_panels_once()
+    panel_stats = await panel_analytics_svc.sample_all_panels_once(force=True)
     return {"ok": True, "users": stats, "panels": panel_stats}

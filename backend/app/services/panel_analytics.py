@@ -248,97 +248,211 @@ async def apply_panel_user_sample(
     return row.online_since is not None
 
 
-async def sample_all_panels_once() -> dict[str, int]:
+async def _sample_panels_with_db(db: AsyncSession, *, now: datetime | None = None) -> dict[str, int]:
+    """Advance panel + user×panel cursors from current PanelAccount counters."""
+    now = _as_utc(now) or _utc_now()
+    up_rows = (
+        await db.execute(
+            select(
+                PanelAccount.user_id,
+                PanelAccount.panel_id,
+                func.coalesce(func.sum(PanelAccount.used_traffic), 0),
+            )
+            .where(
+                PanelAccount.status.in_(
+                    (
+                        PanelAccountStatus.active,
+                        PanelAccountStatus.error,
+                        PanelAccountStatus.pending,
+                        PanelAccountStatus.deleted,
+                    )
+                )
+            )
+            .group_by(PanelAccount.user_id, PanelAccount.panel_id)
+        )
+    ).all()
+
+    online_by_panel: dict[int, int] = {}
+    raw_by_panel: dict[int, int] = {}
+    n_up = 0
+    for uid, pid, total in up_rows:
+        uid_i, pid_i = int(uid), int(pid)
+        raw_i = int(total or 0)
+        raw_by_panel[pid_i] = raw_by_panel.get(pid_i, 0) + raw_i
+        try:
+            is_on = await apply_panel_user_sample(db, uid_i, pid_i, raw_i, now=now)
+            if is_on:
+                online_by_panel[pid_i] = online_by_panel.get(pid_i, 0) + 1
+            n_up += 1
+        except Exception:  # noqa: BLE001
+            logger.exception("panel user sample u=%s p=%s failed", uid_i, pid_i)
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+        if n_up % 80 == 0:
+            await db.commit()
+
+    all_pids = {int(r[0]) for r in (await db.execute(select(Panel.id))).all()}
+    for pid in all_pids:
+        raw_by_panel.setdefault(int(pid), 0)
+        online_by_panel.setdefault(int(pid), 0)
+
+    n_p = 0
+    for pid, raw in raw_by_panel.items():
+        try:
+            await apply_panel_raw_sample(
+                db,
+                int(pid),
+                int(raw),
+                online_n=int(online_by_panel.get(int(pid), 0)),
+                now=now,
+            )
+            n_p += 1
+        except Exception:  # noqa: BLE001
+            logger.exception("panel sample p=%s failed", pid)
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+    await db.commit()
+    return {"panels": n_p, "user_panel": n_up}
+
+
+async def sample_all_panels_once(*, force: bool = False) -> dict[str, int]:
     """Sample raw traffic per panel + per (user,panel) online flags."""
     from app.core.database import AsyncSessionLocal
 
-    if _sample_lock.locked():
+    if _sample_lock.locked() and not force:
         return {"skipped": 1}
     async with _sample_lock:
         t0 = time.monotonic()
         async with AsyncSessionLocal() as db:
-            now = _utc_now()
-            # Per user×panel raw
-            up_rows = (
-                await db.execute(
-                    select(
-                        PanelAccount.user_id,
-                        PanelAccount.panel_id,
-                        func.coalesce(func.sum(PanelAccount.used_traffic), 0),
+            stats = await _sample_panels_with_db(db)
+        stats["ms"] = int((time.monotonic() - t0) * 1000)
+        return stats
+
+
+async def live_panel_totals(db: AsyncSession) -> dict[int, int]:
+    """Current Σ PanelAccount.used_traffic per panel (authoritative cumulative)."""
+    rows = (
+        await db.execute(
+            select(
+                PanelAccount.panel_id,
+                func.coalesce(func.sum(PanelAccount.used_traffic), 0),
+            )
+            .where(
+                PanelAccount.status.in_(
+                    (
+                        PanelAccountStatus.active,
+                        PanelAccountStatus.error,
+                        PanelAccountStatus.pending,
+                        PanelAccountStatus.deleted,
                     )
-                    .where(
-                        PanelAccount.status.in_(
-                            (
-                                PanelAccountStatus.active,
-                                PanelAccountStatus.error,
-                                PanelAccountStatus.pending,
-                                PanelAccountStatus.deleted,
+                )
+            )
+            .group_by(PanelAccount.panel_id)
+        )
+    ).all()
+    return {int(pid): int(raw or 0) for pid, raw in rows}
+
+
+async def refresh_panels_live(*, pull_remotes: bool = True) -> dict[str, Any]:
+    """Pull fresh remote usage then resample all panel analytics.
+
+    This is what the admin «تازه‌سازی زنده» button should call so hour/day
+    buckets and online flags catch up immediately.
+    """
+    from app.core.database import AsyncSessionLocal
+    from app.models.panel import PanelType
+    from app.models.user import User
+    from app.services.orchestrator import refresh_users_usage_batch
+
+    t0 = time.monotonic()
+    pulled = 0
+    astra_synced = 0
+
+    async with _sample_lock:
+        async with AsyncSessionLocal() as db:
+            if pull_remotes:
+                # 1) Fast path: Astra node local stats (no HTTP to foreign panels)
+                try:
+                    from app.services import astra_node as astra_node_svc
+
+                    astra_panels = list(
+                        (
+                            await db.execute(
+                                select(Panel).where(
+                                    Panel.type == PanelType.astra,
+                                    Panel.is_active.is_(True),
+                                )
                             )
                         )
+                        .scalars()
+                        .all()
                     )
-                    .group_by(PanelAccount.user_id, PanelAccount.panel_id)
-                )
-            ).all()
-
-            online_by_panel: dict[int, int] = {}
-            raw_by_panel: dict[int, int] = {}
-            n_up = 0
-            for uid, pid, total in up_rows:
-                uid_i, pid_i = int(uid), int(pid)
-                raw_i = int(total or 0)
-                raw_by_panel[pid_i] = raw_by_panel.get(pid_i, 0) + raw_i
-                try:
-                    is_on = await apply_panel_user_sample(
-                        db, uid_i, pid_i, raw_i, now=now
-                    )
-                    if is_on:
-                        online_by_panel[pid_i] = online_by_panel.get(pid_i, 0) + 1
-                    n_up += 1
-                except Exception:  # noqa: BLE001
-                    logger.exception(
-                        "panel user sample u=%s p=%s failed", uid_i, pid_i
-                    )
-                    try:
-                        await db.rollback()
-                    except Exception:  # noqa: BLE001
-                        pass
-                if n_up % 80 == 0:
+                    for panel in astra_panels:
+                        try:
+                            n = await astra_node_svc.sync_traffic_from_xray(db, panel)
+                            astra_synced += int(n or 0)
+                        except Exception:  # noqa: BLE001
+                            logger.debug(
+                                "astra sync panel=%s failed", panel.id, exc_info=True
+                            )
                     await db.commit()
-
-            # Include panels with zero accounts so state exists
-            all_pids = {
-                int(r[0])
-                for r in (
-                    await db.execute(select(Panel.id))
-                ).all()
-            }
-            for pid in all_pids:
-                raw_by_panel.setdefault(int(pid), 0)
-                online_by_panel.setdefault(int(pid), 0)
-
-            n_p = 0
-            for pid, raw in raw_by_panel.items():
-                try:
-                    await apply_panel_raw_sample(
-                        db,
-                        int(pid),
-                        int(raw),
-                        online_n=int(online_by_panel.get(int(pid), 0)),
-                        now=now,
-                    )
-                    n_p += 1
                 except Exception:  # noqa: BLE001
-                    logger.exception("panel sample p=%s failed", pid)
+                    logger.warning("astra bulk sync for analytics failed", exc_info=True)
                     try:
                         await db.rollback()
                     except Exception:  # noqa: BLE001
                         pass
-            await db.commit()
-        return {
-            "panels": n_p,
-            "user_panel": n_up,
-            "ms": int((time.monotonic() - t0) * 1000),
-        }
+
+                # 2) Live-pull a capped set of users (newest with accounts first)
+                try:
+                    users = list(
+                        (
+                            await db.execute(
+                                select(User)
+                                .join(PanelAccount, PanelAccount.user_id == User.id)
+                                .distinct()
+                                .order_by(User.id.desc())
+                                .limit(250)
+                            )
+                        )
+                        .scalars()
+                        .unique()
+                        .all()
+                    )
+                    if users:
+                        await refresh_users_usage_batch(
+                            db,
+                            users,
+                            force=True,
+                            concurrency=12,
+                            push_remotes=False,
+                            quick=True,
+                            isolated=False,
+                        )
+                        await db.commit()
+                        pulled = len(users)
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "panel analytics remote pull failed", exc_info=True
+                    )
+                    try:
+                        await db.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            sample_stats = await _sample_panels_with_db(db)
+
+    return {
+        "ok": True,
+        "users_pulled": pulled,
+        "astra_synced": astra_synced,
+        **sample_stats,
+        "ms": int((time.monotonic() - t0) * 1000),
+    }
 
 
 async def prune_panel_analytics(db: AsyncSession) -> dict[str, int]:
@@ -724,36 +838,55 @@ async def build_panel_overview(db: AsyncSession) -> dict[str, Any]:
         int(s.panel_id): s
         for s in (await db.execute(select(PanelUsageState))).scalars().all()
     }
+    # Live cumulative from accounts — always accurate even before hour buckets fill
+    live_totals = await live_panel_totals(db)
+    accounts_by_panel: dict[int, int] = {}
+    for pid, cnt in (
+        await db.execute(
+            select(PanelAccount.panel_id, func.count())
+            .where(
+                PanelAccount.status.in_(
+                    (
+                        PanelAccountStatus.active,
+                        PanelAccountStatus.error,
+                        PanelAccountStatus.pending,
+                    )
+                )
+            )
+            .group_by(PanelAccount.panel_id)
+        )
+    ).all():
+        accounts_by_panel[int(pid)] = int(cnt or 0)
+
     online_info = await _online_breakdown(db)
     online_by_pid = {
         int(x["panel_id"]): int(x["online"]) for x in online_info["by_panel"]
     }
 
-    # Prefetch hour sums
     async def period_sum(pid: int, a: int, b: int) -> int:
         return await _sum_panel_hours(db, pid, a, b)
 
     rows = []
     total_hour = 0
     total_day = 0
+    total_live = 0
     for p in panels:
         pid = int(p.id)
         st = states.get(pid)
+        live = int(live_totals.get(pid, 0))
+        total_live += live
         h = await period_sum(pid, hour, hour + 3600)
         d = await period_sum(pid, day, day + 86400)
         w = await period_sum(pid, week, week + 7 * 86400)
         m = await period_sum(pid, month, int(next_month.timestamp()))
         prev_h = await period_sum(pid, hour - 3600, hour)
         online_n = online_by_pid.get(pid, 0)
-        # Instant rate from last sample
         peak = float(st.peak_bps or 0) if st else 0.0
-        # Current hour avg bps
         hour_bps = (h * 8.0) / 3600.0 if h > 0 else 0.0
         per_online_hour = (h / online_n) if online_n > 0 else None
         per_online_bps = (hour_bps / online_n) if online_n > 0 else None
         total_hour += h
         total_day += d
-        # Latest test run
         last_run = (
             await db.execute(
                 select(PanelTestRun)
@@ -768,8 +901,10 @@ async def build_panel_overview(db: AsyncSession) -> dict[str, Any]:
                 "name": p.name,
                 "type": getattr(p.type, "value", p.type),
                 "is_active": bool(getattr(p, "is_active", True)),
+                "accounts": accounts_by_panel.get(pid, 0),
                 "online": online_n,
                 "raw": {
+                    "current_total": live,
                     "hour": h,
                     "day": d,
                     "week": w,
@@ -811,7 +946,15 @@ async def build_panel_overview(db: AsyncSession) -> dict[str, Any]:
             }
         )
 
-    rows.sort(key=lambda r: (-r["raw"]["hour"], -r["online"], r["name"]))
+    # Prefer live cumulative so panels with real usage never look "empty"
+    rows.sort(
+        key=lambda r: (
+            -int(r["raw"]["current_total"] or 0),
+            -int(r["raw"]["hour"] or 0),
+            -int(r["online"] or 0),
+            r["name"],
+        )
+    )
 
     # Global hourly 24h
     g_start = hour - 23 * 3600
@@ -850,6 +993,7 @@ async def build_panel_overview(db: AsyncSession) -> dict[str, Any]:
         "generated_at": now.isoformat(),
         "online": online_info,
         "totals": {
+            "raw_current": total_live,
             "raw_hour": total_hour,
             "raw_day": total_day,
             "panels": len(panels),
@@ -861,7 +1005,10 @@ async def build_panel_overview(db: AsyncSession) -> dict[str, Any]:
             "peak_bytes": by_hod[peak_hod] if peak_hod is not None else 0,
         },
         "panels": rows,
-        "note": "مصرف خام بدون ضریب · آنلاین از دلتای مصرف هر پنل · اپراتور از IP تقریبی",
+        "note": (
+            "مصرف فعلی = جمع خام اکانت‌های همان پنل (همیشه دقیق). "
+            "ساعت/روز/هفته از نمونه‌برداری دوره‌ای است — با «تازه‌سازی زنده» تازه می‌شود."
+        ),
     }
 
 
@@ -889,6 +1036,8 @@ async def build_panel_detail(db: AsyncSession, panel_id: int) -> dict[str, Any]:
     )
 
     st = await db.get(PanelUsageState, int(panel_id))
+    live_map = await live_panel_totals(db)
+    live_total = int(live_map.get(int(panel_id), 0))
     cur_h = await _sum_panel_hours(db, panel_id, hour, hour + 3600)
     prev_h = await _sum_panel_hours(db, panel_id, hour - 3600, hour)
     cur_d = await _sum_panel_hours(db, panel_id, day, day + 86400)
@@ -984,6 +1133,7 @@ async def build_panel_detail(db: AsyncSession, panel_id: int) -> dict[str, Any]:
         "peak_bps_label": format_bps(float(st.peak_bps or 0) if st else 0),
         "peak_bps_at": st.peak_bps_at.isoformat() if st and st.peak_bps_at else None,
         "lifetime_raw": int(st.last_raw_total or 0) if st else 0,
+        "current_total": live_total,
         "compare": {
             "hour": {
                 "current": cur_h,
