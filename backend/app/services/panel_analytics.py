@@ -367,11 +367,15 @@ async def _sample_panels_with_db(db: AsyncSession, *, now: datetime | None = Non
 
 
 async def sample_all_panels_once(*, force: bool = False) -> dict[str, int]:
-    """Sample raw traffic per panel + per (user,panel) online flags."""
+    """Sample raw traffic per panel + per (user,panel) online flags.
+
+    Never waits on a busy lock so HTTP overview stays responsive.
+    """
     from app.core.database import AsyncSessionLocal
 
-    if _sample_lock.locked() and not force:
-        return {"skipped": 1}
+    _ = force
+    if _sample_lock.locked():
+        return {"skipped": 1, "busy": 1}
     async with _sample_lock:
         t0 = time.monotonic()
         async with AsyncSessionLocal() as db:
@@ -407,8 +411,8 @@ async def live_panel_totals(db: AsyncSession) -> dict[int, int]:
 async def refresh_panels_live(*, pull_remotes: bool = True) -> dict[str, Any]:
     """Pull fresh remote usage then resample all panel analytics.
 
-    This is what the admin «تازه‌سازی زنده» button should call so hour/day
-    buckets and online flags catch up immediately.
+    Remote I/O runs outside the sample lock so the overview API never stalls
+    behind a long refresh.
     """
     from app.core.database import AsyncSessionLocal
     from app.models.panel import PanelType
@@ -419,80 +423,76 @@ async def refresh_panels_live(*, pull_remotes: bool = True) -> dict[str, Any]:
     pulled = 0
     astra_synced = 0
 
-    async with _sample_lock:
+    if pull_remotes:
         async with AsyncSessionLocal() as db:
-            if pull_remotes:
-                # 1) Fast path: Astra node local stats (no HTTP to foreign panels)
-                try:
-                    from app.services import astra_node as astra_node_svc
+            # 1) Fast path: Astra node local stats
+            try:
+                from app.services import astra_node as astra_node_svc
 
-                    astra_panels = list(
-                        (
-                            await db.execute(
-                                select(Panel).where(
-                                    Panel.type == PanelType.astra,
-                                    Panel.is_active.is_(True),
-                                )
+                astra_panels = list(
+                    (
+                        await db.execute(
+                            select(Panel).where(
+                                Panel.type == PanelType.astra,
+                                Panel.is_active.is_(True),
                             )
                         )
-                        .scalars()
-                        .all()
                     )
-                    for panel in astra_panels:
-                        try:
-                            n = await astra_node_svc.sync_traffic_from_xray(db, panel)
-                            astra_synced += int(n or 0)
-                        except Exception:  # noqa: BLE001
-                            logger.debug(
-                                "astra sync panel=%s failed", panel.id, exc_info=True
-                            )
+                    .scalars()
+                    .all()
+                )
+                for panel in astra_panels:
+                    try:
+                        n = await astra_node_svc.sync_traffic_from_xray(db, panel)
+                        astra_synced += int(n or 0)
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "astra sync panel=%s failed", panel.id, exc_info=True
+                        )
+                await db.commit()
+            except Exception:  # noqa: BLE001
+                logger.warning("astra bulk sync for analytics failed", exc_info=True)
+                try:
+                    await db.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # 2) Live-pull a capped set of users
+            try:
+                users = list(
+                    (
+                        await db.execute(
+                            select(User)
+                            .join(PanelAccount, PanelAccount.user_id == User.id)
+                            .distinct()
+                            .order_by(User.id.desc())
+                            .limit(250)
+                        )
+                    )
+                    .scalars()
+                    .unique()
+                    .all()
+                )
+                if users:
+                    await refresh_users_usage_batch(
+                        db,
+                        users,
+                        force=True,
+                        concurrency=12,
+                        push_remotes=False,
+                        quick=True,
+                        isolated=False,
+                    )
                     await db.commit()
-                except Exception:  # noqa: BLE001
-                    logger.warning("astra bulk sync for analytics failed", exc_info=True)
-                    try:
-                        await db.rollback()
-                    except Exception:  # noqa: BLE001
-                        pass
-
-                # 2) Live-pull a capped set of users (newest with accounts first)
+                    pulled = len(users)
+            except Exception:  # noqa: BLE001
+                logger.warning("panel analytics remote pull failed", exc_info=True)
                 try:
-                    users = list(
-                        (
-                            await db.execute(
-                                select(User)
-                                .join(PanelAccount, PanelAccount.user_id == User.id)
-                                .distinct()
-                                .order_by(User.id.desc())
-                                .limit(250)
-                            )
-                        )
-                        .scalars()
-                        .unique()
-                        .all()
-                    )
-                    if users:
-                        await refresh_users_usage_batch(
-                            db,
-                            users,
-                            force=True,
-                            concurrency=12,
-                            push_remotes=False,
-                            quick=True,
-                            isolated=False,
-                        )
-                        await db.commit()
-                        pulled = len(users)
+                    await db.rollback()
                 except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "panel analytics remote pull failed", exc_info=True
-                    )
-                    try:
-                        await db.rollback()
-                    except Exception:  # noqa: BLE001
-                        pass
+                    pass
 
-            sample_stats = await _sample_panels_with_db(db)
-
+    sample_stats = await sample_all_panels_once(force=True)
     return {
         "ok": True,
         "users_pulled": pulled,
@@ -902,13 +902,54 @@ async def build_panel_overview(
     ).all():
         accounts_by_panel[int(pid)] = int(cnt or 0)
 
-    online_info = await _online_breakdown(db)
+    try:
+        online_info = await _online_breakdown(db)
+    except Exception:  # noqa: BLE001
+        logger.exception("panel online breakdown failed")
+        online_info = {
+            "total_online": 0,
+            "panel_online_total": 0,
+            "by_panel": [],
+            "operators": {},
+            "brands": {},
+        }
     online_by_pid = {
         int(x["panel_id"]): int(x["online"]) for x in online_info["by_panel"]
     }
 
-    async def period_sum(pid: int, a: int, b: int) -> int:
-        return await _sum_panel_hours(db, pid, a, b)
+    # Batch period sums (one query per window instead of N×panels)
+    async def _batched(a: int, b: int) -> dict[int, int]:
+        rows_q = (
+            await db.execute(
+                select(
+                    PanelUsageHourBucket.panel_id,
+                    func.coalesce(func.sum(PanelUsageHourBucket.raw_bytes), 0),
+                )
+                .where(
+                    PanelUsageHourBucket.hour_ts >= int(a),
+                    PanelUsageHourBucket.hour_ts < int(b),
+                )
+                .group_by(PanelUsageHourBucket.panel_id)
+            )
+        ).all()
+        return {int(pid): int(raw or 0) for pid, raw in rows_q}
+
+    hour_map = await _batched(hour, hour + 3600)
+    prev_hour_map = await _batched(hour - 3600, hour)
+    day_map = await _batched(day, day + 86400)
+    week_map = await _batched(week, week + 7 * 86400)
+    month_map = await _batched(month, next_month_ts)
+
+    # Latest test run per panel (recent rows only)
+    last_runs: dict[int, PanelTestRun] = {}
+    for tr in (
+        await db.execute(
+            select(PanelTestRun).order_by(PanelTestRun.ts.desc()).limit(800)
+        )
+    ).scalars().all():
+        pid = int(tr.panel_id)
+        if pid not in last_runs:
+            last_runs[pid] = tr
 
     rows = []
     total_hour = 0
@@ -923,22 +964,15 @@ async def build_panel_overview(
         pending = max(0, live - cursor)
         total_live += live
         total_pending += pending
-        h = (await period_sum(pid, hour, hour + 3600)) + pending
-        d = (await period_sum(pid, day, day + 86400)) + pending
-        w = (await period_sum(pid, week, week + 7 * 86400)) + pending
-        m = (await period_sum(pid, month, next_month_ts)) + pending
-        prev_h = await period_sum(pid, hour - 3600, hour)
+        h = int(hour_map.get(pid, 0)) + pending
+        d = int(day_map.get(pid, 0)) + pending
+        w = int(week_map.get(pid, 0)) + pending
+        m = int(month_map.get(pid, 0)) + pending
+        prev_h = int(prev_hour_map.get(pid, 0))
         online_n = online_by_pid.get(pid, 0)
         total_hour += h
         total_day += d
-        last_run = (
-            await db.execute(
-                select(PanelTestRun)
-                .where(PanelTestRun.panel_id == pid)
-                .order_by(PanelTestRun.ts.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
+        last_run = last_runs.get(pid)
         rows.append(
             {
                 "panel_id": pid,
@@ -958,11 +992,15 @@ async def build_panel_overview(
                 },
                 "compare_hour_pct": _pct_change(h, prev_h),
                 "tests": {
-                    "runs": int(st.tests_total or 0) if st else 0,
-                    "configs_tested": int(st.configs_tested_total or 0) if st else 0,
-                    "top100": int(st.top100_total or 0) if st else 0,
-                    "good": int(st.good_total or 0) if st else 0,
-                    "all_ops_ok": int(st.all_ops_ok_total or 0) if st else 0,
+                    "runs": int(getattr(st, "tests_total", 0) or 0) if st else 0,
+                    "configs_tested": int(getattr(st, "configs_tested_total", 0) or 0)
+                    if st
+                    else 0,
+                    "top100": int(getattr(st, "top100_total", 0) or 0) if st else 0,
+                    "good": int(getattr(st, "good_total", 0) or 0) if st else 0,
+                    "all_ops_ok": int(getattr(st, "all_ops_ok_total", 0) or 0)
+                    if st
+                    else 0,
                     "last_test_at": st.last_test_at.isoformat()
                     if st and st.last_test_at
                     else None,

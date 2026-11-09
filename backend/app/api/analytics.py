@@ -165,7 +165,10 @@ async def analytics_user(
 
 @router.get("/api/analytics/panels")
 async def analytics_panels(
-    sample: bool = Query(True, description="Advance local sample cursors first"),
+    sample: bool = Query(
+        False,
+        description="Best-effort local sample first (never blocks if busy)",
+    ),
     tz_offset: int = Query(0, ge=-840, le=840),
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
@@ -173,12 +176,18 @@ async def analytics_panels(
     """Overview of all panels: raw usage, online, operators, test quality."""
     if sample:
         try:
-            await panel_analytics_svc.sample_all_panels_once(force=True)
+            await panel_analytics_svc.sample_all_panels_once(force=False)
         except Exception:  # noqa: BLE001
             logger.debug("panel sample before overview failed", exc_info=True)
-    return await panel_analytics_svc.build_panel_overview(
-        db, tz_offset_min=tz_offset
-    )
+    try:
+        return await panel_analytics_svc.build_panel_overview(
+            db, tz_offset_min=tz_offset
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("build_panel_overview failed")
+        raise HTTPException(
+            status_code=500, detail="خطا در ساخت آمار پنل‌ها"
+        ) from exc
 
 
 @router.post("/api/analytics/panels/refresh")

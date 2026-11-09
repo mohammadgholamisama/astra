@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -222,19 +222,23 @@ export default function PanelAnalyticsPage() {
   const [guideOpen, setGuideOpen] = useState(false);
 
   const tz = tzOffsetMinutes();
-  const autoLiveDone = useRef(false);
 
   const overview = useQuery({
     queryKey: ["analytics-panels", tz],
     queryFn: () =>
-      api<Overview>(`/api/analytics/panels?sample=1&tz_offset=${tz}`),
+      api<Overview>(`/api/analytics/panels?tz_offset=${tz}`, {
+        timeoutMs: 45_000,
+      }),
     refetchInterval: 60_000,
+    retry: 1,
   });
 
   const detail = useQuery({
     queryKey: ["analytics-panel", focusId, tz],
     queryFn: () =>
-      api<Detail>(`/api/analytics/panels/${focusId}?tz_offset=${tz}`),
+      api<Detail>(`/api/analytics/panels/${focusId}?tz_offset=${tz}`, {
+        timeoutMs: 45_000,
+      }),
     enabled: focusId != null,
     refetchInterval: focusId != null ? 45_000 : false,
   });
@@ -256,24 +260,6 @@ export default function PanelAnalyticsPage() {
       }
     },
   });
-
-  // If accounts exist but counters look empty, pull remotes once
-  useEffect(() => {
-    if (autoLiveDone.current || !overview.data || liveRefresh.isPending) return;
-    const panels = overview.data.panels || [];
-    const hasAccounts = panels.some((p) => Number(p.accounts || 0) > 0);
-    const allEmpty = panels.every(
-      (p) =>
-        Number(p.raw.current_total || 0) <= 0 &&
-        Number(p.raw.hour || 0) <= 0 &&
-        Number(p.raw.day || 0) <= 0
-    );
-    if (hasAccounts && allEmpty) {
-      autoLiveDone.current = true;
-      liveRefresh.mutate();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- one-shot auto pull
-  }, [overview.data]);
 
   const data = overview.data;
   const maxHour = useMemo(() => {
@@ -313,12 +299,12 @@ export default function PanelAnalyticsPage() {
       );
     }
     list.sort((a, b) => {
+      const ar = a.raw || { current_total: 0, hour: 0, day: 0 };
+      const br = b.raw || { current_total: 0, hour: 0, day: 0 };
       if (sortKey === "online") return b.online - a.online;
-      if (sortKey === "day") return b.raw.day - a.raw.day;
-      if (sortKey === "hour") return b.raw.hour - a.raw.hour;
-      return (
-        Number(b.raw.current_total || 0) - Number(a.raw.current_total || 0)
-      );
+      if (sortKey === "day") return Number(br.day || 0) - Number(ar.day || 0);
+      if (sortKey === "hour") return Number(br.hour || 0) - Number(ar.hour || 0);
+      return Number(br.current_total || 0) - Number(ar.current_total || 0);
     });
     return list;
   }, [data, q, sortKey]);
@@ -617,6 +603,21 @@ export default function PanelAnalyticsPage() {
           <div className="admin-skel-card" />
           <div className="admin-skel-card" />
         </div>
+      ) : overview.isError ? (
+        <div className="admin-empty">
+          <p>خطا در بارگذاری آمار پنل‌ها</p>
+          <p className="muted" style={{ marginTop: 6 }}>
+            {(overview.error as Error)?.message || "پاسخ سرور ناموفق بود"}
+          </p>
+          <button
+            type="button"
+            className="btn sm"
+            style={{ marginTop: 12 }}
+            onClick={() => void overview.refetch()}
+          >
+            تلاش مجدد
+          </button>
+        </div>
       ) : data ? (
         <>
           {refreshing ? (
@@ -624,7 +625,7 @@ export default function PanelAnalyticsPage() {
               <Loader2 size={22} className="configs-spin" />
               <div>
                 <b>در حال خواندن مصرف زنده از پنل‌ها…</b>
-                <p>بعد از اتمام، جدول و نمودارها با دیتای تازه پر می‌شوند</p>
+                <p>صفحه قابل استفاده است — بعد از اتمام عددها تازه می‌شوند</p>
               </div>
             </div>
           ) : null}
@@ -898,35 +899,37 @@ export default function PanelAnalyticsPage() {
                       </td>
                       <td>{toFaDigits(p.online)}</td>
                       <td>
-                        <b>{formatTraffic(Number(p.raw.current_total || 0))}</b>
+                        <b>
+                          {formatTraffic(Number(p.raw?.current_total || 0))}
+                        </b>
                       </td>
                       <td>
-                        {formatTraffic(p.raw.hour)}{" "}
+                        {formatTraffic(Number(p.raw?.hour || 0))}{" "}
                         <ChangePill pct={p.compare_hour_pct} />
                       </td>
-                      <td>{formatTraffic(p.raw.day)}</td>
-                      <td>{formatTraffic(p.raw.week)}</td>
-                      <td>{formatTraffic(p.raw.month)}</td>
-                      <td>{toFaDigits(p.tests.runs)}</td>
+                      <td>{formatTraffic(Number(p.raw?.day || 0))}</td>
+                      <td>{formatTraffic(Number(p.raw?.week || 0))}</td>
+                      <td>{formatTraffic(Number(p.raw?.month || 0))}</td>
+                      <td>{toFaDigits(p.tests?.runs || 0)}</td>
                       <td>
-                        {toFaDigits(p.tests.last_run?.in_top100 ?? 0)}
+                        {toFaDigits(p.tests?.last_run?.in_top100 ?? 0)}
                         <span className="muted">
                           {" "}
-                          / {toFaDigits(p.tests.top100)}
+                          / {toFaDigits(p.tests?.top100 || 0)}
                         </span>
                       </td>
                       <td>
-                        {toFaDigits(p.tests.last_run?.good ?? 0)}
+                        {toFaDigits(p.tests?.last_run?.good ?? 0)}
                         <span className="muted">
                           {" "}
-                          / {toFaDigits(p.tests.good)}
+                          / {toFaDigits(p.tests?.good || 0)}
                         </span>
                       </td>
                       <td>
-                        {toFaDigits(p.tests.last_run?.all_ops_ok ?? 0)}
+                        {toFaDigits(p.tests?.last_run?.all_ops_ok ?? 0)}
                         <span className="muted">
                           {" "}
-                          / {toFaDigits(p.tests.all_ops_ok)}
+                          / {toFaDigits(p.tests?.all_ops_ok || 0)}
                         </span>
                       </td>
                     </tr>
