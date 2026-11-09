@@ -501,19 +501,19 @@ export default function PanelAnalyticsPage() {
     queryKey: ["analytics-panels", tz],
     queryFn: () =>
       api<Overview>(`/api/analytics/panels?tz_offset=${tz}`, {
-        timeoutMs: 12_000,
+        timeoutMs: 8_000,
       }),
     refetchInterval: 60_000,
     refetchOnWindowFocus: false,
     retry: 1,
-    staleTime: 15_000,
+    staleTime: 20_000,
   });
 
   const detail = useQuery({
     queryKey: ["analytics-panel", focusId, tz],
     queryFn: () =>
       api<Detail>(`/api/analytics/panels/${focusId}?tz_offset=${tz}`, {
-        timeoutMs: 20_000,
+        timeoutMs: 12_000,
       }),
     enabled: focusId != null,
     refetchInterval: false,
@@ -523,7 +523,7 @@ export default function PanelAnalyticsPage() {
     mutationFn: () =>
       api<{ ok: boolean; stats: Record<string, number>; overview: Overview }>(
         `/api/analytics/panels/refresh?tz_offset=${tz}`,
-        { method: "POST", timeoutMs: 12_000 }
+        { method: "POST", timeoutMs: 10_000 }
       ),
     onSuccess: (res) => {
       if (res.overview) {

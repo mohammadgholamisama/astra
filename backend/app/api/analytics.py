@@ -186,44 +186,46 @@ async def analytics_user(
 async def analytics_panels(
     sample: bool = Query(
         False,
-        description="Best-effort local sample first (never blocks if busy)",
+        description="Ignored — overview is always a pure read (no sample/flush)",
     ),
     tz_offset: int = Query(0, ge=-840, le=840),
-    db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
-    """Overview of all panels: raw usage, online, operators, test quality."""
+    """Fast read-only overview. Never writes; never waits on Xray/SQLite locks."""
     import asyncio
 
-    if sample:
-        try:
-            await panel_analytics_svc.sample_all_panels_once(force=False)
-        except Exception:  # noqa: BLE001
-            logger.debug("panel sample before overview failed", exc_info=True)
+    from app.core.database import AsyncSessionLocal
+
+    _ = sample
     try:
-        # Page load stays light — Xray sync happens on «تازه‌سازی زنده»
-        return await asyncio.wait_for(
-            panel_analytics_svc.build_panel_overview(
-                db, tz_offset_min=tz_offset, sync_astra=False, persist=True
-            ),
-            timeout=8.0,
-        )
-    except asyncio.TimeoutError as exc:
-        logger.warning("build_panel_overview timed out")
-        try:
-            return await panel_analytics_svc.build_panel_overview(
-                db, tz_offset_min=tz_offset, sync_astra=False, persist=False
+        async with AsyncSessionLocal() as db:
+            return await asyncio.wait_for(
+                panel_analytics_svc.build_panel_overview(
+                    db,
+                    tz_offset_min=tz_offset,
+                    sync_astra=False,
+                    persist=False,
+                ),
+                timeout=4.0,
             )
-        except Exception as exc2:  # noqa: BLE001
-            logger.exception("build_panel_overview fallback failed")
-            raise HTTPException(
-                status_code=504, detail="آمار پنل‌ها طول کشید — دوباره تلاش کنید"
-            ) from exc2
     except Exception as exc:  # noqa: BLE001
-        logger.exception("build_panel_overview failed")
-        raise HTTPException(
-            status_code=500, detail="خطا در ساخت آمار پنل‌ها"
-        ) from exc
+        logger.warning("build_panel_overview failed/timed out: %s", exc)
+        try:
+            async with AsyncSessionLocal() as db:
+                return await asyncio.wait_for(
+                    panel_analytics_svc.build_panel_overview(
+                        db,
+                        tz_offset_min=tz_offset,
+                        sync_astra=False,
+                        persist=False,
+                    ),
+                    timeout=2.5,
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception("build_panel_overview fallback failed")
+            return panel_analytics_svc._empty_panel_overview(
+                tz_offset_min=tz_offset
+            )
 
 
 @router.post("/api/analytics/panels/refresh")
@@ -231,7 +233,7 @@ async def analytics_panels_refresh(
     tz_offset: int = Query(0, ge=-840, le=840),
     _admin=Depends(get_current_admin),
 ):
-    """Fast Astra live refresh — always returns overview (never 500)."""
+    """Fast Astra live refresh — always returns overview (never 500/timeout to UI)."""
     import asyncio
 
     from app.core.database import AsyncSessionLocal
@@ -239,19 +241,22 @@ async def analytics_panels_refresh(
     try:
         return await asyncio.wait_for(
             panel_analytics_svc.refresh_panel_analytics_fast(
-                tz_offset_min=tz_offset, budget_s=8.0
+                tz_offset_min=tz_offset, budget_s=6.0
             ),
-            timeout=10.0,
+            timeout=7.0,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("panel analytics fast refresh failed: %s", exc)
         try:
             async with AsyncSessionLocal() as db:
-                overview = await panel_analytics_svc.build_panel_overview(
-                    db,
-                    tz_offset_min=tz_offset,
-                    sync_astra=False,
-                    persist=False,
+                overview = await asyncio.wait_for(
+                    panel_analytics_svc.build_panel_overview(
+                        db,
+                        tz_offset_min=tz_offset,
+                        sync_astra=False,
+                        persist=False,
+                    ),
+                    timeout=3.0,
                 )
         except Exception:  # noqa: BLE001
             overview = panel_analytics_svc._empty_panel_overview(

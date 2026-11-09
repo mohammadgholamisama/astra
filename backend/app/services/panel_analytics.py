@@ -940,11 +940,11 @@ def _empty_panel_overview(*, tz_offset_min: int = 0) -> dict[str, Any]:
 async def refresh_panel_analytics_fast(
     *,
     tz_offset_min: int = 0,
-    budget_s: float = 8.0,
+    budget_s: float = 6.0,
 ) -> dict[str, Any]:
-    """«تازه‌سازی زنده» — always returns 200 with an overview.
+    """«تازه‌سازی زنده» — always returns an overview in a few seconds.
 
-    Seed cursors → short Xray sync → flush → overview in a fresh session.
+    Short Xray sync + best-effort flush, then a pure read overview.
     Never raises to the API layer.
     """
     from app.core.database import AsyncSessionLocal
@@ -955,13 +955,18 @@ async def refresh_panel_analytics_fast(
     err: str | None = None
     pre_live: dict[int, int] = {}
 
-    # Phase 1: sync + flush (own session; failures are non-fatal)
+    # Phase 1: sync (+ optional flush) with hard caps — never block the UI
     try:
         async with AsyncSessionLocal() as db:
             try:
-                pre = await live_panel_raw_and_weighted(db)
+                pre = await asyncio.wait_for(
+                    live_panel_raw_and_weighted(db), timeout=1.5
+                )
                 pre_live = {pid: int(v["raw"]) for pid, v in pre.items()}
-                await ensure_panel_cursors_seeded(db, pre_live, now=_utc_now())
+                await asyncio.wait_for(
+                    ensure_panel_cursors_seeded(db, pre_live, now=_utc_now()),
+                    timeout=1.0,
+                )
             except Exception:  # noqa: BLE001
                 logger.debug("fast refresh pre-seed failed", exc_info=True)
 
@@ -970,10 +975,10 @@ async def refresh_panel_analytics_fast(
                     await asyncio.wait_for(
                         sync_astra_panels_live(
                             db,
-                            timeout_per_panel=2.0,
+                            timeout_per_panel=1.5,
                             rebuild_on_limit=False,
                         ),
-                        timeout=3.0,
+                        timeout=2.5,
                     )
                     or 0
                 )
@@ -982,13 +987,19 @@ async def refresh_panel_analytics_fast(
                 logger.debug("fast refresh astra sync failed", exc_info=True)
 
             try:
-                post = await live_panel_raw_and_weighted(db)
+                post = await asyncio.wait_for(
+                    live_panel_raw_and_weighted(db), timeout=1.5
+                )
                 post_live = {pid: int(v["raw"]) for pid, v in post.items()}
                 bytes_hint = sum(
                     max(0, int(post_live.get(pid, 0)) - int(pre_live.get(pid, 0)))
                     for pid in set(pre_live) | set(post_live)
                 )
-                await flush_live_deltas_to_hours(db, post_live, now=_utc_now())
+                # Flush is best-effort; skip quickly if SQLite is busy
+                await asyncio.wait_for(
+                    flush_live_deltas_to_hours(db, post_live, now=_utc_now()),
+                    timeout=1.2,
+                )
             except Exception as exc:  # noqa: BLE001
                 err = err or f"flush:{type(exc).__name__}"
                 logger.debug("fast refresh flush failed", exc_info=True)
@@ -996,11 +1007,11 @@ async def refresh_panel_analytics_fast(
         err = f"phase1:{type(exc).__name__}"
         logger.exception("fast refresh phase1 failed")
 
-    # Phase 2: fresh session for overview (avoids dirty/aborted session state)
+    # Phase 2: pure read overview in a brand-new session
     overview: dict[str, Any] | None = None
     try:
         async with AsyncSessionLocal() as db:
-            remain = max(1.5, float(budget_s) - (time.monotonic() - t0))
+            remain = max(1.2, float(budget_s) - (time.monotonic() - t0))
             overview = await asyncio.wait_for(
                 build_panel_overview(
                     db,
@@ -1013,17 +1024,7 @@ async def refresh_panel_analytics_fast(
     except Exception as exc:  # noqa: BLE001
         err = f"overview:{type(exc).__name__}"
         logger.exception("fast refresh overview failed")
-        try:
-            async with AsyncSessionLocal() as db:
-                overview = await build_panel_overview(
-                    db,
-                    tz_offset_min=tz_offset_min,
-                    sync_astra=False,
-                    persist=False,
-                )
-        except Exception:  # noqa: BLE001
-            logger.exception("fast refresh overview fallback failed")
-            overview = _empty_panel_overview(tz_offset_min=tz_offset_min)
+        overview = _empty_panel_overview(tz_offset_min=tz_offset_min)
 
     return {
         "ok": True,
@@ -1413,15 +1414,18 @@ async def build_panel_overview(
 ) -> dict[str, Any]:
     """Panel analytics overview for the admin UI.
 
-    Flow for accurate «این ساعت» (= chart column start → now):
-      1) seed cursors at pre-sync live (no lifetime dump)
-      2) Astra/Xray sync into clients + PanelAccount
-      3) flush live−cursor into the current chart-hour bucket
-      4) read that bucket as the hour total
-
-    Day uses local midnight buckets. ``persist=False`` skips the flush
-    (debug only) — default is always flush so the current column stays live.
+    ``persist=False`` / ``sync_astra=False`` = pure read path for the page load
+    (no commits, short SQLite busy wait). Refresh uses a separate sync+flush.
     """
+    # Fail fast on SQLite lock instead of waiting up to 60s (page timeout)
+    if not persist and not sync_astra:
+        try:
+            from sqlalchemy import text as _sql_text
+
+            await db.execute(_sql_text("PRAGMA busy_timeout=2500"))
+        except Exception:  # noqa: BLE001
+            pass
+
     now = _utc_now()
     periods = _period_starts(now, tz_offset_min)
     day = int(periods["day"])
@@ -1665,10 +1669,14 @@ async def build_panel_overview(
         by_hod[_hod_index(int(ts), tz_off)] += int(raw or 0)
     peak_hod = max(range(24), key=lambda h: by_hod[h]) if any(by_hod) else None
 
-    try:
-        dash_weighted = await dashboard_weighted_total(db)
-    except Exception:  # noqa: BLE001
-        logger.exception("dashboard weighted total failed")
+    if persist or sync_astra:
+        try:
+            dash_weighted = await dashboard_weighted_total(db)
+        except Exception:  # noqa: BLE001
+            logger.exception("dashboard weighted total failed")
+            dash_weighted = total_weighted
+    else:
+        # Fast read path: avoid an extra full-table User scan
         dash_weighted = total_weighted
 
     top_day_list = [
