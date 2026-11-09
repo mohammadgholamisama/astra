@@ -1482,6 +1482,7 @@ async def sync_traffic_from_xray(
         if proc is not None and proc.returncode is None:
             try:
                 proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=1.0)
             except Exception:  # noqa: BLE001
                 pass
         return 0

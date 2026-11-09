@@ -501,12 +501,12 @@ export default function PanelAnalyticsPage() {
     queryKey: ["analytics-panels", tz],
     queryFn: () =>
       api<Overview>(`/api/analytics/panels?tz_offset=${tz}`, {
-        timeoutMs: 25_000,
+        timeoutMs: 12_000,
       }),
-    refetchInterval: 45_000,
-    refetchOnWindowFocus: true,
+    refetchInterval: 60_000,
+    refetchOnWindowFocus: false,
     retry: 1,
-    staleTime: 8_000,
+    staleTime: 15_000,
   });
 
   const detail = useQuery({
@@ -523,7 +523,7 @@ export default function PanelAnalyticsPage() {
     mutationFn: () =>
       api<{ ok: boolean; stats: Record<string, number>; overview: Overview }>(
         `/api/analytics/panels/refresh?tz_offset=${tz}`,
-        { method: "POST", timeoutMs: 28_000 }
+        { method: "POST", timeoutMs: 12_000 }
       ),
     onSuccess: (res) => {
       if (res.overview) {
@@ -682,16 +682,16 @@ export default function PanelAnalyticsPage() {
             </p>
           ) : liveRefresh.isSuccess && liveRefresh.data?.stats ? (
             <p className="an-sub">
-              بروز شد
+              {liveRefresh.data.stats.error
+                ? "بروز شد (همگام‌سازی جزئی)"
+                : "بروز شد"}
               {typeof liveRefresh.data.stats.ms === "number"
-                ? ` در ${toFaDigits(String(liveRefresh.data.stats.ms))}ms`
+                ? ` در ${toFaDigits(String(Math.round(Number(liveRefresh.data.stats.ms))))}ms`
                 : ""}
               {typeof liveRefresh.data.stats.bytes_added === "number" &&
-              liveRefresh.data.stats.bytes_added > 0
+              Number(liveRefresh.data.stats.bytes_added) > 0
                 ? ` · +${formatTraffic(Number(liveRefresh.data.stats.bytes_added))}`
-                : typeof liveRefresh.data.stats.astra_synced === "number"
-                  ? ` · ${toFaDigits(String(liveRefresh.data.stats.astra_synced))} اکانت`
-                  : ""}
+                : ""}
             </p>
           ) : null}
         </div>

@@ -892,49 +892,45 @@ async def refresh_panels_live(
 async def refresh_panel_analytics_fast(
     *,
     tz_offset_min: int = 0,
-    budget_s: float = 18.0,
+    budget_s: float = 8.0,
 ) -> dict[str, Any]:
-    """One-shot fast refresh for the admin «تازه‌سازی زنده» button.
+    """«تازه‌سازی زنده» — must finish in a few seconds.
 
-    Seed cursors → Xray sync (enough time to finish) → flush chart hour →
-    overview. Never pulls remote panels or samples every user.
+    Seed cursors → short Xray sync → flush current chart hour → overview.
+    Never samples all users/panels and never waits on remote HTTP.
     """
     from app.core.database import AsyncSessionLocal
 
     t0 = time.monotonic()
-    deadline = t0 + max(8.0, float(budget_s))
     astra_synced = 0
     bytes_hint = 0
-    overview: dict[str, Any] | None = None
     err: str | None = None
 
     async with AsyncSessionLocal() as db:
-        # 1) Snapshot live + seed cursors BEFORE sync so growth is flushable
+        pre_live: dict[int, int] = {}
         try:
             pre = await live_panel_raw_and_weighted(db)
             pre_live = {pid: int(v["raw"]) for pid, v in pre.items()}
             await ensure_panel_cursors_seeded(db, pre_live, now=_utc_now())
         except Exception:  # noqa: BLE001
             logger.debug("fast refresh pre-seed failed", exc_info=True)
-            pre_live = {}
 
-        remain = deadline - time.monotonic()
-        if remain > 1.0:
-            try:
-                astra_synced = int(
-                    await asyncio.wait_for(
-                        sync_astra_panels_live(
-                            db,
-                            timeout_per_panel=min(5.0, max(2.0, remain / 2)),
-                            rebuild_on_limit=False,
-                        ),
-                        timeout=min(10.0, remain - 0.5),
-                    )
-                    or 0
+        # Hard cap: statsquery must not dominate the request
+        try:
+            astra_synced = int(
+                await asyncio.wait_for(
+                    sync_astra_panels_live(
+                        db,
+                        timeout_per_panel=2.5,
+                        rebuild_on_limit=False,
+                    ),
+                    timeout=3.5,
                 )
-            except Exception as exc:  # noqa: BLE001
-                err = f"sync:{type(exc).__name__}"
-                logger.debug("fast refresh astra sync failed", exc_info=True)
+                or 0
+            )
+        except Exception as exc:  # noqa: BLE001
+            err = f"sync:{type(exc).__name__}"
+            logger.debug("fast refresh astra sync failed", exc_info=True)
 
         try:
             post = await live_panel_raw_and_weighted(db)
@@ -947,26 +943,27 @@ async def refresh_panel_analytics_fast(
         except Exception:  # noqa: BLE001
             logger.debug("fast refresh flush failed", exc_info=True)
 
-        try:
-            await sample_all_panels_once(force=False)
-        except Exception:  # noqa: BLE001
-            logger.debug("fast refresh panel sample failed", exc_info=True)
-
-        remain = deadline - time.monotonic()
+        # Already flushed — overview is read+marks only (no second Xray sync)
         try:
             overview = await asyncio.wait_for(
                 build_panel_overview(
                     db,
                     tz_offset_min=tz_offset_min,
                     sync_astra=False,
-                    persist=True,
+                    persist=False,
                 ),
-                timeout=max(2.0, remain),
+                timeout=max(2.0, float(budget_s) - (time.monotonic() - t0)),
             )
         except Exception as exc:  # noqa: BLE001
             err = f"overview:{type(exc).__name__}"
             logger.exception("fast refresh overview failed")
-            raise
+            # Last resort: still try a bare overview without wait
+            overview = await build_panel_overview(
+                db,
+                tz_offset_min=tz_offset_min,
+                sync_astra=False,
+                persist=False,
+            )
 
     return {
         "ok": True,
@@ -1380,27 +1377,22 @@ async def build_panel_overview(
         (await db.execute(select(Panel).order_by(Panel.id.asc()))).scalars().all()
     )
 
-    # Pre-sync live → seed cursors so Xray growth is flushable into this hour
-    try:
-        pre_map = await live_panel_raw_and_weighted(db)
-    except Exception:  # noqa: BLE001
-        logger.exception("pre-sync live_panel_raw_and_weighted failed")
-        pre_map = {}
-    pre_live = {pid: int(v["raw"]) for pid, v in pre_map.items()}
-    for p in panels:
-        pre_live.setdefault(int(p.id), 0)
-    try:
-        await ensure_panel_cursors_seeded(db, pre_live, now=now)
-    except Exception:  # noqa: BLE001
-        logger.debug("ensure panel cursors seeded failed", exc_info=True)
-
     if sync_astra:
+        # Seed before sync so Xray growth lands in the current chart hour
+        try:
+            pre_map = await live_panel_raw_and_weighted(db)
+            pre_live = {pid: int(v["raw"]) for pid, v in pre_map.items()}
+            for p in panels:
+                pre_live.setdefault(int(p.id), 0)
+            await ensure_panel_cursors_seeded(db, pre_live, now=now)
+        except Exception:  # noqa: BLE001
+            logger.debug("ensure panel cursors seeded failed", exc_info=True)
         try:
             await asyncio.wait_for(
                 sync_astra_panels_live(
-                    db, timeout_per_panel=4.0, rebuild_on_limit=False
+                    db, timeout_per_panel=2.5, rebuild_on_limit=False
                 ),
-                timeout=9.0,
+                timeout=3.5,
             )
         except Exception:  # noqa: BLE001
             logger.debug("astra sync before panel overview failed", exc_info=True)
@@ -1416,9 +1408,11 @@ async def build_panel_overview(
         live_totals.setdefault(int(p.id), 0)
         weighted_totals.setdefault(int(p.id), 0)
 
-    # Credit post-sync growth into the current chart column
+    # Credit unsampled live growth into the current chart column
     if persist:
         try:
+            if not sync_astra:
+                await ensure_panel_cursors_seeded(db, live_totals, now=now)
             await flush_live_deltas_to_hours(db, live_totals, now=now)
         except Exception:  # noqa: BLE001
             logger.debug("flush live deltas before overview failed", exc_info=True)
