@@ -500,14 +500,25 @@ export default function PanelAnalyticsPage() {
 
   const overview = useQuery({
     queryKey: ["analytics-panels", tz],
-    queryFn: () =>
-      api<Overview>(`/api/analytics/panels?tz_offset=${tz}`, {
+    queryFn: async () => {
+      // Every load/refetch must sync Xray — never serve a stale read-only snapshot
+      const res = await api<{
+        ok?: boolean;
+        overview?: Overview;
+        stats?: Record<string, number>;
+      }>(`/api/analytics/panels/refresh?tz_offset=${tz}`, {
+        method: "POST",
         timeoutMs: 20_000,
-      }),
-    refetchInterval: false,
-    refetchOnWindowFocus: false,
+      });
+      if (res?.overview) return res.overview;
+      return api<Overview>(`/api/analytics/panels?tz_offset=${tz}`, {
+        timeoutMs: 20_000,
+      });
+    },
+    refetchInterval: 60_000,
+    refetchOnWindowFocus: true,
     retry: 1,
-    staleTime: 15_000,
+    staleTime: 0,
   });
 
   const detail = useQuery({
@@ -524,7 +535,7 @@ export default function PanelAnalyticsPage() {
     mutationFn: () =>
       api<{ ok: boolean; stats: Record<string, number>; overview: Overview }>(
         `/api/analytics/panels/refresh?tz_offset=${tz}`,
-        { method: "POST", timeoutMs: 16_000 }
+        { method: "POST", timeoutMs: 20_000 }
       ),
     onSuccess: (res) => {
       if (res.overview) {
@@ -537,18 +548,6 @@ export default function PanelAnalyticsPage() {
       }
     },
   });
-
-  // Live Xray pull on open + every 60s while page is visible (not a stale GET)
-  useEffect(() => {
-    const tick = () => {
-      if (document.visibilityState === "hidden") return;
-      liveRefresh.mutate();
-    };
-    tick();
-    const id = window.setInterval(tick, 60_000);
-    return () => window.clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tz]);
 
   const data = overview.data;
   const maxPanelTotal = useMemo(() => {

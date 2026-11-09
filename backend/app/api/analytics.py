@@ -186,17 +186,29 @@ async def analytics_user(
 async def analytics_panels(
     sample: bool = Query(
         False,
-        description="Ignored — overview is always a pure read (no sample/flush)",
+        description="Ignored — every load runs a live Astra sync + overview",
     ),
     tz_offset: int = Query(0, ge=-840, le=840),
     _admin=Depends(get_current_admin),
 ):
-    """Fast read-only overview. Never writes; never waits on Xray/SQLite locks."""
+    """Live overview on every load — sync Xray, flush hour, return fresh totals."""
     import asyncio
 
     from app.core.database import AsyncSessionLocal
 
     _ = sample
+    try:
+        result = await asyncio.wait_for(
+            panel_analytics_svc.refresh_panel_analytics_fast(
+                tz_offset_min=tz_offset, budget_s=14.0
+            ),
+            timeout=16.0,
+        )
+        overview = (result or {}).get("overview")
+        if isinstance(overview, dict) and overview.get("totals") is not None:
+            return overview
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("live panel overview failed/timed out: %s", exc)
     try:
         async with AsyncSessionLocal() as db:
             return await asyncio.wait_for(
@@ -204,28 +216,15 @@ async def analytics_panels(
                     db,
                     tz_offset_min=tz_offset,
                     sync_astra=False,
-                    persist=False,
+                    persist=True,
                 ),
-                timeout=10.0,
+                timeout=8.0,
             )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("build_panel_overview failed/timed out: %s", exc)
-        try:
-            async with AsyncSessionLocal() as db:
-                return await asyncio.wait_for(
-                    panel_analytics_svc.build_panel_overview(
-                        db,
-                        tz_offset_min=tz_offset,
-                        sync_astra=False,
-                        persist=False,
-                    ),
-                    timeout=8.0,
-                )
-        except Exception:  # noqa: BLE001
-            logger.exception("build_panel_overview fallback failed")
-            raise HTTPException(
-                status_code=500, detail="خطا در ساخت آمار پنل‌ها"
-            ) from exc
+    except Exception:  # noqa: BLE001
+        logger.exception("build_panel_overview fallback failed")
+        raise HTTPException(
+            status_code=500, detail="خطا در ساخت آمار پنل‌ها"
+        ) from None
 
 
 @router.post("/api/analytics/panels/refresh")

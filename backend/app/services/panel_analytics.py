@@ -146,20 +146,26 @@ def _period_from_live_mark(
     mark_ts: int | None,
     mark_raw: int | None,
     period_ts: int,
+    bucket: int = 0,
 ) -> tuple[int, int, int]:
-    """Authoritative bytes in the current local period from a live counter.
+    """Authoritative bytes in the current period from a live counter.
+
+    ``bytes = live − mark_raw`` so the hour grows as soon as live grows —
+    even before hour buckets are flushed. On rollover/reset, seed the mark
+    so any already-flushed ``bucket`` is kept and lifetime is never dumped
+    into «این ساعت» / «امروز».
 
     Returns (bytes_in_period, new_mark_ts, new_mark_raw).
-    On period rollover or counter reset, the mark is re-seeded to ``live``
-    so we never dump lifetime into «امروز» / «این ساعت».
     """
     live_i = max(0, int(live or 0))
+    bucket_i = max(0, min(live_i, int(bucket or 0)))
     period_i = int(period_ts)
     prev_ts = int(mark_ts or 0)
     prev_raw = max(0, int(mark_raw or 0))
     if prev_ts != period_i or live_i < prev_raw:
-        return 0, period_i, live_i
-    return live_i - prev_raw, period_i, prev_raw
+        new_raw = max(0, live_i - bucket_i)
+        return bucket_i, period_i, new_raw
+    return max(0, live_i - prev_raw), period_i, prev_raw
 
 
 def apply_live_period_marks(
@@ -583,7 +589,9 @@ async def live_panel_raw_and_weighted(
         slot["raw"] += raw_i
         slot["weighted"] += int(weighted_bytes(raw_i, coeff))
 
-    # Astra clients are authoritative when ahead of mirrored PanelAccount rows
+    # Fill gaps only: stale AstraNodeClient totals used to OVERRIDE growing
+    # PanelAccount rows and freeze «این ساعت» for hours. PanelAccount (mirrored
+    # from Xray on sync) is the analytics source of truth.
     try:
         client_raw = await _astra_client_raw_by_panel(db)
     except Exception:  # noqa: BLE001
@@ -592,15 +600,12 @@ async def live_panel_raw_and_weighted(
     for pid, craw in client_raw.items():
         slot = out.setdefault(int(pid), {"raw": 0, "weighted": 0})
         acc_raw = int(slot["raw"] or 0)
-        if craw <= acc_raw:
+        craw_i = max(0, int(craw or 0))
+        if acc_raw > 0 or craw_i <= 0:
             continue
-        if acc_raw > 0:
-            ratio = craw / acc_raw
-            slot["weighted"] = int(round(int(slot["weighted"] or 0) * ratio))
-        else:
-            coeff = panel_max.get(int(pid), 1.0) or 1.0
-            slot["weighted"] = int(weighted_bytes(craw, coeff))
-        slot["raw"] = craw
+        coeff = panel_max.get(int(pid), 1.0) or 1.0
+        slot["raw"] = craw_i
+        slot["weighted"] = int(weighted_bytes(craw_i, coeff))
     return out
 
 
@@ -1577,28 +1582,43 @@ async def build_panel_overview(
         pending = _pending_bytes(live=live, cursor=cursor, seeded=seeded)
         bucket_h = int(hour_map.get(pid, 0))
         bucket_d = int(day_map.get(pid, 0))
-        # Flushed chart-hour bucket (+ residual pending)
-        h = _chart_hour_bytes(live=live, bucket=bucket_h, pending=pending)
-        d = _chart_hour_bytes(live=live, bucket=bucket_d, pending=pending)
-        # Also floor by live watermark so growth shows even if flush lagged
-        if st is not None:
-            mark_h_ts = int(getattr(st, "period_hour_ts", 0) or 0)
-            mark_h_raw = max(0, int(getattr(st, "period_hour_raw", 0) or 0))
-            if mark_h_ts == chart_hour and live >= mark_h_raw:
-                h = max(h, live - mark_h_raw)
-            mark_d_ts = int(getattr(st, "period_day_ts", 0) or 0)
-            mark_d_raw = max(0, int(getattr(st, "period_day_raw", 0) or 0))
-            if mark_d_ts == day and live >= mark_d_raw:
-                d = max(d, live - mark_d_raw)
-        if d < h:
-            d = h
-        # Only mutate watermarks when persisting — keeps GET read-path safe
-        # against write locks / aborted sessions.
+        # Primary: live − watermark (moves every sync). Bucket/pending is floor.
+        from_bucket_h = _chart_hour_bytes(
+            live=live, bucket=bucket_h, pending=pending
+        )
+        from_bucket_d = _chart_hour_bytes(
+            live=live, bucket=bucket_d, pending=pending
+        )
+        mark_h_ts = int(getattr(st, "period_hour_ts", 0) or 0) if st else 0
+        mark_h_raw = (
+            max(0, int(getattr(st, "period_hour_raw", 0) or 0)) if st else 0
+        )
+        mark_d_ts = int(getattr(st, "period_day_ts", 0) or 0) if st else 0
+        mark_d_raw = (
+            max(0, int(getattr(st, "period_day_raw", 0) or 0)) if st else 0
+        )
+        h, new_h_ts, new_h_raw = _period_from_live_mark(
+            live,
+            mark_ts=mark_h_ts,
+            mark_raw=mark_h_raw,
+            period_ts=chart_hour,
+            bucket=max(bucket_h, from_bucket_h),
+        )
+        h = max(h, from_bucket_h)
+        d, new_d_ts, new_d_raw = _period_from_live_mark(
+            live,
+            mark_ts=mark_d_ts,
+            mark_raw=mark_d_raw,
+            period_ts=day,
+            bucket=max(bucket_d, from_bucket_d),
+        )
+        d = max(d, from_bucket_d, h)
+        # Persist watermarks whenever allowed so the next load keeps growing
         if persist and st is not None:
-            st.period_hour_ts = chart_hour
-            st.period_hour_raw = max(0, live - h)
-            st.period_day_ts = day
-            st.period_day_raw = max(0, live - d)
+            st.period_hour_ts = new_h_ts
+            st.period_hour_raw = new_h_raw
+            st.period_day_ts = new_d_ts
+            st.period_day_raw = new_d_raw
             marks_touched = True
         h_w = _scale_weighted(h, live, live_w)
         d_w = _scale_weighted(d, live, live_w)
