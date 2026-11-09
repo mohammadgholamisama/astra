@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -12,9 +12,8 @@ import {
   Radio,
   RefreshCw,
   Server,
-  Smartphone,
   Users,
-  Wifi,
+  X,
   Zap,
 } from "lucide-react";
 import AnalyticsGuideModal, {
@@ -135,6 +134,14 @@ type Detail = {
     top100: number;
     good: number;
     all_ops_ok: number;
+    last_run?: {
+      tested: number;
+      in_top100: number;
+      good: number;
+      all_ops_ok: number;
+      avg_ping: number;
+      ts?: string | null;
+    } | null;
     history: {
       ts?: string | null;
       tested: number;
@@ -188,26 +195,224 @@ function BarRow({
   );
 }
 
-function DistChips({
-  items,
+/** Vertical 24h column chart — local time, hover for exact value. */
+function HourlyUsageChart({
+  points,
 }: {
-  items: { label: string; count: number }[];
+  points: { hour_ts: number; raw_bytes: number }[];
 }) {
-  if (!items.length) return <p className="muted">هنوز داده‌ای نیست</p>;
-  const max = Math.max(1, ...items.map((x) => x.count));
+  const [hover, setHover] = useState<number | null>(null);
+  if (!points.length) {
+    return <p className="muted">هنوز دادهٔ ساعتی برای نمودار نیست</p>;
+  }
+  const max = Math.max(1, ...points.map((p) => p.raw_bytes));
+  const total = points.reduce((s, p) => s + p.raw_bytes, 0);
+  const peakIdx = points.reduce(
+    (best, p, i, arr) => (p.raw_bytes > arr[best].raw_bytes ? i : best),
+    0
+  );
+  const peak = points[peakIdx];
+  const avg = total / points.length;
+  const tip = hover != null ? points[hover] : null;
+
   return (
-    <div className="pan-dist">
-      {items.map((x) => (
-        <div key={x.label} className="pan-dist-row">
-          <div className="pan-dist-meta">
-            <span>{x.label}</span>
-            <b>{toFaDigits(x.count)}</b>
-          </div>
-          <div className="an-bar-track">
-            <i style={{ width: `${(x.count / max) * 100}%` }} />
-          </div>
+    <div className="pan-chart">
+      <div className="pan-chart-meta">
+        <div>
+          <span>جمع بازه</span>
+          <b>{formatTraffic(total)}</b>
         </div>
-      ))}
+        <div>
+          <span>اوج</span>
+          <b>
+            {peak ? formatTraffic(peak.raw_bytes) : "—"}
+            {peak ? (
+              <small> · {hourLabelLocal(peak.hour_ts)}</small>
+            ) : null}
+          </b>
+        </div>
+        <div>
+          <span>میانگین ساعتی</span>
+          <b>{formatTraffic(avg)}</b>
+        </div>
+      </div>
+
+      <div className="pan-chart-tip" aria-live="polite">
+        {tip ? (
+          <>
+            <b>{hourLabelLocal(tip.hour_ts)}</b>
+            <span>{formatTraffic(tip.raw_bytes)}</span>
+            {max > 0 ? (
+              <small>
+                {toFaDigits(((tip.raw_bytes / max) * 100).toFixed(0))}٪ از اوج
+              </small>
+            ) : null}
+          </>
+        ) : (
+          <span className="muted">روی ستون‌ها بروید تا جزئیات دیده شود</span>
+        )}
+      </div>
+
+      <div className="pan-chart-plot" role="img" aria-label="نمودار مصرف ۲۴ ساعت">
+        <div className="pan-chart-y">
+          <span>{formatTraffic(max)}</span>
+          <span>{formatTraffic(max / 2)}</span>
+          <span>۰</span>
+        </div>
+        <div className="pan-chart-cols">
+          {points.map((p, i) => {
+            const h = Math.max(p.raw_bytes > 0 ? 4 : 0, (p.raw_bytes / max) * 100);
+            const isPeak = i === peakIdx && p.raw_bytes > 0;
+            const isHover = hover === i;
+            const showLabel = i % 3 === 0 || i === points.length - 1;
+            return (
+              <button
+                type="button"
+                key={p.hour_ts}
+                className={`pan-chart-col${isPeak ? " is-peak" : ""}${
+                  isHover ? " is-hover" : ""
+                }`}
+                style={{ ["--h" as string]: `${h}%` }}
+                onMouseEnter={() => setHover(i)}
+                onMouseLeave={() => setHover(null)}
+                onFocus={() => setHover(i)}
+                onBlur={() => setHover(null)}
+                title={`${hourLabelLocal(p.hour_ts)} — ${formatTraffic(p.raw_bytes)}`}
+              >
+                <i />
+                {showLabel ? (
+                  <span>
+                    {new Date(p.hour_ts * 1000).toLocaleTimeString("fa-IR", {
+                      hour: "2-digit",
+                      minute: "2-digit",
+                      hour12: false,
+                    })}
+                  </span>
+                ) : (
+                  <span className="pan-chart-tick" />
+                )}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PanelDetailModal({
+  panel,
+  detail,
+  loading,
+  onClose,
+}: {
+  panel: PanelRow;
+  detail?: Detail | null;
+  loading: boolean;
+  onClose: () => void;
+}) {
+  const current = Number(
+    detail?.current_total ?? panel.raw?.current_total ?? 0
+  );
+  const hour = Number(detail?.compare?.hour?.current ?? panel.raw?.hour ?? 0);
+  const day = Number(detail?.compare?.day?.current ?? panel.raw?.day ?? 0);
+  const online = Number(detail?.online?.online ?? panel.online ?? 0);
+  const accounts = Number(detail?.accounts ?? panel.accounts ?? 0);
+  const lastRun = detail?.tests?.last_run ?? panel.tests?.last_run ?? null;
+  const hasTest = Boolean(lastRun && Number(lastRun.tested || 0) > 0);
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div
+        className="modal modal-lg pan-detail-modal"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label={panel.name}
+      >
+        <header className="modal-head">
+          <div>
+            <h3>{panel.name}</h3>
+            <p className="modal-sub">
+              {panel.type}
+              {accounts > 0 ? ` · ${toFaDigits(accounts)} اکانت` : ""}
+              {!panel.is_active ? " · خاموش" : ""}
+            </p>
+          </div>
+          <button
+            type="button"
+            className="modal-close"
+            onClick={onClose}
+            aria-label="بستن"
+          >
+            <X size={18} />
+          </button>
+        </header>
+
+        <div className="pan-modal-stats">
+          <article>
+            <span>مصرف فعلی</span>
+            <b>{formatTraffic(current)}</b>
+            <small>جمع خام اکانت‌ها · کل عمر</small>
+          </article>
+          <article>
+            <span>این ساعت</span>
+            <b>{formatTraffic(hour)}</b>
+            <small>از ابتدای ساعت محلی</small>
+          </article>
+          <article>
+            <span>امروز</span>
+            <b>{formatTraffic(day)}</b>
+            <small>از نیمه‌شب محلی</small>
+          </article>
+          <article>
+            <span>آنلاین</span>
+            <b>{toFaDigits(online)}</b>
+            <small>مصرف اخیر روی همین پنل</small>
+          </article>
+        </div>
+
+        {hasTest ? (
+          <div className="pan-modal-test">
+            <h4>آخرین تست پینگ</h4>
+            <div className="pan-modal-test-grid">
+              <span>
+                تست‌شده: <b>{toFaDigits(lastRun!.tested)}</b>
+              </span>
+              <span>
+                top100: <b>{toFaDigits(lastRun!.in_top100)}</b>
+              </span>
+              <span>
+                خوب: <b>{toFaDigits(lastRun!.good)}</b>
+              </span>
+              {lastRun!.avg_ping > 0 ? (
+                <span dir="ltr">
+                  پینگ: <b>{lastRun!.avg_ping.toFixed(0)} ms</b>
+                </span>
+              ) : null}
+            </div>
+            {lastRun!.ts ? (
+              <small className="muted">
+                {new Date(lastRun!.ts).toLocaleString("fa-IR")}
+              </small>
+            ) : null}
+          </div>
+        ) : null}
+
+        {loading ? (
+          <div className="an-fresh-loading" style={{ marginTop: 12 }}>
+            <Loader2 size={18} className="configs-spin" />
+            <div>
+              <b>بارگذاری نمودار…</b>
+            </div>
+          </div>
+        ) : detail?.hourly?.length ? (
+          <div className="pan-modal-chart">
+            <h4>۴۸ ساعت اخیر</h4>
+            <HourlyUsageChart points={detail.hourly} />
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -262,30 +467,12 @@ export default function PanelAnalyticsPage() {
   });
 
   const data = overview.data;
-  const maxHour = useMemo(() => {
-    if (!data?.global_hourly?.length) return 1;
-    return Math.max(1, ...data.global_hourly.map((h) => h.raw_bytes));
-  }, [data]);
   const maxPanelTotal = useMemo(() => {
     if (!data?.panels?.length) return 1;
     return Math.max(
       1,
       ...data.panels.map((p) => Number(p.raw.current_total || p.raw.hour || 0))
     );
-  }, [data]);
-
-  const opItems = useMemo(() => {
-    if (!data?.online?.operators) return [];
-    return Object.entries(data.online.operators)
-      .map(([code, v]) => ({ label: v.label || code, count: v.count }))
-      .sort((a, b) => b.count - a.count);
-  }, [data]);
-
-  const brandItems = useMemo(() => {
-    if (!data?.online?.brands) return [];
-    return Object.entries(data.online.brands)
-      .map(([label, count]) => ({ label, count }))
-      .sort((a, b) => b.count - a.count);
   }, [data]);
 
   const panelsView = useMemo(() => {
@@ -309,7 +496,66 @@ export default function PanelAnalyticsPage() {
     return list;
   }, [data, q, sortKey]);
 
-  const d = detail.data;
+  const focusedPanel = useMemo((): PanelRow | null => {
+    if (focusId == null) return null;
+    const fromList = data?.panels?.find((p) => p.panel_id === focusId);
+    if (fromList) return fromList;
+    const d = detail.data;
+    if (d && d.panel_id === focusId) {
+      return {
+        panel_id: d.panel_id,
+        name: d.name,
+        type: d.type,
+        is_active: true,
+        accounts: d.accounts,
+        online: d.online.online,
+        raw: {
+          current_total: Number(d.current_total ?? d.lifetime_raw ?? 0),
+          hour: d.compare.hour.current,
+          day: d.compare.day.current,
+          week: d.compare.week?.current ?? 0,
+          month: d.compare.month?.current ?? 0,
+          lifetime_cursor: Number(d.lifetime_raw ?? 0),
+        },
+        compare_hour_pct: d.compare.hour.change_pct,
+        tests: d.tests,
+      };
+    }
+    return {
+      panel_id: focusId,
+      name: `پنل #${focusId}`,
+      type: "—",
+      is_active: true,
+      online: 0,
+      raw: {
+        current_total: 0,
+        hour: 0,
+        day: 0,
+        week: 0,
+        month: 0,
+        lifetime_cursor: 0,
+      },
+      compare_hour_pct: null,
+      tests: {
+        runs: 0,
+        configs_tested: 0,
+        top100: 0,
+        good: 0,
+        all_ops_ok: 0,
+        last_run: null,
+      },
+    };
+  }, [data, detail.data, focusId]);
+
+  useEffect(() => {
+    if (focusId == null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setFocusId(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [focusId]);
+
   const refreshing = liveRefresh.isPending;
 
   return (
@@ -319,7 +565,7 @@ export default function PanelAnalyticsPage() {
           <p className="an-kicker">تحلیل زیر‌ساخت</p>
           <h1>آمار پنل‌ها</h1>
           <p className="an-sub">
-            مصرف خام هر پنل، آنلاین‌ها، اپراتور و دستگاه، کیفیت تست پینگ — ساعت‌ها محلی دستگاه شما
+            مصرف خام دقیق، آنلاین، این ساعت و امروز — زمان محلی دستگاه شما
           </p>
           <div className="an-hero-actions">
             <button
@@ -371,234 +617,7 @@ export default function PanelAnalyticsPage() {
         items={PANEL_ANALYTICS_GUIDE}
       />
 
-      {focusId != null ? (
-        <section className="an-user-panel">
-          <div className="an-user-head">
-            <button type="button" className="btn ghost sm" onClick={() => setFocusId(null)}>
-              ← بازگشت
-            </button>
-            <div>
-              <h2>{d?.name || `پنل #${focusId}`}</h2>
-              {d ? (
-                <p className="muted">
-                  {d.type} · {toFaDigits(d.accounts)} اکانت ·{" "}
-                  {toFaDigits(d.online.online)} آنلاین
-                </p>
-              ) : null}
-            </div>
-          </div>
-
-          <div className="an-hero-actions" style={{ marginBottom: 12 }}>
-            <button
-              type="button"
-              className="btn sm"
-              disabled={refreshing}
-              onClick={() => liveRefresh.mutate()}
-            >
-              {refreshing ? (
-                <Loader2 size={14} className="configs-spin" />
-              ) : (
-                <RefreshCw size={14} />
-              )}
-              تازه‌سازی زنده
-            </button>
-          </div>
-
-          {detail.isLoading ? (
-            <div className="admin-skel">
-              <div className="admin-skel-card" />
-            </div>
-          ) : d ? (
-            <>
-              <div className="an-stat-grid">
-                <article className="an-stat" title="جمع خام اکانت‌های همین پنل">
-                  <span>
-                    <Zap size={13} /> مصرف فعلی
-                  </span>
-                  <strong>
-                    {formatTraffic(Number(d.current_total ?? d.lifetime_raw ?? 0))}
-                  </strong>
-                  <small>همیشه از اکانت‌ها</small>
-                </article>
-                <article className="an-stat">
-                  <span>
-                    <Activity size={13} /> این ساعت
-                  </span>
-                  <strong>{formatTraffic(d.compare.hour.current)}</strong>
-                  <small>
-                    <ChangePill pct={d.compare.hour.change_pct} />
-                  </small>
-                </article>
-                <article className="an-stat">
-                  <span>
-                    <Radio size={13} /> آنلاین
-                  </span>
-                  <strong>{toFaDigits(d.online.online)}</strong>
-                  <small>
-                    امروز {formatTraffic(d.compare.day.current)}
-                  </small>
-                </article>
-                <article className="an-stat">
-                  <span>
-                    <Gauge size={13} /> تست‌ها
-                  </span>
-                  <strong>{toFaDigits(d.tests.runs)}</strong>
-                  <small>
-                    top100 {toFaDigits(d.tests.top100)} · خوب{" "}
-                    {toFaDigits(d.tests.good)}
-                  </small>
-                </article>
-              </div>
-
-              <div className="an-grid-2">
-                <section className="an-block">
-                  <h3>مقایسه مصرف خام</h3>
-                  {(["hour", "day", "week", "month"] as const).map((k) => {
-                    const row = d.compare[k];
-                    const title =
-                      k === "hour"
-                        ? "ساعت"
-                        : k === "day"
-                          ? "روز"
-                          : k === "week"
-                            ? "هفته"
-                            : "ماه";
-                    return (
-                      <div key={k} className="an-compare-row">
-                        <div>
-                          <b>{title}</b>
-                          <p>
-                            {formatTraffic(row.current)}{" "}
-                            <span className="muted">vs</span>{" "}
-                            {formatTraffic(row.previous)}
-                          </p>
-                        </div>
-                        <ChangePill pct={row.change_pct} />
-                      </div>
-                    );
-                  })}
-                </section>
-                <section className="an-block">
-                  <h3>
-                    <Wifi size={16} /> اپراتور آنلاین‌ها
-                  </h3>
-                  <DistChips
-                    items={Object.entries(d.online.operators || {}).map(
-                      ([code, v]) => ({
-                        label: v.label || code,
-                        count: v.count,
-                      })
-                    )}
-                  />
-                  <h3 style={{ marginTop: 18 }}>
-                    <Smartphone size={16} /> دستگاه
-                  </h3>
-                  <DistChips
-                    items={Object.entries(d.online.brands || {}).map(
-                      ([label, count]) => ({ label, count })
-                    )}
-                  />
-                </section>
-              </div>
-
-              <section className="an-block">
-                <h3>۴۸ ساعت اخیر (خام · زمان محلی)</h3>
-                <div className="an-bars">
-                  {d.hourly.map((h) => (
-                    <BarRow
-                      key={h.hour_ts}
-                      label={hourLabelLocal(h.hour_ts)}
-                      value={h.raw_bytes}
-                      max={Math.max(1, ...d.hourly.map((x) => x.raw_bytes))}
-                      sub={
-                        h.raw_bytes > 0
-                          ? `آنلاین≈${toFaDigits(Math.round(h.avg_online))}`
-                          : undefined
-                      }
-                    />
-                  ))}
-                </div>
-              </section>
-
-              <section className="an-block">
-                <h3>بازهٔ مصرف در روز</h3>
-                <div className="an-hod">
-                  {d.hour_of_day.bytes.map((b, i) => {
-                    const m = Math.max(1, ...d.hour_of_day.bytes);
-                    const pct = (b / m) * 100;
-                    const peak = d.hour_of_day.peak_hour === i;
-                    return (
-                      <div
-                        key={i}
-                        className={`an-hod-col${peak ? " peak" : ""}`}
-                        title={`${toFaDigits(i)}:۰۰ — ${formatTraffic(b)}`}
-                      >
-                        <i style={{ height: `${Math.max(4, pct)}%` }} />
-                        <span>{toFaDigits(i)}</span>
-                      </div>
-                    );
-                  })}
-                </div>
-                {d.hour_of_day.peak_hour != null ? (
-                  <p className="muted">
-                    اوج حدود ساعت {toFaDigits(d.hour_of_day.peak_hour)} (
-                    {formatTraffic(d.hour_of_day.peak_bytes)})
-                  </p>
-                ) : null}
-              </section>
-
-              <section className="an-block">
-                <h3>تاریخچه تست پینگ</h3>
-                {d.tests.history.length === 0 ? (
-                  <p className="muted">
-                    هنوز تست پینگی به این پنل نسبت داده نشده — بعد از همگام‌سازی
-                    ping-hub پر می‌شود
-                  </p>
-                ) : (
-                  <div className="an-table-wrap">
-                    <table className="an-table">
-                      <thead>
-                        <tr>
-                          <th>زمان</th>
-                          <th>تست‌شده</th>
-                          <th>جزو ۱۰۰</th>
-                          <th>خوب</th>
-                          <th>همه اپراتور</th>
-                          <th>پینگ میانگین</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {d.tests.history.map((t, i) => (
-                          <tr key={i}>
-                            <td>
-                              {t.ts
-                                ? new Date(t.ts).toLocaleString("fa-IR")
-                                : "—"}
-                            </td>
-                            <td>{toFaDigits(t.tested)}</td>
-                            <td>{toFaDigits(t.in_top100)}</td>
-                            <td>{toFaDigits(t.good)}</td>
-                            <td>{toFaDigits(t.all_ops_ok)}</td>
-                            <td dir="ltr">
-                              {t.avg_ping > 0
-                                ? `${t.avg_ping.toFixed(0)} ms`
-                                : "—"}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </section>
-            </>
-          ) : (
-            <div className="admin-empty">
-              <p>خطا در بارگذاری جزئیات پنل</p>
-            </div>
-          )}
-        </section>
-      ) : overview.isLoading ? (
+      {overview.isLoading ? (
         <div className="admin-skel">
           <div className="admin-skel-card" />
           <div className="admin-skel-card" />
@@ -719,67 +738,41 @@ export default function PanelAnalyticsPage() {
             </article>
           </div>
 
-          <div className="an-grid-2">
-            <section className="an-block">
-              <div className="an-block-head">
-                <h3>
-                  <Wifi size={16} /> آنلاین بر اساس اپراتور
-                </h3>
-                <span className="muted">از IP ساب · تقریبی</span>
-              </div>
-              <DistChips items={opItems} />
-            </section>
-            <section className="an-block">
-              <div className="an-block-head">
-                <h3>
-                  <Smartphone size={16} /> آنلاین بر اساس دستگاه
-                </h3>
-                <span className="muted">از User-Agent</span>
-              </div>
-              <DistChips items={brandItems} />
-            </section>
-          </div>
+          <section className="an-block pan-chart-block">
+            <div className="an-block-head">
+              <h3>مصرف کل پنل‌ها — ۲۴ ساعت</h3>
+              <span className="muted">نمودار ستونی · زمان محلی دستگاه</span>
+            </div>
+            <HourlyUsageChart points={data.global_hourly} />
+          </section>
 
           <div className="an-grid-2">
             <section className="an-block">
               <div className="an-block-head">
-                <h3>مصرف کل پنل‌ها — ۲۴ ساعت</h3>
-                <span className="muted">زمان محلی</span>
-              </div>
-              <div className="an-bars">
-                {data.global_hourly.map((h) => (
-                  <BarRow
-                    key={h.hour_ts}
-                    label={hourLabelLocal(h.hour_ts)}
-                    value={h.raw_bytes}
-                    max={maxHour}
-                  />
-                ))}
+                <h3>پرمصرف‌ترین پنل‌ها (امروز)</h3>
+                <span className="muted">کلیک = جزئیات</span>
               </div>
               {(data.top_day_panels || []).length > 0 ? (
-                <>
-                  <h3 style={{ marginTop: 18 }}>
-                    پرمصرف‌ترین پنل‌ها (امروز)
-                  </h3>
-                  <ul className="an-list">
-                    {(data.top_day_panels || []).slice(0, 8).map((p, i) => (
-                      <li key={p.panel_id}>
-                        <button
-                          type="button"
-                          className="an-linkish"
-                          onClick={() => setFocusId(p.panel_id)}
-                        >
-                          <b>
-                            {i === 0 ? "★ " : ""}
-                            {p.name}
-                          </b>
-                        </button>
-                        <span>{formatTraffic(p.raw_bytes)}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </>
-              ) : null}
+                <ul className="an-list">
+                  {(data.top_day_panels || []).slice(0, 8).map((p, i) => (
+                    <li key={p.panel_id}>
+                      <button
+                        type="button"
+                        className="an-linkish"
+                        onClick={() => setFocusId(p.panel_id)}
+                      >
+                        <b>
+                          {i === 0 ? "★ " : ""}
+                          {p.name}
+                        </b>
+                      </button>
+                      <span>{formatTraffic(p.raw_bytes)}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="muted">هنوز مصرف امروز ثبت نشده</p>
+              )}
             </section>
             <section className="an-block">
               <div className="an-block-head">
@@ -788,31 +781,33 @@ export default function PanelAnalyticsPage() {
                 </h3>
                 <span className="muted">کلیک = جزئیات</span>
               </div>
+              <p className="pan-share-note">
+                بازه: <b>کل عمر</b> — جمع خام اکانت‌های هر پنل (نه ساعت و نه امروز)
+              </p>
               <div className="an-bars">
                 {panelsView
-                  .filter(
-                    (p) =>
-                      Number(p.raw.current_total || 0) > 0 || p.raw.hour > 0
-                  )
-                  .map((p, i) => (
-                    <button
-                      key={p.panel_id}
-                      type="button"
-                      className="pan-bar-btn"
-                      onClick={() => setFocusId(p.panel_id)}
-                      title={`${p.name} — مصرف فعلی ${formatTraffic(Number(p.raw.current_total || 0))} · این ساعت ${formatTraffic(p.raw.hour)}`}
-                    >
-                      <BarRow
-                        label={`${i === 0 ? "★ " : ""}${p.name} · ${toFaDigits(p.online)} آنلاین`}
-                        value={Number(p.raw.current_total || p.raw.hour || 0)}
-                        max={maxPanelTotal}
-                        sub={`فعلی ${formatTraffic(Number(p.raw.current_total || 0))} · ساعت ${formatTraffic(p.raw.hour)}`}
-                      />
-                    </button>
-                  ))}
+                  .filter((p) => Number(p.raw.current_total || 0) > 0)
+                  .map((p, i) => {
+                    const total = Number(p.raw.current_total || 0);
+                    return (
+                      <button
+                        key={p.panel_id}
+                        type="button"
+                        className="pan-bar-btn"
+                        onClick={() => setFocusId(p.panel_id)}
+                        title={`${p.name} — ${formatTraffic(total)}`}
+                      >
+                        <BarRow
+                          label={`${i === 0 ? "★ " : ""}${p.name}`}
+                          value={total}
+                          max={maxPanelTotal}
+                          sub={`${formatTraffic(total)} · ${toFaDigits(p.online)} آنلاین`}
+                        />
+                      </button>
+                    );
+                  })}
                 {panelsView.every(
-                  (p) =>
-                    Number(p.raw.current_total || 0) <= 0 && p.raw.hour <= 0
+                  (p) => Number(p.raw.current_total || 0) <= 0
                 ) ? (
                   <p className="muted">
                     هنوز مصرفی نیست — «تازه‌سازی زنده» را بزنید
@@ -838,7 +833,7 @@ export default function PanelAnalyticsPage() {
                 {(
                   [
                     ["total", "مصرف فعلی"],
-                    ["hour", "ساعت"],
+                    ["hour", "این ساعت"],
                     ["day", "امروز"],
                     ["online", "آنلاین"],
                   ] as const
@@ -854,89 +849,56 @@ export default function PanelAnalyticsPage() {
                 ))}
               </div>
             </div>
-            <div className="an-table-wrap">
+            <div className="an-table-wrap pan-table-clean">
               <table className="an-table">
                 <thead>
                   <tr>
                     <th>پنل</th>
                     <th title="آنلاین روی همین پنل">آنلاین</th>
-                    <th title="جمع خام فعلی همه اکانت‌های این پنل — همیشه دقیق">
-                      مصرف فعلی
-                    </th>
-                    <th title="دلتای نمونه‌برداری این ساعت">ساعت</th>
-                    <th>امروز</th>
-                    <th>هفته</th>
-                    <th>ماه</th>
-                    <th title="تعداد دورهای تست ثبت‌شده">تست</th>
-                    <th title="آخرین دور / جمع عمری در ۱۰۰تای برتر">top100</th>
-                    <th title="آخرین دور / جمع عمری کیفیت خوب">خوب</th>
-                    <th title="آخرین دور / جمع عمری OK روی همه اپراتور">همه اپ</th>
+                    <th title="جمع خام اکانت‌ها · کل عمر">مصرف فعلی</th>
+                    <th title="از ابتدای ساعت محلی · شمارنده زنده">این ساعت</th>
+                    <th title="از نیمه‌شب محلی · شمارنده زنده">امروز</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {panelsView.map((p, idx) => (
-                    <tr
-                      key={p.panel_id}
-                      className={idx === 0 && Number(p.raw.current_total || p.raw.day || 0) > 0 ? "is-top" : undefined}
-                    >
-                      <td>
-                        <button
-                          type="button"
-                          className="an-linkish"
-                          onClick={() => setFocusId(p.panel_id)}
-                        >
+                  {panelsView.map((p, idx) => {
+                    const current = Number(p.raw?.current_total || 0);
+                    const hour = Number(p.raw?.hour || 0);
+                    const day = Number(p.raw?.day || 0);
+                    const isTop =
+                      idx === 0 && (current > 0 || day > 0 || hour > 0);
+                    return (
+                      <tr
+                        key={p.panel_id}
+                        className={isTop ? "is-top" : undefined}
+                        onClick={() => setFocusId(p.panel_id)}
+                        style={{ cursor: "pointer" }}
+                      >
+                        <td>
                           <b>
-                            {idx === 0 && Number(p.raw.current_total || p.raw.day || 0) > 0
-                              ? "★ "
-                              : ""}
+                            {isTop ? "★ " : ""}
                             {p.name}
                           </b>
-                        </button>
-                        <div className="muted" style={{ fontSize: "0.75rem" }}>
-                          {p.type}
-                          {p.accounts != null
-                            ? ` · ${toFaDigits(p.accounts)} اکانت`
-                            : ""}
-                          {!p.is_active ? " · خاموش" : ""}
-                        </div>
-                      </td>
-                      <td>{toFaDigits(p.online)}</td>
-                      <td>
-                        <b>
-                          {formatTraffic(Number(p.raw?.current_total || 0))}
-                        </b>
-                      </td>
-                      <td>
-                        {formatTraffic(Number(p.raw?.hour || 0))}{" "}
-                        <ChangePill pct={p.compare_hour_pct} />
-                      </td>
-                      <td>{formatTraffic(Number(p.raw?.day || 0))}</td>
-                      <td>{formatTraffic(Number(p.raw?.week || 0))}</td>
-                      <td>{formatTraffic(Number(p.raw?.month || 0))}</td>
-                      <td>{toFaDigits(p.tests?.runs || 0)}</td>
-                      <td>
-                        {toFaDigits(p.tests?.last_run?.in_top100 ?? 0)}
-                        <span className="muted">
-                          {" "}
-                          / {toFaDigits(p.tests?.top100 || 0)}
-                        </span>
-                      </td>
-                      <td>
-                        {toFaDigits(p.tests?.last_run?.good ?? 0)}
-                        <span className="muted">
-                          {" "}
-                          / {toFaDigits(p.tests?.good || 0)}
-                        </span>
-                      </td>
-                      <td>
-                        {toFaDigits(p.tests?.last_run?.all_ops_ok ?? 0)}
-                        <span className="muted">
-                          {" "}
-                          / {toFaDigits(p.tests?.all_ops_ok || 0)}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
+                          <div className="muted" style={{ fontSize: "0.75rem" }}>
+                            {p.type}
+                            {p.accounts != null
+                              ? ` · ${toFaDigits(p.accounts)} اکانت`
+                              : ""}
+                            {!p.is_active ? " · خاموش" : ""}
+                          </div>
+                        </td>
+                        <td>{toFaDigits(p.online)}</td>
+                        <td>
+                          <b>{formatTraffic(current)}</b>
+                        </td>
+                        <td>
+                          {formatTraffic(hour)}{" "}
+                          <ChangePill pct={p.compare_hour_pct} />
+                        </td>
+                        <td>{formatTraffic(day)}</td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -946,8 +908,8 @@ export default function PanelAnalyticsPage() {
               </p>
             ) : null}
             <p className="muted" style={{ marginTop: 10 }}>
-              {data.note} · ستون‌های تست: آخرین دور / جمع عمری · برای جزئیات روی نام
-              پنل کلیک کنید
+              مصرف فعلی = کل عمر · این ساعت/امروز از شمارنده زنده محلی · کلیک روی
+              ردیف = جزئیات
             </p>
           </section>
         </>
@@ -956,6 +918,19 @@ export default function PanelAnalyticsPage() {
           <p>خطا در بارگذاری آمار پنل‌ها</p>
         </div>
       )}
+
+      {focusId != null && focusedPanel ? (
+        <PanelDetailModal
+          panel={focusedPanel}
+          detail={
+            detail.data && detail.data.panel_id === focusId
+              ? detail.data
+              : null
+          }
+          loading={detail.isLoading || detail.isFetching}
+          onClose={() => setFocusId(null)}
+        />
+      ) : null}
     </div>
   );
 }

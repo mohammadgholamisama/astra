@@ -1473,6 +1473,18 @@ async def build_panel_detail(
             "top100": int(st.top100_total or 0) if st else 0,
             "good": int(st.good_total or 0) if st else 0,
             "all_ops_ok": int(st.all_ops_ok_total or 0) if st else 0,
+            "last_run": (
+                {
+                    "tested": int(tests[0].tested or 0),
+                    "in_top100": int(tests[0].in_top100 or 0),
+                    "good": int(tests[0].good or 0),
+                    "all_ops_ok": int(tests[0].all_ops_ok or 0),
+                    "avg_ping": float(tests[0].avg_ping or -1),
+                    "ts": tests[0].ts.isoformat() if tests[0].ts else None,
+                }
+                if tests
+                else None
+            ),
             "history": [
                 {
                     "ts": t.ts.isoformat() if t.ts else None,
