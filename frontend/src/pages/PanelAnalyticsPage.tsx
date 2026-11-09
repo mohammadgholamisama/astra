@@ -264,7 +264,7 @@ function HourlyUsageChart({
         ? hourValue(tip, mode)
         : 0;
   const tipIsNow = Boolean(tip?.is_current);
-  const hourWeightedHint =
+  const hourRawHint =
     currentHourRaw != null &&
     Number(currentHourRaw) > 0 &&
     Math.abs(Number(currentHourRaw) - currentVal) > 1
@@ -287,9 +287,10 @@ function HourlyUsageChart({
           <span>این ساعت</span>
           <b>{formatTraffic(currentVal)}</b>
           <small>
-            از {clockLabel(series[currentIdx]?.hour_ts || 0)} تا الان · خام Astra
-            {hourWeightedHint != null
-              ? ` · با ضریب ${formatTraffic(hourWeightedHint)}`
+            از {clockLabel(series[currentIdx]?.hour_ts || 0)} تا الان
+            {mode === "weighted" ? " · با ضریب" : " · خام Astra"}
+            {hourRawHint != null
+              ? ` · خام ${formatTraffic(hourRawHint)}`
               : ""}
           </small>
         </div>
@@ -503,7 +504,7 @@ export default function PanelAnalyticsPage() {
       api<Overview>(`/api/analytics/panels?tz_offset=${tz}`, {
         timeoutMs: 20_000,
       }),
-    refetchInterval: 60_000,
+    refetchInterval: false,
     refetchOnWindowFocus: false,
     retry: 1,
     staleTime: 15_000,
@@ -523,7 +524,7 @@ export default function PanelAnalyticsPage() {
     mutationFn: () =>
       api<{ ok: boolean; stats: Record<string, number>; overview: Overview }>(
         `/api/analytics/panels/refresh?tz_offset=${tz}`,
-        { method: "POST", timeoutMs: 10_000 }
+        { method: "POST", timeoutMs: 16_000 }
       ),
     onSuccess: (res) => {
       if (res.overview) {
@@ -537,15 +538,15 @@ export default function PanelAnalyticsPage() {
     },
   });
 
-  // Auto live pull every 3 minutes while this page is open & visible
+  // Live Xray pull on open + every 60s while page is visible (not a stale GET)
   useEffect(() => {
-    const LIVE_MS = 3 * 60_000;
-    const id = window.setInterval(() => {
+    const tick = () => {
       if (document.visibilityState === "hidden") return;
       liveRefresh.mutate();
-    }, LIVE_MS);
+    };
+    tick();
+    const id = window.setInterval(tick, 60_000);
     return () => window.clearInterval(id);
-    // mutate is stable; re-arm only if tz changes
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tz]);
 
@@ -815,14 +816,14 @@ export default function PanelAnalyticsPage() {
             <HourlyUsageChart
               points={data.global_hourly || []}
               mode="weighted"
-              currentHourBytes={Number(data.totals?.raw_hour || 0)}
+              currentHourBytes={Number(data.totals?.weighted_hour || 0)}
               currentHourRaw={
-                data.totals?.weighted_hour != null &&
+                data.totals?.raw_hour != null &&
                 Math.abs(
-                  Number(data.totals.weighted_hour) -
-                    Number(data.totals?.raw_hour || 0)
+                  Number(data.totals.weighted_hour || 0) -
+                    Number(data.totals.raw_hour || 0)
                 ) > 1
-                  ? Number(data.totals.weighted_hour)
+                  ? Number(data.totals.raw_hour)
                   : null
               }
             />

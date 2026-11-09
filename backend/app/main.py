@@ -262,7 +262,7 @@ async def _analytics_sample_loop() -> None:
                 if cycle % 3 == 0:
                     live = await panel_analytics_svc.refresh_panel_analytics_fast(
                         tz_offset_min=0,
-                        budget_s=8.0,
+                        budget_s=14.0,
                     )
                     live_stats = (live or {}).get("stats") or {}
                     if cycle == 0 or cycle % 30 == 0:

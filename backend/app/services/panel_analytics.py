@@ -668,51 +668,62 @@ async def sync_astra_panels_live(
 ) -> int:
     """Pull fresh Xray traffic into PanelAccount for all active Astra panels.
 
-    Analytics path defaults ``rebuild_on_limit=False`` so quota flips never
-    stall the stats page behind an xray/nginx rebuild.
+    Each panel uses its own DB session and runs in parallel so a short UI
+    budget still covers many nodes (sequential sync under a 2–3s cap left most
+    panels unsynced → frozen «این ساعت»). ``rebuild_on_limit=False`` by default.
     """
+    from app.core.database import AsyncSessionLocal
     from app.models.panel import PanelType
     from app.services import astra_node as astra_node_svc
 
-    panels = list(
-        (
+    panel_ids = [
+        int(pid)
+        for (pid,) in (
             await db.execute(
-                select(Panel).where(
+                select(Panel.id).where(
                     Panel.type == PanelType.astra,
                     Panel.is_active.is_(True),
                 )
             )
-        )
-        .scalars()
-        .all()
-    )
-    if not panels:
+        ).all()
+    ]
+    if not panel_ids:
         return 0
 
-    updated = 0
-    for panel in panels:
+    async def _one(pid: int) -> int:
         try:
-            updated += int(
-                await astra_node_svc.sync_traffic_from_xray(
-                    db,
-                    panel,
-                    timeout=timeout_per_panel,
-                    rebuild_on_limit=rebuild_on_limit,
+            async with AsyncSessionLocal() as s:
+                panel = await s.get(Panel, pid)
+                if panel is None:
+                    return 0
+                n = int(
+                    await astra_node_svc.sync_traffic_from_xray(
+                        s,
+                        panel,
+                        timeout=timeout_per_panel,
+                        rebuild_on_limit=rebuild_on_limit,
+                    )
+                    or 0
                 )
-                or 0
-            )
+                try:
+                    await s.commit()
+                except Exception:  # noqa: BLE001
+                    await s.rollback()
+                    return 0
+                return n
         except Exception:  # noqa: BLE001
             logger.debug(
-                "astra analytics sync panel=%s failed", panel.id, exc_info=True
+                "astra analytics sync panel=%s failed", pid, exc_info=True
             )
+            return 0
+
+    results = await asyncio.gather(*[_one(pid) for pid in panel_ids])
+    updated = int(sum(int(x or 0) for x in results))
+    # Caller session must re-read rows committed by the worker sessions
     try:
-        await db.commit()
+        db.expire_all()
     except Exception:  # noqa: BLE001
-        logger.debug("astra analytics sync commit failed", exc_info=True)
-        try:
-            await db.rollback()
-        except Exception:  # noqa: BLE001
-            pass
+        pass
     return updated
 
 
@@ -940,11 +951,11 @@ def _empty_panel_overview(*, tz_offset_min: int = 0) -> dict[str, Any]:
 async def refresh_panel_analytics_fast(
     *,
     tz_offset_min: int = 0,
-    budget_s: float = 6.0,
+    budget_s: float = 12.0,
 ) -> dict[str, Any]:
     """«تازه‌سازی زنده» — always returns an overview in a few seconds.
 
-    Short Xray sync + best-effort flush, then a pure read overview.
+    Parallel Xray sync + flush into the current chart hour, then overview.
     Never raises to the API layer.
     """
     from app.core.database import AsyncSessionLocal
@@ -954,31 +965,33 @@ async def refresh_panel_analytics_fast(
     bytes_hint = 0
     err: str | None = None
     pre_live: dict[int, int] = {}
+    budget = max(6.0, float(budget_s or 12.0))
 
-    # Phase 1: sync (+ optional flush) with hard caps — never block the UI
+    # Phase 1: sync (+ flush) — parallel panels so many nodes fit the budget
     try:
         async with AsyncSessionLocal() as db:
             try:
                 pre = await asyncio.wait_for(
-                    live_panel_raw_and_weighted(db), timeout=1.5
+                    live_panel_raw_and_weighted(db), timeout=2.0
                 )
                 pre_live = {pid: int(v["raw"]) for pid, v in pre.items()}
                 await asyncio.wait_for(
                     ensure_panel_cursors_seeded(db, pre_live, now=_utc_now()),
-                    timeout=1.0,
+                    timeout=1.5,
                 )
             except Exception:  # noqa: BLE001
                 logger.debug("fast refresh pre-seed failed", exc_info=True)
 
+            sync_budget = min(8.0, max(3.0, budget * 0.55))
             try:
                 astra_synced = int(
                     await asyncio.wait_for(
                         sync_astra_panels_live(
                             db,
-                            timeout_per_panel=1.5,
+                            timeout_per_panel=2.5,
                             rebuild_on_limit=False,
                         ),
-                        timeout=2.5,
+                        timeout=sync_budget,
                     )
                     or 0
                 )
@@ -988,17 +1001,16 @@ async def refresh_panel_analytics_fast(
 
             try:
                 post = await asyncio.wait_for(
-                    live_panel_raw_and_weighted(db), timeout=1.5
+                    live_panel_raw_and_weighted(db), timeout=2.0
                 )
                 post_live = {pid: int(v["raw"]) for pid, v in post.items()}
                 bytes_hint = sum(
                     max(0, int(post_live.get(pid, 0)) - int(pre_live.get(pid, 0)))
                     for pid in set(pre_live) | set(post_live)
                 )
-                # Flush is best-effort; skip quickly if SQLite is busy
                 await asyncio.wait_for(
                     flush_live_deltas_to_hours(db, post_live, now=_utc_now()),
-                    timeout=1.2,
+                    timeout=2.0,
                 )
             except Exception as exc:  # noqa: BLE001
                 err = err or f"flush:{type(exc).__name__}"
@@ -1007,17 +1019,17 @@ async def refresh_panel_analytics_fast(
         err = f"phase1:{type(exc).__name__}"
         logger.exception("fast refresh phase1 failed")
 
-    # Phase 2: pure read overview in a brand-new session
+    # Phase 2: overview in a fresh session (persist marks so next load moves)
     overview: dict[str, Any] | None = None
     try:
         async with AsyncSessionLocal() as db:
-            remain = max(1.2, float(budget_s) - (time.monotonic() - t0))
+            remain = max(2.0, budget - (time.monotonic() - t0))
             overview = await asyncio.wait_for(
                 build_panel_overview(
                     db,
                     tz_offset_min=tz_offset_min,
                     sync_astra=False,
-                    persist=False,
+                    persist=True,
                 ),
                 timeout=remain,
             )
@@ -1565,14 +1577,24 @@ async def build_panel_overview(
         pending = _pending_bytes(live=live, cursor=cursor, seeded=seeded)
         bucket_h = int(hour_map.get(pid, 0))
         bucket_d = int(day_map.get(pid, 0))
-        # Authoritative: flushed chart-hour bucket (+ residual pending)
+        # Flushed chart-hour bucket (+ residual pending)
         h = _chart_hour_bytes(live=live, bucket=bucket_h, pending=pending)
         d = _chart_hour_bytes(live=live, bucket=bucket_d, pending=pending)
+        # Also floor by live watermark so growth shows even if flush lagged
+        if st is not None:
+            mark_h_ts = int(getattr(st, "period_hour_ts", 0) or 0)
+            mark_h_raw = max(0, int(getattr(st, "period_hour_raw", 0) or 0))
+            if mark_h_ts == chart_hour and live >= mark_h_raw:
+                h = max(h, live - mark_h_raw)
+            mark_d_ts = int(getattr(st, "period_day_ts", 0) or 0)
+            mark_d_raw = max(0, int(getattr(st, "period_day_raw", 0) or 0))
+            if mark_d_ts == day and live >= mark_d_raw:
+                d = max(d, live - mark_d_raw)
         if d < h:
             d = h
-        # Only mutate watermarks when persisting — keeps refresh read-path safe
-        # against SQLite write locks / aborted sessions.
-        if persist:
+        # Only mutate watermarks when persisting — keeps GET read-path safe
+        # against write locks / aborted sessions.
+        if persist and st is not None:
             st.period_hour_ts = chart_hour
             st.period_hour_raw = max(0, live - h)
             st.period_day_ts = day
