@@ -35,6 +35,8 @@ type Overview = {
   online_users: number;
   raw_hour: { current: number; previous: number; change_pct: number | null };
   raw_today: number;
+  raw_current?: number;
+  raw_pending?: number;
   hour_of_day: { bytes: number[]; peak_hour: number | null; peak_bytes: number };
   global_hourly: { hour_ts: number; raw_bytes: number }[];
   top_hour: { username: string; raw_bytes: number }[];
@@ -684,14 +686,20 @@ export default function AnalyticsPage() {
             </article>
             <article className="an-stat">
               <span>
-                <Zap size={13} /> مصرف این ساعت
+                <Zap size={13} /> مصرف فعلی کل
               </span>
-              <strong>{formatTraffic(data.raw_hour.current)}</strong>
-              <ChangePill pct={data.raw_hour.change_pct} />
+              <strong>
+                {formatTraffic(Number(data.raw_current || 0))}
+              </strong>
+              <small>جمع خام اکانت‌ها</small>
             </article>
             <article className="an-stat">
-              <span>مصرف امروز</span>
-              <strong>{formatTraffic(data.raw_today)}</strong>
+              <span>این ساعت / امروز</span>
+              <strong>{formatTraffic(data.raw_hour.current)}</strong>
+              <small>
+                امروز {formatTraffic(data.raw_today)}{" "}
+                <ChangePill pct={data.raw_hour.change_pct} />
+              </small>
             </article>
             <article className="an-stat">
               <span>اوج ساعات روز</span>

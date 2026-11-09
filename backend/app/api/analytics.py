@@ -93,7 +93,7 @@ async def _fresh_sample_user(db: AsyncSession, user: User) -> User:
             await db.execute(select(User).where(User.id == int(user.id)))
         ).scalar_one_or_none() or user
 
-    # Sum raw per panel for sampling
+    # Sum raw per panel for sampling (user + panel cursors)
     acc_rows = (
         await db.execute(
             select(
@@ -105,17 +105,36 @@ async def _fresh_sample_user(db: AsyncSession, user: User) -> User:
         )
     ).all()
     total = 0
+    panel_online: dict[int, int] = {}
     for pid, raw in acc_rows:
         raw_i = int(raw or 0)
         total += raw_i
         try:
-            await panel_analytics_svc.apply_panel_user_sample(
+            is_on = await panel_analytics_svc.apply_panel_user_sample(
                 db, int(user.id), int(pid), raw_i
             )
+            if is_on:
+                panel_online[int(pid)] = 1
         except Exception:  # noqa: BLE001
             logger.debug(
                 "panel user sample failed u=%s p=%s", user.id, pid, exc_info=True
             )
+    # Also advance each affected panel's raw cursor from live totals
+    try:
+        live_by_panel = await panel_analytics_svc.live_panel_totals(db)
+        for pid, _raw in acc_rows:
+            pid_i = int(pid)
+            try:
+                await panel_analytics_svc.apply_panel_raw_sample(
+                    db,
+                    pid_i,
+                    int(live_by_panel.get(pid_i, 0)),
+                    online_n=int(panel_online.get(pid_i, 0)),
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("panel raw sample failed p=%s", pid_i, exc_info=True)
+    except Exception:  # noqa: BLE001
+        logger.debug("panel live totals after user refresh failed", exc_info=True)
     try:
         await analytics_svc.apply_raw_sample(db, int(user.id), total)
         await db.commit()

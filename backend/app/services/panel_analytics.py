@@ -87,6 +87,16 @@ def _clamp_tz_offset(tz_offset_min: int | None) -> int:
     return max(-14 * 60, min(14 * 60, off))
 
 
+def _align_down_hour(ts: int) -> int:
+    return int(ts) - (int(ts) % 3600)
+
+
+def _align_up_hour(ts: int) -> int:
+    t = int(ts)
+    r = t % 3600
+    return t if r == 0 else t + (3600 - r)
+
+
 def _period_starts(now: datetime, tz_offset_min: int = 0) -> dict[str, int]:
     off = _clamp_tz_offset(tz_offset_min)
     local = now - timedelta(minutes=off)
@@ -106,16 +116,23 @@ def _period_starts(now: datetime, tz_offset_min: int = 0) -> dict[str, int]:
     )
 
     def to_utc_ts(local_dt: datetime) -> int:
-        ts = int((local_dt + timedelta(minutes=off)).timestamp())
-        return ts - (ts % 3600)
+        return int((local_dt + timedelta(minutes=off)).timestamp())
 
+    hour = to_utc_ts(local_hour)
+    day = to_utc_ts(local_day)
+    week = to_utc_ts(local_week)
+    month = to_utc_ts(local_month)
     return {
-        "hour": to_utc_ts(local_hour),
-        "day": to_utc_ts(local_day),
-        "week": to_utc_ts(local_week),
-        "month": to_utc_ts(local_month),
+        "hour": hour,
+        "hour_end": hour + 3600,
+        "day": day,
+        "day_end": day + 86400,
+        "week": week,
+        "week_end": week + 7 * 86400,
+        "month": month,
         "next_month": to_utc_ts(next_month),
         "prev_month": to_utc_ts(prev_month),
+        "grid_hour": _align_down_hour(int(now.timestamp())),
         "tz_offset_min": off,
     }
 
@@ -124,6 +141,26 @@ def _hod_index(hour_ts: int, tz_offset_min: int = 0) -> int:
     off = _clamp_tz_offset(tz_offset_min)
     local_ts = int(hour_ts) - off * 60
     return int((local_ts % 86400) // 3600)
+
+
+def _overlap_bytes(hour_ts: int, raw: int, start_ts: int, end_ts: int) -> int:
+    if raw <= 0 or end_ts <= start_ts:
+        return 0
+    b0 = int(hour_ts)
+    b1 = b0 + 3600
+    o0 = max(b0, int(start_ts))
+    o1 = min(b1, int(end_ts))
+    if o1 <= o0:
+        return 0
+    if o0 == b0 and o1 == b1:
+        return int(raw)
+    return int(round(int(raw) * ((o1 - o0) / 3600.0)))
+
+
+def _pending_bytes(*, live: int, cursor: int, seeded: bool) -> int:
+    if not seeded:
+        return 0
+    return max(0, int(live) - int(cursor))
 
 
 def parse_device_brand(user_agent: str) -> str:
@@ -207,6 +244,57 @@ async def _bump_panel_hour(
         row.peak_bps = float(peak_bps)
 
 
+async def _distribute_panel_delta(
+    db: AsyncSession,
+    panel_id: int,
+    delta: int,
+    start: datetime,
+    end: datetime,
+    *,
+    peak_bps: float = 0.0,
+    online_n: int = 0,
+    active: bool = False,
+) -> None:
+    if delta <= 0:
+        return
+    start = _as_utc(start) or end
+    end = _as_utc(end) or start
+    if end <= start:
+        await _bump_panel_hour(
+            db, panel_id, _hour_ts(end), delta, 0, peak_bps, int(online_n)
+        )
+        return
+    total_sec = (end - start).total_seconds()
+    if total_sec > 48 * 3600:
+        start = end - timedelta(hours=48)
+        total_sec = (end - start).total_seconds()
+    segs: list[tuple[int, float]] = []
+    t = start
+    while t < end:
+        hour_floor = _hour_ts(t)
+        hour_end = datetime.fromtimestamp(hour_floor + 3600, tz=timezone.utc)
+        seg_end = min(end, hour_end)
+        segs.append((hour_floor, max(0.0, (seg_end - t).total_seconds())))
+        t = seg_end
+    if not segs:
+        await _bump_panel_hour(
+            db, panel_id, _hour_ts(end), delta, 0, peak_bps, int(online_n)
+        )
+        return
+    assigned = 0
+    for i, (h, sec) in enumerate(segs):
+        if i == len(segs) - 1:
+            part = max(0, delta - assigned)
+        else:
+            part = int(round(delta * (sec / total_sec))) if total_sec > 0 else 0
+            assigned += part
+        act = int(round(sec)) if active else 0
+        if part > 0 or act > 0:
+            await _bump_panel_hour(
+                db, panel_id, h, part, act, peak_bps, int(online_n)
+            )
+
+
 async def apply_panel_raw_sample(
     db: AsyncSession,
     panel_id: int,
@@ -225,13 +313,20 @@ async def apply_panel_raw_sample(
         state.last_sample_at = now
         return
 
-    dt = max(1.0, min(600.0, (now - last_at).total_seconds()))
+    dt = max(1.0, (now - last_at).total_seconds())
+    dt_rate = max(1.0, min(600.0, dt))
     delta = 0 if raw < prev else (raw - prev)
-    rate_bps = (delta * 8.0) / dt if delta > 0 else 0.0
-    hour = _hour_ts(now)
-    active_sec = int(round(dt)) if delta >= _ONLINE_MIN_BYTES else 0
-    await _bump_panel_hour(
-        db, panel_id, hour, delta, active_sec, rate_bps, int(online_n)
+    rate_bps = (delta * 8.0) / dt_rate if delta > 0 else 0.0
+    active = delta >= _ONLINE_MIN_BYTES
+    await _distribute_panel_delta(
+        db,
+        panel_id,
+        delta,
+        last_at,
+        now,
+        peak_bps=rate_bps,
+        online_n=int(online_n),
+        active=active,
     )
     if rate_bps > float(state.peak_bps or 0):
         state.peak_bps = float(rate_bps)
@@ -327,16 +422,13 @@ async def _sample_panels_with_db(db: AsyncSession, *, now: datetime | None = Non
         raw_i = int(total or 0)
         raw_by_panel[pid_i] = raw_by_panel.get(pid_i, 0) + raw_i
         try:
-            is_on = await apply_panel_user_sample(db, uid_i, pid_i, raw_i, now=now)
+            async with db.begin_nested():
+                is_on = await apply_panel_user_sample(db, uid_i, pid_i, raw_i, now=now)
             if is_on:
                 online_by_panel[pid_i] = online_by_panel.get(pid_i, 0) + 1
             n_up += 1
         except Exception:  # noqa: BLE001
             logger.exception("panel user sample u=%s p=%s failed", uid_i, pid_i)
-            try:
-                await db.rollback()
-            except Exception:  # noqa: BLE001
-                pass
         if n_up % 80 == 0:
             await db.commit()
 
@@ -348,20 +440,17 @@ async def _sample_panels_with_db(db: AsyncSession, *, now: datetime | None = Non
     n_p = 0
     for pid, raw in raw_by_panel.items():
         try:
-            await apply_panel_raw_sample(
-                db,
-                int(pid),
-                int(raw),
-                online_n=int(online_by_panel.get(int(pid), 0)),
-                now=now,
-            )
+            async with db.begin_nested():
+                await apply_panel_raw_sample(
+                    db,
+                    int(pid),
+                    int(raw),
+                    online_n=int(online_by_panel.get(int(pid), 0)),
+                    now=now,
+                )
             n_p += 1
         except Exception:  # noqa: BLE001
             logger.exception("panel sample p=%s failed", pid)
-            try:
-                await db.rollback()
-            except Exception:  # noqa: BLE001
-                pass
     await db.commit()
     return {"panels": n_p, "user_panel": n_up}
 
@@ -733,14 +822,23 @@ async def record_ping_rank_for_panels(
 async def _sum_panel_hours(
     db: AsyncSession, panel_id: int, start_ts: int, end_ts: int
 ) -> int:
-    q = await db.execute(
-        select(func.coalesce(func.sum(PanelUsageHourBucket.raw_bytes), 0)).where(
-            PanelUsageHourBucket.panel_id == int(panel_id),
-            PanelUsageHourBucket.hour_ts >= int(start_ts),
-            PanelUsageHourBucket.hour_ts < int(end_ts),
+    if int(end_ts) <= int(start_ts):
+        return 0
+    lo = _align_down_hour(int(start_ts))
+    hi = _align_up_hour(int(end_ts))
+    rows = (
+        await db.execute(
+            select(PanelUsageHourBucket.hour_ts, PanelUsageHourBucket.raw_bytes).where(
+                PanelUsageHourBucket.panel_id == int(panel_id),
+                PanelUsageHourBucket.hour_ts >= lo,
+                PanelUsageHourBucket.hour_ts < hi,
+            )
         )
+    ).all()
+    return sum(
+        _overlap_bytes(int(ts), int(raw or 0), int(start_ts), int(end_ts))
+        for ts, raw in rows
     )
-    return int(q.scalar() or 0)
 
 
 async def _hour_rows_panel(
@@ -871,10 +969,14 @@ async def build_panel_overview(
     now = _utc_now()
     periods = _period_starts(now, tz_offset_min)
     hour = int(periods["hour"])
+    hour_end = int(periods["hour_end"])
     day = int(periods["day"])
+    day_end = int(periods["day_end"])
     week = int(periods["week"])
+    week_end = int(periods["week_end"])
     month = int(periods["month"])
     next_month_ts = int(periods["next_month"])
+    grid_hour = int(periods["grid_hour"])
     tz_off = int(periods["tz_offset_min"])
 
     panels = list((await db.execute(select(Panel).order_by(Panel.id.asc()))).scalars().all())
@@ -917,28 +1019,34 @@ async def build_panel_overview(
         int(x["panel_id"]): int(x["online"]) for x in online_info["by_panel"]
     }
 
-    # Batch period sums (one query per window instead of N×panels)
-    async def _batched(a: int, b: int) -> dict[int, int]:
+    # Batch period sums with overlap proration
+    async def _batched_overlap(a: int, b: int) -> dict[int, int]:
+        lo = _align_down_hour(a)
+        hi = _align_up_hour(b)
         rows_q = (
             await db.execute(
                 select(
                     PanelUsageHourBucket.panel_id,
-                    func.coalesce(func.sum(PanelUsageHourBucket.raw_bytes), 0),
+                    PanelUsageHourBucket.hour_ts,
+                    PanelUsageHourBucket.raw_bytes,
+                ).where(
+                    PanelUsageHourBucket.hour_ts >= lo,
+                    PanelUsageHourBucket.hour_ts < hi,
                 )
-                .where(
-                    PanelUsageHourBucket.hour_ts >= int(a),
-                    PanelUsageHourBucket.hour_ts < int(b),
-                )
-                .group_by(PanelUsageHourBucket.panel_id)
             )
         ).all()
-        return {int(pid): int(raw or 0) for pid, raw in rows_q}
+        out: dict[int, int] = {}
+        for pid, ts, raw in rows_q:
+            out[int(pid)] = out.get(int(pid), 0) + _overlap_bytes(
+                int(ts), int(raw or 0), a, b
+            )
+        return out
 
-    hour_map = await _batched(hour, hour + 3600)
-    prev_hour_map = await _batched(hour - 3600, hour)
-    day_map = await _batched(day, day + 86400)
-    week_map = await _batched(week, week + 7 * 86400)
-    month_map = await _batched(month, next_month_ts)
+    hour_map = await _batched_overlap(hour, hour_end)
+    prev_hour_map = await _batched_overlap(hour - 3600, hour)
+    day_map = await _batched_overlap(day, day_end)
+    week_map = await _batched_overlap(week, week_end)
+    month_map = await _batched_overlap(month, next_month_ts)
 
     # Latest test run per panel (recent rows only)
     last_runs: dict[int, PanelTestRun] = {}
@@ -961,7 +1069,8 @@ async def build_panel_overview(
         st = states.get(pid)
         live = int(live_totals.get(pid, 0))
         cursor = int(st.last_raw_total or 0) if st else 0
-        pending = max(0, live - cursor)
+        seeded = bool(st and st.last_sample_at is not None)
+        pending = _pending_bytes(live=live, cursor=cursor, seeded=seeded)
         total_live += live
         total_pending += pending
         h = int(hour_map.get(pid, 0)) + pending
@@ -1046,8 +1155,8 @@ async def build_panel_overview(
     top_hour = _top_row("hour")
     top_day = _top_row("day")
 
-    # Global hourly 24h + pending into current hour
-    g_start = hour - 23 * 3600
+    # Global hourly 24h + pending into current UTC grid hour
+    g_start = grid_hour - 23 * 3600
     g_rows = (
         await db.execute(
             select(
@@ -1069,7 +1178,7 @@ async def build_panel_overview(
         global_hourly.append({"hour_ts": ts, "raw_bytes": raw})
 
     # Peak hour-of-day last 7d — client local clock
-    heat_start = hour - 7 * 86400
+    heat_start = grid_hour - 7 * 86400
     heat = (
         await db.execute(
             select(PanelUsageHourBucket.hour_ts, PanelUsageHourBucket.raw_bytes).where(
@@ -1081,7 +1190,7 @@ async def build_panel_overview(
     for ts, raw in heat:
         by_hod[_hod_index(int(ts), tz_off)] += int(raw or 0)
     if total_pending:
-        by_hod[_hod_index(hour, tz_off)] += total_pending
+        by_hod[_hod_index(grid_hour, tz_off)] += total_pending
     peak_hod = max(range(24), key=lambda h: by_hod[h]) if any(by_hod) else None
 
     # Top panels by day for the 24h section list
@@ -1141,29 +1250,34 @@ async def build_panel_detail(
     now = _utc_now()
     periods = _period_starts(now, tz_offset_min)
     hour = int(periods["hour"])
+    hour_end = int(periods["hour_end"])
     day = int(periods["day"])
+    day_end = int(periods["day_end"])
     week = int(periods["week"])
+    week_end = int(periods["week_end"])
     month = int(periods["month"])
     next_month_ts = int(periods["next_month"])
     prev_month = int(periods["prev_month"])
+    grid_hour = int(periods["grid_hour"])
     tz_off = int(periods["tz_offset_min"])
 
     st = await db.get(PanelUsageState, int(panel_id))
     live_map = await live_panel_totals(db)
     live_total = int(live_map.get(int(panel_id), 0))
     cursor = int(st.last_raw_total or 0) if st else 0
-    pending = max(0, live_total - cursor)
-    cur_h = (await _sum_panel_hours(db, panel_id, hour, hour + 3600)) + pending
+    seeded = bool(st and st.last_sample_at is not None)
+    pending = _pending_bytes(live=live_total, cursor=cursor, seeded=seeded)
+    cur_h = (await _sum_panel_hours(db, panel_id, hour, hour_end)) + pending
     prev_h = await _sum_panel_hours(db, panel_id, hour - 3600, hour)
-    cur_d = (await _sum_panel_hours(db, panel_id, day, day + 86400)) + pending
+    cur_d = (await _sum_panel_hours(db, panel_id, day, day_end)) + pending
     prev_d = await _sum_panel_hours(db, panel_id, day - 86400, day)
-    cur_w = (await _sum_panel_hours(db, panel_id, week, week + 7 * 86400)) + pending
+    cur_w = (await _sum_panel_hours(db, panel_id, week, week_end)) + pending
     prev_w = await _sum_panel_hours(db, panel_id, week - 7 * 86400, week)
     cur_m = (await _sum_panel_hours(db, panel_id, month, next_month_ts)) + pending
     prev_m = await _sum_panel_hours(db, panel_id, prev_month, month)
 
-    series_start = hour - 47 * 3600
-    buckets = await _hour_rows_panel(db, panel_id, series_start, hour + 3600)
+    series_start = grid_hour - 47 * 3600
+    buckets = await _hour_rows_panel(db, panel_id, series_start, grid_hour + 3600)
     by_h = {int(b.hour_ts): b for b in buckets}
     hourly = []
     for i in range(48):
@@ -1184,13 +1298,13 @@ async def build_panel_detail(
             }
         )
 
-    heat_start = hour - 14 * 86400
-    heat_rows = await _hour_rows_panel(db, panel_id, heat_start, hour + 3600)
+    heat_start = grid_hour - 14 * 86400
+    heat_rows = await _hour_rows_panel(db, panel_id, heat_start, grid_hour + 3600)
     by_hod = [0] * 24
     for b in heat_rows:
         by_hod[_hod_index(int(b.hour_ts), tz_off)] += int(b.raw_bytes or 0)
     if pending:
-        by_hod[_hod_index(hour, tz_off)] += pending
+        by_hod[_hod_index(grid_hour, tz_off)] += pending
     peak_hod = max(range(24), key=lambda h: by_hod[h]) if any(by_hod) else None
 
     online_info = await _online_breakdown(db)
