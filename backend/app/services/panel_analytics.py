@@ -487,12 +487,12 @@ async def _sample_panels_with_db(db: AsyncSession, *, now: datetime | None = Non
 async def sample_all_panels_once(*, force: bool = False) -> dict[str, int]:
     """Sample raw traffic per panel + per (user,panel) online flags.
 
-    Never waits on a busy lock so HTTP overview stays responsive.
+    ``force=True`` waits for the lock (used by live refresh). Otherwise skip
+    if another sampler is already running so HTTP stays responsive.
     """
     from app.core.database import AsyncSessionLocal
 
-    _ = force
-    if _sample_lock.locked():
+    if not force and _sample_lock.locked():
         return {"skipped": 1, "busy": 1}
     async with _sample_lock:
         t0 = time.monotonic()
@@ -958,21 +958,21 @@ async def refresh_panel_analytics_fast(
     tz_offset_min: int = 0,
     budget_s: float = 12.0,
 ) -> dict[str, Any]:
-    """«تازه‌سازی زنده» — always returns an overview in a few seconds.
+    """«تازه‌سازی زنده» — sync → flush → sample → overview.
 
-    Parallel Xray sync + flush into the current chart hour, then overview.
-    Never raises to the API layer.
+    Every call must move totals when Xray/usage grew. Never raises to API.
     """
     from app.core.database import AsyncSessionLocal
 
     t0 = time.monotonic()
     astra_synced = 0
     bytes_hint = 0
+    sampled = 0
     err: str | None = None
     pre_live: dict[int, int] = {}
-    budget = max(6.0, float(budget_s or 12.0))
+    budget = max(8.0, float(budget_s or 12.0))
 
-    # Phase 1: sync (+ flush) — parallel panels so many nodes fit the budget
+    # Phase 1: parallel Xray sync + credit growth into the current chart hour
     try:
         async with AsyncSessionLocal() as db:
             try:
@@ -987,13 +987,13 @@ async def refresh_panel_analytics_fast(
             except Exception:  # noqa: BLE001
                 logger.debug("fast refresh pre-seed failed", exc_info=True)
 
-            sync_budget = min(8.0, max(3.0, budget * 0.55))
+            sync_budget = min(9.0, max(4.0, budget * 0.5))
             try:
                 astra_synced = int(
                     await asyncio.wait_for(
                         sync_astra_panels_live(
                             db,
-                            timeout_per_panel=2.5,
+                            timeout_per_panel=3.0,
                             rebuild_on_limit=False,
                         ),
                         timeout=sync_budget,
@@ -1015,7 +1015,7 @@ async def refresh_panel_analytics_fast(
                 )
                 await asyncio.wait_for(
                     flush_live_deltas_to_hours(db, post_live, now=_utc_now()),
-                    timeout=2.0,
+                    timeout=2.5,
                 )
             except Exception as exc:  # noqa: BLE001
                 err = err or f"flush:{type(exc).__name__}"
@@ -1024,11 +1024,21 @@ async def refresh_panel_analytics_fast(
         err = f"phase1:{type(exc).__name__}"
         logger.exception("fast refresh phase1 failed")
 
-    # Phase 2: overview in a fresh session (persist marks so next load moves)
+    # Phase 1b: force sampler so hour buckets catch any cursor growth
+    try:
+        sample_stats = await asyncio.wait_for(
+            sample_all_panels_once(force=True), timeout=4.0
+        )
+        sampled = int((sample_stats or {}).get("panels") or 0)
+    except Exception as exc:  # noqa: BLE001
+        err = err or f"sample:{type(exc).__name__}"
+        logger.debug("fast refresh sample failed", exc_info=True)
+
+    # Phase 2: overview with persisted live watermarks
     overview: dict[str, Any] | None = None
     try:
         async with AsyncSessionLocal() as db:
-            remain = max(2.0, budget - (time.monotonic() - t0))
+            remain = max(2.5, budget - (time.monotonic() - t0))
             overview = await asyncio.wait_for(
                 build_panel_overview(
                     db,
@@ -1049,6 +1059,7 @@ async def refresh_panel_analytics_fast(
             "astra_synced": astra_synced,
             "astra_only": True,
             "users_pulled": 0,
+            "sampled_panels": sampled,
             "bytes_added": int(bytes_hint),
             "ms": int((time.monotonic() - t0) * 1000),
             "error": err,
@@ -1582,7 +1593,7 @@ async def build_panel_overview(
         pending = _pending_bytes(live=live, cursor=cursor, seeded=seeded)
         bucket_h = int(hour_map.get(pid, 0))
         bucket_d = int(day_map.get(pid, 0))
-        # Primary: live − watermark (moves every sync). Bucket/pending is floor.
+        # Floor from flushed bucket + unflushed pending (live − cursor)
         from_bucket_h = _chart_hour_bytes(
             live=live, bucket=bucket_h, pending=pending
         )
@@ -1597,6 +1608,14 @@ async def build_panel_overview(
         mark_d_raw = (
             max(0, int(getattr(st, "period_day_raw", 0) or 0)) if st else 0
         )
+        # Repair chased / broken marks that locked hour to a fixed bucket
+        if (
+            st is not None
+            and mark_h_ts == chart_hour
+            and live > 0
+            and mark_h_raw >= live
+        ):
+            mark_h_raw = max(0, live - max(bucket_h, from_bucket_h))
         h, new_h_ts, new_h_raw = _period_from_live_mark(
             live,
             mark_ts=mark_h_ts,
@@ -1605,6 +1624,24 @@ async def build_panel_overview(
             bucket=max(bucket_h, from_bucket_h),
         )
         h = max(h, from_bucket_h)
+        # Backfill hour bucket if live−mark ran ahead of flushed bytes
+        if persist and st is not None and h > bucket_h:
+            try:
+                async with db.begin_nested():
+                    await _bump_panel_hour(
+                        db,
+                        pid,
+                        chart_hour,
+                        int(h - bucket_h),
+                        active_seconds=0,
+                        peak_bps=0.0,
+                        online_n=0,
+                    )
+                bucket_h = h
+                hour_map[pid] = h
+                marks_touched = True
+            except Exception:  # noqa: BLE001
+                logger.debug("reconcile hour bucket p=%s failed", pid, exc_info=True)
         d, new_d_ts, new_d_raw = _period_from_live_mark(
             live,
             mark_ts=mark_d_ts,
@@ -1613,7 +1650,7 @@ async def build_panel_overview(
             bucket=max(bucket_d, from_bucket_d),
         )
         d = max(d, from_bucket_d, h)
-        # Persist watermarks whenever allowed so the next load keeps growing
+        # Persist watermarks — baseline must NOT chase live during the hour
         if persist and st is not None:
             st.period_hour_ts = new_h_ts
             st.period_hour_raw = new_h_raw
@@ -1674,6 +1711,27 @@ async def build_panel_overview(
             except Exception:  # noqa: BLE001
                 pass
 
+    if persist or sync_astra:
+        try:
+            dash_weighted = await dashboard_weighted_total(db)
+        except Exception:  # noqa: BLE001
+            logger.exception("dashboard weighted total failed")
+            dash_weighted = total_weighted
+    else:
+        dash_weighted = total_weighted
+
+    # Tie «این ساعت» با ضریب to dashboard «ترافیک مصرفی» so when consumption
+    # moves on the dashboard, the hour column moves too (same live ratio).
+    if total_live > 0 and dash_weighted > 0:
+        total_hour_w = max(
+            int(total_hour_w),
+            _scale_weighted(total_hour, total_live, int(dash_weighted)),
+        )
+        total_day_w = max(
+            int(total_day_w),
+            _scale_weighted(total_day, total_live, int(dash_weighted)),
+        )
+
     # Chart current bar must equal «این ساعت» totals
     raw_by_ts[grid_hour] = int(total_hour)
     w_by_ts[grid_hour] = int(total_hour_w)
@@ -1716,16 +1774,6 @@ async def build_panel_overview(
     for ts, raw in raw_by_ts.items():
         by_hod[_hod_index(int(ts), tz_off)] += int(raw or 0)
     peak_hod = max(range(24), key=lambda h: by_hod[h]) if any(by_hod) else None
-
-    if persist or sync_astra:
-        try:
-            dash_weighted = await dashboard_weighted_total(db)
-        except Exception:  # noqa: BLE001
-            logger.exception("dashboard weighted total failed")
-            dash_weighted = total_weighted
-    else:
-        # Fast read path: avoid an extra full-table User scan
-        dash_weighted = total_weighted
 
     top_day_list = [
         {

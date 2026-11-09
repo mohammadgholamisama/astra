@@ -501,24 +501,26 @@ export default function PanelAnalyticsPage() {
   const overview = useQuery({
     queryKey: ["analytics-panels", tz],
     queryFn: async () => {
-      // Every load/refetch must sync Xray — never serve a stale read-only snapshot
+      // Every load/refetch syncs Xray + rebuilds hour stats (never a stale snapshot)
       const res = await api<{
         ok?: boolean;
         overview?: Overview;
         stats?: Record<string, number>;
-      }>(`/api/analytics/panels/refresh?tz_offset=${tz}`, {
+      }>(`/api/analytics/panels/refresh?tz_offset=${tz}&_=${Date.now()}`, {
         method: "POST",
-        timeoutMs: 20_000,
+        timeoutMs: 22_000,
       });
       if (res?.overview) return res.overview;
-      return api<Overview>(`/api/analytics/panels?tz_offset=${tz}`, {
-        timeoutMs: 20_000,
-      });
+      return api<Overview>(
+        `/api/analytics/panels?tz_offset=${tz}&_=${Date.now()}`,
+        { timeoutMs: 22_000 }
+      );
     },
-    refetchInterval: 60_000,
+    refetchInterval: 3 * 60_000,
     refetchOnWindowFocus: true,
     retry: 1,
     staleTime: 0,
+    gcTime: 0,
   });
 
   const detail = useQuery({
@@ -809,7 +811,10 @@ export default function PanelAnalyticsPage() {
             <div className="an-block-head">
               <h3>مصرف کل پنل‌ها — ۲۴ ساعت</h3>
               <span className="muted">
-                با ضریب · زنده با هر رفرش · زمان محلی
+                با ضریب · همگام هر ۳ دقیقه · زمان محلی
+                {data?.generated_at
+                  ? ` · ${new Date(data.generated_at).toLocaleTimeString("fa-IR")}`
+                  : ""}
               </span>
             </div>
             <HourlyUsageChart

@@ -256,22 +256,25 @@ async def _analytics_sample_loop() -> None:
             await sem.acquire()
             try:
                 stats = await analytics_svc.sample_all_users_once()
-                panel_stats = await panel_analytics_svc.sample_all_panels_once()
-                # Pull live Xray→Astra totals every ~3 minutes so «این ساعت» stays fresh
-                # even when nobody is on the analytics page.
+                panel_stats = await panel_analytics_svc.sample_all_panels_once(
+                    force=True
+                )
+                # Every ~3 minutes: full live sync so all panel hour columns move
+                # with real consumption (same cadence the UI expects).
                 if cycle % 3 == 0:
                     live = await panel_analytics_svc.refresh_panel_analytics_fast(
                         tz_offset_min=0,
-                        budget_s=14.0,
+                        budget_s=16.0,
                     )
                     live_stats = (live or {}).get("stats") or {}
-                    if cycle == 0 or cycle % 30 == 0:
-                        logger.info(
-                            "analytics live refresh: astra=%s bytes=+%s ms=%s",
-                            live_stats.get("astra_synced"),
-                            live_stats.get("bytes_added"),
-                            live_stats.get("ms"),
-                        )
+                    logger.info(
+                        "analytics live refresh: astra=%s bytes=+%s sampled=%s ms=%s err=%s",
+                        live_stats.get("astra_synced"),
+                        live_stats.get("bytes_added"),
+                        live_stats.get("sampled_panels"),
+                        live_stats.get("ms"),
+                        live_stats.get("error"),
+                    )
             finally:
                 sem.release()
             cycle += 1
