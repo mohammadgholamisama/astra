@@ -9901,3 +9901,196 @@ html[dir="rtl"] .configs-switch input:checked + .configs-switch-track::after,
 .pan-bar-btn:hover .an-bar-track > i {
   filter: brightness(1.15);
 }
+
+/* Analytics guide + polish */
+.an-hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+}
+.an-updated {
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+.an-guide {
+  border-radius: 16px;
+  border: 1px solid color-mix(in srgb, var(--ok) 18%, transparent);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--ok) 8%, transparent), transparent 55%),
+    var(--card, rgba(255, 255, 255, 0.03));
+  overflow: hidden;
+}
+.an-guide-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: right;
+}
+.an-guide-toggle-main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.an-guide-toggle-main strong {
+  display: block;
+  font-size: 0.95rem;
+}
+.an-guide-toggle-main small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+.an-guide-chevron {
+  transition: transform 0.2s ease;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+.an-guide.is-open .an-guide-chevron {
+  transform: rotate(180deg);
+}
+.an-guide-body {
+  padding: 0 16px 16px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+.an-guide-intro {
+  margin: 12px 0 14px;
+  color: var(--muted);
+  font-size: 0.88rem;
+  line-height: 1.6;
+}
+.an-guide-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.an-guide-item {
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.14);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+.an-guide-item header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  color: var(--ok);
+}
+.an-guide-item.tone-danger header { color: var(--danger); }
+.an-guide-item.tone-warn header { color: var(--warn); }
+.an-guide-item.tone-muted header { color: var(--muted); }
+.an-guide-item h4 {
+  margin: 0;
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+.an-guide-item p {
+  margin: 0;
+  font-size: 0.82rem;
+  line-height: 1.55;
+  color: color-mix(in srgb, var(--text, #fff) 82%, var(--muted));
+}
+.an-section-head {
+  margin: 4px 0 2px;
+}
+.an-section-head h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+.an-section-head p {
+  margin: 4px 0 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.an-block-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.an-block-head h3 {
+  margin: 0;
+}
+.an-health-chip {
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, transform 0.15s ease;
+}
+.an-health-chip:hover {
+  border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+}
+.an-health-chip.is-active {
+  background: color-mix(in srgb, var(--ok) 16%, transparent);
+  border-color: color-mix(in srgb, var(--ok) 55%, transparent);
+}
+.an-inline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.an-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.an-filter-input {
+  flex: 1;
+  min-width: 180px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(0, 0, 0, 0.2);
+  color: inherit;
+  outline: none;
+}
+.an-filter-input:focus {
+  border-color: color-mix(in srgb, var(--ok) 50%, transparent);
+}
+.an-sort-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.an-sort-pill {
+  padding: 7px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: transparent;
+  color: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.an-sort-pill.is-active {
+  background: color-mix(in srgb, var(--ok) 18%, transparent);
+  border-color: color-mix(in srgb, var(--ok) 50%, transparent);
+  font-weight: 650;
+}
+.an-card {
+  transition: border-color 0.15s ease, transform 0.15s ease;
+}
+.an-card:hover {
+  border-color: color-mix(in srgb, var(--ok) 28%, transparent);
+}
+.an-table tbody tr {
+  transition: background 0.12s ease;
+}
+.an-table tbody tr:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+@media (max-width: 860px) {
+  .an-guide-grid { grid-template-columns: 1fr; }
+}

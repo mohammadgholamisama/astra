@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
@@ -7,11 +8,14 @@ import {
   Gauge,
   Minus,
   Radio,
+  RefreshCw,
   Server,
   Smartphone,
+  Users,
   Wifi,
   Zap,
 } from "lucide-react";
+import AnalyticsGuide, { PANEL_ANALYTICS_GUIDE } from "../components/AnalyticsGuide";
 import { api } from "../lib/api";
 import { formatTraffic, toFaDigits } from "../lib/format";
 
@@ -195,6 +199,8 @@ function DistChips({
 
 export default function PanelAnalyticsPage() {
   const [focusId, setFocusId] = useState<number | null>(null);
+  const [q, setQ] = useState("");
+  const [sortKey, setSortKey] = useState<"hour" | "online" | "day">("hour");
 
   const overview = useQuery({
     queryKey: ["analytics-panels"],
@@ -233,6 +239,24 @@ export default function PanelAnalyticsPage() {
       .sort((a, b) => b.count - a.count);
   }, [data]);
 
+  const panelsView = useMemo(() => {
+    let list = [...(data?.panels || [])];
+    const needle = q.trim().toLowerCase();
+    if (needle) {
+      list = list.filter(
+        (p) =>
+          p.name.toLowerCase().includes(needle) ||
+          p.type.toLowerCase().includes(needle)
+      );
+    }
+    list.sort((a, b) => {
+      if (sortKey === "online") return b.online - a.online;
+      if (sortKey === "day") return b.raw.day - a.raw.day;
+      return b.raw.hour - a.raw.hour;
+    });
+    return list;
+  }, [data, q, sortKey]);
+
   const d = detail.data;
 
   return (
@@ -245,8 +269,39 @@ export default function PanelAnalyticsPage() {
             مصرف خام هر پنل، آنلاین‌ها، اپراتور و دستگاه، کیفیت تست پینگ، و نرخ مصرف
             نسبت به تعداد آنلاین
           </p>
+          <div className="an-hero-actions">
+            <Link to="/analytics" className="btn ghost sm">
+              <Users size={14} />
+              آمار کاربران
+            </Link>
+            <button
+              type="button"
+              className="btn ghost sm"
+              disabled={overview.isFetching}
+              onClick={() => void overview.refetch()}
+            >
+              <RefreshCw
+                size={14}
+                className={overview.isFetching ? "configs-spin" : undefined}
+              />
+              بروزرسانی
+            </button>
+            {data?.generated_at ? (
+              <span className="an-updated">
+                آخرین نمونه:{" "}
+                {new Date(data.generated_at).toLocaleTimeString("fa-IR")}
+              </span>
+            ) : null}
+          </div>
         </div>
       </header>
+
+      <AnalyticsGuide
+        title="راهنمای آمار پنل‌ها"
+        intro="مصرف‌ها خام و بدون ضریب‌اند. تست پینگ از ping-hub می‌آید؛ اپراتور از IP ساب تقریبی است."
+        items={PANEL_ANALYTICS_GUIDE}
+        defaultOpen={focusId == null}
+      />
 
       {focusId != null ? (
         <section className="an-user-panel">
@@ -455,7 +510,7 @@ export default function PanelAnalyticsPage() {
       ) : data ? (
         <>
           <div className="an-cards">
-            <article className="an-card">
+            <article className="an-card" title="کاربران با مصرف اخیر (سطح کاربر)">
               <p className="an-card-label">
                 <Radio size={14} /> آنلاین کل
               </p>
@@ -466,11 +521,12 @@ export default function PanelAnalyticsPage() {
                 جمع اسلات پنل: {toFaDigits(data.online.panel_online_total)}
               </p>
             </article>
-            <article className="an-card">
+            <article className="an-card" title="بدون ضریب">
               <p className="an-card-label">
                 <Zap size={14} /> مصرف خام این ساعت
               </p>
               <p className="an-card-big">{formatTraffic(data.totals.raw_hour)}</p>
+              <p className="an-card-hint">جمع همه پنل‌ها</p>
             </article>
             <article className="an-card">
               <p className="an-card-label">
@@ -494,15 +550,21 @@ export default function PanelAnalyticsPage() {
 
           <div className="an-grid-2">
             <section className="an-block">
-              <h3>
-                <Wifi size={16} /> آنلاین بر اساس اپراتور
-              </h3>
+              <div className="an-block-head">
+                <h3>
+                  <Wifi size={16} /> آنلاین بر اساس اپراتور
+                </h3>
+                <span className="muted">از IP ساب · تقریبی</span>
+              </div>
               <DistChips items={opItems} />
             </section>
             <section className="an-block">
-              <h3>
-                <Smartphone size={16} /> آنلاین بر اساس دستگاه
-              </h3>
+              <div className="an-block-head">
+                <h3>
+                  <Smartphone size={16} /> آنلاین بر اساس دستگاه
+                </h3>
+                <span className="muted">از User-Agent</span>
+              </div>
               <DistChips items={brandItems} />
             </section>
           </div>
@@ -522,11 +584,14 @@ export default function PanelAnalyticsPage() {
               </div>
             </section>
             <section className="an-block">
-              <h3>
-                <Gauge size={16} /> سهم مصرف این ساعت
-              </h3>
+              <div className="an-block-head">
+                <h3>
+                  <Gauge size={16} /> سهم مصرف این ساعت
+                </h3>
+                <span className="muted">کلیک = جزئیات پنل</span>
+              </div>
               <div className="an-bars">
-                {data.panels.map((p) => (
+                {panelsView.map((p) => (
                   <button
                     key={p.panel_id}
                     type="button"
@@ -550,26 +615,55 @@ export default function PanelAnalyticsPage() {
           </div>
 
           <section className="an-block">
-            <h3>جدول پنل‌ها</h3>
+            <div className="an-block-head">
+              <h3>جدول پنل‌ها</h3>
+              <span className="muted">{toFaDigits(panelsView.length)} پنل</span>
+            </div>
+            <div className="an-toolbar">
+              <input
+                className="an-filter-input"
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+                placeholder="جستجوی نام پنل…"
+              />
+              <div className="an-sort-pills">
+                {(
+                  [
+                    ["hour", "ساعت"],
+                    ["day", "امروز"],
+                    ["online", "آنلاین"],
+                  ] as const
+                ).map(([k, label]) => (
+                  <button
+                    key={k}
+                    type="button"
+                    className={`an-sort-pill${sortKey === k ? " is-active" : ""}`}
+                    onClick={() => setSortKey(k)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
             <div className="an-table-wrap">
               <table className="an-table">
                 <thead>
                   <tr>
                     <th>پنل</th>
-                    <th>آنلاین</th>
-                    <th>ساعت</th>
+                    <th title="آنلاین روی همین پنل">آنلاین</th>
+                    <th title="مصرف خام این ساعت">ساعت</th>
                     <th>امروز</th>
                     <th>هفته</th>
                     <th>ماه</th>
-                    <th>نرخ</th>
-                    <th>تست</th>
-                    <th>top100</th>
-                    <th>خوب</th>
-                    <th>همه اپ</th>
+                    <th title="نرخ تقریبی مصرف">نرخ</th>
+                    <th title="تعداد دورهای تست ثبت‌شده">تست</th>
+                    <th title="آخرین دور / جمع عمری در ۱۰۰تای برتر">top100</th>
+                    <th title="آخرین دور / جمع عمری کیفیت خوب">خوب</th>
+                    <th title="آخرین دور / جمع عمری OK روی همه اپراتور">همه اپ</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {data.panels.map((p) => (
+                  {panelsView.map((p) => (
                     <tr key={p.panel_id}>
                       <td>
                         <button
@@ -620,8 +714,14 @@ export default function PanelAnalyticsPage() {
                 </tbody>
               </table>
             </div>
+            {panelsView.length === 0 ? (
+              <p className="muted" style={{ marginTop: 10 }}>
+                پنلی با این جستجو پیدا نشد
+              </p>
+            ) : null}
             <p className="muted" style={{ marginTop: 10 }}>
-              {data.note} · ستون‌های تست: آخرین دور / جمع عمری
+              {data.note} · ستون‌های تست: آخرین دور / جمع عمری · برای جزئیات روی نام
+              پنل کلیک کنید
             </p>
           </section>
         </>

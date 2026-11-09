@@ -1,5 +1,5 @@
 import { FormEvent, useMemo, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
@@ -7,11 +7,14 @@ import {
   ArrowUpRight,
   Minus,
   Radio,
+  RefreshCw,
   Search,
+  Server,
   Smartphone,
   Wifi,
   Zap,
 } from "lucide-react";
+import AnalyticsGuide, { USER_ANALYTICS_GUIDE } from "../components/AnalyticsGuide";
 import { api } from "../lib/api";
 import { formatTraffic, toFaDigits } from "../lib/format";
 
@@ -207,6 +210,7 @@ export default function AnalyticsPage() {
   const nav = useNavigate();
   const focusUser = (params.get("u") || "").trim();
   const [q, setQ] = useState(focusUser);
+  const [healthFilter, setHealthFilter] = useState<string | null>(null);
 
   const overview = useQuery({
     queryKey: ["analytics-overview"],
@@ -231,6 +235,12 @@ export default function AnalyticsPage() {
     return Math.max(1, ...data.hour_of_day.bytes);
   }, [data]);
 
+  const filteredHealthUsers = useMemo(() => {
+    const list = data?.health_users || [];
+    if (!healthFilter) return list;
+    return list.filter((u) => u.health.code === healthFilter);
+  }, [data, healthFilter]);
+
   function onSearch(e: FormEvent) {
     e.preventDefault();
     const name = q.trim();
@@ -253,6 +263,28 @@ export default function AnalyticsPage() {
             مصرف خام بدون ضریب، وضعیت اتصال، سرعت لحظه‌ای، دستگاه‌ها و اینترنت‌های
             آپدیت ساب
           </p>
+          <div className="an-hero-actions">
+            <Link to="/panel-analytics" className="btn ghost sm">
+              <Server size={14} />
+              آمار پنل‌ها
+            </Link>
+            <button
+              type="button"
+              className="btn ghost sm"
+              disabled={overview.isFetching}
+              onClick={() => void overview.refetch()}
+              title="به‌روزرسانی"
+            >
+              <RefreshCw size={14} className={overview.isFetching ? "configs-spin" : undefined} />
+              بروزرسانی
+            </button>
+            {data?.generated_at ? (
+              <span className="an-updated">
+                آخرین نمونه:{" "}
+                {new Date(data.generated_at).toLocaleTimeString("fa-IR")}
+              </span>
+            ) : null}
+          </div>
         </div>
         <form className="an-search" onSubmit={onSearch}>
           <Search size={16} />
@@ -267,6 +299,13 @@ export default function AnalyticsPage() {
           </button>
         </form>
       </header>
+
+      <AnalyticsGuide
+        title="راهنمای آمار کاربران"
+        intro="همهٔ مصرف‌های این صفحه خام و بدون ضریب‌اند. وضعیت‌ها از ترکیب مصرف + آپدیت ساب حدس زده می‌شوند."
+        items={USER_ANALYTICS_GUIDE}
+        defaultOpen={!focusUser}
+      />
 
       {focusUser ? (
         <section className="an-user-panel">
@@ -542,24 +581,27 @@ export default function AnalyticsPage() {
           ) : data ? (
             <>
               <div className="an-cards">
-                <article className="an-card">
+                <article className="an-card" title="کاربرانی با مصرف اخیر روی پنل‌ها">
                   <p className="an-card-label">
                     <Radio size={14} /> آنلاین الان
                   </p>
                   <p className="an-card-big">{toFaDigits(data.online_users)}</p>
+                  <p className="an-card-hint">از دلتای مصرف خام، نه فقط باز کردن ساب</p>
                 </article>
-                <article className="an-card">
+                <article className="an-card" title="بدون ضریب گروه">
                   <p className="an-card-label">
                     <Zap size={14} /> مصرف خام این ساعت
                   </p>
                   <p className="an-card-big">{formatTraffic(data.raw_hour.current)}</p>
                   <ChangePill pct={data.raw_hour.change_pct} />
+                  <p className="an-card-hint">نسبت به ساعت قبل</p>
                 </article>
                 <article className="an-card">
                   <p className="an-card-label">
                     <Activity size={14} /> مصرف خام امروز
                   </p>
                   <p className="an-card-big">{formatTraffic(data.raw_today)}</p>
+                  <p className="an-card-hint">از نیمه‌شب UTC تا الان</p>
                 </article>
                 <article className="an-card">
                   <p className="an-card-label">اوج ساعتی روز (۷ روز)</p>
@@ -569,17 +611,37 @@ export default function AnalyticsPage() {
                       : "—"}
                   </p>
                   <p className="an-card-hint">
-                    {formatTraffic(data.hour_of_day.peak_bytes)}
+                    {formatTraffic(data.hour_of_day.peak_bytes)} · پرترافیک‌ترین بازه
                   </p>
                 </article>
               </div>
 
+              <div className="an-section-head">
+                <h2>وضعیت کاربران</h2>
+                <p>روی هر وضعیت کلیک کنید تا جدول فیلتر شود</p>
+              </div>
               <div className="an-health-strip">
+                <button
+                  type="button"
+                  className={`an-health-chip${healthFilter == null ? " is-active" : ""}`}
+                  onClick={() => setHealthFilter(null)}
+                >
+                  <b>همه</b>
+                </button>
                 {Object.entries(data.health_counts).map(([code, n]) => (
-                  <span key={code} className="an-health-chip">
+                  <button
+                    key={code}
+                    type="button"
+                    className={`an-health-chip${healthFilter === code ? " is-active" : ""}`}
+                    title={USER_ANALYTICS_GUIDE.find((g) => g.title.includes(HEALTH_LABELS[code]?.slice(0, 4) || "___"))?.body
+                      || HEALTH_LABELS[code]}
+                    onClick={() =>
+                      setHealthFilter((cur) => (cur === code ? null : code))
+                    }
+                  >
                     <b>{HEALTH_LABELS[code] || code}</b>
                     <em>{toFaDigits(n)}</em>
-                  </span>
+                  </button>
                 ))}
               </div>
 
@@ -644,21 +706,29 @@ export default function AnalyticsPage() {
               </section>
 
               <section className="an-block">
-                <h3>وضعیت کاربران</h3>
+                <div className="an-block-head">
+                  <h3>لیست وضعیت‌ها</h3>
+                  <span className="muted">
+                    {toFaDigits(filteredHealthUsers.length)} مورد
+                    {healthFilter
+                      ? ` · فیلتر: ${HEALTH_LABELS[healthFilter] || healthFilter}`
+                      : ""}
+                  </span>
+                </div>
                 <div className="an-table-wrap">
                   <table className="an-table">
                     <thead>
                       <tr>
                         <th>کاربر</th>
                         <th>وضعیت</th>
-                        <th>۱س</th>
-                        <th>۲۴س</th>
-                        <th>دستگاه</th>
-                        <th>اینترنت</th>
+                        <th title="مصرف خام یک ساعت اخیر">۱س</th>
+                        <th title="مصرف خام ۲۴ ساعت">۲۴س</th>
+                        <th title="تعداد کلاینت متمایز روی ساب">دستگاه</th>
+                        <th title="تعداد شبکه/اینترنت متمایز">اینترنت</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {data.health_users.slice(0, 40).map((u) => (
+                      {filteredHealthUsers.slice(0, 50).map((u) => (
                         <tr key={u.username}>
                           <td>
                             <button
@@ -678,7 +748,10 @@ export default function AnalyticsPage() {
                             </button>
                           </td>
                           <td>
-                            <span className={`badge ${toneClass(u.health.tone)}`}>
+                            <span
+                              className={`badge ${toneClass(u.health.tone)}`}
+                              title={u.health.hint}
+                            >
                               {u.health.label}
                             </span>
                           </td>
@@ -691,18 +764,33 @@ export default function AnalyticsPage() {
                     </tbody>
                   </table>
                 </div>
+                {filteredHealthUsers.length === 0 ? (
+                  <p className="muted" style={{ marginTop: 10 }}>
+                    موردی با این فیلتر نیست
+                  </p>
+                ) : null}
                 <p className="muted" style={{ marginTop: 10 }}>
-                  {data.note || "مصرف ساعتی بدون ضریب است"} · برای جزئیات یک کاربر روی
-                  ردیف کلیک کنید یا از کاربران → تحلیل رفتار بروید
+                  {data.note || "مصرف ساعتی بدون ضریب است"} · روی ردیف کلیک کنید تا
+                  جزئیات کامل باز شود
                 </p>
-                <button
-                  type="button"
-                  className="btn ghost sm"
-                  style={{ marginTop: 8 }}
-                  onClick={() => nav("/users")}
-                >
-                  رفتن به کاربران
-                </button>
+                <div className="an-inline-actions">
+                  <button
+                    type="button"
+                    className="btn ghost sm"
+                    onClick={() => nav("/users")}
+                  >
+                    رفتن به کاربران
+                  </button>
+                  {healthFilter ? (
+                    <button
+                      type="button"
+                      className="btn ghost sm"
+                      onClick={() => setHealthFilter(null)}
+                    >
+                      پاک کردن فیلتر
+                    </button>
+                  ) : null}
+                </div>
               </section>
             </>
           ) : (
