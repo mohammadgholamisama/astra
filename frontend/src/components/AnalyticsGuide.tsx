@@ -1,5 +1,4 @@
-import { useState } from "react";
-import { BookOpen, ChevronDown, Info } from "lucide-react";
+import { BookOpen, Info, X } from "lucide-react";
 
 export type GuideItem = {
   title: string;
@@ -8,40 +7,44 @@ export type GuideItem = {
 };
 
 type Props = {
+  open: boolean;
+  onClose: () => void;
   title?: string;
   intro?: string;
   items: GuideItem[];
-  defaultOpen?: boolean;
 };
 
-export default function AnalyticsGuide({
+/** Modal-only guide — open via a separate button on the page. */
+export default function AnalyticsGuideModal({
+  open,
+  onClose,
   title = "راهنمای آمار",
   intro,
   items,
-  defaultOpen = false,
 }: Props) {
-  const [open, setOpen] = useState(defaultOpen);
-
+  if (!open) return null;
   return (
-    <section className={`an-guide${open ? " is-open" : ""}`}>
-      <button
-        type="button"
-        className="an-guide-toggle"
-        onClick={() => setOpen((v) => !v)}
-        aria-expanded={open}
+    <div className="modal-backdrop" onClick={onClose}>
+      <div
+        className="modal modal-lg an-guide-modal"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
       >
-        <span className="an-guide-toggle-main">
-          <BookOpen size={16} />
-          <span>
-            <strong>{title}</strong>
-            <small>معنی هر آیتم و نحوهٔ محاسبه</small>
-          </span>
-        </span>
-        <ChevronDown size={18} className="an-guide-chevron" />
-      </button>
-      {open ? (
-        <div className="an-guide-body">
-          {intro ? <p className="an-guide-intro">{intro}</p> : null}
+        <header className="modal-head">
+          <div>
+            <h3>
+              <BookOpen size={18} style={{ marginInlineEnd: 8, verticalAlign: -3 }} />
+              {title}
+            </h3>
+            {intro ? <p className="modal-sub">{intro}</p> : null}
+          </div>
+          <button type="button" className="modal-close" onClick={onClose} aria-label="بستن">
+            <X size={18} />
+          </button>
+        </header>
+        <div className="an-guide-modal-body">
           <div className="an-guide-grid">
             {items.map((it) => (
               <article
@@ -57,101 +60,63 @@ export default function AnalyticsGuide({
             ))}
           </div>
         </div>
-      ) : null}
-    </section>
+      </div>
+    </div>
   );
 }
 
 export const USER_ANALYTICS_GUIDE: GuideItem[] = [
   {
-    title: "آنلاین الان",
-    body: "کاربرانی که در چند دقیقه اخیر مصرف خام قابل‌توجه داشته‌اند. از دلتای ترافیک حساب می‌شود، نه فقط باز کردن ساب.",
+    title: "آنلاین",
+    body: "اگر در چند دقیقه اخیر مصرف خام قابل‌توجه داشته باشد آنلاین است (از دلتای ترافیک، نه فقط باز کردن ساب).",
     tone: "ok",
   },
   {
     title: "مصرف خام",
-    body: "حجم واقعی روی پنل‌ها بدون ضریب گروه. برای مقایسه واقعی سرعت و رفتار است؛ با «مصرف با ضریب» صورتحساب فرق دارد.",
+    body: "حجم واقعی روی پنل‌ها بدون ضریب گروه. برای مقایسه واقعی رفتار است.",
   },
   {
-    title: "وصل و سالم",
-    body: "اخیراً مصرف فعال دارد و اتصال پایدار به‌نظر می‌رسد.",
-    tone: "ok",
+    title: "مقایسه ساعت/روز/هفته/ماه",
+    body: "مصرف خام بازهٔ جاری در برابر بازهٔ قبلی و درصد تغییر.",
   },
   {
-    title: "اذیت می‌شود",
-    body: "ساب را اخیراً آپدیت کرده ولی مصرف نزدیک صفر است — معمولاً کانفیگ‌ها کار نمی‌کنند یا به اینترنت وصل نمی‌شود.",
-    tone: "danger",
+    title: "نمودار ساعتی",
+    body: "مصرف هر ساعت در ۴۸ ساعت اخیر. روی هر ستون هاور کنید تا زمان و حجم دیده شود.",
   },
   {
-    title: "بلااستفاده / استفاده‌نشده",
-    body: "چند روز بدون مصرف و بدون آپدیت ساب. استفاده‌نشده برای اکانت‌های تازه‌ساخته‌ای است که هنوز چیزی رد نکرده‌اند.",
-    tone: "muted",
+    title: "ساعات روز",
+    body: "در کدام ساعت‌های شبانه‌روز بیشتر مصرف داشته. ستون طلایی = اوج.",
   },
   {
-    title: "چنددستگاهی",
-    body: "چند کلاینت یا چند شبکهٔ اینترنت مختلف روی یک لینک ساب دیده شده؛ احتمال اشتراک‌گذاری ساب.",
-    tone: "warn",
+    title: "دستگاه / اینترنت",
+    body: "از درخواست آپدیت لینک ساب: اپ کلاینت و شبکه‌های اینترنت متمایز (/24).",
   },
   {
-    title: "نشست آنلاین",
-    body: "بازهٔ پیوسته‌ای که کاربر مصرف داشته. نشست فعلی با نشست قبلی از نظر حجم و سرعت مقایسه می‌شود.",
-  },
-  {
-    title: "بالاترین سرعت عمری",
-    body: "بیشترین نرخ تقریبی (بایت بر ثانیه) که از نمونه‌برداری مصرف خام از روز اول دیده شده.",
-  },
-  {
-    title: "دستگاه / اینترنت ساب",
-    body: "از User-Agent و IP درخواست آپدیت ساب: اپ کلاینت (v2rayNG و …) و شبکه‌های /24 متمایز.",
-  },
-  {
-    title: "نمودار ساعات روز",
-    body: "جمع مصرف در هر ساعت شبانه‌روز؛ ستون طلایی = بازهٔ اوج مصرف.",
+    title: "بالاترین سرعت",
+    body: "بیشترین نرخ تقریبی مصرف که از نمونه‌برداری ثبت شده.",
   },
 ];
 
 export const PANEL_ANALYTICS_GUIDE: GuideItem[] = [
   {
     title: "آنلاین کل / هر پنل",
-    body: "کاربرانی که روی همان پنل اخیراً مصرف خام داشته‌اند. یک نفر می‌تواند همزمان روی چند پنل آنلاین باشد.",
+    body: "کاربرانی که روی همان پنل اخیراً مصرف خام داشته‌اند.",
     tone: "ok",
   },
   {
     title: "مصرف خام پنل",
-    body: "جمع دلتای used_traffic همهٔ اکانت‌های آن پنل — بدون ضریب. ساعت/روز/هفته/ماه از همین باکت‌هاست.",
+    body: "جمع دلتای ترافیک اکانت‌های آن پنل بدون ضریب.",
   },
   {
     title: "نرخ و سرانه",
-    body: "نرخ ≈ مصرف ساعت ÷ ۳۶۰۰. سرانه = همان نرخ تقسیم بر تعداد آنلاین همان پنل برای مقایسهٔ بازدهی پنل‌ها.",
+    body: "نرخ ≈ مصرف ساعت ÷ ۳۶۰۰. سرانه = نرخ ÷ تعداد آنلاین همان پنل.",
   },
   {
-    title: "اپراتور آنلاین‌ها",
-    body: "تخمین از IP آخرین آپدیت ساب (ایرانسل / همراه / رایتل). دقیق مثل انتخاب دستی اپ پینگ نیست.",
-    tone: "warn",
+    title: "اپراتور / دستگاه",
+    body: "تخمین از IP و User-Agent آخرین آپدیت ساب.",
   },
   {
-    title: "دستگاه (آیفون/شیائومی/…)",
-    body: "از User-Agent کلاینت هنگام آپدیت ساب استخراج می‌شود.",
-  },
-  {
-    title: "تست / top100",
-    body: "از همگام‌سازی ping-hub: چند کانفیگ این پنل در دور تست امتیاز گرفته و چندتایش بین ۱۰۰تای برتر بوده.",
-  },
-  {
-    title: "خوب",
-    body: "کانفیگ‌هایی با پینگ/پایداری/پکت‌لاس در آستانهٔ معقول در همان دور تست.",
-    tone: "ok",
-  },
-  {
-    title: "همه اپراتور",
-    body: "اگر دادهٔ per-operator از هاب باشد روی هر سه اپراتور OK؛ وگرنه تقریبی با چند دستگاه تست‌کننده.",
-  },
-  {
-    title: "بازهٔ مصرف روز",
-    body: "در چه ساعاتی از شبانه‌روز این پنل بیشتر لود شده؛ برای ظرفیت و زمان پیک مفید است.",
-  },
-  {
-    title: "ستون تست جدول",
-    body: "عدد اول = آخرین دور تست، عدد دوم = جمع عمری ثبت‌شده برای آن پنل.",
+    title: "تست پینگ",
+    body: "از همگام‌سازی ping-hub: تعداد تست، top100، خوب، OK روی اپراتورها.",
   },
 ];

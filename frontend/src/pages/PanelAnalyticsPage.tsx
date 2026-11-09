@@ -5,6 +5,7 @@ import {
   Activity,
   ArrowDownRight,
   ArrowUpRight,
+  BookOpen,
   Gauge,
   Minus,
   Radio,
@@ -15,7 +16,9 @@ import {
   Wifi,
   Zap,
 } from "lucide-react";
-import AnalyticsGuide, { PANEL_ANALYTICS_GUIDE } from "../components/AnalyticsGuide";
+import AnalyticsGuideModal, {
+  PANEL_ANALYTICS_GUIDE,
+} from "../components/AnalyticsGuide";
 import { api } from "../lib/api";
 import { formatTraffic, toFaDigits } from "../lib/format";
 
@@ -201,6 +204,7 @@ export default function PanelAnalyticsPage() {
   const [focusId, setFocusId] = useState<number | null>(null);
   const [q, setQ] = useState("");
   const [sortKey, setSortKey] = useState<"hour" | "online" | "day">("hour");
+  const [guideOpen, setGuideOpen] = useState(false);
 
   const overview = useQuery({
     queryKey: ["analytics-panels"],
@@ -270,6 +274,14 @@ export default function PanelAnalyticsPage() {
             نسبت به تعداد آنلاین
           </p>
           <div className="an-hero-actions">
+            <button
+              type="button"
+              className="btn ghost sm"
+              onClick={() => setGuideOpen(true)}
+            >
+              <BookOpen size={14} />
+              راهنما
+            </button>
             <Link to="/analytics" className="btn ghost sm">
               <Users size={14} />
               آمار کاربران
@@ -296,11 +308,12 @@ export default function PanelAnalyticsPage() {
         </div>
       </header>
 
-      <AnalyticsGuide
+      <AnalyticsGuideModal
+        open={guideOpen}
+        onClose={() => setGuideOpen(false)}
         title="راهنمای آمار پنل‌ها"
-        intro="مصرف‌ها خام و بدون ضریب‌اند. تست پینگ از ping-hub می‌آید؛ اپراتور از IP ساب تقریبی است."
+        intro="مصرف‌ها خام و بدون ضریب‌اند. تست پینگ از ping-hub می‌آید."
         items={PANEL_ANALYTICS_GUIDE}
-        defaultOpen={focusId == null}
       />
 
       {focusId != null ? (
