@@ -225,28 +225,29 @@ function HourlyUsageChart({
   points,
   mode = "weighted",
 }: {
-  points: HourPoint[];
+  points?: HourPoint[] | null;
   mode?: "weighted" | "raw";
 }) {
   const [hover, setHover] = useState<number | null>(null);
-  if (!points.length) {
+  const series = points ?? [];
+  if (!series.length) {
     return <p className="muted">هنوز دادهٔ ساعتی برای نمودار نیست</p>;
   }
-  const vals = points.map((p) => hourValue(p, mode));
+  const vals = series.map((p) => hourValue(p, mode));
   const max = Math.max(1, ...vals);
   const total = vals.reduce((s, v) => s + v, 0);
-  const totalRaw = points.reduce((s, p) => s + Number(p.raw_bytes || 0), 0);
+  const totalRaw = series.reduce((s, p) => s + Number(p.raw_bytes || 0), 0);
   const peakIdx = vals.reduce(
     (best, v, i, arr) => (v > arr[best] ? i : best),
     0
   );
-  const nowIdx = points.findIndex((p) => p.is_current);
-  const currentIdx = nowIdx >= 0 ? nowIdx : points.length - 1;
-  const peak = points[peakIdx];
+  const nowIdx = series.findIndex((p) => p.is_current);
+  const currentIdx = nowIdx >= 0 ? nowIdx : series.length - 1;
+  const peak = series[peakIdx];
   const peakVal = vals[peakIdx];
   const currentVal = vals[currentIdx] || 0;
   const tipIdx = hover != null ? hover : currentIdx;
-  const tip = points[tipIdx];
+  const tip = series[tipIdx];
   const tipVal = tip ? hourValue(tip, mode) : 0;
   const tipIsNow = Boolean(tip?.is_current);
 
@@ -265,7 +266,7 @@ function HourlyUsageChart({
         <div>
           <span>این ساعت</span>
           <b>{formatTraffic(currentVal)}</b>
-          <small>زنده · {clockLabel(points[currentIdx]?.hour_ts || 0)}</small>
+          <small>زنده · {clockLabel(series[currentIdx]?.hour_ts || 0)}</small>
         </div>
         <div>
           <span>اوج ۲۴س</span>
@@ -308,7 +309,7 @@ function HourlyUsageChart({
           <span>۰</span>
         </div>
         <div className="pan-chart-cols">
-          {points.map((p, i) => {
+          {series.map((p, i) => {
             const v = vals[i];
             const h = Math.max(v > 0 ? 5 : 0, (v / max) * 100);
             const isPeak = i === peakIdx && v > 0;
@@ -316,7 +317,7 @@ function HourlyUsageChart({
             const isHover = hover === i;
             const showLabel =
               i === 0 ||
-              i === points.length - 1 ||
+              i === series.length - 1 ||
               i % 2 === 0 ||
               isNow;
             return (
@@ -475,9 +476,9 @@ export default function PanelAnalyticsPage() {
     queryKey: ["analytics-panels", tz],
     queryFn: () =>
       api<Overview>(`/api/analytics/panels?tz_offset=${tz}`, {
-        timeoutMs: 60_000,
+        timeoutMs: 45_000,
       }),
-    refetchInterval: 30_000,
+    refetchInterval: 45_000,
     refetchOnWindowFocus: true,
     retry: 1,
   });
@@ -509,6 +510,18 @@ export default function PanelAnalyticsPage() {
       }
     },
   });
+
+  // After fast overview paints, refresh live Xray/remotes in background once
+  useEffect(() => {
+    if (!overview.isSuccess || liveRefresh.isPending || liveRefresh.isSuccess) {
+      return;
+    }
+    const t = window.setTimeout(() => {
+      liveRefresh.mutate();
+    }, 400);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [overview.isSuccess]);
 
   const data = overview.data;
   const maxPanelTotal = useMemo(() => {
@@ -727,7 +740,7 @@ export default function PanelAnalyticsPage() {
                 <Zap size={13} /> مصرف کل · بدون ضریب
               </span>
               <strong>
-                {formatTraffic(Number(data.totals.raw_current || 0))}
+                {formatTraffic(Number(data.totals?.raw_current || 0))}
               </strong>
               <small>جمع خام اکانت‌ها</small>
             </article>
@@ -739,7 +752,7 @@ export default function PanelAnalyticsPage() {
                 <Zap size={13} /> مصرف کل · با ضریب
               </span>
               <strong>
-                {formatTraffic(Number(data.totals.weighted_current || 0))}
+                {formatTraffic(Number(data.totals?.weighted_current || 0))}
               </strong>
               <small>مثل داشبورد</small>
             </article>
@@ -747,7 +760,7 @@ export default function PanelAnalyticsPage() {
               <span>
                 <Server size={13} /> پنل‌ها
               </span>
-              <strong>{toFaDigits(data.totals.panels)}</strong>
+              <strong>{toFaDigits(data.totals?.panels || 0)}</strong>
               <small>{toFaDigits(panelsView.length)} در لیست</small>
             </article>
           </div>
@@ -759,7 +772,10 @@ export default function PanelAnalyticsPage() {
                 با ضریب · زنده با هر رفرش · زمان محلی
               </span>
             </div>
-            <HourlyUsageChart points={data.global_hourly} mode="weighted" />
+            <HourlyUsageChart
+              points={data.global_hourly || []}
+              mode="weighted"
+            />
           </section>
 
           <section className="an-block">

@@ -487,12 +487,21 @@ async def sample_all_panels_once(*, force: bool = False) -> dict[str, int]:
         return stats
 
 
+def _coeff_from_panel_config(config: dict | None) -> float:
+    """Local coeff reader — avoid importing heavy orchestrator on every overview."""
+    from app.services.quota import norm_coeff
+
+    try:
+        return float(norm_coeff((config or {}).get("coefficient", 1)))
+    except Exception:  # noqa: BLE001
+        return 1.0
+
+
 async def live_panel_raw_and_weighted(
     db: AsyncSession,
 ) -> dict[int, dict[str, int]]:
     """Σ raw and Σ (raw × group coefficient) per panel from our PanelAccount rows."""
     from app.models.group import GroupPanel
-    from app.services.orchestrator import coefficient_from_config
     from app.services.quota import norm_coeff, weighted_bytes
 
     gp_rows = (
@@ -503,7 +512,7 @@ async def live_panel_raw_and_weighted(
     claim: dict[tuple[int, int], float] = {}
     panel_max: dict[int, float] = {}
     for pid, gid, cfg in gp_rows:
-        c = float(coefficient_from_config(cfg if isinstance(cfg, dict) else {}))
+        c = _coeff_from_panel_config(cfg if isinstance(cfg, dict) else {})
         claim[(int(pid), int(gid))] = c
         panel_max[int(pid)] = max(float(panel_max.get(int(pid), 0.0)), c)
 
@@ -1144,7 +1153,13 @@ async def build_panel_overview(
     db: AsyncSession,
     *,
     tz_offset_min: int = 0,
+    sync_astra: bool = False,
 ) -> dict[str, Any]:
+    """Build panel analytics overview.
+
+    Keep ``sync_astra=False`` on plain GET — Xray statsquery can hang the page.
+    Live refresh already syncs Astra before calling this with fresh account rows.
+    """
     now = _utc_now()
     periods = _period_starts(now, tz_offset_min)
     hour = int(periods["hour"])
@@ -1159,25 +1174,29 @@ async def build_panel_overview(
     tz_off = int(periods["tz_offset_min"])
 
     panels = list((await db.execute(select(Panel).order_by(Panel.id.asc()))).scalars().all())
-    # 1) Fresh Astra Xray counters → PanelAccount (source of truth for this chart)
-    try:
-        await sync_astra_panels_live(db)
-    except Exception:  # noqa: BLE001
-        logger.debug("astra sync before panel overview failed", exc_info=True)
+    # Optional short Astra sync (only when caller asks — never block default GET)
+    if sync_astra:
+        try:
+            await asyncio.wait_for(sync_astra_panels_live(db), timeout=6.0)
+        except Exception:  # noqa: BLE001
+            logger.debug("astra sync before panel overview failed", exc_info=True)
 
     states = {
         int(s.panel_id): s
         for s in (await db.execute(select(PanelUsageState))).scalars().all()
     }
-    # 2) Live cumulative from our PanelAccount rows (raw + weighted with coeff)
-    usage_map = await live_panel_raw_and_weighted(db)
+    # Live cumulative from PanelAccount rows (raw + weighted with coeff)
+    try:
+        usage_map = await live_panel_raw_and_weighted(db)
+    except Exception:  # noqa: BLE001
+        logger.exception("live_panel_raw_and_weighted failed")
+        usage_map = {}
     live_totals = {pid: int(v["raw"]) for pid, v in usage_map.items()}
     weighted_totals = {pid: int(v["weighted"]) for pid, v in usage_map.items()}
-    # Ensure every panel id exists in maps
     for p in panels:
         live_totals.setdefault(int(p.id), 0)
         weighted_totals.setdefault(int(p.id), 0)
-    # 3) Materialize full growth into hour buckets (current + catch-up hours)
+    # Materialize growth into current hour bucket (DB-only, fast)
     try:
         await flush_live_deltas_to_hours(db, live_totals, now=now)
         states = {
@@ -1564,22 +1583,13 @@ async def build_panel_detail(
     grid_hour = int(periods["grid_hour"])
     tz_off = int(periods["tz_offset_min"])
 
-    # Fresh Xray → accounts for Astra panels before reading totals / hourly
-    try:
-        from app.services import astra_node as astra_node_svc
-
-        if str(getattr(panel.type, "value", panel.type)) == "astra":
-            await astra_node_svc.sync_traffic_from_xray(db, panel)
-            await db.commit()
-    except Exception:  # noqa: BLE001
-        logger.debug("astra sync before panel detail failed", exc_info=True)
-        try:
-            await db.rollback()
-        except Exception:  # noqa: BLE001
-            pass
-
+    # Do not block detail on Xray — use current PanelAccount + flush (fast)
     st = await _get_or_create_panel_state(db, int(panel_id))
-    usage_map = await live_panel_raw_and_weighted(db)
+    try:
+        usage_map = await live_panel_raw_and_weighted(db)
+    except Exception:  # noqa: BLE001
+        logger.exception("live usage for panel detail failed")
+        usage_map = {}
     live_total = int(usage_map.get(int(panel_id), {}).get("raw", 0))
     live_weighted = int(usage_map.get(int(panel_id), {}).get("weighted", 0))
     try:
