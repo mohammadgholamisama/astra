@@ -1,22 +1,32 @@
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
   ArrowDownRight,
   ArrowUpRight,
+  Clock,
+  Loader2,
   Minus,
   Radio,
   RefreshCw,
   Search,
   Server,
   Smartphone,
+  Sparkles,
   Wifi,
+  X,
   Zap,
 } from "lucide-react";
 import AnalyticsGuide, { USER_ANALYTICS_GUIDE } from "../components/AnalyticsGuide";
 import { api } from "../lib/api";
 import { formatTraffic, toFaDigits } from "../lib/format";
+
+type SearchHit = {
+  username: string;
+  display_name?: string | null;
+  status: string;
+};
 
 type Health = {
   code: string;
@@ -211,6 +221,24 @@ export default function AnalyticsPage() {
   const focusUser = (params.get("u") || "").trim();
   const [q, setQ] = useState(focusUser);
   const [healthFilter, setHealthFilter] = useState<string | null>(null);
+  const [suggestOpen, setSuggestOpen] = useState(false);
+  const [freshKey, setFreshKey] = useState(0);
+  const searchWrapRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    setQ(focusUser);
+  }, [focusUser]);
+
+  useEffect(() => {
+    function onDoc(e: MouseEvent) {
+      if (!searchWrapRef.current?.contains(e.target as Node)) {
+        setSuggestOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, []);
 
   const overview = useQuery({
     queryKey: ["analytics-overview"],
@@ -219,10 +247,25 @@ export default function AnalyticsPage() {
   });
 
   const userQ = useQuery({
-    queryKey: ["analytics-user", focusUser],
-    queryFn: () => api<UserAnalytics>(`/api/analytics/user/${encodeURIComponent(focusUser)}`),
+    queryKey: ["analytics-user", focusUser, freshKey],
+    queryFn: () =>
+      api<UserAnalytics>(
+        `/api/analytics/user/${encodeURIComponent(focusUser)}?refresh=1`,
+        { timeoutMs: 90_000 }
+      ),
     enabled: Boolean(focusUser),
-    refetchInterval: focusUser ? 45_000 : false,
+    refetchInterval: focusUser ? 60_000 : false,
+    staleTime: 0,
+  });
+
+  const suggestQ = useQuery({
+    queryKey: ["analytics-user-search", q.trim()],
+    queryFn: () =>
+      api<{ items: SearchHit[] }>(
+        `/api/analytics/users/search?q=${encodeURIComponent(q.trim())}&limit=12`
+      ),
+    enabled: q.trim().length >= 1,
+    placeholderData: (prev) => prev,
   });
 
   const data = overview.data;
@@ -241,6 +284,17 @@ export default function AnalyticsPage() {
     return list.filter((u) => u.health.code === healthFilter);
   }, [data, healthFilter]);
 
+  const suggestions = suggestQ.data?.items || [];
+
+  function openUser(name: string) {
+    const u = name.trim();
+    if (!u) return;
+    setSuggestOpen(false);
+    setQ(u);
+    setFreshKey((k) => k + 1);
+    setParams({ u });
+  }
+
   function onSearch(e: FormEvent) {
     e.preventDefault();
     const name = q.trim();
@@ -248,15 +302,16 @@ export default function AnalyticsPage() {
       setParams({});
       return;
     }
-    setParams({ u: name });
+    openUser(name);
   }
 
   const ua = userQ.data;
+  const refreshing = Boolean(focusUser) && (userQ.isFetching || userQ.isLoading);
 
   return (
     <div className="an-page">
-      <header className="an-hero">
-        <div>
+      <header className="an-hero an-hero-users">
+        <div className="an-hero-copy">
           <p className="an-kicker">تحلیل رفتار</p>
           <h1>آمار کاربران</h1>
           <p className="an-sub">
@@ -286,62 +341,190 @@ export default function AnalyticsPage() {
             ) : null}
           </div>
         </div>
-        <form className="an-search" onSubmit={onSearch}>
-          <Search size={16} />
-          <input
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="یوزرنیم کاربر…"
-            dir="ltr"
-          />
-          <button type="submit" className="btn sm">
-            تحلیل
-          </button>
-        </form>
+
+        <div className="an-search-panel" ref={searchWrapRef}>
+          <div className="an-search-panel-head">
+            <Sparkles size={15} />
+            <span>جستجوی کاربر</span>
+            <small>با انتخاب، آخرین مصرف از پنل‌ها همین الان خوانده می‌شود</small>
+          </div>
+          <form className="an-search an-search-lg" onSubmit={onSearch}>
+            <Search size={18} className="an-search-ico" />
+            <input
+              ref={inputRef}
+              value={q}
+              onChange={(e) => {
+                setQ(e.target.value);
+                setSuggestOpen(true);
+              }}
+              onFocus={() => setSuggestOpen(true)}
+              placeholder="یوزرنیم یا نام نمایشی…"
+              dir="ltr"
+              autoComplete="off"
+              spellCheck={false}
+            />
+            {q ? (
+              <button
+                type="button"
+                className="an-search-clear"
+                aria-label="پاک کردن"
+                onClick={() => {
+                  setQ("");
+                  setSuggestOpen(false);
+                  inputRef.current?.focus();
+                }}
+              >
+                <X size={16} />
+              </button>
+            ) : null}
+            <button type="submit" className="btn sm an-search-go" disabled={!q.trim()}>
+              {refreshing && focusUser === q.trim() ? (
+                <>
+                  <Loader2 size={14} className="configs-spin" />
+                  در حال خواندن…
+                </>
+              ) : (
+                <>تحلیل زنده</>
+              )}
+            </button>
+          </form>
+          {suggestOpen && q.trim().length >= 1 ? (
+            <div className="an-suggest">
+              {suggestQ.isFetching && suggestions.length === 0 ? (
+                <div className="an-suggest-empty">
+                  <Loader2 size={14} className="configs-spin" />
+                  در حال جستجو…
+                </div>
+              ) : suggestions.length === 0 ? (
+                <div className="an-suggest-empty">کاربری پیدا نشد — Enter برای تلاش مستقیم</div>
+              ) : (
+                <ul>
+                  {suggestions.map((s) => (
+                    <li key={s.username}>
+                      <button
+                        type="button"
+                        onClick={() => openUser(s.username)}
+                      >
+                        <span className="an-suggest-main">
+                          <b dir="ltr">{s.username}</b>
+                          {s.display_name ? (
+                            <small>{s.display_name}</small>
+                          ) : null}
+                        </span>
+                        <span className="badge muted">{s.status}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          ) : null}
+        </div>
       </header>
 
       <AnalyticsGuide
         title="راهنمای آمار کاربران"
-        intro="همهٔ مصرف‌های این صفحه خام و بدون ضریب‌اند. وضعیت‌ها از ترکیب مصرف + آپدیت ساب حدس زده می‌شوند."
+        intro="همهٔ مصرف‌های این صفحه خام و بدون ضریب‌اند. وضعیت‌ها از ترکیب مصرف + آپدیت ساب حدس زده می‌شوند. با جستجو، مصرف زنده از پنل‌ها تازه می‌شود."
         items={USER_ANALYTICS_GUIDE}
         defaultOpen={!focusUser}
       />
 
       {focusUser ? (
         <section className="an-user-panel">
-          <div className="an-user-head">
-            <button type="button" className="btn ghost sm" onClick={() => setParams({})}>
-              ← بازگشت به نمای کلی
-            </button>
-            <div>
-              <h2 dir="ltr">{focusUser}</h2>
-              {ua?.display_name ? <p className="muted">{ua.display_name}</p> : null}
+          <div className={`an-user-banner tone-${ua?.health.tone || "muted"}`}>
+            <div className="an-user-banner-main">
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() => {
+                  setParams({});
+                  setQ("");
+                }}
+              >
+                ← نمای کلی
+              </button>
+              <div className="an-user-banner-id">
+                <h2 dir="ltr">{focusUser}</h2>
+                {ua?.display_name ? <p>{ua.display_name}</p> : null}
+              </div>
+              {ua ? (
+                <span className={`badge ${toneClass(ua.health.tone)}`} title={ua.health.hint}>
+                  {ua.health.label}
+                </span>
+              ) : null}
+              {ua?.online ? <span className="badge ok">آنلاین</span> : null}
             </div>
+            <div className="an-user-banner-actions">
+              {refreshing ? (
+                <span className="an-live-pill">
+                  <Loader2 size={14} className="configs-spin" />
+                  در حال گرفتن دیتای تازه از پنل‌ها…
+                </span>
+              ) : (
+                <span className="an-live-pill is-ok">
+                  <Sparkles size={14} />
+                  دیتای تازه خوانده شد
+                </span>
+              )}
+              <button
+                type="button"
+                className="btn sm"
+                disabled={refreshing}
+                onClick={() => setFreshKey((k) => k + 1)}
+              >
+                <RefreshCw size={14} className={refreshing ? "configs-spin" : undefined} />
+                تازه‌سازی زنده
+              </button>
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() => nav(`/users?q=${encodeURIComponent(focusUser)}`)}
+              >
+                صفحه کاربر
+              </button>
+            </div>
+            {ua ? (
+              <div className="an-user-banner-meta">
+                <span title={ua.health.hint}>{ua.health.hint}</span>
+                {ua.last_sub_fetch_at ? (
+                  <span>
+                    <Clock size={13} /> آخرین ساب:{" "}
+                    {new Date(ua.last_sub_fetch_at).toLocaleString("fa-IR")}
+                  </span>
+                ) : (
+                  <span>هنوز آپدیت سابی دیده نشده</span>
+                )}
+                {ua.online_since ? (
+                  <span>
+                    آنلاین از {new Date(ua.online_since).toLocaleString("fa-IR")}
+                  </span>
+                ) : null}
+              </div>
+            ) : null}
           </div>
 
           {userQ.isLoading ? (
-            <div className="admin-skel">
-              <div className="admin-skel-card" />
-              <div className="admin-skel-card" />
+            <div className="an-fresh-loading">
+              <Loader2 size={22} className="configs-spin" />
+              <div>
+                <b>در حال خواندن مصرف زنده…</b>
+                <p>از پنل‌های اصلی ترافیک تازه گرفته می‌شود و بعد آمار ساخته می‌شود</p>
+              </div>
             </div>
           ) : userQ.isError ? (
             <div className="admin-empty">
               <p>کاربر پیدا نشد یا خطا در دریافت آمار</p>
+              <button type="button" className="btn sm" onClick={() => setFreshKey((k) => k + 1)}>
+                تلاش مجدد
+              </button>
             </div>
           ) : ua ? (
             <>
-              <div className="an-cards">
-                <article className="an-card">
-                  <span className={`badge ${toneClass(ua.health.tone)}`}>
-                    {ua.health.label}
-                  </span>
+              <div className="an-cards an-cards-user">
+                <article className="an-card an-card-accent">
+                  <p className="an-card-label">وضعیت رفتار</p>
+                  <p className="an-card-big">{ua.health.label}</p>
                   <p className="an-card-hint">{ua.health.hint}</p>
-                  <p className="an-card-meta">
-                    {ua.online ? "آنلاین الان" : "آفلاین"}
-                    {ua.online_since
-                      ? ` · از ${new Date(ua.online_since).toLocaleString("fa-IR")}`
-                      : ""}
-                  </p>
                 </article>
                 <article className="an-card">
                   <p className="an-card-label">بالاترین سرعت عمری</p>
