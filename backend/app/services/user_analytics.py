@@ -80,6 +80,77 @@ def _as_utc(dt: datetime | None) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
+def _clamp_tz_offset(tz_offset_min: int | None) -> int:
+    """JS Date.getTimezoneOffset() minutes; clamp to ±14h."""
+    try:
+        off = int(tz_offset_min or 0)
+    except (TypeError, ValueError):
+        off = 0
+    return max(-14 * 60, min(14 * 60, off))
+
+
+def _local_now(now: datetime, tz_offset_min: int) -> datetime:
+    """Wall-clock local time for the client (tz-naive-ish UTC stamp shifted)."""
+    return now - timedelta(minutes=int(tz_offset_min))
+
+
+def _period_starts(now: datetime, tz_offset_min: int = 0) -> dict[str, int]:
+    """Local day/hour/week/month starts as UTC unix seconds for bucket queries.
+
+    Buckets are stored on UTC hour floors; we approximate local periods by
+    converting local midnights/hours back to UTC.
+    """
+    off = _clamp_tz_offset(tz_offset_min)
+    local = _local_now(now, off)
+    local_hour = local.replace(minute=0, second=0, microsecond=0)
+    local_day = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    wd = local.weekday()
+    local_week = (local - timedelta(days=wd)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    local_month = local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if local_month.month == 12:
+        next_month = local_month.replace(year=local_month.year + 1, month=1)
+    else:
+        next_month = local_month.replace(month=local_month.month + 1)
+    prev_month = (local_month - timedelta(days=1)).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+
+    def to_utc_ts(local_dt: datetime) -> int:
+        return int((local_dt + timedelta(minutes=off)).timestamp())
+
+    hour = to_utc_ts(local_hour)
+    # Snap to stored bucket grid (UTC hour floors)
+    hour = hour - (hour % 3600)
+    day = to_utc_ts(local_day)
+    day = day - (day % 3600)
+    week = to_utc_ts(local_week)
+    week = week - (week % 3600)
+    month = to_utc_ts(local_month)
+    month = month - (month % 3600)
+    next_m = to_utc_ts(next_month)
+    next_m = next_m - (next_m % 3600)
+    prev_m = to_utc_ts(prev_month)
+    prev_m = prev_m - (prev_m % 3600)
+    return {
+        "hour": hour,
+        "day": day,
+        "week": week,
+        "month": month,
+        "next_month": next_m,
+        "prev_month": prev_m,
+        "tz_offset_min": off,
+    }
+
+
+def _hod_index(hour_ts: int, tz_offset_min: int = 0) -> int:
+    """Map a UTC hour bucket to the client's local clock hour 0–23."""
+    off = _clamp_tz_offset(tz_offset_min)
+    local_ts = int(hour_ts) - off * 60
+    return int((local_ts % 86400) // 3600)
+
+
 def parse_client_app(user_agent: str) -> str:
     ua = (user_agent or "").strip()
     if not ua:
@@ -679,23 +750,24 @@ def _pct_change(cur: int | float, prev: int | float) -> float | None:
     return round(((c - p) / p) * 100.0, 1)
 
 
-async def build_user_analytics(db: AsyncSession, user: User) -> dict[str, Any]:
+async def build_user_analytics(
+    db: AsyncSession,
+    user: User,
+    *,
+    tz_offset_min: int = 0,
+) -> dict[str, Any]:
     uid = int(user.id)
     now = _utc_now()
-    hour = _hour_ts(now)
-    day = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-    # Align week to Monday 00:00 UTC
-    wd = now.weekday()
-    week_start_dt = (now - timedelta(days=wd)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    week = int(week_start_dt.timestamp())
-    month_start_dt = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    month = int(month_start_dt.timestamp())
+    periods = _period_starts(now, tz_offset_min)
+    hour = int(periods["hour"])
+    day = int(periods["day"])
+    week = int(periods["week"])
+    month = int(periods["month"])
+    next_month_ts = int(periods["next_month"])
+    prev_month = int(periods["prev_month"])
+    tz_off = int(periods["tz_offset_min"])
 
     state = await db.get(UserUsageState, uid)
-    peak_bps = float(state.peak_bps or 0) if state else 0.0
-    peak_at = state.peak_bps_at.isoformat() if state and state.peak_bps_at else None
     online = bool(state and state.online_since is not None)
     online_since = (
         state.online_since.isoformat() if state and state.online_since else None
@@ -703,27 +775,31 @@ async def build_user_analytics(db: AsyncSession, user: User) -> dict[str, Any]:
     last_sub = _as_utc(state.last_sub_fetch_at) if state else None
     last_sample = _as_utc(state.last_sample_at) if state else None
 
-    # Periods
-    cur_hour = await _sum_hours(db, uid, hour, hour + 3600)
-    prev_hour = await _sum_hours(db, uid, hour - 3600, hour)
-    cur_day = await _sum_hours(db, uid, day, day + 86400)
-    prev_day = await _sum_hours(db, uid, day - 86400, day)
-    cur_week = await _sum_hours(db, uid, week, week + 7 * 86400)
-    prev_week = await _sum_hours(db, uid, week - 7 * 86400, week)
-    # Month length approx via next month boundary
-    if month_start_dt.month == 12:
-        next_month = month_start_dt.replace(year=month_start_dt.year + 1, month=1)
-    else:
-        next_month = month_start_dt.replace(month=month_start_dt.month + 1)
-    prev_month_start = (month_start_dt - timedelta(days=1)).replace(
-        day=1, hour=0, minute=0, second=0, microsecond=0
+    # Live raw from accounts (authoritative) vs last sample cursor
+    live_raw = int(
+        (
+            await db.execute(
+                select(func.coalesce(func.sum(PanelAccount.used_traffic), 0)).where(
+                    PanelAccount.user_id == uid
+                )
+            )
+        ).scalar()
+        or 0
     )
-    cur_month = await _sum_hours(db, uid, month, int(next_month.timestamp()))
-    prev_month = await _sum_hours(
-        db, uid, int(prev_month_start.timestamp()), month
-    )
+    cursor = int(state.last_raw_total or 0) if state else 0
+    pending = max(0, live_raw - cursor)
 
-    # Last 48h series
+    # Periods (local-aligned) + pending into current hour/day
+    cur_hour = (await _sum_hours(db, uid, hour, hour + 3600)) + pending
+    prev_hour = await _sum_hours(db, uid, hour - 3600, hour)
+    cur_day = (await _sum_hours(db, uid, day, day + 86400)) + pending
+    prev_day = await _sum_hours(db, uid, day - 86400, day)
+    cur_week = (await _sum_hours(db, uid, week, week + 7 * 86400)) + pending
+    prev_week = await _sum_hours(db, uid, week - 7 * 86400, week)
+    cur_month = (await _sum_hours(db, uid, month, next_month_ts)) + pending
+    prev_month_bytes = await _sum_hours(db, uid, prev_month, month)
+
+    # Last 48h series (local-aligned hour grid)
     series_start = hour - 47 * 3600
     buckets = await _hour_rows(db, uid, series_start, hour + 3600)
     by_h = {int(b.hour_ts): b for b in buckets}
@@ -732,29 +808,25 @@ async def build_user_analytics(db: AsyncSession, user: User) -> dict[str, Any]:
         ts = series_start + i * 3600
         b = by_h.get(ts)
         raw = int(b.raw_bytes or 0) if b else 0
+        if i == 47:
+            raw += pending
         act = int(b.active_seconds or 0) if b else 0
-        # MB/s average over active seconds (or full hour if active unknown)
-        denom = act if act > 0 else (3600 if raw > 0 else 0)
-        mbps = (raw * 8.0 / denom) if denom else 0.0
-        mbytes_s = (raw / denom / (1024 * 1024)) if denom else 0.0
         hourly.append(
             {
                 "hour_ts": ts,
                 "raw_bytes": raw,
                 "active_seconds": act,
-                "peak_bps": float(b.peak_bps or 0) if b else 0.0,
-                "avg_bps": mbps,
-                "avg_mbytes_s": round(mbytes_s, 4),
             }
         )
 
-    # Day-of heatmap: last 14 days by local-ish UTC hour-of-day
+    # Day-of heatmap: last 14 days by client local hour-of-day
     heat_start = hour - 14 * 86400
     heat_rows = await _hour_rows(db, uid, heat_start, hour + 3600)
     by_hod = [0] * 24
     for b in heat_rows:
-        hod = int((int(b.hour_ts) % 86400) // 3600)
-        by_hod[hod] += int(b.raw_bytes or 0)
+        by_hod[_hod_index(int(b.hour_ts), tz_off)] += int(b.raw_bytes or 0)
+    if pending:
+        by_hod[_hod_index(hour, tz_off)] += pending
     peak_hod = max(range(24), key=lambda h: by_hod[h]) if any(by_hod) else None
 
     # Sessions
@@ -775,17 +847,13 @@ async def build_user_analytics(db: AsyncSession, user: User) -> dict[str, Any]:
     closed = [s for s in sessions if not s.open]
     open_s = next((s for s in sessions if s.open), None)
     if open_s and state and state.online_since is not None:
-        raw_now = int(state.last_raw_total or 0)
-        used = max(0, raw_now - int(state.online_raw_at_start or 0))
+        used = max(0, live_raw - int(state.online_raw_at_start or 0))
         started = _as_utc(open_s.started_at) or now
         dur = max(1.0, (now - started).total_seconds())
         current_session = {
             "started_at": started.isoformat(),
             "duration_seconds": int(dur),
             "raw_bytes": used,
-            "avg_bps": (used * 8.0) / dur,
-            "avg_mbytes_s": round(used / dur / (1024 * 1024), 4),
-            "peak_bps": float(open_s.peak_bps or 0),
             "open": True,
         }
     if closed:
@@ -798,8 +866,6 @@ async def build_user_analytics(db: AsyncSession, user: User) -> dict[str, Any]:
             "ended_at": s.ended_at.isoformat() if s.ended_at else None,
             "duration_seconds": int(dur),
             "raw_bytes": int(s.raw_bytes or 0),
-            "avg_bps": float(s.avg_bps or 0),
-            "peak_bps": float(s.peak_bps or 0),
             "open": False,
         }
 
@@ -808,9 +874,6 @@ async def build_user_analytics(db: AsyncSession, user: User) -> dict[str, Any]:
         session_vs_prev = {
             "bytes_change_pct": _pct_change(
                 current_session["raw_bytes"], prev_session["raw_bytes"]
-            ),
-            "avg_bps_change_pct": _pct_change(
-                current_session["avg_bps"], prev_session["avg_bps"]
             ),
         }
 
@@ -885,15 +948,15 @@ async def build_user_analytics(db: AsyncSession, user: User) -> dict[str, Any]:
         "health": health,
         "online": online,
         "online_since": online_since,
-        "peak_bps": peak_bps,
-        "peak_bps_label": format_bps(peak_bps),
-        "peak_bps_at": peak_at,
         "last_sub_fetch_at": last_sub.isoformat() if last_sub else None,
         "last_sample_at": last_sample.isoformat() if last_sample else None,
+        "tz_offset_min": tz_off,
         "raw_totals": {
-            "lifetime_raw_cursor": int(state.last_raw_total or 0) if state else 0,
+            "current_raw": live_raw,
+            "lifetime_raw_cursor": cursor,
+            "pending_raw": pending,
             "weighted_used": int(user.used_traffic or 0),
-            "note": "ساعتی‌ها بدون ضریب‌اند؛ used_traffic پنل با ضریب است",
+            "note": "مصرف‌ها خام و بدون ضریب‌اند؛ بازه‌ها با ساعت محلی دستگاه",
         },
         "compare": {
             "hour": {
@@ -913,8 +976,8 @@ async def build_user_analytics(db: AsyncSession, user: User) -> dict[str, Any]:
             },
             "month": {
                 "current": cur_month,
-                "previous": prev_month,
-                "change_pct": _pct_change(cur_month, prev_month),
+                "previous": prev_month_bytes,
+                "change_pct": _pct_change(cur_month, prev_month_bytes),
             },
         },
         "current_session": current_session,
@@ -959,9 +1022,17 @@ async def build_user_analytics(db: AsyncSession, user: User) -> dict[str, Any]:
     }
 
 
-async def build_overview(db: AsyncSession, *, limit_users: int = 40) -> dict[str, Any]:
+async def build_overview(
+    db: AsyncSession,
+    *,
+    limit_users: int = 40,
+    tz_offset_min: int = 0,
+) -> dict[str, Any]:
     now = _utc_now()
-    hour = _hour_ts(now)
+    periods = _period_starts(now, tz_offset_min)
+    hour = int(periods["hour"])
+    day = int(periods["day"])
+    tz_off = int(periods["tz_offset_min"])
     # Aggregate raw this hour / prev
     cur = int(
         (
@@ -983,7 +1054,6 @@ async def build_overview(db: AsyncSession, *, limit_users: int = 40) -> dict[str
         ).scalar()
         or 0
     )
-    day = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     today = int(
         (
             await db.execute(
@@ -1006,7 +1076,7 @@ async def build_overview(db: AsyncSession, *, limit_users: int = 40) -> dict[str
         or 0
     )
 
-    # Peak hour-of-day across all users (last 7d)
+    # Peak hour-of-day across all users (last 7d) — client local clock
     heat_start = hour - 7 * 86400
     rows = (
         await db.execute(
@@ -1017,8 +1087,7 @@ async def build_overview(db: AsyncSession, *, limit_users: int = 40) -> dict[str
     ).all()
     by_hod = [0] * 24
     for ts, raw in rows:
-        hod = int((int(ts) % 86400) // 3600)
-        by_hod[hod] += int(raw or 0)
+        by_hod[_hod_index(int(ts), tz_off)] += int(raw or 0)
     peak_hod = max(range(24), key=lambda h: by_hod[h]) if any(by_hod) else None
 
     # Top consumers this hour
@@ -1163,6 +1232,7 @@ async def build_overview(db: AsyncSession, *, limit_users: int = 40) -> dict[str
 
     return {
         "generated_at": now.isoformat(),
+        "tz_offset_min": tz_off,
         "online_users": online_n,
         "raw_hour": {
             "current": cur,
@@ -1186,5 +1256,5 @@ async def build_overview(db: AsyncSession, *, limit_users: int = 40) -> dict[str
         ],
         "health_counts": health_counts,
         "health_users": health_users[:limit_users],
-        "note": "مصرف ساعتی بدون ضریب پنل است",
+        "note": "مصرف خام بدون ضریب · ساعت‌ها بر اساس زمان محلی دستگاه",
     }

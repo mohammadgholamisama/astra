@@ -22,10 +22,18 @@ logger = logging.getLogger("astra.analytics.api")
 @router.get("/api/analytics/overview")
 async def analytics_overview(
     limit: int = Query(40, ge=5, le=120),
+    tz_offset: int = Query(
+        0,
+        ge=-840,
+        le=840,
+        description="JS Date.getTimezoneOffset() minutes",
+    ),
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
-    return await analytics_svc.build_overview(db, limit_users=limit)
+    return await analytics_svc.build_overview(
+        db, limit_users=limit, tz_offset_min=tz_offset
+    )
 
 
 @router.get("/api/analytics/users/search")
@@ -139,6 +147,7 @@ async def analytics_user(
         True,
         description="Pull live usage + sample analytics before returning",
     ),
+    tz_offset: int = Query(0, ge=-840, le=840),
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
@@ -149,20 +158,32 @@ async def analytics_user(
         raise HTTPException(status_code=404, detail="کاربر پیدا نشد")
     if refresh:
         user = await _fresh_sample_user(db, user)
-    return await analytics_svc.build_user_analytics(db, user)
+    return await analytics_svc.build_user_analytics(
+        db, user, tz_offset_min=tz_offset
+    )
 
 
 @router.get("/api/analytics/panels")
 async def analytics_panels(
+    sample: bool = Query(True, description="Advance local sample cursors first"),
+    tz_offset: int = Query(0, ge=-840, le=840),
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
     """Overview of all panels: raw usage, online, operators, test quality."""
-    return await panel_analytics_svc.build_panel_overview(db)
+    if sample:
+        try:
+            await panel_analytics_svc.sample_all_panels_once(force=True)
+        except Exception:  # noqa: BLE001
+            logger.debug("panel sample before overview failed", exc_info=True)
+    return await panel_analytics_svc.build_panel_overview(
+        db, tz_offset_min=tz_offset
+    )
 
 
 @router.post("/api/analytics/panels/refresh")
 async def analytics_panels_refresh(
+    tz_offset: int = Query(0, ge=-840, le=840),
     _admin=Depends(get_current_admin),
 ):
     """Live-pull remotes, resample analytics, return fresh overview."""
@@ -175,7 +196,9 @@ async def analytics_panels_refresh(
         logger.debug("user sample after panel refresh failed", exc_info=True)
     # Fresh session so we see commits from the live-pull session
     async with AsyncSessionLocal() as db:
-        overview = await panel_analytics_svc.build_panel_overview(db)
+        overview = await panel_analytics_svc.build_panel_overview(
+            db, tz_offset_min=tz_offset
+        )
     return {"ok": True, "stats": stats, "overview": overview}
 
 
@@ -183,13 +206,16 @@ async def analytics_panels_refresh(
 async def analytics_panel_detail(
     panel_id: int,
     refresh: bool = Query(False),
+    tz_offset: int = Query(0, ge=-840, le=840),
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
     if refresh:
         await panel_analytics_svc.refresh_panels_live(pull_remotes=True)
     try:
-        return await panel_analytics_svc.build_panel_detail(db, panel_id)
+        return await panel_analytics_svc.build_panel_detail(
+            db, panel_id, tz_offset_min=tz_offset
+        )
     except KeyError:
         raise HTTPException(status_code=404, detail="پنل پیدا نشد") from None
 

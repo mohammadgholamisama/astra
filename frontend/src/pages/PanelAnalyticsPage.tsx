@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -20,6 +20,7 @@ import {
 import AnalyticsGuideModal, {
   PANEL_ANALYTICS_GUIDE,
 } from "../components/AnalyticsGuide";
+import { hourLabelLocal, tzOffsetMinutes } from "../lib/analyticsTime";
 import { api } from "../lib/api";
 import { formatTraffic, toFaDigits } from "../lib/format";
 
@@ -32,6 +33,7 @@ type PanelRow = {
   online: number;
   raw: {
     current_total?: number;
+    pending?: number;
     hour: number;
     day: number;
     week: number;
@@ -39,14 +41,6 @@ type PanelRow = {
     lifetime_cursor: number;
   };
   compare_hour_pct: number | null;
-  rate: {
-    hour_bps: number;
-    hour_label: string;
-    peak_bps: number;
-    peak_label: string;
-    per_online_bytes_hour: number | null;
-    per_online_label: string | null;
-  };
   tests: {
     runs: number;
     configs_tested: number;
@@ -65,6 +59,13 @@ type PanelRow = {
   };
 };
 
+type TopHit = {
+  panel_id: number;
+  name: string;
+  raw_bytes: number;
+  metric?: string;
+};
+
 type Overview = {
   generated_at: string;
   online: {
@@ -81,10 +82,23 @@ type Overview = {
   };
   totals: {
     raw_current?: number;
+    raw_pending?: number;
     raw_hour: number;
     raw_day: number;
     panels: number;
   };
+  top?: {
+    by_current?: TopHit | null;
+    by_hour?: TopHit | null;
+    by_day?: TopHit | null;
+  };
+  top_day_panels?: {
+    panel_id: number;
+    name: string;
+    raw_bytes: number;
+    current_total: number;
+    online: number;
+  }[];
   global_hourly: { hour_ts: number; raw_bytes: number }[];
   hour_of_day: { bytes: number[]; peak_hour: number | null; peak_bytes: number };
   panels: PanelRow[];
@@ -101,9 +115,9 @@ type Detail = {
     operators: Record<string, { count: number; label: string }>;
     brands: Record<string, number>;
   };
-  peak_bps_label: string;
   lifetime_raw: number;
   current_total?: number;
+  pending_raw?: number;
   compare: Record<
     string,
     { current: number; previous: number; change_pct: number | null }
@@ -111,10 +125,8 @@ type Detail = {
   hourly: {
     hour_ts: number;
     raw_bytes: number;
-    avg_mbytes_s: number;
     avg_online: number;
     online_peak: number;
-    per_online_label: string;
   }[];
   hour_of_day: { bytes: number[]; peak_hour: number | null; peak_bytes: number };
   tests: {
@@ -132,7 +144,6 @@ type Detail = {
       avg_ping: number;
     }[];
   };
-  rate_now: { hour_label: string; per_online_bps: number };
 };
 
 function ChangePill({ pct }: { pct: number | null | undefined }) {
@@ -177,14 +188,6 @@ function BarRow({
   );
 }
 
-function hourLabel(ts: number) {
-  return new Date(ts * 1000).toLocaleString("fa-IR", {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-  });
-}
-
 function DistChips({
   items,
 }: {
@@ -218,15 +221,20 @@ export default function PanelAnalyticsPage() {
   );
   const [guideOpen, setGuideOpen] = useState(false);
 
+  const tz = tzOffsetMinutes();
+  const autoLiveDone = useRef(false);
+
   const overview = useQuery({
-    queryKey: ["analytics-panels"],
-    queryFn: () => api<Overview>("/api/analytics/panels"),
+    queryKey: ["analytics-panels", tz],
+    queryFn: () =>
+      api<Overview>(`/api/analytics/panels?sample=1&tz_offset=${tz}`),
     refetchInterval: 60_000,
   });
 
   const detail = useQuery({
-    queryKey: ["analytics-panel", focusId],
-    queryFn: () => api<Detail>(`/api/analytics/panels/${focusId}`),
+    queryKey: ["analytics-panel", focusId, tz],
+    queryFn: () =>
+      api<Detail>(`/api/analytics/panels/${focusId}?tz_offset=${tz}`),
     enabled: focusId != null,
     refetchInterval: focusId != null ? 45_000 : false,
   });
@@ -234,12 +242,12 @@ export default function PanelAnalyticsPage() {
   const liveRefresh = useMutation({
     mutationFn: () =>
       api<{ ok: boolean; stats: Record<string, number>; overview: Overview }>(
-        "/api/analytics/panels/refresh",
+        `/api/analytics/panels/refresh?tz_offset=${tz}`,
         { method: "POST", timeoutMs: 180_000 }
       ),
     onSuccess: (res) => {
       if (res.overview) {
-        qc.setQueryData(["analytics-panels"], res.overview);
+        qc.setQueryData(["analytics-panels", tz], res.overview);
       } else {
         void qc.invalidateQueries({ queryKey: ["analytics-panels"] });
       }
@@ -248,6 +256,24 @@ export default function PanelAnalyticsPage() {
       }
     },
   });
+
+  // If accounts exist but counters look empty, pull remotes once
+  useEffect(() => {
+    if (autoLiveDone.current || !overview.data || liveRefresh.isPending) return;
+    const panels = overview.data.panels || [];
+    const hasAccounts = panels.some((p) => Number(p.accounts || 0) > 0);
+    const allEmpty = panels.every(
+      (p) =>
+        Number(p.raw.current_total || 0) <= 0 &&
+        Number(p.raw.hour || 0) <= 0 &&
+        Number(p.raw.day || 0) <= 0
+    );
+    if (hasAccounts && allEmpty) {
+      autoLiveDone.current = true;
+      liveRefresh.mutate();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one-shot auto pull
+  }, [overview.data]);
 
   const data = overview.data;
   const maxHour = useMemo(() => {
@@ -307,8 +333,7 @@ export default function PanelAnalyticsPage() {
           <p className="an-kicker">تحلیل زیر‌ساخت</p>
           <h1>آمار پنل‌ها</h1>
           <p className="an-sub">
-            مصرف خام هر پنل، آنلاین‌ها، اپراتور و دستگاه، کیفیت تست پینگ، و نرخ مصرف
-            نسبت به تعداد آنلاین
+            مصرف خام هر پنل، آنلاین‌ها، اپراتور و دستگاه، کیفیت تست پینگ — ساعت‌ها محلی دستگاه شما
           </p>
           <div className="an-hero-actions">
             <button
@@ -423,7 +448,9 @@ export default function PanelAnalyticsPage() {
                     <Radio size={13} /> آنلاین
                   </span>
                   <strong>{toFaDigits(d.online.online)}</strong>
-                  <small dir="ltr">نرخ {d.rate_now.hour_label}</small>
+                  <small>
+                    امروز {formatTraffic(d.compare.day.current)}
+                  </small>
                 </article>
                 <article className="an-stat">
                   <span>
@@ -489,17 +516,17 @@ export default function PanelAnalyticsPage() {
               </div>
 
               <section className="an-block">
-                <h3>۴۸ ساعت اخیر (خام · بدون ضریب)</h3>
+                <h3>۴۸ ساعت اخیر (خام · زمان محلی)</h3>
                 <div className="an-bars">
                   {d.hourly.map((h) => (
                     <BarRow
                       key={h.hour_ts}
-                      label={hourLabel(h.hour_ts)}
+                      label={hourLabelLocal(h.hour_ts)}
                       value={h.raw_bytes}
                       max={Math.max(1, ...d.hourly.map((x) => x.raw_bytes))}
                       sub={
                         h.raw_bytes > 0
-                          ? `≈ ${h.avg_mbytes_s.toFixed(3)} MB/s · آنلاین≈${toFaDigits(h.avg_online)} · سرانه ${h.per_online_label}`
+                          ? `آنلاین≈${toFaDigits(Math.round(h.avg_online))}`
                           : undefined
                       }
                     />
@@ -602,6 +629,43 @@ export default function PanelAnalyticsPage() {
             </div>
           ) : null}
 
+          {data.top?.by_current || data.top?.by_day ? (
+            <div className="an-top-callout">
+              <Zap size={16} />
+              <div>
+                <b>
+                  بیشترین مصرف:{" "}
+                  {(data.top.by_day || data.top.by_current)?.name}
+                </b>
+                <small>
+                  {data.top.by_day
+                    ? "بر اساس مصرف امروز"
+                    : "بر اساس مصرف فعلی"}
+                </small>
+              </div>
+              <span className="an-top-val">
+                {formatTraffic(
+                  Number(
+                    (data.top.by_day || data.top.by_current)?.raw_bytes || 0
+                  )
+                )}
+              </span>
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() =>
+                  setFocusId(
+                    Number(
+                      (data.top?.by_day || data.top?.by_current)?.panel_id
+                    )
+                  )
+                }
+              >
+                جزئیات
+              </button>
+            </div>
+          ) : null}
+
           <div className="an-stat-grid">
             <article className="an-stat">
               <span>
@@ -619,14 +683,23 @@ export default function PanelAnalyticsPage() {
               <strong>
                 {formatTraffic(Number(data.totals.raw_current || 0))}
               </strong>
-              <small>همیشه از اکانت‌ها — دقیق</small>
+              <small>
+                {data.top?.by_current
+                  ? `بیشترین: ${data.top.by_current.name}`
+                  : "از اکانت‌ها — دقیق"}
+              </small>
             </article>
             <article className="an-stat">
               <span>
                 <Activity size={13} /> این ساعت / امروز
               </span>
               <strong>{formatTraffic(data.totals.raw_hour)}</strong>
-              <small>امروز: {formatTraffic(data.totals.raw_day)}</small>
+              <small>
+                امروز: {formatTraffic(data.totals.raw_day)}
+                {data.top?.by_hour
+                  ? ` · اوج ساعت: ${data.top.by_hour.name}`
+                  : ""}
+              </small>
             </article>
             <article className="an-stat">
               <span>
@@ -634,7 +707,7 @@ export default function PanelAnalyticsPage() {
               </span>
               <strong>{toFaDigits(data.totals.panels)}</strong>
               <small>
-                اوج روز:{" "}
+                اوج محلی:{" "}
                 {data.hour_of_day.peak_hour != null
                   ? `ساعت ${toFaDigits(data.hour_of_day.peak_hour)}`
                   : "—"}
@@ -665,17 +738,44 @@ export default function PanelAnalyticsPage() {
 
           <div className="an-grid-2">
             <section className="an-block">
-              <h3>مصرف کل پنل‌ها — ۲۴ ساعت</h3>
+              <div className="an-block-head">
+                <h3>مصرف کل پنل‌ها — ۲۴ ساعت</h3>
+                <span className="muted">زمان محلی</span>
+              </div>
               <div className="an-bars">
                 {data.global_hourly.map((h) => (
                   <BarRow
                     key={h.hour_ts}
-                    label={hourLabel(h.hour_ts)}
+                    label={hourLabelLocal(h.hour_ts)}
                     value={h.raw_bytes}
                     max={maxHour}
                   />
                 ))}
               </div>
+              {(data.top_day_panels || []).length > 0 ? (
+                <>
+                  <h3 style={{ marginTop: 18 }}>
+                    پرمصرف‌ترین پنل‌ها (امروز)
+                  </h3>
+                  <ul className="an-list">
+                    {(data.top_day_panels || []).slice(0, 8).map((p, i) => (
+                      <li key={p.panel_id}>
+                        <button
+                          type="button"
+                          className="an-linkish"
+                          onClick={() => setFocusId(p.panel_id)}
+                        >
+                          <b>
+                            {i === 0 ? "★ " : ""}
+                            {p.name}
+                          </b>
+                        </button>
+                        <span>{formatTraffic(p.raw_bytes)}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              ) : null}
             </section>
             <section className="an-block">
               <div className="an-block-head">
@@ -686,25 +786,29 @@ export default function PanelAnalyticsPage() {
               </div>
               <div className="an-bars">
                 {panelsView
-                  .filter((p) => Number(p.raw.current_total || 0) > 0 || p.raw.hour > 0)
-                  .map((p) => (
-                  <button
-                    key={p.panel_id}
-                    type="button"
-                    className="pan-bar-btn"
-                    onClick={() => setFocusId(p.panel_id)}
-                    title={`${p.name} — مصرف فعلی ${formatTraffic(Number(p.raw.current_total || 0))} · این ساعت ${formatTraffic(p.raw.hour)}`}
-                  >
-                    <BarRow
-                      label={`${p.name} · ${toFaDigits(p.online)} آنلاین`}
-                      value={Number(p.raw.current_total || p.raw.hour || 0)}
-                      max={maxPanelTotal}
-                      sub={`فعلی ${formatTraffic(Number(p.raw.current_total || 0))} · ساعت ${formatTraffic(p.raw.hour)}`}
-                    />
-                  </button>
-                ))}
+                  .filter(
+                    (p) =>
+                      Number(p.raw.current_total || 0) > 0 || p.raw.hour > 0
+                  )
+                  .map((p, i) => (
+                    <button
+                      key={p.panel_id}
+                      type="button"
+                      className="pan-bar-btn"
+                      onClick={() => setFocusId(p.panel_id)}
+                      title={`${p.name} — مصرف فعلی ${formatTraffic(Number(p.raw.current_total || 0))} · این ساعت ${formatTraffic(p.raw.hour)}`}
+                    >
+                      <BarRow
+                        label={`${i === 0 ? "★ " : ""}${p.name} · ${toFaDigits(p.online)} آنلاین`}
+                        value={Number(p.raw.current_total || p.raw.hour || 0)}
+                        max={maxPanelTotal}
+                        sub={`فعلی ${formatTraffic(Number(p.raw.current_total || 0))} · ساعت ${formatTraffic(p.raw.hour)}`}
+                      />
+                    </button>
+                  ))}
                 {panelsView.every(
-                  (p) => Number(p.raw.current_total || 0) <= 0 && p.raw.hour <= 0
+                  (p) =>
+                    Number(p.raw.current_total || 0) <= 0 && p.raw.hour <= 0
                 ) ? (
                   <p className="muted">
                     هنوز مصرفی نیست — «تازه‌سازی زنده» را بزنید
@@ -759,7 +863,6 @@ export default function PanelAnalyticsPage() {
                     <th>امروز</th>
                     <th>هفته</th>
                     <th>ماه</th>
-                    <th title="نرخ تقریبی مصرف">نرخ</th>
                     <th title="تعداد دورهای تست ثبت‌شده">تست</th>
                     <th title="آخرین دور / جمع عمری در ۱۰۰تای برتر">top100</th>
                     <th title="آخرین دور / جمع عمری کیفیت خوب">خوب</th>
@@ -767,15 +870,23 @@ export default function PanelAnalyticsPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {panelsView.map((p) => (
-                    <tr key={p.panel_id}>
+                  {panelsView.map((p, idx) => (
+                    <tr
+                      key={p.panel_id}
+                      className={idx === 0 && Number(p.raw.current_total || p.raw.day || 0) > 0 ? "is-top" : undefined}
+                    >
                       <td>
                         <button
                           type="button"
                           className="an-linkish"
                           onClick={() => setFocusId(p.panel_id)}
                         >
-                          <b>{p.name}</b>
+                          <b>
+                            {idx === 0 && Number(p.raw.current_total || p.raw.day || 0) > 0
+                              ? "★ "
+                              : ""}
+                            {p.name}
+                          </b>
                         </button>
                         <div className="muted" style={{ fontSize: "0.75rem" }}>
                           {p.type}
@@ -796,7 +907,6 @@ export default function PanelAnalyticsPage() {
                       <td>{formatTraffic(p.raw.day)}</td>
                       <td>{formatTraffic(p.raw.week)}</td>
                       <td>{formatTraffic(p.raw.month)}</td>
-                      <td dir="ltr">{p.rate.hour_label}</td>
                       <td>{toFaDigits(p.tests.runs)}</td>
                       <td>
                         {toFaDigits(p.tests.last_run?.in_top100 ?? 0)}

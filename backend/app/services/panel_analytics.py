@@ -79,6 +79,53 @@ def _as_utc(dt: datetime | None) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
+def _clamp_tz_offset(tz_offset_min: int | None) -> int:
+    try:
+        off = int(tz_offset_min or 0)
+    except (TypeError, ValueError):
+        off = 0
+    return max(-14 * 60, min(14 * 60, off))
+
+
+def _period_starts(now: datetime, tz_offset_min: int = 0) -> dict[str, int]:
+    off = _clamp_tz_offset(tz_offset_min)
+    local = now - timedelta(minutes=off)
+    local_hour = local.replace(minute=0, second=0, microsecond=0)
+    local_day = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    wd = local.weekday()
+    local_week = (local - timedelta(days=wd)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    local_month = local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if local_month.month == 12:
+        next_month = local_month.replace(year=local_month.year + 1, month=1)
+    else:
+        next_month = local_month.replace(month=local_month.month + 1)
+    prev_month = (local_month - timedelta(days=1)).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+
+    def to_utc_ts(local_dt: datetime) -> int:
+        ts = int((local_dt + timedelta(minutes=off)).timestamp())
+        return ts - (ts % 3600)
+
+    return {
+        "hour": to_utc_ts(local_hour),
+        "day": to_utc_ts(local_day),
+        "week": to_utc_ts(local_week),
+        "month": to_utc_ts(local_month),
+        "next_month": to_utc_ts(next_month),
+        "prev_month": to_utc_ts(prev_month),
+        "tz_offset_min": off,
+    }
+
+
+def _hod_index(hour_ts: int, tz_offset_min: int = 0) -> int:
+    off = _clamp_tz_offset(tz_offset_min)
+    local_ts = int(hour_ts) - off * 60
+    return int((local_ts % 86400) // 3600)
+
+
 def parse_device_brand(user_agent: str) -> str:
     ua = (user_agent or "").strip()
     if not ua:
@@ -816,22 +863,19 @@ async def _online_breakdown(db: AsyncSession) -> dict[str, Any]:
     }
 
 
-async def build_panel_overview(db: AsyncSession) -> dict[str, Any]:
+async def build_panel_overview(
+    db: AsyncSession,
+    *,
+    tz_offset_min: int = 0,
+) -> dict[str, Any]:
     now = _utc_now()
-    hour = _hour_ts(now)
-    day = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-    wd = now.weekday()
-    week = int(
-        (now - timedelta(days=wd))
-        .replace(hour=0, minute=0, second=0, microsecond=0)
-        .timestamp()
-    )
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    month = int(month_start.timestamp())
-    if month_start.month == 12:
-        next_month = month_start.replace(year=month_start.year + 1, month=1)
-    else:
-        next_month = month_start.replace(month=month_start.month + 1)
+    periods = _period_starts(now, tz_offset_min)
+    hour = int(periods["hour"])
+    day = int(periods["day"])
+    week = int(periods["week"])
+    month = int(periods["month"])
+    next_month_ts = int(periods["next_month"])
+    tz_off = int(periods["tz_offset_min"])
 
     panels = list((await db.execute(select(Panel).order_by(Panel.id.asc()))).scalars().all())
     states = {
@@ -870,21 +914,21 @@ async def build_panel_overview(db: AsyncSession) -> dict[str, Any]:
     total_hour = 0
     total_day = 0
     total_live = 0
+    total_pending = 0
     for p in panels:
         pid = int(p.id)
         st = states.get(pid)
         live = int(live_totals.get(pid, 0))
+        cursor = int(st.last_raw_total or 0) if st else 0
+        pending = max(0, live - cursor)
         total_live += live
-        h = await period_sum(pid, hour, hour + 3600)
-        d = await period_sum(pid, day, day + 86400)
-        w = await period_sum(pid, week, week + 7 * 86400)
-        m = await period_sum(pid, month, int(next_month.timestamp()))
+        total_pending += pending
+        h = (await period_sum(pid, hour, hour + 3600)) + pending
+        d = (await period_sum(pid, day, day + 86400)) + pending
+        w = (await period_sum(pid, week, week + 7 * 86400)) + pending
+        m = (await period_sum(pid, month, next_month_ts)) + pending
         prev_h = await period_sum(pid, hour - 3600, hour)
         online_n = online_by_pid.get(pid, 0)
-        peak = float(st.peak_bps or 0) if st else 0.0
-        hour_bps = (h * 8.0) / 3600.0 if h > 0 else 0.0
-        per_online_hour = (h / online_n) if online_n > 0 else None
-        per_online_bps = (hour_bps / online_n) if online_n > 0 else None
         total_hour += h
         total_day += d
         last_run = (
@@ -905,24 +949,14 @@ async def build_panel_overview(db: AsyncSession) -> dict[str, Any]:
                 "online": online_n,
                 "raw": {
                     "current_total": live,
+                    "pending": pending,
                     "hour": h,
                     "day": d,
                     "week": w,
                     "month": m,
-                    "lifetime_cursor": int(st.last_raw_total or 0) if st else 0,
+                    "lifetime_cursor": cursor,
                 },
                 "compare_hour_pct": _pct_change(h, prev_h),
-                "rate": {
-                    "hour_bps": hour_bps,
-                    "hour_label": format_bps(hour_bps),
-                    "peak_bps": peak,
-                    "peak_label": format_bps(peak),
-                    "per_online_bytes_hour": per_online_hour,
-                    "per_online_bps": per_online_bps,
-                    "per_online_label": format_bps(per_online_bps or 0)
-                    if per_online_bps
-                    else None,
-                },
                 "tests": {
                     "runs": int(st.tests_total or 0) if st else 0,
                     "configs_tested": int(st.configs_tested_total or 0) if st else 0,
@@ -956,7 +990,25 @@ async def build_panel_overview(db: AsyncSession) -> dict[str, Any]:
         )
     )
 
-    # Global hourly 24h
+    def _top_row(key: str) -> dict[str, Any] | None:
+        if not rows:
+            return None
+        best = max(rows, key=lambda r: int(r["raw"].get(key) or 0))
+        val = int(best["raw"].get(key) or 0)
+        if val <= 0:
+            return None
+        return {
+            "panel_id": best["panel_id"],
+            "name": best["name"],
+            "raw_bytes": val,
+            "metric": key,
+        }
+
+    top_current = _top_row("current_total")
+    top_hour = _top_row("hour")
+    top_day = _top_row("day")
+
+    # Global hourly 24h + pending into current hour
     g_start = hour - 23 * 3600
     g_rows = (
         await db.execute(
@@ -970,12 +1022,15 @@ async def build_panel_overview(db: AsyncSession) -> dict[str, Any]:
         )
     ).all()
     g_map = {int(t): int(v or 0) for t, v in g_rows}
-    global_hourly = [
-        {"hour_ts": g_start + i * 3600, "raw_bytes": g_map.get(g_start + i * 3600, 0)}
-        for i in range(24)
-    ]
+    global_hourly = []
+    for i in range(24):
+        ts = g_start + i * 3600
+        raw = g_map.get(ts, 0)
+        if i == 23:
+            raw += total_pending
+        global_hourly.append({"hour_ts": ts, "raw_bytes": raw})
 
-    # Peak hour-of-day last 7d across panels
+    # Peak hour-of-day last 7d — client local clock
     heat_start = hour - 7 * 86400
     heat = (
         await db.execute(
@@ -986,18 +1041,41 @@ async def build_panel_overview(db: AsyncSession) -> dict[str, Any]:
     ).all()
     by_hod = [0] * 24
     for ts, raw in heat:
-        by_hod[int((int(ts) % 86400) // 3600)] += int(raw or 0)
+        by_hod[_hod_index(int(ts), tz_off)] += int(raw or 0)
+    if total_pending:
+        by_hod[_hod_index(hour, tz_off)] += total_pending
     peak_hod = max(range(24), key=lambda h: by_hod[h]) if any(by_hod) else None
+
+    # Top panels by day for the 24h section list
+    top_day_list = [
+        {
+            "panel_id": r["panel_id"],
+            "name": r["name"],
+            "raw_bytes": int(r["raw"]["day"] or 0),
+            "current_total": int(r["raw"]["current_total"] or 0),
+            "online": int(r["online"] or 0),
+        }
+        for r in sorted(rows, key=lambda x: -int(x["raw"]["day"] or 0))
+        if int(r["raw"]["day"] or 0) > 0 or int(r["raw"]["current_total"] or 0) > 0
+    ][:12]
 
     return {
         "generated_at": now.isoformat(),
+        "tz_offset_min": tz_off,
         "online": online_info,
         "totals": {
             "raw_current": total_live,
+            "raw_pending": total_pending,
             "raw_hour": total_hour,
             "raw_day": total_day,
             "panels": len(panels),
         },
+        "top": {
+            "by_current": top_current,
+            "by_hour": top_hour,
+            "by_day": top_day,
+        },
+        "top_day_panels": top_day_list,
         "global_hourly": global_hourly,
         "hour_of_day": {
             "bytes": by_hod,
@@ -1006,48 +1084,45 @@ async def build_panel_overview(db: AsyncSession) -> dict[str, Any]:
         },
         "panels": rows,
         "note": (
-            "مصرف فعلی = جمع خام اکانت‌های همان پنل (همیشه دقیق). "
-            "ساعت/روز/هفته از نمونه‌برداری دوره‌ای است — با «تازه‌سازی زنده» تازه می‌شود."
+            "مصرف فعلی = جمع خام اکانت‌ها (دقیق). "
+            "ساعت/روز شامل مصرف تازهٔ هنوز نمونه‌نشده هم هست. "
+            "ساعت‌ها بر اساس زمان محلی دستگاه شماست."
         ),
     }
 
 
-async def build_panel_detail(db: AsyncSession, panel_id: int) -> dict[str, Any]:
+async def build_panel_detail(
+    db: AsyncSession,
+    panel_id: int,
+    *,
+    tz_offset_min: int = 0,
+) -> dict[str, Any]:
     panel = await db.get(Panel, int(panel_id))
     if panel is None:
         raise KeyError("panel")
     now = _utc_now()
-    hour = _hour_ts(now)
-    day = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-    wd = now.weekday()
-    week = int(
-        (now - timedelta(days=wd))
-        .replace(hour=0, minute=0, second=0, microsecond=0)
-        .timestamp()
-    )
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    month = int(month_start.timestamp())
-    if month_start.month == 12:
-        next_month = month_start.replace(year=month_start.year + 1, month=1)
-    else:
-        next_month = month_start.replace(month=month_start.month + 1)
-    prev_month_start = (month_start - timedelta(days=1)).replace(
-        day=1, hour=0, minute=0, second=0, microsecond=0
-    )
+    periods = _period_starts(now, tz_offset_min)
+    hour = int(periods["hour"])
+    day = int(periods["day"])
+    week = int(periods["week"])
+    month = int(periods["month"])
+    next_month_ts = int(periods["next_month"])
+    prev_month = int(periods["prev_month"])
+    tz_off = int(periods["tz_offset_min"])
 
     st = await db.get(PanelUsageState, int(panel_id))
     live_map = await live_panel_totals(db)
     live_total = int(live_map.get(int(panel_id), 0))
-    cur_h = await _sum_panel_hours(db, panel_id, hour, hour + 3600)
+    cursor = int(st.last_raw_total or 0) if st else 0
+    pending = max(0, live_total - cursor)
+    cur_h = (await _sum_panel_hours(db, panel_id, hour, hour + 3600)) + pending
     prev_h = await _sum_panel_hours(db, panel_id, hour - 3600, hour)
-    cur_d = await _sum_panel_hours(db, panel_id, day, day + 86400)
+    cur_d = (await _sum_panel_hours(db, panel_id, day, day + 86400)) + pending
     prev_d = await _sum_panel_hours(db, panel_id, day - 86400, day)
-    cur_w = await _sum_panel_hours(db, panel_id, week, week + 7 * 86400)
+    cur_w = (await _sum_panel_hours(db, panel_id, week, week + 7 * 86400)) + pending
     prev_w = await _sum_panel_hours(db, panel_id, week - 7 * 86400, week)
-    cur_m = await _sum_panel_hours(db, panel_id, month, int(next_month.timestamp()))
-    prev_m = await _sum_panel_hours(
-        db, panel_id, int(prev_month_start.timestamp()), month
-    )
+    cur_m = (await _sum_panel_hours(db, panel_id, month, next_month_ts)) + pending
+    prev_m = await _sum_panel_hours(db, panel_id, prev_month, month)
 
     series_start = hour - 47 * 3600
     buckets = await _hour_rows_panel(db, panel_id, series_start, hour + 3600)
@@ -1057,22 +1132,17 @@ async def build_panel_detail(db: AsyncSession, panel_id: int) -> dict[str, Any]:
         ts = series_start + i * 3600
         b = by_h.get(ts)
         raw = int(b.raw_bytes or 0) if b else 0
+        if i == 47:
+            raw += pending
         sc = int(b.sample_count or 0) if b else 0
         on_sum = int(b.online_sum or 0) if b else 0
         avg_online = (on_sum / sc) if sc else 0.0
-        bps = (raw * 8.0) / 3600.0 if raw else 0.0
-        per_on = (bps / avg_online) if avg_online > 0 else 0.0
         hourly.append(
             {
                 "hour_ts": ts,
                 "raw_bytes": raw,
-                "peak_bps": float(b.peak_bps or 0) if b else 0.0,
-                "avg_bps": bps,
-                "avg_mbytes_s": round(raw / 3600 / (1024 * 1024), 4) if raw else 0.0,
                 "avg_online": round(avg_online, 2),
                 "online_peak": int(b.online_peak or 0) if b else 0,
-                "per_online_bps": per_on,
-                "per_online_label": format_bps(per_on),
             }
         )
 
@@ -1080,7 +1150,9 @@ async def build_panel_detail(db: AsyncSession, panel_id: int) -> dict[str, Any]:
     heat_rows = await _hour_rows_panel(db, panel_id, heat_start, hour + 3600)
     by_hod = [0] * 24
     for b in heat_rows:
-        by_hod[int((int(b.hour_ts) % 86400) // 3600)] += int(b.raw_bytes or 0)
+        by_hod[_hod_index(int(b.hour_ts), tz_off)] += int(b.raw_bytes or 0)
+    if pending:
+        by_hod[_hod_index(hour, tz_off)] += pending
     peak_hod = max(range(24), key=lambda h: by_hod[h]) if any(by_hod) else None
 
     online_info = await _online_breakdown(db)
@@ -1129,11 +1201,10 @@ async def build_panel_detail(db: AsyncSession, panel_id: int) -> dict[str, Any]:
         "is_active": bool(getattr(panel, "is_active", True)),
         "accounts": accounts_n,
         "online": panel_online,
-        "peak_bps": float(st.peak_bps or 0) if st else 0.0,
-        "peak_bps_label": format_bps(float(st.peak_bps or 0) if st else 0),
-        "peak_bps_at": st.peak_bps_at.isoformat() if st and st.peak_bps_at else None,
-        "lifetime_raw": int(st.last_raw_total or 0) if st else 0,
+        "tz_offset_min": tz_off,
+        "lifetime_raw": cursor,
         "current_total": live_total,
+        "pending_raw": pending,
         "compare": {
             "hour": {
                 "current": cur_h,
@@ -1179,14 +1250,5 @@ async def build_panel_detail(db: AsyncSession, panel_id: int) -> dict[str, Any]:
                 }
                 for t in tests
             ],
-        },
-        "rate_now": {
-            "hour_bps": (cur_h * 8.0) / 3600.0,
-            "hour_label": format_bps((cur_h * 8.0) / 3600.0),
-            "per_online_bps": (
-                ((cur_h * 8.0) / 3600.0) / int(panel_online.get("online") or 1)
-            )
-            if int(panel_online.get("online") or 0) > 0
-            else 0.0,
         },
     }

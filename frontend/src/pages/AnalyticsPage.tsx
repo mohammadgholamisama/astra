@@ -6,7 +6,6 @@ import {
   ArrowUpRight,
   BookOpen,
   Clock,
-  HelpCircle,
   Loader2,
   Minus,
   Radio,
@@ -21,6 +20,7 @@ import {
 import AnalyticsGuideModal, {
   USER_ANALYTICS_GUIDE,
 } from "../components/AnalyticsGuide";
+import { hourLabelLocal, tzOffsetMinutes } from "../lib/analyticsTime";
 import { api } from "../lib/api";
 import { formatTraffic, toFaDigits } from "../lib/format";
 
@@ -46,9 +46,8 @@ type UserAnalytics = {
   display_name?: string | null;
   online: boolean;
   online_since?: string | null;
-  peak_bps_label: string;
-  peak_bps_at?: string | null;
   last_sub_fetch_at?: string | null;
+  raw_totals?: { current_raw?: number; pending_raw?: number };
   compare: Record<
     string,
     { current: number; previous: number; change_pct: number | null }
@@ -56,12 +55,10 @@ type UserAnalytics = {
   current_session?: {
     duration_seconds: number;
     raw_bytes: number;
-    avg_mbytes_s: number;
   } | null;
   hourly: {
     hour_ts: number;
     raw_bytes: number;
-    avg_mbytes_s: number;
   }[];
   hour_of_day: { bytes: number[]; peak_hour: number | null; peak_bytes: number };
   devices: {
@@ -101,14 +98,6 @@ function ChangePill({ pct }: { pct: number | null | undefined }) {
   );
 }
 
-function hourLabel(ts: number) {
-  return new Date(ts * 1000).toLocaleString("fa-IR", {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-  });
-}
-
 function durLabel(sec: number) {
   const s = Math.max(0, Math.floor(sec));
   if (s < 60) return `${toFaDigits(s)} ثانیه`;
@@ -118,7 +107,7 @@ function durLabel(sec: number) {
   return `${toFaDigits(h)}س ${toFaDigits(m)}د`;
 }
 
-/** Horizontal bar with explicit hover tooltip. */
+/** Horizontal usage bar — native title only (no overlapping absolute tips). */
 function UsageBar({
   label,
   value,
@@ -139,9 +128,6 @@ function UsageBar({
       </div>
       <div className="an-ubar-track">
         <i style={{ width: `${pct}%` }} />
-      </div>
-      <div className="an-ubar-tip" role="tooltip">
-        {tip}
       </div>
     </div>
   );
@@ -175,17 +161,20 @@ export default function AnalyticsPage() {
     return () => document.removeEventListener("mousedown", onDoc);
   }, []);
 
+  const tz = tzOffsetMinutes();
+
   const overview = useQuery({
-    queryKey: ["analytics-overview"],
-    queryFn: () => api<Overview>("/api/analytics/overview"),
+    queryKey: ["analytics-overview", tz],
+    queryFn: () =>
+      api<Overview>(`/api/analytics/overview?tz_offset=${tz}`),
     refetchInterval: 60_000,
   });
 
   const userQ = useQuery({
-    queryKey: ["analytics-user", focusUser, freshKey],
+    queryKey: ["analytics-user", focusUser, freshKey, tz],
     queryFn: () =>
       api<UserAnalytics>(
-        `/api/analytics/user/${encodeURIComponent(focusUser)}?refresh=1`,
+        `/api/analytics/user/${encodeURIComponent(focusUser)}?refresh=1&tz_offset=${tz}`,
         { timeoutMs: 90_000 }
       ),
     enabled: Boolean(focusUser),
@@ -248,7 +237,7 @@ export default function AnalyticsPage() {
           <p className="an-kicker">تحلیل رفتار</p>
           <h1>آمار کاربران</h1>
           <p className="an-sub">
-            مصرف خام، آنلاین بودن، سرعت، دستگاه و اینترنت آپدیت ساب
+            مصرف خام، آنلاین بودن، دستگاه و اینترنت آپدیت ساب — ساعت‌ها محلی دستگاه شما
           </p>
           <div className="an-hero-actions">
             <button
@@ -461,20 +450,20 @@ export default function AnalyticsPage() {
               </button>
             </div>
           ) : ua ? (
-            <>
+            <div className="an-user-stack">
               <div className="an-stat-grid">
                 <article className="an-stat">
                   <span>وضعیت</span>
                   <strong>{ua.online ? "آنلاین" : "آفلاین"}</strong>
                 </article>
                 <article className="an-stat">
-                  <span>بالاترین سرعت</span>
-                  <strong dir="ltr">{ua.peak_bps_label}</strong>
-                  <small>
-                    {ua.peak_bps_at
-                      ? new Date(ua.peak_bps_at).toLocaleString("fa-IR")
-                      : "هنوز ثبت نشده"}
-                  </small>
+                  <span>
+                    <Zap size={13} /> مصرف فعلی
+                  </span>
+                  <strong>
+                    {formatTraffic(Number(ua.raw_totals?.current_raw || 0))}
+                  </strong>
+                  <small>خام · بدون ضریب</small>
                 </article>
                 <article className="an-stat">
                   <span>
@@ -529,10 +518,6 @@ export default function AnalyticsPage() {
                       <p>
                         مصرف {formatTraffic(ua.current_session.raw_bytes)}
                       </p>
-                      <p dir="ltr" className="muted">
-                        میانگین ≈ {ua.current_session.avg_mbytes_s.toFixed(3)}{" "}
-                        MB/s
-                      </p>
                     </div>
                   ) : (
                     <p className="muted">الان آنلاین تشخیص داده نشده</p>
@@ -543,22 +528,16 @@ export default function AnalyticsPage() {
               <section className="an-block">
                 <div className="an-block-head">
                   <h3>مصرف ساعتی — ۴۸ ساعت اخیر</h3>
-                  <span className="muted">
-                    <HelpCircle size={13} /> روی هر ردیف بروید
-                  </span>
+                  <span className="muted">زمان محلی دستگاه</span>
                 </div>
                 <div className="an-bars">
                   {ua.hourly.map((h) => (
                     <UsageBar
                       key={h.hour_ts}
-                      label={hourLabel(h.hour_ts)}
+                      label={hourLabelLocal(h.hour_ts)}
                       value={h.raw_bytes}
                       max={userHourMax}
-                      tip={`${hourLabel(h.hour_ts)} — مصرف خام ${formatTraffic(h.raw_bytes)}${
-                        h.raw_bytes > 0
-                          ? ` · حدود ${h.avg_mbytes_s.toFixed(3)} MB/s`
-                          : ""
-                      }`}
+                      tip={`${hourLabelLocal(h.hour_ts)} — ${formatTraffic(h.raw_bytes)}`}
                     />
                   ))}
                 </div>
@@ -567,7 +546,7 @@ export default function AnalyticsPage() {
               <section className="an-block">
                 <div className="an-block-head">
                   <h3>مصرف در ساعات شبانه‌روز</h3>
-                  <span className="muted">هاور = جزئیات ساعت</span>
+                  <span className="muted">ساعت محلی</span>
                 </div>
                 <div className="an-hod an-hod-live">
                   {ua.hour_of_day.bytes.map((b, i) => {
@@ -685,7 +664,7 @@ export default function AnalyticsPage() {
                   </div>
                 </section>
               ) : null}
-            </>
+            </div>
           ) : null}
         </section>
       ) : overview.isLoading ? (
@@ -735,10 +714,10 @@ export default function AnalyticsPage() {
                 {data.global_hourly.map((h) => (
                   <UsageBar
                     key={h.hour_ts}
-                    label={hourLabel(h.hour_ts)}
+                    label={hourLabelLocal(h.hour_ts)}
                     value={h.raw_bytes}
                     max={maxHour}
-                    tip={`${hourLabel(h.hour_ts)} — مصرف خام همه کاربران: ${formatTraffic(h.raw_bytes)}`}
+                    tip={`${hourLabelLocal(h.hour_ts)} — ${formatTraffic(h.raw_bytes)}`}
                   />
                 ))}
               </div>
