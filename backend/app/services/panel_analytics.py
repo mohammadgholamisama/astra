@@ -487,12 +487,13 @@ async def _sample_panels_with_db(db: AsyncSession, *, now: datetime | None = Non
 async def sample_all_panels_once(*, force: bool = False) -> dict[str, int]:
     """Sample raw traffic per panel + per (user,panel) online flags.
 
-    ``force=True`` waits for the lock (used by live refresh). Otherwise skip
-    if another sampler is already running so HTTP stays responsive.
+    Never blocks waiting on the lock — a busy sampler returns skipped so HTTP
+    / live-refresh cannot deadlock the event loop.
     """
     from app.core.database import AsyncSessionLocal
 
-    if not force and _sample_lock.locked():
+    _ = force
+    if _sample_lock.locked():
         return {"skipped": 1, "busy": 1}
     async with _sample_lock:
         t0 = time.monotonic()
@@ -956,44 +957,39 @@ def _empty_panel_overview(*, tz_offset_min: int = 0) -> dict[str, Any]:
 async def refresh_panel_analytics_fast(
     *,
     tz_offset_min: int = 0,
-    budget_s: float = 12.0,
+    budget_s: float = 10.0,
 ) -> dict[str, Any]:
-    """«تازه‌سازی زنده» — sync → flush → sample → overview.
-
-    Every call must move totals when Xray/usage grew. Never raises to API.
-    """
+    """«تازه‌سازی زنده» — parallel sync + flush + overview. Never hangs the UI."""
     from app.core.database import AsyncSessionLocal
 
     t0 = time.monotonic()
     astra_synced = 0
     bytes_hint = 0
-    sampled = 0
     err: str | None = None
     pre_live: dict[int, int] = {}
-    budget = max(8.0, float(budget_s or 12.0))
+    budget = max(6.0, float(budget_s or 10.0))
 
-    # Phase 1: parallel Xray sync + credit growth into the current chart hour
     try:
         async with AsyncSessionLocal() as db:
             try:
                 pre = await asyncio.wait_for(
-                    live_panel_raw_and_weighted(db), timeout=2.0
+                    live_panel_raw_and_weighted(db), timeout=1.5
                 )
                 pre_live = {pid: int(v["raw"]) for pid, v in pre.items()}
                 await asyncio.wait_for(
                     ensure_panel_cursors_seeded(db, pre_live, now=_utc_now()),
-                    timeout=1.5,
+                    timeout=1.0,
                 )
             except Exception:  # noqa: BLE001
                 logger.debug("fast refresh pre-seed failed", exc_info=True)
 
-            sync_budget = min(9.0, max(4.0, budget * 0.5))
+            sync_budget = min(6.0, max(3.0, budget * 0.55))
             try:
                 astra_synced = int(
                     await asyncio.wait_for(
                         sync_astra_panels_live(
                             db,
-                            timeout_per_panel=3.0,
+                            timeout_per_panel=2.0,
                             rebuild_on_limit=False,
                         ),
                         timeout=sync_budget,
@@ -1006,7 +1002,7 @@ async def refresh_panel_analytics_fast(
 
             try:
                 post = await asyncio.wait_for(
-                    live_panel_raw_and_weighted(db), timeout=2.0
+                    live_panel_raw_and_weighted(db), timeout=1.5
                 )
                 post_live = {pid: int(v["raw"]) for pid, v in post.items()}
                 bytes_hint = sum(
@@ -1015,7 +1011,7 @@ async def refresh_panel_analytics_fast(
                 )
                 await asyncio.wait_for(
                     flush_live_deltas_to_hours(db, post_live, now=_utc_now()),
-                    timeout=2.5,
+                    timeout=2.0,
                 )
             except Exception as exc:  # noqa: BLE001
                 err = err or f"flush:{type(exc).__name__}"
@@ -1024,21 +1020,16 @@ async def refresh_panel_analytics_fast(
         err = f"phase1:{type(exc).__name__}"
         logger.exception("fast refresh phase1 failed")
 
-    # Phase 1b: force sampler so hour buckets catch any cursor growth
+    # Best-effort sample (never waits on a busy lock)
     try:
-        sample_stats = await asyncio.wait_for(
-            sample_all_panels_once(force=True), timeout=4.0
-        )
-        sampled = int((sample_stats or {}).get("panels") or 0)
-    except Exception as exc:  # noqa: BLE001
-        err = err or f"sample:{type(exc).__name__}"
-        logger.debug("fast refresh sample failed", exc_info=True)
+        await sample_all_panels_once(force=False)
+    except Exception:  # noqa: BLE001
+        logger.debug("fast refresh sample skipped", exc_info=True)
 
-    # Phase 2: overview with persisted live watermarks
     overview: dict[str, Any] | None = None
     try:
         async with AsyncSessionLocal() as db:
-            remain = max(2.5, budget - (time.monotonic() - t0))
+            remain = max(2.0, budget - (time.monotonic() - t0))
             overview = await asyncio.wait_for(
                 build_panel_overview(
                     db,
@@ -1051,7 +1042,19 @@ async def refresh_panel_analytics_fast(
     except Exception as exc:  # noqa: BLE001
         err = f"overview:{type(exc).__name__}"
         logger.exception("fast refresh overview failed")
-        overview = _empty_panel_overview(tz_offset_min=tz_offset_min)
+        try:
+            async with AsyncSessionLocal() as db:
+                overview = await asyncio.wait_for(
+                    build_panel_overview(
+                        db,
+                        tz_offset_min=tz_offset_min,
+                        sync_astra=False,
+                        persist=False,
+                    ),
+                    timeout=3.0,
+                )
+        except Exception:  # noqa: BLE001
+            overview = _empty_panel_overview(tz_offset_min=tz_offset_min)
 
     return {
         "ok": True,
@@ -1059,7 +1062,6 @@ async def refresh_panel_analytics_fast(
             "astra_synced": astra_synced,
             "astra_only": True,
             "users_pulled": 0,
-            "sampled_panels": sampled,
             "bytes_added": int(bytes_hint),
             "ms": int((time.monotonic() - t0) * 1000),
             "error": err,

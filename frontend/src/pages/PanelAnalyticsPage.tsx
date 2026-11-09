@@ -500,27 +500,14 @@ export default function PanelAnalyticsPage() {
 
   const overview = useQuery({
     queryKey: ["analytics-panels", tz],
-    queryFn: async () => {
-      // Every load/refetch syncs Xray + rebuilds hour stats (never a stale snapshot)
-      const res = await api<{
-        ok?: boolean;
-        overview?: Overview;
-        stats?: Record<string, number>;
-      }>(`/api/analytics/panels/refresh?tz_offset=${tz}&_=${Date.now()}`, {
-        method: "POST",
-        timeoutMs: 22_000,
-      });
-      if (res?.overview) return res.overview;
-      return api<Overview>(
-        `/api/analytics/panels?tz_offset=${tz}&_=${Date.now()}`,
-        { timeoutMs: 22_000 }
-      );
-    },
+    queryFn: () =>
+      api<Overview>(`/api/analytics/panels?tz_offset=${tz}`, {
+        timeoutMs: 12_000,
+      }),
     refetchInterval: 3 * 60_000,
     refetchOnWindowFocus: true,
     retry: 1,
-    staleTime: 0,
-    gcTime: 0,
+    staleTime: 10_000,
   });
 
   const detail = useQuery({
@@ -537,7 +524,7 @@ export default function PanelAnalyticsPage() {
     mutationFn: () =>
       api<{ ok: boolean; stats: Record<string, number>; overview: Overview }>(
         `/api/analytics/panels/refresh?tz_offset=${tz}`,
-        { method: "POST", timeoutMs: 20_000 }
+        { method: "POST", timeoutMs: 14_000 }
       ),
     onSuccess: (res) => {
       if (res.overview) {
@@ -550,6 +537,22 @@ export default function PanelAnalyticsPage() {
       }
     },
   });
+
+  // Open fast via GET, then pull live Xray in the background (and every 3 min)
+  useEffect(() => {
+    const tick = () => {
+      if (document.visibilityState === "hidden") return;
+      if (liveRefresh.isPending) return;
+      liveRefresh.mutate();
+    };
+    const boot = window.setTimeout(tick, 400);
+    const id = window.setInterval(tick, 3 * 60_000);
+    return () => {
+      window.clearTimeout(boot);
+      window.clearInterval(id);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tz]);
 
   const data = overview.data;
   const maxPanelTotal = useMemo(() => {
@@ -811,7 +814,7 @@ export default function PanelAnalyticsPage() {
             <div className="an-block-head">
               <h3>مصرف کل پنل‌ها — ۲۴ ساعت</h3>
               <span className="muted">
-                با ضریب · همگام هر ۳ دقیقه · زمان محلی
+                با ضریب · بروز خودکار هر ۳ دقیقه · زمان محلی
                 {data?.generated_at
                   ? ` · ${new Date(data.generated_at).toLocaleTimeString("fa-IR")}`
                   : ""}
