@@ -628,6 +628,25 @@ async def get_subscription(
     if not user:
         return PlainTextResponse("Not found", status_code=404)
 
+    # Analytics: log VPN client sub updates (debounced, never blocks feed)
+    try:
+        if not _wants_html_page(request):
+            from app.services.user_analytics import record_sub_fetch
+
+            hdrs = {k: v for k, v in request.headers.items()}
+            client_host = request.client.host if request.client else None
+            asyncio.create_task(
+                record_sub_fetch(
+                    user_id=int(user.id),
+                    headers=hdrs,
+                    client_host=client_host,
+                    is_probe=_wants_probe(request),
+                ),
+                name=f"astra-sub-fetch-{int(user.id)}",
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
     try:
         if _wants_html_page(request):
             return await _render_info_page(db, token, user)

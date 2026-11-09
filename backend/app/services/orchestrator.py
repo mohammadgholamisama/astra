@@ -31,6 +31,22 @@ _locks_guard = asyncio.Lock()
 _panel_remote_sem: asyncio.Semaphore | None = None
 # One admin/heal bulk retry at a time — avoids stampede on a recovering panel
 _bulk_retry_lock = asyncio.Lock()
+# One group panel-resync at a time per group (manual Apply + auto after save)
+_group_resync_locks: dict[int, asyncio.Lock] = {}
+_group_resync_running: set[int] = set()
+
+
+def _group_resync_lock(group_id: int) -> asyncio.Lock:
+    gid = int(group_id)
+    lock = _group_resync_locks.get(gid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _group_resync_locks[gid] = lock
+    return lock
+
+
+def group_resync_in_progress(group_id: int) -> bool:
+    return int(group_id) in _group_resync_running
 
 
 def _remote_sem() -> asyncio.Semaphore:
@@ -6456,9 +6472,12 @@ async def resync_users_for_group(
     1. Delete upstream accounts for panels no longer linked to this group
        (remove from panel + Astra DB — not only from the sub feed).
     2. Provision newly added panels and hydrate share links.
-    3. Recount weighted usage and push remotes (caps / disable on quota).
+    3. If Astra quota is exhausted (limited/expired/disabled), freeze remotes
+       so new configs stay cut like the rest of the sub.
+    4. Recount weighted usage.
 
-    Local recount should already have run on save for immediate UI feedback.
+    Processes users one-by-one with periodic commits so a long run stays
+    durable and does not hold one giant transaction open.
     """
     from app.models.group import Group
     from app.models.group_config import GroupConfigItem
@@ -6470,6 +6489,36 @@ async def resync_users_for_group(
     from sqlalchemy import delete
 
     gid = int(group_id)
+    lock = _group_resync_lock(gid)
+    if lock.locked():
+        logger.info("group %s resync already running — skip", gid)
+        return 0
+
+    async with lock:
+        _group_resync_running.add(gid)
+        try:
+            return await _resync_users_for_group_locked(
+                db, gid, removed_panel_ids=removed_panel_ids
+            )
+        finally:
+            _group_resync_running.discard(gid)
+
+
+async def _resync_users_for_group_locked(
+    db: AsyncSession,
+    gid: int,
+    *,
+    removed_panel_ids: list[int] | None = None,
+) -> int:
+    from app.models.group import Group
+    from app.models.group_config import GroupConfigItem
+    from app.services.group_configs import (
+        _get_sample_user,
+        sample_username_for_group,
+        sync_items_from_sample,
+    )
+    from sqlalchemy import delete
+
     removed_hint = {int(p) for p in (removed_panel_ids or []) if p is not None}
     # Membership = all GroupPanel rows (even inactive panels keep remotes until
     # the admin actually removes the panel from the group).
@@ -6571,6 +6620,28 @@ async def resync_users_for_group(
                     exc_info=True,
                 )
 
+        # New remotes must respect Astra quota — freeze like heal_user_coverage
+        if user.status in (
+            UserStatus.limited,
+            UserStatus.expired,
+            UserStatus.disabled,
+        ):
+            try:
+                await sync_modify_user(
+                    db,
+                    user,
+                    skip_nginx_sync=True,
+                    freeze_fast=True,
+                    remote_timeout=8,
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "group %s freeze user=%s failed",
+                    gid,
+                    user.username,
+                    exc_info=True,
+                )
+
     # Sample probe first — keeps Configs page + hide rules panel-aligned
     sample_name = sample_username_for_group(gid)
     sample = await _get_sample_user(db, gid)
@@ -6581,57 +6652,111 @@ async def resync_users_for_group(
             group = await db.get(Group, gid)
             if sample is not None and group is not None:
                 await sync_items_from_sample(db, group, sample)
+            await db.commit()
         except Exception:  # noqa: BLE001
             logger.exception("group %s sample reconcile failed", gid)
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
 
     ug = await db.execute(select(UserGroup.user_id).where(UserGroup.group_id == gid))
-    user_ids = [row[0] for row in ug.all()]
+    user_ids = [int(row[0]) for row in ug.all() if row[0] is not None]
     if not user_ids:
         await db.flush()
         return 0
 
-    result = await db.execute(
-        select(User)
-        .where(User.id.in_(user_ids))
-        .options(selectinload(User.panel_accounts).selectinload(PanelAccount.panel))
-    )
-    users = [
-        u
-        for u in result.scalars().unique().all()
-        if u.username != sample_name
-        and not str(u.username or "").startswith(f"ag{gid}s")
-        and "نمونه کانفیگ" not in (u.note or "")
-    ]
-    if not users:
-        await db.flush()
-        return 0
+    # Stable order — newest first so recent buyers get slots sooner
+    user_ids = sorted(set(user_ids), reverse=True)
 
     ok = 0
-    for user in users:
+    failed = 0
+    touched_uids: list[int] = []
+    # Commit every N users so progress survives crashes / pool pressure
+    commit_every = 3
+
+    for idx, uid in enumerate(user_ids, start=1):
         try:
+            result = await db.execute(
+                select(User)
+                .where(User.id == uid)
+                .options(
+                    selectinload(User.panel_accounts).selectinload(PanelAccount.panel)
+                )
+            )
+            user = result.scalars().unique().first()
+            if user is None:
+                continue
+            uname = str(user.username or "")
+            if uname == sample_name or uname.startswith(f"ag{gid}s"):
+                continue
+            if "نمونه کانفیگ" in (user.note or ""):
+                continue
+
             await _reconcile_user(user)
             ok += 1
+            touched_uids.append(int(user.id))
         except Exception:  # noqa: BLE001
+            failed += 1
             logger.exception(
-                "group %s reconcile user=%s failed",
+                "group %s reconcile user_id=%s failed",
                 gid,
-                getattr(user, "username", "?"),
+                uid,
             )
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            continue
 
-    await recount_group_usage_local(db, gid)
+        if idx % commit_every == 0:
+            try:
+                await db.commit()
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "group %s mid-resync commit failed at %s/%s",
+                    gid,
+                    idx,
+                    len(user_ids),
+                    exc_info=True,
+                )
+                try:
+                    await db.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+            # Brief yield so login / other requests can use the pool
+            await asyncio.sleep(0.05)
+
     try:
-        from app.api.subscription import invalidate_user_feed_cache
-
-        invalidate_user_feed_cache(*[int(u.id) for u in users])
+        await recount_group_usage_local(db, gid)
     except Exception:  # noqa: BLE001
-        pass
-    await db.flush()
+        logger.warning("group %s recount after resync failed", gid, exc_info=True)
+
+    if touched_uids:
+        try:
+            from app.api.subscription import invalidate_user_feed_cache
+
+            invalidate_user_feed_cache(*touched_uids)
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        logger.warning("group %s final resync commit failed", gid, exc_info=True)
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+
     logger.info(
-        "group %s panel/coeff resync: reconciled=%s/%s desired_panels=%s",
+        "group %s panel resync done: ok=%s failed=%s total=%s desired_panels=%s removed=%s",
         gid,
         ok,
-        len(users),
+        failed,
+        len(user_ids),
         sorted(desired_panel_ids),
+        sorted(removed_hint),
     )
     return ok
 

@@ -77,16 +77,33 @@ def _panel_remote_fingerprint(panels: list[Any]) -> tuple[tuple[int, str], ...]:
 async def _bg_resync_group_users(
     group_id: int, removed_panel_ids: list[int] | None = None
 ) -> None:
-    """Push new caps/coeffs + remote delete for removed panels (non-blocking)."""
-    from app.core.database import AsyncSessionLocal
-    from app.services.orchestrator import resync_users_for_group
+    """Push new caps/coeffs + remote delete for removed panels (non-blocking).
 
+    Uses its own DB session and commits progress inside resync so a long run
+    does not crash the request pool or lose all work on failure.
+    """
+    from app.core.database import AsyncSessionLocal
+    from app.services.orchestrator import (
+        group_resync_in_progress,
+        resync_users_for_group,
+    )
+
+    if group_resync_in_progress(group_id):
+        logger.info("bg group %s resync skipped — already in progress", group_id)
+        return
     try:
         async with AsyncSessionLocal() as db:
             n = await resync_users_for_group(
                 db, group_id, removed_panel_ids=removed_panel_ids or []
             )
-            await db.commit()
+            # resync commits internally; final commit is harmless if idle
+            try:
+                await db.commit()
+            except Exception:  # noqa: BLE001
+                try:
+                    await db.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
             logger.info(
                 "bg group %s resync ok users=%s removed_panels=%s",
                 group_id,
@@ -526,6 +543,50 @@ async def get_group(
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
     return _to_out(group)
+
+
+@router.post("/api/group/{group_id}/resync-users")
+async def resync_group_users(
+    group_id: int,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """Apply current group panel membership to every user's remotes + sub.
+
+    - Panels removed from the group → delete accounts on those panels
+    - Panels added → provision + hydrate share links (frozen if Astra is limited)
+    Runs in background so the admin UI stays responsive even for large groups.
+    """
+    from app.services.orchestrator import group_resync_in_progress
+
+    group = await db.get(Group, group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail="گروه پیدا نشد")
+    if group_resync_in_progress(group_id):
+        return {
+            "ok": True,
+            "started": False,
+            "detail": "همگام‌سازی این گروه از قبل در حال اجراست",
+            "group_id": int(group_id),
+        }
+    ug = await db.execute(
+        select(UserGroup.user_id).where(UserGroup.group_id == int(group_id))
+    )
+    user_count = len({int(r[0]) for r in ug.all() if r[0] is not None})
+    asyncio.create_task(
+        _bg_resync_group_users(int(group_id), []),
+        name=f"astra-group-manual-resync-{group_id}",
+    )
+    return {
+        "ok": True,
+        "started": True,
+        "detail": (
+            f"اعمال تغییرات پنل روی ساب کاربران شروع شد"
+            f" ({user_count} کاربر) — تا اتمام در پس‌زمینه ادامه دارد"
+        ),
+        "group_id": int(group_id),
+        "users": user_count,
+    }
 
 
 @router.put("/api/group/{group_id}/move", response_model=GroupOut)

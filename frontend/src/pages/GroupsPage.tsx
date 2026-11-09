@@ -542,6 +542,29 @@ export default function GroupsPage() {
     },
   });
 
+  const [resyncingGroupId, setResyncingGroupId] = useState<number | null>(null);
+  const resyncGroup = useMutation({
+    mutationFn: (id: number) =>
+      api<{ ok: boolean; started?: boolean; detail: string; users?: number }>(
+        `/api/group/${id}/resync-users`,
+        { method: "POST" }
+      ),
+    onMutate: (id) => {
+      setResyncingGroupId(id);
+    },
+    onSuccess: (res) => {
+      window.alert(res.detail || "اعمال تغییرات پنل شروع شد");
+    },
+    onError: (e: unknown) => {
+      window.alert(
+        e instanceof Error ? e.message : "اعمال تغییرات پنل ناموفق بود"
+      );
+    },
+    onSettled: () => {
+      setResyncingGroupId(null);
+    },
+  });
+
   function togglePanel(panel: Panel) {
     setPicks((prev) => {
       if (prev.some((p) => p.panel_id === panel.id)) {
@@ -965,6 +988,34 @@ export default function GroupsPage() {
                 </div>
               </div>
               <div className="groups-row-actions">
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  disabled={resyncGroup.isPending && resyncingGroupId === g.id}
+                  title="پنل اضافه‌شده ساخته می‌شود؛ پنل حذف‌شده از ساب و پنل اصلی پاک می‌شود. حتی اگر طول بکشد در پس‌زمینه تمام می‌شود."
+                  onClick={() => {
+                    const n = (g.panels || []).length;
+                    const ok = window.confirm(
+                      `اعمال تغییرات پنل‌های گروه «${g.name}» روی ساب همه کاربران؟\n` +
+                        `• پنل‌های فعلی گروه (${toFaDigits(n)}): کانفیگ ساخته/همگام می‌شود\n` +
+                        `• پنل‌های حذف‌شده: از پنل اصلی و ساب کاربران پاک می‌شود\n` +
+                        `اگر حجم کاربر تمام باشد، کانفیگ‌های جدید هم خاموش می‌مانند.`
+                    );
+                    if (ok) resyncGroup.mutate(g.id);
+                  }}
+                >
+                  <RefreshCw
+                    size={14}
+                    className={
+                      resyncGroup.isPending && resyncingGroupId === g.id
+                        ? "configs-spin"
+                        : undefined
+                    }
+                  />
+                  {resyncGroup.isPending && resyncingGroupId === g.id
+                    ? "در حال اعمال…"
+                    : "اعمال پنل‌ها روی ساب"}
+                </button>
                 <button
                   type="button"
                   className="btn ghost sm"

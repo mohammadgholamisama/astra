@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.api import (
+    analytics,
     api_keys,
     astra_outbounds,
     auth,
@@ -36,6 +37,7 @@ from app.models import config_location as _config_location_model  # noqa: F401
 from app.models import group_config as _group_config_model  # noqa: F401
 from app.models import group_config_hide as _group_config_hide_model  # noqa: F401
 from app.models import site_setting as _site_setting_model  # noqa: F401
+from app.models import user_analytics as _user_analytics_model  # noqa: F401
 from app.models.user import PanelAccount, User, UserStatus
 from app.core.config import get_settings
 from app.core.database import (
@@ -239,6 +241,36 @@ async def _usage_sync_loop() -> None:
         await asyncio.sleep(cooldown)
 
 
+async def _analytics_sample_loop() -> None:
+    """Every ~60s: snapshot raw (no-coeff) usage into hourly buckets + sessions."""
+    from app.core.database import AsyncSessionLocal, background_db_sem
+    from app.services import user_analytics as analytics_svc
+
+    await asyncio.sleep(20)
+    cycle = 0
+    while True:
+        try:
+            sem = background_db_sem()
+            await sem.acquire()
+            try:
+                stats = await analytics_svc.sample_all_users_once()
+            finally:
+                sem.release()
+            cycle += 1
+            if cycle == 1 or cycle % 30 == 0:
+                logger.info("analytics sample: %s", stats)
+            if cycle % 120 == 0:
+                async with AsyncSessionLocal() as db:
+                    pruned = await analytics_svc.prune_analytics(db)
+                    if any(pruned.values()):
+                        logger.info("analytics prune: %s", pruned)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("analytics sample loop failed")
+        await asyncio.sleep(60)
+
+
 def _resolve_frontend_dist() -> Path | None:
     """Locate built SPA (production install or local frontend/dist)."""
     candidates: list[Path] = []
@@ -288,6 +320,9 @@ async def lifespan(_app: FastAPI):
             logging.getLogger("astra").exception("order_kind boot task failed")
 
     usage_task = asyncio.create_task(_usage_sync_loop(), name="astra-usage-sync")
+    analytics_task = asyncio.create_task(
+        _analytics_sample_loop(), name="astra-analytics-sample"
+    )
     retry_errors_task = asyncio.create_task(
         _auto_retry_errors_loop(), name="astra-auto-retry-errors"
     )
@@ -302,12 +337,14 @@ async def lifespan(_app: FastAPI):
         yield
     finally:
         usage_task.cancel()
+        analytics_task.cancel()
         retry_errors_task.cancel()
         outbound_task.cancel()
         order_boot_task.cancel()
         pool_task.cancel()
         for task in (
             usage_task,
+            analytics_task,
             retry_errors_task,
             outbound_task,
             order_boot_task,
@@ -399,6 +436,7 @@ app.include_router(config_lookup.router)
 app.include_router(backup.router)
 app.include_router(subscription.router)
 app.include_router(system.router)
+app.include_router(analytics.router)
 
 
 @app.get("/health")

@@ -1,8 +1,9 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import {
+  Activity,
   AlertTriangle,
   BarChart3,
   Check,
@@ -294,6 +295,7 @@ export default function UsersPage() {
   const [open, setOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
   const [search, setSearch] = useState(() => searchParams.get("q")?.trim() || "");
   const [page, setPage] = useState(0);
   const [filter, setFilter] = useState<FilterKey>("all");
@@ -1833,6 +1835,22 @@ export default function UsersPage() {
                   <span className="user-actions-label">
                     <strong>مصرف گروه‌ها</strong>
                     <small>جمع حجم هر گروه با ضریب</small>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setMenuUser(null);
+                    navigate(`/analytics?u=${encodeURIComponent(u.username)}`);
+                  }}
+                >
+                  <span className="user-actions-ico">
+                    <Activity size={18} />
+                  </span>
+                  <span className="user-actions-label">
+                    <strong>تحلیل رفتار</strong>
+                    <small>سرعت، نشست، دستگاه و اینترنت ساب</small>
                   </span>
                 </button>
                 <button

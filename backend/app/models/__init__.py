@@ -10,6 +10,13 @@ from app.models.panel import Panel, PanelCategory, PanelType
 from app.models.site_setting import SiteSetting
 from app.models.template import UserTemplate
 from app.models.user import PanelAccount, PanelAccountStatus, User, UserStatus
+from app.models.user_analytics import (
+    SubClientProfile,
+    SubFetchEvent,
+    UsageHourBucket,
+    UsageSession,
+    UserUsageState,
+)
 
 __all__ = [
     "Admin",
@@ -33,4 +40,9 @@ __all__ = [
     "PanelAccountStatus",
     "User",
     "UserStatus",
+    "UserUsageState",
+    "UsageHourBucket",
+    "UsageSession",
+    "SubClientProfile",
+    "SubFetchEvent",
 ]

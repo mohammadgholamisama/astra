@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import {
+  Activity,
   BookOpen,
   DatabaseBackup,
   LayoutDashboard,
@@ -47,6 +48,7 @@ const navSections: NavSection[] = [
       { to: "/panels", label: "پنل‌ها", icon: Server },
       { to: "/groups", label: "گروه‌ها", icon: Layers },
       { to: "/users", label: "کاربران", icon: Users },
+      { to: "/analytics", label: "آمار کاربران", icon: Activity },
     ],
   },
   {
