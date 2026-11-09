@@ -8,6 +8,7 @@ import OutboundsPage from "./pages/OutboundsPage";
 import GroupsPage from "./pages/GroupsPage";
 import UsersPage from "./pages/UsersPage";
 import AnalyticsPage from "./pages/AnalyticsPage";
+import PanelAnalyticsPage from "./pages/PanelAnalyticsPage";
 import BackupPage from "./pages/BackupPage";
 import SettingsPage from "./pages/SettingsPage";
 import ConfigOrderPage from "./pages/ConfigOrderPage";
@@ -37,6 +38,7 @@ export default function App() {
         <Route path="groups" element={<GroupsPage />} />
         <Route path="users" element={<UsersPage />} />
         <Route path="analytics" element={<AnalyticsPage />} />
+        <Route path="panel-analytics" element={<PanelAnalyticsPage />} />
         <Route path="configs" element={<Navigate to="/config-order" replace />} />
         <Route path="config-order" element={<ConfigOrderPage />} />
         <Route path="config-lookup" element={<ConfigLookupPage />} />

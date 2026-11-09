@@ -17,6 +17,12 @@ from app.models.user_analytics import (
     UsageSession,
     UserUsageState,
 )
+from app.models.panel_analytics import (
+    PanelTestRun,
+    PanelUsageHourBucket,
+    PanelUsageState,
+    PanelUserTrafficState,
+)
 
 __all__ = [
     "Admin",
@@ -45,4 +51,8 @@ __all__ = [
     "UsageSession",
     "SubClientProfile",
     "SubFetchEvent",
+    "PanelUsageState",
+    "PanelUsageHourBucket",
+    "PanelUserTrafficState",
+    "PanelTestRun",
 ]

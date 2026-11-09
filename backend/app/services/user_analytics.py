@@ -518,6 +518,11 @@ async def record_sub_fetch(
     app = parse_client_app(ua)
     dkey = _device_key(app, ua)
     nkey = _network_key(ip)
+    from app.services.iran_operators import classify_operator
+    from app.services.panel_analytics import parse_device_brand
+
+    op_code = classify_operator(ip)
+    brand = parse_device_brand(ua)
     uid = int(user_id)
     now_m = time.monotonic()
     debounce_key = (uid, dkey)
@@ -550,6 +555,8 @@ async def record_sub_fetch(
                     client_app=app[:64],
                     user_agent=ua,
                     country=country,
+                    operator=op_code[:16],
+                    device_brand=brand[:32],
                 )
             )
             await _upsert_profile(
@@ -567,6 +574,24 @@ async def record_sub_fetch(
                 kind="network",
                 key=nkey,
                 label=nkey if nkey != "local" else "لوکال",
+                detail=ip,
+                now=now,
+            )
+            await _upsert_profile(
+                db,
+                uid,
+                kind="brand",
+                key=brand.lower()[:64],
+                label=brand,
+                detail=ua[:240] if ua else None,
+                now=now,
+            )
+            await _upsert_profile(
+                db,
+                uid,
+                kind="operator",
+                key=op_code[:64],
+                label=op_code,
                 detail=ip,
                 now=now,
             )

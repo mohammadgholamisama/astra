@@ -140,3 +140,7 @@ class SubFetchEvent(Base):
     client_app: Mapped[str] = mapped_column(String(64), default="")
     user_agent: Mapped[str] = mapped_column(String(400), default="")
     country: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # Best-effort: irancell|mci|rightel|other
+    operator: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Best-effort OEM / OS brand from UA
+    device_brand: Mapped[str | None] = mapped_column(String(32), nullable=True)

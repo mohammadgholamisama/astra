@@ -63,6 +63,8 @@ class PingRankItemIn(BaseModel):
     device_count: int = 0
     # Legacy field — ignored by apply_ping_rank (tests never auto-hide)
     fail_device_count: int = 0
+    # Optional per-operator samples from ping-hub (for panel analytics)
+    operator_pings: list[dict] | None = None
 
 
 class PingRankBody(BaseModel):

@@ -49,6 +49,7 @@ const navSections: NavSection[] = [
       { to: "/groups", label: "گروه‌ها", icon: Layers },
       { to: "/users", label: "کاربران", icon: Users },
       { to: "/analytics", label: "آمار کاربران", icon: Activity },
+      { to: "/panel-analytics", label: "آمار پنل‌ها", icon: Server },
     ],
   },
   {

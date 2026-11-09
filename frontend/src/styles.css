@@ -9878,3 +9878,26 @@ html[dir="rtl"] .configs-switch input:checked + .configs-switch-track::after,
   .an-hod span { display: none; }
   .an-hod-col:nth-child(3n) span { display: block; }
 }
+
+/* Panel analytics extras */
+.pan-dist { display: flex; flex-direction: column; gap: 8px; }
+.pan-dist-row { display: flex; flex-direction: column; gap: 4px; }
+.pan-dist-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 0.84rem;
+}
+.pan-bar-btn {
+  display: block;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: inherit;
+  padding: 0;
+  cursor: pointer;
+}
+.pan-bar-btn:hover .an-bar-track > i {
+  filter: brightness(1.15);
+}

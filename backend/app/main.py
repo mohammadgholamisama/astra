@@ -38,6 +38,7 @@ from app.models import group_config as _group_config_model  # noqa: F401
 from app.models import group_config_hide as _group_config_hide_model  # noqa: F401
 from app.models import site_setting as _site_setting_model  # noqa: F401
 from app.models import user_analytics as _user_analytics_model  # noqa: F401
+from app.models import panel_analytics as _panel_analytics_model  # noqa: F401
 from app.models.user import PanelAccount, User, UserStatus
 from app.core.config import get_settings
 from app.core.database import (
@@ -244,6 +245,7 @@ async def _usage_sync_loop() -> None:
 async def _analytics_sample_loop() -> None:
     """Every ~60s: snapshot raw (no-coeff) usage into hourly buckets + sessions."""
     from app.core.database import AsyncSessionLocal, background_db_sem
+    from app.services import panel_analytics as panel_analytics_svc
     from app.services import user_analytics as analytics_svc
 
     await asyncio.sleep(20)
@@ -254,16 +256,20 @@ async def _analytics_sample_loop() -> None:
             await sem.acquire()
             try:
                 stats = await analytics_svc.sample_all_users_once()
+                panel_stats = await panel_analytics_svc.sample_all_panels_once()
             finally:
                 sem.release()
             cycle += 1
             if cycle == 1 or cycle % 30 == 0:
-                logger.info("analytics sample: %s", stats)
+                logger.info("analytics sample: users=%s panels=%s", stats, panel_stats)
             if cycle % 120 == 0:
                 async with AsyncSessionLocal() as db:
                     pruned = await analytics_svc.prune_analytics(db)
-                    if any(pruned.values()):
-                        logger.info("analytics prune: %s", pruned)
+                    ppruned = await panel_analytics_svc.prune_panel_analytics(db)
+                    if any(pruned.values()) or any(ppruned.values()):
+                        logger.info(
+                            "analytics prune: users=%s panels=%s", pruned, ppruned
+                        )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001

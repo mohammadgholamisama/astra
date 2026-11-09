@@ -1,4 +1,4 @@
-"""Admin analytics: overview + per-user behavior dossier."""
+"""Admin analytics: overview + per-user / per-panel dossiers."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_admin
 from app.core.database import get_db
 from app.models.user import User
+from app.services import panel_analytics as panel_analytics_svc
 from app.services import user_analytics as analytics_svc
 
 router = APIRouter(tags=["Analytics"])
@@ -37,10 +38,32 @@ async def analytics_user(
     return await analytics_svc.build_user_analytics(db, user)
 
 
+@router.get("/api/analytics/panels")
+async def analytics_panels(
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """Overview of all panels: raw usage, online, operators, test quality."""
+    return await panel_analytics_svc.build_panel_overview(db)
+
+
+@router.get("/api/analytics/panels/{panel_id}")
+async def analytics_panel_detail(
+    panel_id: int,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    try:
+        return await panel_analytics_svc.build_panel_detail(db, panel_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="پنل پیدا نشد") from None
+
+
 @router.post("/api/analytics/sample-now")
 async def analytics_sample_now(
     _admin=Depends(get_current_admin),
 ):
     """Force one analytics sample cycle (admin/debug)."""
     stats = await analytics_svc.sample_all_users_once()
-    return {"ok": True, **stats}
+    panel_stats = await panel_analytics_svc.sample_all_panels_once()
+    return {"ok": True, "users": stats, "panels": panel_stats}

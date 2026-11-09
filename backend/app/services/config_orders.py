@@ -951,7 +951,22 @@ async def apply_ping_rank(
             row.device_count = int(devices.get(key) or 1)
     await db.commit()
     await refresh_cache(db)
-    return await list_workspace(db)
+    workspace = await list_workspace(db)
+    # Panel analytics: attribute this test cycle to each panel
+    try:
+        from app.services.panel_analytics import record_ping_rank_for_panels
+
+        await record_ping_rank_for_panels(
+            db, ranked, workspace_items=list(workspace.items)
+        )
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception("panel test analytics after ping-rank failed")
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+    return workspace
 
 
 async def seed_order_kind_from_folders_once(db: AsyncSession) -> int:
