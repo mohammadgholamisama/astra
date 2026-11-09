@@ -261,7 +261,7 @@ async def _analytics_sample_loop() -> None:
                 if cycle % 3 == 0:
                     live = await panel_analytics_svc.refresh_panel_analytics_fast(
                         tz_offset_min=0,
-                        budget_s=10.0,
+                        budget_s=5.5,
                     )
                     live_stats = (live or {}).get("stats") or {}
                     logger.info(

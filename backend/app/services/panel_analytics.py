@@ -29,6 +29,7 @@ _IDLE_STREAK_END = 3
 _HOUR_RETENTION_DAYS = 120
 _TEST_RETENTION_DAYS = 180
 _sample_lock = asyncio.Lock()
+_refresh_lock = asyncio.Lock()
 
 # "Really good" thresholds from ping-rank metrics
 _GOOD_PING_MS = 180.0
@@ -954,120 +955,152 @@ def _empty_panel_overview(*, tz_offset_min: int = 0) -> dict[str, Any]:
     }
 
 
+async def _quick_overview(
+    *,
+    tz_offset_min: int,
+    persist: bool,
+    timeout: float,
+) -> dict[str, Any]:
+    from app.core.database import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        return await asyncio.wait_for(
+            build_panel_overview(
+                db,
+                tz_offset_min=tz_offset_min,
+                sync_astra=False,
+                persist=persist,
+            ),
+            timeout=max(0.8, float(timeout)),
+        )
+
+
 async def refresh_panel_analytics_fast(
     *,
     tz_offset_min: int = 0,
-    budget_s: float = 10.0,
+    budget_s: float = 5.5,
 ) -> dict[str, Any]:
-    """«تازه‌سازی زنده» — parallel sync + flush + overview. Never hangs the UI."""
+    """«تازه‌سازی زنده» — hard-capped (~5s). Always returns an overview."""
     from app.core.database import AsyncSessionLocal
 
     t0 = time.monotonic()
+    budget = min(6.0, max(4.0, float(budget_s or 5.5)))
     astra_synced = 0
     bytes_hint = 0
     err: str | None = None
-    pre_live: dict[int, int] = {}
-    budget = max(6.0, float(budget_s or 10.0))
 
-    try:
-        async with AsyncSessionLocal() as db:
-            try:
-                pre = await asyncio.wait_for(
-                    live_panel_raw_and_weighted(db), timeout=1.5
-                )
-                pre_live = {pid: int(v["raw"]) for pid, v in pre.items()}
-                await asyncio.wait_for(
-                    ensure_panel_cursors_seeded(db, pre_live, now=_utc_now()),
-                    timeout=1.0,
-                )
-            except Exception:  # noqa: BLE001
-                logger.debug("fast refresh pre-seed failed", exc_info=True)
-
-            sync_budget = min(6.0, max(3.0, budget * 0.55))
-            try:
-                astra_synced = int(
-                    await asyncio.wait_for(
-                        sync_astra_panels_live(
-                            db,
-                            timeout_per_panel=2.0,
-                            rebuild_on_limit=False,
-                        ),
-                        timeout=sync_budget,
-                    )
-                    or 0
-                )
-            except Exception as exc:  # noqa: BLE001
-                err = f"sync:{type(exc).__name__}"
-                logger.debug("fast refresh astra sync failed", exc_info=True)
-
-            try:
-                post = await asyncio.wait_for(
-                    live_panel_raw_and_weighted(db), timeout=1.5
-                )
-                post_live = {pid: int(v["raw"]) for pid, v in post.items()}
-                bytes_hint = sum(
-                    max(0, int(post_live.get(pid, 0)) - int(pre_live.get(pid, 0)))
-                    for pid in set(pre_live) | set(post_live)
-                )
-                await asyncio.wait_for(
-                    flush_live_deltas_to_hours(db, post_live, now=_utc_now()),
-                    timeout=2.0,
-                )
-            except Exception as exc:  # noqa: BLE001
-                err = err or f"flush:{type(exc).__name__}"
-                logger.debug("fast refresh flush failed", exc_info=True)
-    except Exception as exc:  # noqa: BLE001
-        err = f"phase1:{type(exc).__name__}"
-        logger.exception("fast refresh phase1 failed")
-
-    # Best-effort sample (never waits on a busy lock)
-    try:
-        await sample_all_panels_once(force=False)
-    except Exception:  # noqa: BLE001
-        logger.debug("fast refresh sample skipped", exc_info=True)
-
-    overview: dict[str, Any] | None = None
-    try:
-        async with AsyncSessionLocal() as db:
-            remain = max(2.0, budget - (time.monotonic() - t0))
-            overview = await asyncio.wait_for(
-                build_panel_overview(
-                    db,
-                    tz_offset_min=tz_offset_min,
-                    sync_astra=False,
-                    persist=True,
-                ),
-                timeout=remain,
-            )
-    except Exception as exc:  # noqa: BLE001
-        err = f"overview:{type(exc).__name__}"
-        logger.exception("fast refresh overview failed")
+    # Another refresh already running — return a fast read so the UI never waits
+    if _refresh_lock.locked():
         try:
-            async with AsyncSessionLocal() as db:
-                overview = await asyncio.wait_for(
-                    build_panel_overview(
-                        db,
-                        tz_offset_min=tz_offset_min,
-                        sync_astra=False,
-                        persist=False,
-                    ),
-                    timeout=3.0,
-                )
+            overview = await _quick_overview(
+                tz_offset_min=tz_offset_min, persist=False, timeout=2.5
+            )
         except Exception:  # noqa: BLE001
             overview = _empty_panel_overview(tz_offset_min=tz_offset_min)
+        return {
+            "ok": True,
+            "stats": {
+                "astra_synced": 0,
+                "astra_only": True,
+                "users_pulled": 0,
+                "bytes_added": 0,
+                "ms": int((time.monotonic() - t0) * 1000),
+                "busy": 1,
+            },
+            "overview": overview,
+        }
 
-    return {
-        "ok": True,
-        "stats": {
-            "astra_synced": astra_synced,
-            "astra_only": True,
-            "users_pulled": 0,
-            "bytes_added": int(bytes_hint),
-            "ms": int((time.monotonic() - t0) * 1000),
-            "error": err,
-        },
-        "overview": overview or _empty_panel_overview(tz_offset_min=tz_offset_min),
-    }
+    async with _refresh_lock:
+        pre_live: dict[int, int] = {}
+        try:
+            async with AsyncSessionLocal() as db:
+                try:
+                    pre = await asyncio.wait_for(
+                        live_panel_raw_and_weighted(db), timeout=1.0
+                    )
+                    pre_live = {pid: int(v["raw"]) for pid, v in pre.items()}
+                    await asyncio.wait_for(
+                        ensure_panel_cursors_seeded(db, pre_live, now=_utc_now()),
+                        timeout=0.8,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug("fast refresh pre-seed failed", exc_info=True)
+
+                sync_budget = min(2.8, max(1.5, budget * 0.45))
+                try:
+                    astra_synced = int(
+                        await asyncio.wait_for(
+                            sync_astra_panels_live(
+                                db,
+                                timeout_per_panel=1.2,
+                                rebuild_on_limit=False,
+                            ),
+                            timeout=sync_budget,
+                        )
+                        or 0
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    err = f"sync:{type(exc).__name__}"
+                    logger.debug("fast refresh astra sync failed", exc_info=True)
+
+                try:
+                    post = await asyncio.wait_for(
+                        live_panel_raw_and_weighted(db), timeout=1.0
+                    )
+                    post_live = {pid: int(v["raw"]) for pid, v in post.items()}
+                    bytes_hint = sum(
+                        max(
+                            0,
+                            int(post_live.get(pid, 0)) - int(pre_live.get(pid, 0)),
+                        )
+                        for pid in set(pre_live) | set(post_live)
+                    )
+                    await asyncio.wait_for(
+                        flush_live_deltas_to_hours(
+                            db, post_live, now=_utc_now()
+                        ),
+                        timeout=1.2,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    err = err or f"flush:{type(exc).__name__}"
+                    logger.debug("fast refresh flush failed", exc_info=True)
+        except Exception as exc:  # noqa: BLE001
+            err = f"phase1:{type(exc).__name__}"
+            logger.exception("fast refresh phase1 failed")
+
+        overview: dict[str, Any] | None = None
+        remain = max(1.2, budget - (time.monotonic() - t0))
+        try:
+            # Persist marks so next GET shows the new hour — keep it short
+            overview = await _quick_overview(
+                tz_offset_min=tz_offset_min,
+                persist=True,
+                timeout=remain,
+            )
+        except Exception as exc:  # noqa: BLE001
+            err = err or f"overview:{type(exc).__name__}"
+            logger.debug("fast refresh overview persist failed", exc_info=True)
+            try:
+                overview = await _quick_overview(
+                    tz_offset_min=tz_offset_min,
+                    persist=False,
+                    timeout=2.0,
+                )
+            except Exception:  # noqa: BLE001
+                overview = _empty_panel_overview(tz_offset_min=tz_offset_min)
+
+        return {
+            "ok": True,
+            "stats": {
+                "astra_synced": astra_synced,
+                "astra_only": True,
+                "users_pulled": 0,
+                "bytes_added": int(bytes_hint),
+                "ms": int((time.monotonic() - t0) * 1000),
+                "error": err,
+            },
+            "overview": overview or _empty_panel_overview(tz_offset_min=tz_offset_min),
+        }
 
 
 async def prune_panel_analytics(db: AsyncSession) -> dict[str, int]:
@@ -1626,24 +1659,6 @@ async def build_panel_overview(
             bucket=max(bucket_h, from_bucket_h),
         )
         h = max(h, from_bucket_h)
-        # Backfill hour bucket if live−mark ran ahead of flushed bytes
-        if persist and st is not None and h > bucket_h:
-            try:
-                async with db.begin_nested():
-                    await _bump_panel_hour(
-                        db,
-                        pid,
-                        chart_hour,
-                        int(h - bucket_h),
-                        active_seconds=0,
-                        peak_bps=0.0,
-                        online_n=0,
-                    )
-                bucket_h = h
-                hour_map[pid] = h
-                marks_touched = True
-            except Exception:  # noqa: BLE001
-                logger.debug("reconcile hour bucket p=%s failed", pid, exc_info=True)
         d, new_d_ts, new_d_raw = _period_from_live_mark(
             live,
             mark_ts=mark_d_ts,

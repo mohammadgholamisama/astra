@@ -524,7 +524,7 @@ export default function PanelAnalyticsPage() {
     mutationFn: () =>
       api<{ ok: boolean; stats: Record<string, number>; overview: Overview }>(
         `/api/analytics/panels/refresh?tz_offset=${tz}`,
-        { method: "POST", timeoutMs: 14_000 }
+        { method: "POST", timeoutMs: 8_000 }
       ),
     onSuccess: (res) => {
       if (res.overview) {
@@ -536,16 +536,28 @@ export default function PanelAnalyticsPage() {
         void qc.invalidateQueries({ queryKey: ["analytics-panel", focusId] });
       }
     },
+    onError: () => {
+      // Timeout / network: still reload latest sampled overview so the page moves
+      void overview.refetch();
+      if (focusId != null) {
+        void qc.invalidateQueries({ queryKey: ["analytics-panel", focusId] });
+      }
+    },
   });
 
-  // Open fast via GET, then pull live Xray in the background (and every 3 min)
+  // Open fast via GET, then live-pull in background (and every 3 min)
   useEffect(() => {
+    let pending = false;
     const tick = () => {
-      if (document.visibilityState === "hidden") return;
-      if (liveRefresh.isPending) return;
-      liveRefresh.mutate();
+      if (document.visibilityState === "hidden" || pending) return;
+      pending = true;
+      liveRefresh.mutate(undefined, {
+        onSettled: () => {
+          pending = false;
+        },
+      });
     };
-    const boot = window.setTimeout(tick, 400);
+    const boot = window.setTimeout(tick, 300);
     const id = window.setInterval(tick, 3 * 60_000);
     return () => {
       window.clearTimeout(boot);
@@ -692,16 +704,13 @@ export default function PanelAnalyticsPage() {
               </span>
             ) : null}
           </div>
-          {liveRefresh.isError ? (
-            <p className="an-sub" style={{ color: "var(--danger)" }}>
-              تازه‌سازی ناموفق بود —{" "}
-              {(liveRefresh.error as Error)?.message || "دوباره تلاش کنید"}
-            </p>
-          ) : liveRefresh.isSuccess && liveRefresh.data?.stats ? (
+          {liveRefresh.isSuccess && liveRefresh.data?.stats ? (
             <p className="an-sub">
-              {liveRefresh.data.stats.error
-                ? "بروز شد (همگام‌سازی جزئی)"
-                : "بروز شد"}
+              {liveRefresh.data.stats.busy
+                ? "بروز شد"
+                : liveRefresh.data.stats.error
+                  ? "بروز شد (همگام‌سازی جزئی)"
+                  : "بروز شد"}
               {typeof liveRefresh.data.stats.ms === "number"
                 ? ` در ${toFaDigits(String(Math.round(Number(liveRefresh.data.stats.ms))))}ms`
                 : ""}
@@ -709,6 +718,10 @@ export default function PanelAnalyticsPage() {
               Number(liveRefresh.data.stats.bytes_added) > 0
                 ? ` · +${formatTraffic(Number(liveRefresh.data.stats.bytes_added))}`
                 : ""}
+            </p>
+          ) : liveRefresh.isError ? (
+            <p className="an-sub">
+              نمونهٔ ذخیره‌شده نشان داده شد — همگام‌سازی زنده طول کشید
             </p>
           ) : null}
         </div>

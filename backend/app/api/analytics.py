@@ -241,9 +241,9 @@ async def analytics_panels_refresh(
     try:
         return await asyncio.wait_for(
             panel_analytics_svc.refresh_panel_analytics_fast(
-                tz_offset_min=tz_offset, budget_s=10.0
+                tz_offset_min=tz_offset, budget_s=5.5
             ),
-            timeout=12.0,
+            timeout=7.0,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("panel analytics fast refresh failed: %s", exc)
@@ -256,7 +256,7 @@ async def analytics_panels_refresh(
                         sync_astra=False,
                         persist=False,
                     ),
-                    timeout=3.0,
+                    timeout=2.5,
                 )
         except Exception:  # noqa: BLE001
             overview = panel_analytics_svc._empty_panel_overview(
