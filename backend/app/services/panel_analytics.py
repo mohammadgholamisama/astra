@@ -514,17 +514,16 @@ async def _astra_client_raw_by_panel(db: AsyncSession) -> dict[int, int]:
         await db.execute(
             select(
                 AstraNodeClient.panel_id,
-                func.coalesce(
-                    func.sum(
-                        func.coalesce(AstraNodeClient.used_down, 0)
-                        + func.coalesce(AstraNodeClient.used_up, 0)
-                    ),
-                    0,
-                ),
-            ).group_by(AstraNodeClient.panel_id)
+                AstraNodeClient.used_down,
+                AstraNodeClient.used_up,
+            )
         )
     ).all()
-    return {int(pid): max(0, int(total or 0)) for pid, total in rows}
+    out: dict[int, int] = {}
+    for pid, down, up in rows:
+        pid_i = int(pid)
+        out[pid_i] = out.get(pid_i, 0) + max(0, int(down or 0)) + max(0, int(up or 0))
+    return out
 
 
 async def live_panel_raw_and_weighted(
@@ -889,15 +888,64 @@ async def refresh_panels_live(
     }
 
 
+def _empty_panel_overview(*, tz_offset_min: int = 0) -> dict[str, Any]:
+    """Minimal valid overview payload so the UI never breaks on refresh errors."""
+    now = _utc_now()
+    periods = _period_starts(now, tz_offset_min)
+    grid_hour = int(periods["grid_hour"])
+    g_start = grid_hour - 23 * 3600
+    return {
+        "generated_at": now.isoformat(),
+        "tz_offset_min": int(periods["tz_offset_min"]),
+        "show_online": False,
+        "online": {
+            "available": False,
+            "source": "none",
+            "total_online": 0,
+            "panel_online_total": 0,
+            "by_panel": [],
+            "operators": {},
+            "brands": {},
+        },
+        "totals": {
+            "raw_current": 0,
+            "weighted_current": 0,
+            "account_weighted": 0,
+            "raw_pending": 0,
+            "raw_hour": 0,
+            "weighted_hour": 0,
+            "raw_day": 0,
+            "weighted_day": 0,
+            "panels": 0,
+        },
+        "top": {"by_current": None, "by_hour": None, "by_day": None},
+        "top_day_panels": [],
+        "global_hourly": [
+            {
+                "hour_ts": g_start + i * 3600,
+                "raw_bytes": 0,
+                "weighted_bytes": 0,
+                "is_current": (g_start + i * 3600) == grid_hour,
+            }
+            for i in range(24)
+        ],
+        "hour_of_day": {"bytes": [0] * 24, "peak_hour": None, "peak_bytes": 0},
+        "panels": [],
+        "chart_hour_ts": grid_hour,
+        "chart_hour_end_ts": grid_hour + 3600,
+        "note": "آمار موقتاً در دسترس نبود — دوباره تازه‌سازی کنید.",
+    }
+
+
 async def refresh_panel_analytics_fast(
     *,
     tz_offset_min: int = 0,
     budget_s: float = 8.0,
 ) -> dict[str, Any]:
-    """«تازه‌سازی زنده» — must finish in a few seconds.
+    """«تازه‌سازی زنده» — always returns 200 with an overview.
 
-    Seed cursors → short Xray sync → flush current chart hour → overview.
-    Never samples all users/panels and never waits on remote HTTP.
+    Seed cursors → short Xray sync → flush → overview in a fresh session.
+    Never raises to the API layer.
     """
     from app.core.database import AsyncSessionLocal
 
@@ -905,46 +953,54 @@ async def refresh_panel_analytics_fast(
     astra_synced = 0
     bytes_hint = 0
     err: str | None = None
+    pre_live: dict[int, int] = {}
 
-    async with AsyncSessionLocal() as db:
-        pre_live: dict[int, int] = {}
-        try:
-            pre = await live_panel_raw_and_weighted(db)
-            pre_live = {pid: int(v["raw"]) for pid, v in pre.items()}
-            await ensure_panel_cursors_seeded(db, pre_live, now=_utc_now())
-        except Exception:  # noqa: BLE001
-            logger.debug("fast refresh pre-seed failed", exc_info=True)
+    # Phase 1: sync + flush (own session; failures are non-fatal)
+    try:
+        async with AsyncSessionLocal() as db:
+            try:
+                pre = await live_panel_raw_and_weighted(db)
+                pre_live = {pid: int(v["raw"]) for pid, v in pre.items()}
+                await ensure_panel_cursors_seeded(db, pre_live, now=_utc_now())
+            except Exception:  # noqa: BLE001
+                logger.debug("fast refresh pre-seed failed", exc_info=True)
 
-        # Hard cap: statsquery must not dominate the request
-        try:
-            astra_synced = int(
-                await asyncio.wait_for(
-                    sync_astra_panels_live(
-                        db,
-                        timeout_per_panel=2.5,
-                        rebuild_on_limit=False,
-                    ),
-                    timeout=3.5,
+            try:
+                astra_synced = int(
+                    await asyncio.wait_for(
+                        sync_astra_panels_live(
+                            db,
+                            timeout_per_panel=2.0,
+                            rebuild_on_limit=False,
+                        ),
+                        timeout=3.0,
+                    )
+                    or 0
                 )
-                or 0
-            )
-        except Exception as exc:  # noqa: BLE001
-            err = f"sync:{type(exc).__name__}"
-            logger.debug("fast refresh astra sync failed", exc_info=True)
+            except Exception as exc:  # noqa: BLE001
+                err = f"sync:{type(exc).__name__}"
+                logger.debug("fast refresh astra sync failed", exc_info=True)
 
-        try:
-            post = await live_panel_raw_and_weighted(db)
-            post_live = {pid: int(v["raw"]) for pid, v in post.items()}
-            bytes_hint = sum(
-                max(0, int(post_live.get(pid, 0)) - int(pre_live.get(pid, 0)))
-                for pid in set(pre_live) | set(post_live)
-            )
-            await flush_live_deltas_to_hours(db, post_live, now=_utc_now())
-        except Exception:  # noqa: BLE001
-            logger.debug("fast refresh flush failed", exc_info=True)
+            try:
+                post = await live_panel_raw_and_weighted(db)
+                post_live = {pid: int(v["raw"]) for pid, v in post.items()}
+                bytes_hint = sum(
+                    max(0, int(post_live.get(pid, 0)) - int(pre_live.get(pid, 0)))
+                    for pid in set(pre_live) | set(post_live)
+                )
+                await flush_live_deltas_to_hours(db, post_live, now=_utc_now())
+            except Exception as exc:  # noqa: BLE001
+                err = err or f"flush:{type(exc).__name__}"
+                logger.debug("fast refresh flush failed", exc_info=True)
+    except Exception as exc:  # noqa: BLE001
+        err = f"phase1:{type(exc).__name__}"
+        logger.exception("fast refresh phase1 failed")
 
-        # Already flushed — overview is read+marks only (no second Xray sync)
-        try:
+    # Phase 2: fresh session for overview (avoids dirty/aborted session state)
+    overview: dict[str, Any] | None = None
+    try:
+        async with AsyncSessionLocal() as db:
+            remain = max(1.5, float(budget_s) - (time.monotonic() - t0))
             overview = await asyncio.wait_for(
                 build_panel_overview(
                     db,
@@ -952,18 +1008,22 @@ async def refresh_panel_analytics_fast(
                     sync_astra=False,
                     persist=False,
                 ),
-                timeout=max(2.0, float(budget_s) - (time.monotonic() - t0)),
+                timeout=remain,
             )
-        except Exception as exc:  # noqa: BLE001
-            err = f"overview:{type(exc).__name__}"
-            logger.exception("fast refresh overview failed")
-            # Last resort: still try a bare overview without wait
-            overview = await build_panel_overview(
-                db,
-                tz_offset_min=tz_offset_min,
-                sync_astra=False,
-                persist=False,
-            )
+    except Exception as exc:  # noqa: BLE001
+        err = f"overview:{type(exc).__name__}"
+        logger.exception("fast refresh overview failed")
+        try:
+            async with AsyncSessionLocal() as db:
+                overview = await build_panel_overview(
+                    db,
+                    tz_offset_min=tz_offset_min,
+                    sync_astra=False,
+                    persist=False,
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception("fast refresh overview fallback failed")
+            overview = _empty_panel_overview(tz_offset_min=tz_offset_min)
 
     return {
         "ok": True,
@@ -975,7 +1035,7 @@ async def refresh_panel_analytics_fast(
             "ms": int((time.monotonic() - t0) * 1000),
             "error": err,
         },
-        "overview": overview,
+        "overview": overview or _empty_panel_overview(tz_offset_min=tz_offset_min),
     }
 
 
@@ -1484,14 +1544,14 @@ async def build_panel_overview(
     for p in panels:
         pid = int(p.id)
         st = states.get(pid)
-        if st is None:
+        if st is None and persist:
             st = await _get_or_create_panel_state(db, pid)
             states[pid] = st
             marks_touched = True
         live = int(live_totals.get(pid, 0))
         live_w = int(weighted_totals.get(pid, 0))
-        cursor = int(st.last_raw_total or 0)
-        seeded = bool(st.last_sample_at is not None)
+        cursor = int(st.last_raw_total or 0) if st else 0
+        seeded = bool(st and st.last_sample_at is not None)
         pending = _pending_bytes(live=live, cursor=cursor, seeded=seeded)
         bucket_h = int(hour_map.get(pid, 0))
         bucket_d = int(day_map.get(pid, 0))
@@ -1500,13 +1560,14 @@ async def build_panel_overview(
         d = _chart_hour_bytes(live=live, bucket=bucket_d, pending=pending)
         if d < h:
             d = h
-        # Keep watermarks aligned to the chart column so later live growth
-        # between flushes stays consistent (never seed mid-hour to full live).
-        st.period_hour_ts = chart_hour
-        st.period_hour_raw = max(0, live - h)
-        st.period_day_ts = day
-        st.period_day_raw = max(0, live - d)
-        marks_touched = True
+        # Only mutate watermarks when persisting — keeps refresh read-path safe
+        # against SQLite write locks / aborted sessions.
+        if persist:
+            st.period_hour_ts = chart_hour
+            st.period_hour_raw = max(0, live - h)
+            st.period_day_ts = day
+            st.period_day_raw = max(0, live - d)
+            marks_touched = True
         h_w = _scale_weighted(h, live, live_w)
         d_w = _scale_weighted(d, live, live_w)
         total_live += live
@@ -1540,7 +1601,7 @@ async def build_panel_overview(
                 },
                 "compare_hour_pct": None,
                 "tests": {
-                    "runs": int(getattr(st, "tests_total", 0) or 0),
+                    "runs": int(getattr(st, "tests_total", 0) or 0) if st else 0,
                     "configs_tested": 0,
                     "top100": 0,
                     "good": 0,
@@ -1551,7 +1612,7 @@ async def build_panel_overview(
             }
         )
 
-    if marks_touched:
+    if marks_touched and persist:
         try:
             await db.commit()
         except Exception:  # noqa: BLE001

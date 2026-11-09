@@ -231,8 +231,10 @@ async def analytics_panels_refresh(
     tz_offset: int = Query(0, ge=-840, le=840),
     _admin=Depends(get_current_admin),
 ):
-    """Fast Astra live refresh — hard-capped to a few seconds."""
+    """Fast Astra live refresh — always returns overview (never 500)."""
     import asyncio
+
+    from app.core.database import AsyncSessionLocal
 
     try:
         return await asyncio.wait_for(
@@ -241,10 +243,8 @@ async def analytics_panels_refresh(
             ),
             timeout=10.0,
         )
-    except asyncio.TimeoutError as exc:
-        # Never leave the UI hanging — return last known overview quickly
-        from app.core.database import AsyncSessionLocal
-
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("panel analytics fast refresh failed: %s", exc)
         try:
             async with AsyncSessionLocal() as db:
                 overview = await panel_analytics_svc.build_panel_overview(
@@ -253,28 +253,22 @@ async def analytics_panels_refresh(
                     sync_astra=False,
                     persist=False,
                 )
-            return {
-                "ok": True,
-                "stats": {
-                    "astra_synced": 0,
-                    "astra_only": True,
-                    "users_pulled": 0,
-                    "bytes_added": 0,
-                    "ms": 10000,
-                    "error": "timeout",
-                },
-                "overview": overview,
-            }
         except Exception:  # noqa: BLE001
-            raise HTTPException(
-                status_code=504,
-                detail="تازه‌سازی بیش از حد طول کشید — دوباره تلاش کنید",
-            ) from exc
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("panel analytics fast refresh failed")
-        raise HTTPException(
-            status_code=500, detail="خطا در تازه‌سازی آمار پنل‌ها"
-        ) from exc
+            overview = panel_analytics_svc._empty_panel_overview(
+                tz_offset_min=tz_offset
+            )
+        return {
+            "ok": True,
+            "stats": {
+                "astra_synced": 0,
+                "astra_only": True,
+                "users_pulled": 0,
+                "bytes_added": 0,
+                "ms": 0,
+                "error": type(exc).__name__,
+            },
+            "overview": overview,
+        }
 
 
 @router.get("/api/analytics/panels/{panel_id}")
