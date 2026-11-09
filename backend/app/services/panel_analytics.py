@@ -563,30 +563,84 @@ async def live_panel_totals(db: AsyncSession) -> dict[int, int]:
     return {pid: int(v["raw"]) for pid, v in usage.items()}
 
 
+async def sync_astra_panels_live(db: AsyncSession) -> int:
+    """Pull fresh Xray traffic into PanelAccount for all active Astra panels."""
+    from app.models.panel import PanelType
+    from app.services import astra_node as astra_node_svc
+
+    panels = list(
+        (
+            await db.execute(
+                select(Panel).where(
+                    Panel.type == PanelType.astra,
+                    Panel.is_active.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    updated = 0
+    for panel in panels:
+        try:
+            n = await astra_node_svc.sync_traffic_from_xray(db, panel)
+            updated += int(n or 0)
+        except Exception:  # noqa: BLE001
+            logger.debug("astra analytics sync panel=%s failed", panel.id, exc_info=True)
+    if panels:
+        try:
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            logger.debug("astra analytics sync commit failed", exc_info=True)
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+    return updated
+
+
 async def flush_live_deltas_to_hours(
     db: AsyncSession,
     live_totals: dict[int, int],
     *,
     now: datetime | None = None,
 ) -> int:
-    """Write unflushed live growth into hour buckets and advance cursors.
+    """Write unflushed live growth into the *current* hour bucket.
 
-    Called on every overview/refresh so the current hour bar is up to date
-    from Astra PanelAccount counters without waiting for the background loop.
+    Unlike the background sampler, catch-up after Xray sync is credited entirely
+    to the current hour — spreading a multi-hour idle gap would invent fake
+    traffic in empty past hours and under-count the active hour.
     """
     now = _as_utc(now) or _utc_now()
+    hour_ts = _hour_ts(now)
     touched = 0
     for pid, live in live_totals.items():
         try:
             async with db.begin_nested():
-                await apply_panel_raw_sample(
-                    db,
-                    int(pid),
-                    int(live),
-                    online_n=0,
-                    now=now,
-                )
-            touched += 1
+                state = await _get_or_create_panel_state(db, int(pid))
+                raw = max(0, int(live))
+                prev = int(state.last_raw_total or 0)
+                last_at = _as_utc(state.last_sample_at)
+                if last_at is None:
+                    # First seed: adopt baseline, do not dump lifetime into chart
+                    state.last_raw_total = raw
+                    state.last_sample_at = now
+                    touched += 1
+                    continue
+                delta = 0 if raw < prev else (raw - prev)
+                if delta > 0:
+                    await _bump_panel_hour(
+                        db,
+                        int(pid),
+                        hour_ts,
+                        delta,
+                        active_seconds=0,
+                        peak_bps=0.0,
+                        online_n=0,
+                    )
+                state.last_raw_total = raw
+                state.last_sample_at = now
+                touched += 1
         except Exception:  # noqa: BLE001
             logger.debug("flush live hour p=%s failed", pid, exc_info=True)
     if touched:
@@ -1105,18 +1159,27 @@ async def build_panel_overview(
     tz_off = int(periods["tz_offset_min"])
 
     panels = list((await db.execute(select(Panel).order_by(Panel.id.asc()))).scalars().all())
+    # 1) Fresh Astra Xray counters → PanelAccount (source of truth for this chart)
+    try:
+        await sync_astra_panels_live(db)
+    except Exception:  # noqa: BLE001
+        logger.debug("astra sync before panel overview failed", exc_info=True)
+
     states = {
         int(s.panel_id): s
         for s in (await db.execute(select(PanelUsageState))).scalars().all()
     }
-    # Live cumulative from our PanelAccount rows (raw + weighted with coeff)
+    # 2) Live cumulative from our PanelAccount rows (raw + weighted with coeff)
     usage_map = await live_panel_raw_and_weighted(db)
     live_totals = {pid: int(v["raw"]) for pid, v in usage_map.items()}
     weighted_totals = {pid: int(v["weighted"]) for pid, v in usage_map.items()}
-    # Materialize growth into hour buckets so «این ساعت» on the chart is live
+    # Ensure every panel id exists in maps
+    for p in panels:
+        live_totals.setdefault(int(p.id), 0)
+        weighted_totals.setdefault(int(p.id), 0)
+    # 3) Materialize full growth into hour buckets (current + catch-up hours)
     try:
         await flush_live_deltas_to_hours(db, live_totals, now=now)
-        # Reload states after cursor advance
         states = {
             int(s.panel_id): s
             for s in (await db.execute(select(PanelUsageState))).scalars().all()
@@ -1368,28 +1431,31 @@ async def build_panel_overview(
         w_by_ts[ts_i] = w_by_ts.get(ts_i, 0) + _scale_weighted(
             raw_i, live_r, live_w
         )
-    # Tiny residual pending (if flush skipped a panel) into current hour only
+    # Residual pending (flush miss) → current hour, full amount
     for r in rows:
         pending_i = max(0, int(r["raw"].get("pending") or 0))
         if pending_i <= 0:
             continue
         live_r = int(r["raw"].get("current_total") or 0)
         live_w = int((r.get("weighted") or {}).get("current_total") or 0)
-        safe_p = min(pending_i, max(8 * 1024 * 1024, int(live_r * 0.01)))
-        if safe_p <= 0:
-            continue
-        raw_by_ts[grid_hour] = raw_by_ts.get(grid_hour, 0) + safe_p
+        raw_by_ts[grid_hour] = raw_by_ts.get(grid_hour, 0) + pending_i
         w_by_ts[grid_hour] = w_by_ts.get(grid_hour, 0) + _scale_weighted(
-            safe_p, live_r, live_w
+            pending_i, live_r, live_w
         )
+
     global_hourly = []
     for i in range(24):
         ts = g_start + i * 3600
+        raw_i = int(raw_by_ts.get(ts, 0))
+        w_i = int(w_by_ts.get(ts, 0))
+        # Coeff >= 1 ⇒ weighted must not be below raw
+        if w_i < raw_i:
+            w_i = raw_i
         global_hourly.append(
             {
                 "hour_ts": ts,
-                "raw_bytes": int(raw_by_ts.get(ts, 0)),
-                "weighted_bytes": int(w_by_ts.get(ts, 0)),
+                "raw_bytes": raw_i,
+                "weighted_bytes": w_i,
                 "is_current": ts == grid_hour,
             }
         )
@@ -1498,10 +1564,31 @@ async def build_panel_detail(
     grid_hour = int(periods["grid_hour"])
     tz_off = int(periods["tz_offset_min"])
 
+    # Fresh Xray → accounts for Astra panels before reading totals / hourly
+    try:
+        from app.services import astra_node as astra_node_svc
+
+        if str(getattr(panel.type, "value", panel.type)) == "astra":
+            await astra_node_svc.sync_traffic_from_xray(db, panel)
+            await db.commit()
+    except Exception:  # noqa: BLE001
+        logger.debug("astra sync before panel detail failed", exc_info=True)
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+
     st = await _get_or_create_panel_state(db, int(panel_id))
     usage_map = await live_panel_raw_and_weighted(db)
     live_total = int(usage_map.get(int(panel_id), {}).get("raw", 0))
     live_weighted = int(usage_map.get(int(panel_id), {}).get("weighted", 0))
+    try:
+        await flush_live_deltas_to_hours(
+            db, {int(panel_id): live_total}, now=now
+        )
+        st = await _get_or_create_panel_state(db, int(panel_id))
+    except Exception:  # noqa: BLE001
+        logger.debug("flush before panel detail failed", exc_info=True)
     cursor = int(st.last_raw_total or 0)
     seeded = bool(st.last_sample_at is not None)
     pending = _pending_bytes(live=live_total, cursor=cursor, seeded=seeded)
