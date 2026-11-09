@@ -243,7 +243,7 @@ async def _usage_sync_loop() -> None:
 
 
 async def _analytics_sample_loop() -> None:
-    """Every ~60s: snapshot raw (no-coeff) usage into hourly buckets + sessions."""
+    """Every ~60s: snapshot usage; every ~3 min: live Astra sync into panel stats."""
     from app.core.database import AsyncSessionLocal, background_db_sem
     from app.services import panel_analytics as panel_analytics_svc
     from app.services import user_analytics as analytics_svc
@@ -257,6 +257,21 @@ async def _analytics_sample_loop() -> None:
             try:
                 stats = await analytics_svc.sample_all_users_once()
                 panel_stats = await panel_analytics_svc.sample_all_panels_once()
+                # Pull live Xray→Astra totals every ~3 minutes so «این ساعت» stays fresh
+                # even when nobody is on the analytics page.
+                if cycle % 3 == 0:
+                    live = await panel_analytics_svc.refresh_panel_analytics_fast(
+                        tz_offset_min=0,
+                        budget_s=8.0,
+                    )
+                    live_stats = (live or {}).get("stats") or {}
+                    if cycle == 0 or cycle % 30 == 0:
+                        logger.info(
+                            "analytics live refresh: astra=%s bytes=+%s ms=%s",
+                            live_stats.get("astra_synced"),
+                            live_stats.get("bytes_added"),
+                            live_stats.get("ms"),
+                        )
             finally:
                 sem.release()
             cycle += 1

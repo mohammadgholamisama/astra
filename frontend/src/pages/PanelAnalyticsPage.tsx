@@ -537,6 +537,18 @@ export default function PanelAnalyticsPage() {
     },
   });
 
+  // Auto live pull every 3 minutes while this page is open & visible
+  useEffect(() => {
+    const LIVE_MS = 3 * 60_000;
+    const id = window.setInterval(() => {
+      if (document.visibilityState === "hidden") return;
+      liveRefresh.mutate();
+    }, LIVE_MS);
+    return () => window.clearInterval(id);
+    // mutate is stable; re-arm only if tz changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tz]);
+
   const data = overview.data;
   const maxPanelTotal = useMemo(() => {
     if (!data?.panels?.length) return 1;
