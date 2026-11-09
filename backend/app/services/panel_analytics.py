@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -20,13 +19,13 @@ from app.models.panel_analytics import (
     PanelUserTrafficState,
 )
 from app.models.user import PanelAccount, PanelAccountStatus
-from app.models.user_analytics import SubClientProfile, SubFetchEvent, UserUsageState
-from app.services.iran_operators import classify_operator, operator_label
+from app.models.user_analytics import UserUsageState
 
 logger = logging.getLogger("astra.panel_analytics")
 
-_ONLINE_MIN_BYTES = 48 * 1024
-_IDLE_STREAK_END = 2
+# Any meaningful traffic growth between samples (~60s) marks the user online.
+_ONLINE_MIN_BYTES = 4 * 1024
+_IDLE_STREAK_END = 3
 _HOUR_RETENTION_DAYS = 120
 _TEST_RETENTION_DAYS = 180
 _sample_lock = asyncio.Lock()
@@ -35,28 +34,6 @@ _sample_lock = asyncio.Lock()
 _GOOD_PING_MS = 180.0
 _GOOD_STABILITY = 70.0
 _GOOD_PACKET_LOSS = 5.0
-
-_BRAND_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("iPhone", re.compile(r"iphone", re.I)),
-    ("iPad", re.compile(r"ipad", re.I)),
-    ("Samsung", re.compile(r"samsung|\bsm-[a-z0-9]+", re.I)),
-    ("Xiaomi", re.compile(r"xiaomi|\bredmi\b|\bpoco\b|\bmi\s?\d", re.I)),
-    ("Huawei", re.compile(r"huawei|\bhuawei|\balphabet", re.I)),
-    ("Honor", re.compile(r"\bhonor\b|\bhry-", re.I)),
-    ("OnePlus", re.compile(r"oneplus|\bop\d{2}", re.I)),
-    ("OPPO", re.compile(r"\boppo\b|\bcph\d+", re.I)),
-    ("vivo", re.compile(r"\bvivo\b", re.I)),
-    ("Realme", re.compile(r"realme", re.I)),
-    ("Nokia", re.compile(r"nokia", re.I)),
-    ("Google Pixel", re.compile(r"pixel", re.I)),
-    ("Sony", re.compile(r"sony|xperia", re.I)),
-    ("LG", re.compile(r"\blg[- ]", re.I)),
-    ("Motorola", re.compile(r"motorola|\bmoto\b", re.I)),
-    ("Windows", re.compile(r"windows nt|windows phone", re.I)),
-    ("macOS", re.compile(r"mac os x|macintosh", re.I)),
-    ("Linux", re.compile(r"linux(?!.*android)", re.I)),
-    ("Android", re.compile(r"android", re.I)),
-]
 
 
 def _utc_now() -> datetime:
@@ -209,16 +186,6 @@ def apply_live_period_marks(
     if d < h:
         d = h
     return int(h), int(d)
-
-
-def parse_device_brand(user_agent: str) -> str:
-    ua = (user_agent or "").strip()
-    if not ua:
-        return "نامشخص"
-    for name, pat in _BRAND_PATTERNS:
-        if pat.search(ua):
-            return name
-    return "سایر"
 
 
 def format_bps(bps: float) -> str:
@@ -453,7 +420,6 @@ async def _sample_panels_with_db(db: AsyncSession, *, now: datetime | None = Non
                     (
                         PanelAccountStatus.active,
                         PanelAccountStatus.error,
-                        PanelAccountStatus.pending,
                         PanelAccountStatus.deleted,
                     )
                 )
@@ -521,28 +487,119 @@ async def sample_all_panels_once(*, force: bool = False) -> dict[str, int]:
         return stats
 
 
-async def live_panel_totals(db: AsyncSession) -> dict[int, int]:
-    """Current Σ PanelAccount.used_traffic per panel (authoritative cumulative)."""
+async def live_panel_raw_and_weighted(
+    db: AsyncSession,
+) -> dict[int, dict[str, int]]:
+    """Σ raw and Σ (raw × group coefficient) per panel from our PanelAccount rows."""
+    from app.models.group import GroupPanel
+    from app.services.orchestrator import coefficient_from_config
+    from app.services.quota import norm_coeff, weighted_bytes
+
+    gp_rows = (
+        await db.execute(
+            select(GroupPanel.panel_id, GroupPanel.group_id, GroupPanel.config)
+        )
+    ).all()
+    claim: dict[tuple[int, int], float] = {}
+    panel_max: dict[int, float] = {}
+    for pid, gid, cfg in gp_rows:
+        c = float(coefficient_from_config(cfg if isinstance(cfg, dict) else {}))
+        claim[(int(pid), int(gid))] = c
+        panel_max[int(pid)] = max(float(panel_max.get(int(pid), 0.0)), c)
+
+    # Same statuses as User.used_traffic / dashboard (pending does not count)
     rows = (
         await db.execute(
             select(
                 PanelAccount.panel_id,
-                func.coalesce(func.sum(PanelAccount.used_traffic), 0),
-            )
-            .where(
+                PanelAccount.group_id,
+                PanelAccount.used_traffic,
+                PanelAccount.applied_coefficient,
+            ).where(
                 PanelAccount.status.in_(
                     (
                         PanelAccountStatus.active,
                         PanelAccountStatus.error,
-                        PanelAccountStatus.pending,
                         PanelAccountStatus.deleted,
                     )
                 )
             )
-            .group_by(PanelAccount.panel_id)
         )
     ).all()
-    return {int(pid): int(raw or 0) for pid, raw in rows}
+
+    out: dict[int, dict[str, int]] = {}
+    for pid, gid, raw, applied in rows:
+        pid_i = int(pid)
+        raw_i = max(0, int(raw or 0))
+        if applied is not None:
+            coeff = norm_coeff(applied)
+        elif gid is not None:
+            coeff = claim.get((pid_i, int(gid)), panel_max.get(pid_i, 1.0) or 1.0)
+        else:
+            coeff = panel_max.get(pid_i, 1.0) or 1.0
+        slot = out.setdefault(pid_i, {"raw": 0, "weighted": 0})
+        slot["raw"] += raw_i
+        slot["weighted"] += int(weighted_bytes(raw_i, coeff))
+    return out
+
+
+async def dashboard_weighted_total(db: AsyncSession) -> int:
+    """Σ User.used_traffic — same number as dashboard «ترافیک مصرفی»."""
+    from app.models.user import User
+
+    return int(
+        (
+            await db.execute(
+                select(func.coalesce(func.sum(User.used_traffic), 0))
+            )
+        ).scalar()
+        or 0
+    )
+
+
+async def live_panel_totals(db: AsyncSession) -> dict[int, int]:
+    """Current Σ PanelAccount.used_traffic per panel (authoritative cumulative)."""
+    usage = await live_panel_raw_and_weighted(db)
+    return {pid: int(v["raw"]) for pid, v in usage.items()}
+
+
+def _scale_weighted(raw_part: int, raw_total: int, weighted_total: int) -> int:
+    """Map a raw period slice to weighted using the panel's live raw→weighted ratio."""
+    r = max(0, int(raw_part or 0))
+    rt = max(0, int(raw_total or 0))
+    wt = max(0, int(weighted_total or 0))
+    if r <= 0 or rt <= 0:
+        return 0
+    return int(round(r * (wt / rt)))
+
+
+def _period_bytes_from_panel(
+    *,
+    live: int,
+    pending: int,
+    bucket: int,
+    watermark: int,
+) -> int:
+    """Hour/day from our sampled buckets (+safe pending), floored by live watermark.
+
+    Pending larger than a short sampling lag is ignored so a stale cursor cannot
+    dump lifetime bytes into «امروز» / «این ساعت».
+    """
+    live_i = max(0, int(live or 0))
+    if live_i <= 0:
+        return 0
+    bucket_i = max(0, int(bucket or 0))
+    pending_i = max(0, int(pending or 0))
+    # ~1–few minutes of lag, or 5% of live — never a multi-day backlog
+    pending_cap = max(
+        64 * 1024 * 1024,
+        bucket_i * 3,
+        int(live_i * 0.05),
+    )
+    safe_pending = min(pending_i, pending_cap)
+    from_buckets = min(bucket_i + safe_pending, live_i)
+    from_wm = min(max(0, int(watermark or 0)), live_i)
+    return max(from_buckets, from_wm)
 
 
 async def refresh_panels_live(*, pull_remotes: bool = True) -> dict[str, Any]:
@@ -905,7 +962,12 @@ async def _hour_rows_panel(
 
 
 async def _online_breakdown(db: AsyncSession) -> dict[str, Any]:
-    """Online users by panel, operator, device brand."""
+    """Online users by panel from Astra traffic cursors (not remote panel APIs).
+
+    Prefer per-panel ``PanelUserTrafficState.online_since``. Users only marked
+    online globally are attributed to the panel where they have the most raw
+    traffic. If nothing is marked online, ``available`` is false so UI can hide it.
+    """
     online_rows = list(
         (
             await db.execute(
@@ -923,89 +985,66 @@ async def _online_breakdown(db: AsyncSession) -> dict[str, Any]:
         by_panel.setdefault(int(r.panel_id), set()).add(int(r.user_id))
         online_uids.add(int(r.user_id))
 
-    # Global online (user-level) also counted
     global_online = {
         int(s.user_id)
         for s in (
             await db.execute(
                 select(UserUsageState).where(UserUsageState.online_since.is_not(None))
             )
-        ).scalars().all()
-    }
-    all_online = online_uids | global_online
-
-    # Last fetch meta per user
-    op_by_user: dict[int, str] = {}
-    brand_by_user: dict[int, str] = {}
-    if all_online:
-        # Latest sub fetch per user
-        events = (
-            await db.execute(
-                select(SubFetchEvent)
-                .where(SubFetchEvent.user_id.in_(list(all_online)))
-                .order_by(SubFetchEvent.ts.desc())
-            )
-        ).scalars().all()
-        for e in events:
-            uid = int(e.user_id)
-            if uid not in op_by_user:
-                op = getattr(e, "operator", None) or classify_operator(e.client_ip)
-                op_by_user[uid] = op
-            if uid not in brand_by_user:
-                brand = getattr(e, "device_brand", None) or parse_device_brand(
-                    e.user_agent or ""
-                )
-                brand_by_user[uid] = brand
-        # Brand profiles fallback
-        brands = (
-            await db.execute(
-                select(SubClientProfile).where(
-                    SubClientProfile.user_id.in_(list(all_online)),
-                    SubClientProfile.kind == "brand",
-                )
-            )
-        ).scalars().all()
-        for p in brands:
-            uid = int(p.user_id)
-            if uid not in brand_by_user:
-                brand_by_user[uid] = p.label or "نامشخص"
-
-    def _count_map(uids: set[int], mapping: dict[int, str], default: str) -> dict[str, int]:
-        out: dict[str, int] = {}
-        for uid in uids:
-            key = mapping.get(uid) or default
-            out[key] = out.get(key, 0) + 1
-        return out
-
-    panels_out = []
-    for pid, uids in sorted(by_panel.items(), key=lambda kv: -len(kv[1])):
-        op_c = _count_map(uids, op_by_user, "other")
-        panels_out.append(
-            {
-                "panel_id": pid,
-                "online": len(uids),
-                "operators": {
-                    code: {
-                        "count": n,
-                        "label": operator_label(code),
-                    }
-                    for code, n in sorted(op_c.items(), key=lambda x: -x[1])
-                },
-                "brands": _count_map(uids, brand_by_user, "نامشخص"),
-            }
         )
+        .scalars()
+        .all()
+    }
+    missing = global_online - online_uids
+    if missing:
+        acc_rows = (
+            await db.execute(
+                select(
+                    PanelAccount.user_id,
+                    PanelAccount.panel_id,
+                    PanelAccount.used_traffic,
+                ).where(
+                    PanelAccount.user_id.in_(list(missing)),
+                    PanelAccount.status.in_(
+                        (
+                            PanelAccountStatus.active,
+                            PanelAccountStatus.error,
+                            PanelAccountStatus.pending,
+                        )
+                    ),
+                )
+            )
+        ).all()
+        best: dict[int, tuple[int, int]] = {}
+        for uid, pid, raw in acc_rows:
+            uid_i, pid_i, raw_i = int(uid), int(pid), int(raw or 0)
+            prev = best.get(uid_i)
+            if prev is None or raw_i > prev[1]:
+                best[uid_i] = (pid_i, raw_i)
+        for uid_i, (pid_i, _) in best.items():
+            by_panel.setdefault(pid_i, set()).add(uid_i)
+            online_uids.add(uid_i)
 
-    global_ops = _count_map(all_online, op_by_user, "other")
-    global_brands = _count_map(all_online, brand_by_user, "نامشخص")
+    all_online = online_uids | global_online
+    panels_out = [
+        {
+            "panel_id": pid,
+            "online": len(uids),
+            "operators": {},
+            "brands": {},
+        }
+        for pid, uids in sorted(by_panel.items(), key=lambda kv: -len(kv[1]))
+    ]
+    total = len(all_online)
+    panel_slots = sum(len(v) for v in by_panel.values())
     return {
-        "total_online": len(all_online),
-        "panel_online_total": sum(len(v) for v in by_panel.values()),
+        "available": total > 0,
+        "source": "astra_traffic",
+        "total_online": total,
+        "panel_online_total": panel_slots,
         "by_panel": panels_out,
-        "operators": {
-            code: {"count": n, "label": operator_label(code)}
-            for code, n in sorted(global_ops.items(), key=lambda x: -x[1])
-        },
-        "brands": dict(sorted(global_brands.items(), key=lambda x: -x[1])),
+        "operators": {},
+        "brands": {},
     }
 
 
@@ -1032,8 +1071,10 @@ async def build_panel_overview(
         int(s.panel_id): s
         for s in (await db.execute(select(PanelUsageState))).scalars().all()
     }
-    # Live cumulative from accounts — always accurate even before hour buckets fill
-    live_totals = await live_panel_totals(db)
+    # Live cumulative from our PanelAccount rows (raw + weighted with coeff)
+    usage_map = await live_panel_raw_and_weighted(db)
+    live_totals = {pid: int(v["raw"]) for pid, v in usage_map.items()}
+    weighted_totals = {pid: int(v["weighted"]) for pid, v in usage_map.items()}
     accounts_by_panel: dict[int, int] = {}
     for pid, cnt in (
         await db.execute(
@@ -1057,6 +1098,8 @@ async def build_panel_overview(
     except Exception:  # noqa: BLE001
         logger.exception("panel online breakdown failed")
         online_info = {
+            "available": False,
+            "source": "none",
             "total_online": 0,
             "panel_online_total": 0,
             "by_panel": [],
@@ -1066,6 +1109,7 @@ async def build_panel_overview(
     online_by_pid = {
         int(x["panel_id"]): int(x["online"]) for x in online_info["by_panel"]
     }
+    show_online = bool(online_info.get("available"))
 
     # Batch period sums with overlap proration
     async def _batched_overlap(a: int, b: int) -> dict[int, int]:
@@ -1111,6 +1155,9 @@ async def build_panel_overview(
     total_hour = 0
     total_day = 0
     total_live = 0
+    total_weighted = 0
+    total_hour_w = 0
+    total_day_w = 0
     total_pending = 0
     marks_dirty = False
     for p in panels:
@@ -1121,22 +1168,42 @@ async def build_panel_overview(
             states[pid] = st
             marks_dirty = True
         live = int(live_totals.get(pid, 0))
+        live_w = int(weighted_totals.get(pid, 0))
         cursor = int(st.last_raw_total or 0)
         seeded = bool(st.last_sample_at is not None)
         pending = _pending_bytes(live=live, cursor=cursor, seeded=seeded)
-        # Authoritative hour/day from live watermarks (not poisoned hour buckets)
-        h, d = apply_live_period_marks(st, live, hour_ts=hour, day_ts=day)
+        wm_h, wm_d = apply_live_period_marks(st, live, hour_ts=hour, day_ts=day)
         marks_dirty = True
+        # Prefer our sampled hour buckets (+pending); watermark fills gaps
+        h = _period_bytes_from_panel(
+            live=live,
+            pending=pending,
+            bucket=int(hour_map.get(pid, 0)),
+            watermark=wm_h,
+        )
+        d = _period_bytes_from_panel(
+            live=live,
+            pending=pending,
+            bucket=int(day_map.get(pid, 0)),
+            watermark=wm_d,
+        )
+        if d < h:
+            d = h
+        h_w = _scale_weighted(h, live, live_w)
+        d_w = _scale_weighted(d, live, live_w)
         # Week/month still from buckets but never exceed live on panel
         w = min(int(week_map.get(pid, 0)) + pending, live)
         m = min(int(month_map.get(pid, 0)) + pending, live)
         # Bucket-based previous hour for compare only (clamped)
         prev_h = min(int(prev_hour_map.get(pid, 0)), live)
-        online_n = online_by_pid.get(pid, 0)
+        online_n = online_by_pid.get(pid, 0) if show_online else 0
         total_live += live
+        total_weighted += live_w
         total_pending += pending
         total_hour += h
         total_day += d
+        total_hour_w += h_w
+        total_day_w += d_w
         last_run = last_runs.get(pid)
         rows.append(
             {
@@ -1154,6 +1221,11 @@ async def build_panel_overview(
                     "week": w,
                     "month": m,
                     "lifetime_cursor": cursor,
+                },
+                "weighted": {
+                    "current_total": live_w,
+                    "hour": h_w,
+                    "day": d_w,
                 },
                 "compare_hour_pct": _pct_change(h, prev_h),
                 "tests": {
@@ -1221,27 +1293,52 @@ async def build_panel_overview(
     top_hour = _top_row("hour")
     top_day = _top_row("day")
 
-    # Global hourly 24h + pending into current UTC grid hour
+    # Global hourly 24h: scale each panel's sampled raw → weighted, then sum
     g_start = grid_hour - 23 * 3600
     g_rows = (
         await db.execute(
             select(
+                PanelUsageHourBucket.panel_id,
                 PanelUsageHourBucket.hour_ts,
-                func.coalesce(func.sum(PanelUsageHourBucket.raw_bytes), 0),
-            )
-            .where(PanelUsageHourBucket.hour_ts >= g_start)
-            .group_by(PanelUsageHourBucket.hour_ts)
-            .order_by(PanelUsageHourBucket.hour_ts.asc())
+                PanelUsageHourBucket.raw_bytes,
+            ).where(PanelUsageHourBucket.hour_ts >= g_start)
         )
     ).all()
-    g_map = {int(t): int(v or 0) for t, v in g_rows}
+    raw_by_ts: dict[int, int] = {}
+    w_by_ts: dict[int, int] = {}
+    for pid, ts, raw in g_rows:
+        ts_i = int(ts)
+        raw_i = max(0, int(raw or 0))
+        live_r = int(live_totals.get(int(pid), 0))
+        live_w = int(weighted_totals.get(int(pid), 0))
+        raw_by_ts[ts_i] = raw_by_ts.get(ts_i, 0) + raw_i
+        w_by_ts[ts_i] = w_by_ts.get(ts_i, 0) + _scale_weighted(
+            raw_i, live_r, live_w
+        )
+    # Unflushed growth into current grid hour (per panel, safely capped)
+    for r in rows:
+        pid = int(r["panel_id"])
+        live_r = int(r["raw"].get("current_total") or 0)
+        live_w = int((r.get("weighted") or {}).get("current_total") or 0)
+        pending_i = max(0, int(r["raw"].get("pending") or 0))
+        pending_cap = max(64 * 1024 * 1024, int(live_r * 0.05))
+        safe_p = min(pending_i, pending_cap)
+        if safe_p <= 0:
+            continue
+        raw_by_ts[grid_hour] = raw_by_ts.get(grid_hour, 0) + safe_p
+        w_by_ts[grid_hour] = w_by_ts.get(grid_hour, 0) + _scale_weighted(
+            safe_p, live_r, live_w
+        )
     global_hourly = []
     for i in range(24):
         ts = g_start + i * 3600
-        raw = g_map.get(ts, 0)
-        if i == 23:
-            raw += total_pending
-        global_hourly.append({"hour_ts": ts, "raw_bytes": raw})
+        global_hourly.append(
+            {
+                "hour_ts": ts,
+                "raw_bytes": int(raw_by_ts.get(ts, 0)),
+                "weighted_bytes": int(w_by_ts.get(ts, 0)),
+            }
+        )
 
     # Peak hour-of-day last 7d — client local clock
     heat_start = grid_hour - 7 * 86400
@@ -1272,15 +1369,35 @@ async def build_panel_overview(
         if int(r["raw"]["day"] or 0) > 0 or int(r["raw"]["current_total"] or 0) > 0
     ][:12]
 
+    # Authoritative weighted total = same as dashboard «ترافیک مصرفی»
+    try:
+        dash_weighted = await dashboard_weighted_total(db)
+    except Exception:  # noqa: BLE001
+        logger.exception("dashboard weighted total failed")
+        dash_weighted = total_weighted
+
     return {
         "generated_at": now.isoformat(),
         "tz_offset_min": tz_off,
-        "online": online_info,
+        "show_online": show_online,
+        "online": online_info if show_online else {
+            "available": False,
+            "source": "none",
+            "total_online": 0,
+            "panel_online_total": 0,
+            "by_panel": [],
+            "operators": {},
+            "brands": {},
+        },
         "totals": {
             "raw_current": total_live,
+            "weighted_current": int(dash_weighted),
+            "account_weighted": total_weighted,
             "raw_pending": total_pending,
             "raw_hour": total_hour,
+            "weighted_hour": total_hour_w,
             "raw_day": total_day,
+            "weighted_day": total_day_w,
             "panels": len(panels),
         },
         "top": {
@@ -1297,9 +1414,9 @@ async def build_panel_overview(
         },
         "panels": rows,
         "note": (
-            "مصرف فعلی = جمع خام اکانت‌ها. "
-            "این ساعت / امروز از اختلاف شمارنده زنده نسبت به ابتدای بازهٔ محلی است (دقیق). "
-            "نمودارها از نمونه‌برداری ساعتی‌اند."
+            "بدون ضریب = Σ خام اکانت‌های Astra. "
+            "با ضریب کل = همان «ترافیک مصرفی» داشبورد (Σ User.used_traffic). "
+            "نمودار ۲۴س با ضریب هر پنل از نمونه‌برداری Astra است."
         ),
     }
 
@@ -1328,12 +1445,13 @@ async def build_panel_detail(
     tz_off = int(periods["tz_offset_min"])
 
     st = await _get_or_create_panel_state(db, int(panel_id))
-    live_map = await live_panel_totals(db)
-    live_total = int(live_map.get(int(panel_id), 0))
+    usage_map = await live_panel_raw_and_weighted(db)
+    live_total = int(usage_map.get(int(panel_id), {}).get("raw", 0))
+    live_weighted = int(usage_map.get(int(panel_id), {}).get("weighted", 0))
     cursor = int(st.last_raw_total or 0)
     seeded = bool(st.last_sample_at is not None)
     pending = _pending_bytes(live=live_total, cursor=cursor, seeded=seeded)
-    cur_h, cur_d = apply_live_period_marks(
+    wm_h, wm_d = apply_live_period_marks(
         st, live_total, hour_ts=hour, day_ts=day
     )
     try:
@@ -1344,6 +1462,18 @@ async def build_panel_detail(
             await db.rollback()
         except Exception:  # noqa: BLE001
             pass
+    bucket_h = await _sum_panel_hours(db, panel_id, hour, hour_end)
+    bucket_d = await _sum_panel_hours(db, panel_id, day, day_end)
+    cur_h = _period_bytes_from_panel(
+        live=live_total, pending=pending, bucket=bucket_h, watermark=wm_h
+    )
+    cur_d = _period_bytes_from_panel(
+        live=live_total, pending=pending, bucket=bucket_d, watermark=wm_d
+    )
+    if cur_d < cur_h:
+        cur_d = cur_h
+    cur_h_w = _scale_weighted(cur_h, live_total, live_weighted)
+    cur_d_w = _scale_weighted(cur_d, live_total, live_weighted)
     prev_h = min(await _sum_panel_hours(db, panel_id, hour - 3600, hour), live_total)
     prev_d = min(await _sum_panel_hours(db, panel_id, day - 86400, day), live_total)
     cur_w = min(
@@ -1390,10 +1520,13 @@ async def build_panel_detail(
     peak_hod = max(range(24), key=lambda h: by_hod[h]) if any(by_hod) else None
 
     online_info = await _online_breakdown(db)
+    show_online = bool(online_info.get("available"))
     panel_online = next(
         (x for x in online_info["by_panel"] if int(x["panel_id"]) == int(panel_id)),
         {"online": 0, "operators": {}, "brands": {}},
     )
+    if not show_online:
+        panel_online = {"online": 0, "operators": {}, "brands": {}}
 
     tests = list(
         (
@@ -1434,21 +1567,30 @@ async def build_panel_detail(
         "type": getattr(panel.type, "value", panel.type),
         "is_active": bool(getattr(panel, "is_active", True)),
         "accounts": accounts_n,
+        "show_online": show_online,
         "online": panel_online,
         "tz_offset_min": tz_off,
         "lifetime_raw": cursor,
         "current_total": live_total,
+        "current_weighted": live_weighted,
         "pending_raw": pending,
+        "weighted": {
+            "current_total": live_weighted,
+            "hour": cur_h_w,
+            "day": cur_d_w,
+        },
         "compare": {
             "hour": {
                 "current": cur_h,
                 "previous": prev_h,
                 "change_pct": _pct_change(cur_h, prev_h),
+                "weighted": cur_h_w,
             },
             "day": {
                 "current": cur_d,
                 "previous": prev_d,
                 "change_pct": _pct_change(cur_d, prev_d),
+                "weighted": cur_d_w,
             },
             "week": {
                 "current": cur_w,
