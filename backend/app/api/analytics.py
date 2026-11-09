@@ -201,12 +201,12 @@ async def analytics_panels(
         except Exception:  # noqa: BLE001
             logger.debug("panel sample before overview failed", exc_info=True)
     try:
-        # Hard budget so the page never spins for minutes
+        # Hard budget: enough for Xray statsquery, never minutes
         return await asyncio.wait_for(
             panel_analytics_svc.build_panel_overview(
                 db, tz_offset_min=tz_offset, sync_astra=True, persist=True
             ),
-            timeout=12.0,
+            timeout=18.0,
         )
     except asyncio.TimeoutError as exc:
         logger.warning("build_panel_overview timed out")
@@ -238,9 +238,9 @@ async def analytics_panels_refresh(
     try:
         return await asyncio.wait_for(
             panel_analytics_svc.refresh_panel_analytics_fast(
-                tz_offset_min=tz_offset, budget_s=10.0
+                tz_offset_min=tz_offset, budget_s=18.0
             ),
-            timeout=14.0,
+            timeout=22.0,
         )
     except asyncio.TimeoutError as exc:
         raise HTTPException(

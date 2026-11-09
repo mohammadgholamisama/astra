@@ -501,7 +501,7 @@ export default function PanelAnalyticsPage() {
     queryKey: ["analytics-panels", tz],
     queryFn: () =>
       api<Overview>(`/api/analytics/panels?tz_offset=${tz}`, {
-        timeoutMs: 18_000,
+        timeoutMs: 25_000,
       }),
     refetchInterval: 45_000,
     refetchOnWindowFocus: true,
@@ -523,7 +523,7 @@ export default function PanelAnalyticsPage() {
     mutationFn: () =>
       api<{ ok: boolean; stats: Record<string, number>; overview: Overview }>(
         `/api/analytics/panels/refresh?tz_offset=${tz}`,
-        { method: "POST", timeoutMs: 20_000 }
+        { method: "POST", timeoutMs: 28_000 }
       ),
     onSuccess: (res) => {
       if (res.overview) {
@@ -686,9 +686,12 @@ export default function PanelAnalyticsPage() {
               {typeof liveRefresh.data.stats.ms === "number"
                 ? ` در ${toFaDigits(String(liveRefresh.data.stats.ms))}ms`
                 : ""}
-              {typeof liveRefresh.data.stats.astra_synced === "number"
-                ? ` · ${toFaDigits(String(liveRefresh.data.stats.astra_synced))} اکانت Astra`
-                : ""}
+              {typeof liveRefresh.data.stats.bytes_added === "number" &&
+              liveRefresh.data.stats.bytes_added > 0
+                ? ` · +${formatTraffic(Number(liveRefresh.data.stats.bytes_added))}`
+                : typeof liveRefresh.data.stats.astra_synced === "number"
+                  ? ` · ${toFaDigits(String(liveRefresh.data.stats.astra_synced))} اکانت`
+                  : ""}
             </p>
           ) : null}
         </div>

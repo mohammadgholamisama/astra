@@ -1372,9 +1372,15 @@ def _apply_xray_counter_delta(client: AstraNodeClient, xray_total: int) -> int:
     """
     xray_total = max(0, int(xray_total or 0))
     prev = client.stats_counter
+    base = int(client.used_down or 0) + int(client.used_up or 0)
     if prev is None:
-        # First sync after upgrade / new client: adopt baseline, keep cumulative.
+        # First sync: prime counter. If cumulative is still empty, adopt the
+        # live Xray reading so real usage is not thrown away as "baseline".
         client.stats_counter = xray_total
+        if base <= 0 and xray_total > 0:
+            client.used_down = xray_total
+            client.used_up = 0
+            return xray_total
         return 0
     prev_i = max(0, int(prev))
     if xray_total >= prev_i:
@@ -1385,7 +1391,6 @@ def _apply_xray_counter_delta(client: AstraNodeClient, xray_total: int) -> int:
     client.stats_counter = xray_total
     if delta <= 0:
         return 0
-    base = int(client.used_down or 0) + int(client.used_up or 0)
     client.used_down = base + delta
     client.used_up = 0
     return delta
@@ -1398,6 +1403,7 @@ async def _push_client_usage_to_accounts(
 
     Exact mirror (including shrink to 0 after reset). AstraNodeClient is the
     source of truth — never-shrink here made traffic resets look like no-ops.
+    Matches ``remote_username`` or the linked user.username (same as links).
     """
     if not by_email:
         return 0
@@ -1405,15 +1411,25 @@ async def _push_client_usage_to_accounts(
 
     accounts = (
         await db.execute(
-            select(PanelAccount).where(PanelAccount.panel_id == panel_id)
+            select(PanelAccount)
+            .where(PanelAccount.panel_id == panel_id)
+            .options(selectinload(PanelAccount.user))
         )
     ).scalars().all()
     n = 0
     for acc in accounts:
         email = (acc.remote_username or "").strip()
-        if not email or email not in by_email:
+        uname = ""
+        user = acc.__dict__.get("user")
+        if user is not None:
+            uname = (getattr(user, "username", None) or "").strip()
+        got: int | None = None
+        if email and email in by_email:
+            got = int(by_email[email])
+        elif uname and uname in by_email:
+            got = int(by_email[uname])
+        if got is None:
             continue
-        got = int(by_email[email])
         prev = int(acc.used_traffic or 0)
         if got != prev:
             acc.used_traffic = got
