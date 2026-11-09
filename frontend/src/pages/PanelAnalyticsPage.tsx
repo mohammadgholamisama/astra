@@ -501,12 +501,12 @@ export default function PanelAnalyticsPage() {
     queryKey: ["analytics-panels", tz],
     queryFn: () =>
       api<Overview>(`/api/analytics/panels?tz_offset=${tz}`, {
-        timeoutMs: 45_000,
+        timeoutMs: 18_000,
       }),
-    refetchInterval: 60_000,
-    refetchOnWindowFocus: false,
-    retry: 2,
-    staleTime: 10_000,
+    refetchInterval: 45_000,
+    refetchOnWindowFocus: true,
+    retry: 1,
+    staleTime: 8_000,
   });
 
   const detail = useQuery({
@@ -523,7 +523,7 @@ export default function PanelAnalyticsPage() {
     mutationFn: () =>
       api<{ ok: boolean; stats: Record<string, number>; overview: Overview }>(
         `/api/analytics/panels/refresh?tz_offset=${tz}`,
-        { method: "POST", timeoutMs: 180_000 }
+        { method: "POST", timeoutMs: 20_000 }
       ),
     onSuccess: (res) => {
       if (res.overview) {
@@ -677,7 +677,18 @@ export default function PanelAnalyticsPage() {
           </div>
           {liveRefresh.isError ? (
             <p className="an-sub" style={{ color: "var(--danger)" }}>
-              تازه‌سازی ناموفق بود — دوباره تلاش کنید
+              تازه‌سازی ناموفق بود —{" "}
+              {(liveRefresh.error as Error)?.message || "دوباره تلاش کنید"}
+            </p>
+          ) : liveRefresh.isSuccess && liveRefresh.data?.stats ? (
+            <p className="an-sub">
+              بروز شد
+              {typeof liveRefresh.data.stats.ms === "number"
+                ? ` در ${toFaDigits(String(liveRefresh.data.stats.ms))}ms`
+                : ""}
+              {typeof liveRefresh.data.stats.astra_synced === "number"
+                ? ` · ${toFaDigits(String(liveRefresh.data.stats.astra_synced))} اکانت Astra`
+                : ""}
             </p>
           ) : null}
         </div>

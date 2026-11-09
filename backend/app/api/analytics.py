@@ -193,15 +193,33 @@ async def analytics_panels(
     _admin=Depends(get_current_admin),
 ):
     """Overview of all panels: raw usage, online, operators, test quality."""
+    import asyncio
+
     if sample:
         try:
             await panel_analytics_svc.sample_all_panels_once(force=False)
         except Exception:  # noqa: BLE001
             logger.debug("panel sample before overview failed", exc_info=True)
     try:
-        return await panel_analytics_svc.build_panel_overview(
-            db, tz_offset_min=tz_offset, sync_astra=True
+        # Hard budget so the page never spins for minutes
+        return await asyncio.wait_for(
+            panel_analytics_svc.build_panel_overview(
+                db, tz_offset_min=tz_offset, sync_astra=True, persist=True
+            ),
+            timeout=12.0,
         )
+    except asyncio.TimeoutError as exc:
+        logger.warning("build_panel_overview timed out")
+        try:
+            # Fallback: read-only, no Xray — still show last known totals
+            return await panel_analytics_svc.build_panel_overview(
+                db, tz_offset_min=tz_offset, sync_astra=False, persist=False
+            )
+        except Exception as exc2:  # noqa: BLE001
+            logger.exception("build_panel_overview fallback failed")
+            raise HTTPException(
+                status_code=504, detail="آمار پنل‌ها طول کشید — دوباره تلاش کنید"
+            ) from exc2
     except Exception as exc:  # noqa: BLE001
         logger.exception("build_panel_overview failed")
         raise HTTPException(
@@ -214,20 +232,26 @@ async def analytics_panels_refresh(
     tz_offset: int = Query(0, ge=-840, le=840),
     _admin=Depends(get_current_admin),
 ):
-    """Live-pull remotes, resample analytics, return fresh overview."""
-    from app.core.database import AsyncSessionLocal
+    """Fast Astra live refresh for the panel stats page (seconds, not minutes)."""
+    import asyncio
 
-    stats = await panel_analytics_svc.refresh_panels_live(pull_remotes=True)
     try:
-        await analytics_svc.sample_all_users_once()
-    except Exception:  # noqa: BLE001
-        logger.debug("user sample after panel refresh failed", exc_info=True)
-    # Fresh session so we see commits from the live-pull session
-    async with AsyncSessionLocal() as db:
-        overview = await panel_analytics_svc.build_panel_overview(
-            db, tz_offset_min=tz_offset, sync_astra=True, persist=True
+        return await asyncio.wait_for(
+            panel_analytics_svc.refresh_panel_analytics_fast(
+                tz_offset_min=tz_offset, budget_s=10.0
+            ),
+            timeout=14.0,
         )
-    return {"ok": True, "stats": stats, "overview": overview}
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="تازه‌سازی بیش از حد طول کشید — دوباره تلاش کنید",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("panel analytics fast refresh failed")
+        raise HTTPException(
+            status_code=500, detail="خطا در تازه‌سازی آمار پنل‌ها"
+        ) from exc
 
 
 @router.get("/api/analytics/panels/{panel_id}")

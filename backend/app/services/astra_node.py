@@ -1422,13 +1422,22 @@ async def _push_client_usage_to_accounts(
 
 
 async def sync_traffic_from_xray(
-    db: AsyncSession, panel: Panel, *, timeout: float = 8.0
+    db: AsyncSession,
+    panel: Panel,
+    *,
+    timeout: float = 8.0,
+    rebuild_on_limit: bool = True,
 ) -> int:
-    """Pull per-email uplink+downlink from Xray StatsService and accumulate usage."""
+    """Pull per-email uplink+downlink from Xray StatsService and accumulate usage.
+
+    ``rebuild_on_limit=False`` skips config rebuild (analytics fast path) so a
+    quota flip cannot stall the stats API for minutes.
+    """
     api_port = int((panel.meta or {}).get("xray_api_port") or (10085 + int(panel.id)))
     xray_bin = os.environ.get("ASTRA_XRAY_BIN", "/usr/local/bin/xray")
     if not Path(xray_bin).is_file():
         return 0
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             xray_bin,
@@ -1454,6 +1463,11 @@ async def sync_traffic_from_xray(
         text = out_b.decode("utf-8", "replace")
     except Exception as exc:  # noqa: BLE001
         logger.debug("xray statsquery failed: %s", exc)
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
         return 0
 
     totals = _parse_xray_user_traffic(text)
@@ -1490,7 +1504,7 @@ async def sync_traffic_from_xray(
     except Exception:  # noqa: BLE001
         logger.debug("push client usage to accounts failed", exc_info=True)
     await db.flush()
-    if need_rebuild:
+    if need_rebuild and rebuild_on_limit:
         await rebuild_xray_config(db, panel)
     return updated
 

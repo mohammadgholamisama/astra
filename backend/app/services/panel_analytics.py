@@ -582,9 +582,16 @@ async def live_panel_totals(db: AsyncSession) -> dict[int, int]:
 
 
 async def sync_astra_panels_live(
-    db: AsyncSession, *, timeout_per_panel: float = 2.0
+    db: AsyncSession,
+    *,
+    timeout_per_panel: float = 2.0,
+    rebuild_on_limit: bool = False,
 ) -> int:
-    """Pull fresh Xray traffic into PanelAccount for all active Astra panels."""
+    """Pull fresh Xray traffic into PanelAccount for all active Astra panels.
+
+    Analytics path defaults ``rebuild_on_limit=False`` so quota flips never
+    stall the stats page behind an xray/nginx rebuild.
+    """
     from app.models.panel import PanelType
     from app.services import astra_node as astra_node_svc
 
@@ -603,22 +610,22 @@ async def sync_astra_panels_live(
     if not panels:
         return 0
 
-    async def _one(panel: Panel) -> int:
+    updated = 0
+    for panel in panels:
         try:
-            return int(
+            updated += int(
                 await astra_node_svc.sync_traffic_from_xray(
-                    db, panel, timeout=timeout_per_panel
+                    db,
+                    panel,
+                    timeout=timeout_per_panel,
+                    rebuild_on_limit=rebuild_on_limit,
                 )
                 or 0
             )
         except Exception:  # noqa: BLE001
-            logger.debug("astra analytics sync panel=%s failed", panel.id, exc_info=True)
-            return 0
-
-    # Sequential is safer on shared AsyncSession; keep each call short.
-    updated = 0
-    for panel in panels:
-        updated += await _one(panel)
+            logger.debug(
+                "astra analytics sync panel=%s failed", panel.id, exc_info=True
+            )
     try:
         await db.commit()
     except Exception:  # noqa: BLE001
@@ -725,14 +732,17 @@ def _period_bytes_from_panel(
     return max(from_buckets, from_wm)
 
 
-async def refresh_panels_live(*, pull_remotes: bool = True) -> dict[str, Any]:
-    """Pull fresh remote usage then resample all panel analytics.
+async def refresh_panels_live(
+    *,
+    pull_remotes: bool = False,
+    astra_only: bool = True,
+) -> dict[str, Any]:
+    """Refresh panel analytics sources.
 
-    Remote I/O runs outside the sample lock so the overview API never stalls
-    behind a long refresh.
+    Default is Astra-only (local Xray statsquery) — fast and accurate for the
+    panel stats page. Remote Marzban/etc pulls are opt-in and can take minutes.
     """
     from app.core.database import AsyncSessionLocal
-    from app.models.panel import PanelType
     from app.models.user import User
     from app.services.orchestrator import refresh_users_usage_batch
 
@@ -740,43 +750,17 @@ async def refresh_panels_live(*, pull_remotes: bool = True) -> dict[str, Any]:
     pulled = 0
     astra_synced = 0
 
-    if pull_remotes:
-        async with AsyncSessionLocal() as db:
-            # 1) Fast path: Astra node local stats
-            try:
-                from app.services import astra_node as astra_node_svc
+    async with AsyncSessionLocal() as db:
+        # 1) Fast path: Astra node local stats (always)
+        try:
+            astra_synced = await sync_astra_panels_live(
+                db, timeout_per_panel=1.2, rebuild_on_limit=False
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("astra bulk sync for analytics failed", exc_info=True)
 
-                astra_panels = list(
-                    (
-                        await db.execute(
-                            select(Panel).where(
-                                Panel.type == PanelType.astra,
-                                Panel.is_active.is_(True),
-                            )
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-                for panel in astra_panels:
-                    try:
-                        n = await astra_node_svc.sync_traffic_from_xray(
-                            db, panel, timeout=3.0
-                        )
-                        astra_synced += int(n or 0)
-                    except Exception:  # noqa: BLE001
-                        logger.debug(
-                            "astra sync panel=%s failed", panel.id, exc_info=True
-                        )
-                await db.commit()
-            except Exception:  # noqa: BLE001
-                logger.warning("astra bulk sync for analytics failed", exc_info=True)
-                try:
-                    await db.rollback()
-                except Exception:  # noqa: BLE001
-                    pass
-
-            # 2) Live-pull a capped set of users
+        # 2) Optional remote pull (slow) — disabled by default
+        if pull_remotes and not astra_only:
             try:
                 users = list(
                     (
@@ -785,7 +769,7 @@ async def refresh_panels_live(*, pull_remotes: bool = True) -> dict[str, Any]:
                             .join(PanelAccount, PanelAccount.user_id == User.id)
                             .distinct()
                             .order_by(User.id.desc())
-                            .limit(250)
+                            .limit(80)
                         )
                     )
                     .scalars()
@@ -793,14 +777,17 @@ async def refresh_panels_live(*, pull_remotes: bool = True) -> dict[str, Any]:
                     .all()
                 )
                 if users:
-                    await refresh_users_usage_batch(
-                        db,
-                        users,
-                        force=True,
-                        concurrency=12,
-                        push_remotes=False,
-                        quick=True,
-                        isolated=False,
+                    await asyncio.wait_for(
+                        refresh_users_usage_batch(
+                            db,
+                            users,
+                            force=True,
+                            concurrency=8,
+                            push_remotes=False,
+                            quick=True,
+                            isolated=False,
+                        ),
+                        timeout=12.0,
                     )
                     await db.commit()
                     pulled = len(users)
@@ -816,8 +803,89 @@ async def refresh_panels_live(*, pull_remotes: bool = True) -> dict[str, Any]:
         "ok": True,
         "users_pulled": pulled,
         "astra_synced": astra_synced,
+        "astra_only": bool(astra_only or not pull_remotes),
         **sample_stats,
         "ms": int((time.monotonic() - t0) * 1000),
+    }
+
+
+async def refresh_panel_analytics_fast(
+    *,
+    tz_offset_min: int = 0,
+    budget_s: float = 10.0,
+) -> dict[str, Any]:
+    """One-shot fast refresh for the admin «تازه‌سازی زنده» button.
+
+    Hard time budget: Astra Xray sync → flush current chart hour → overview.
+    Never pulls remote panels or samples every user (that hung for minutes).
+    """
+    from app.core.database import AsyncSessionLocal
+
+    t0 = time.monotonic()
+    deadline = t0 + max(3.0, float(budget_s))
+    astra_synced = 0
+    overview: dict[str, Any] | None = None
+    err: str | None = None
+
+    async with AsyncSessionLocal() as db:
+        remain = deadline - time.monotonic()
+        if remain > 0.4:
+            try:
+                astra_synced = int(
+                    await asyncio.wait_for(
+                        sync_astra_panels_live(
+                            db,
+                            timeout_per_panel=min(1.0, remain / 2),
+                            rebuild_on_limit=False,
+                        ),
+                        timeout=min(3.5, remain),
+                    )
+                    or 0
+                )
+            except Exception as exc:  # noqa: BLE001
+                err = f"sync:{type(exc).__name__}"
+                logger.debug("fast refresh astra sync failed", exc_info=True)
+
+        # Local panel sample (non-blocking if busy)
+        try:
+            await sample_all_panels_once(force=False)
+        except Exception:  # noqa: BLE001
+            logger.debug("fast refresh panel sample failed", exc_info=True)
+
+        remain = deadline - time.monotonic()
+        try:
+            if remain > 0.3:
+                overview = await asyncio.wait_for(
+                    build_panel_overview(
+                        db,
+                        tz_offset_min=tz_offset_min,
+                        sync_astra=False,
+                        persist=True,
+                    ),
+                    timeout=remain,
+                )
+            else:
+                overview = await build_panel_overview(
+                    db,
+                    tz_offset_min=tz_offset_min,
+                    sync_astra=False,
+                    persist=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            err = f"overview:{type(exc).__name__}"
+            logger.exception("fast refresh overview failed")
+            raise
+
+    return {
+        "ok": True,
+        "stats": {
+            "astra_synced": astra_synced,
+            "astra_only": True,
+            "users_pulled": 0,
+            "ms": int((time.monotonic() - t0) * 1000),
+            "error": err,
+        },
+        "overview": overview,
     }
 
 
@@ -1527,7 +1595,7 @@ async def build_panel_detail(
             from app.services import astra_node as astra_node_svc
 
             await astra_node_svc.sync_traffic_from_xray(
-                db, panel, timeout=1.5
+                db, panel, timeout=1.5, rebuild_on_limit=False
             )
             await db.commit()
             st = await _get_or_create_panel_state(db, int(panel_id))
