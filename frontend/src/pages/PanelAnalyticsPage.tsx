@@ -264,10 +264,9 @@ function HourlyUsageChart({
         ? hourValue(tip, mode)
         : 0;
   const tipIsNow = Boolean(tip?.is_current);
-  const hourRawHint =
+  const hourWeightedHint =
     currentHourRaw != null &&
     Number(currentHourRaw) > 0 &&
-    mode === "weighted" &&
     Math.abs(Number(currentHourRaw) - currentVal) > 1
       ? Number(currentHourRaw)
       : null;
@@ -288,8 +287,10 @@ function HourlyUsageChart({
           <span>این ساعت</span>
           <b>{formatTraffic(currentVal)}</b>
           <small>
-            از {clockLabel(series[currentIdx]?.hour_ts || 0)} تا الان
-            {hourRawHint != null ? ` · خام ${formatTraffic(hourRawHint)}` : ""}
+            از {clockLabel(series[currentIdx]?.hour_ts || 0)} تا الان · خام Astra
+            {hourWeightedHint != null
+              ? ` · با ضریب ${formatTraffic(hourWeightedHint)}`
+              : ""}
           </small>
         </div>
         <div>
@@ -500,12 +501,12 @@ export default function PanelAnalyticsPage() {
     queryKey: ["analytics-panels", tz],
     queryFn: () =>
       api<Overview>(`/api/analytics/panels?tz_offset=${tz}`, {
-        timeoutMs: 20_000,
+        timeoutMs: 45_000,
       }),
     refetchInterval: 60_000,
     refetchOnWindowFocus: false,
-    retry: 1,
-    staleTime: 15_000,
+    retry: 2,
+    staleTime: 10_000,
   });
 
   const detail = useQuery({
@@ -788,12 +789,16 @@ export default function PanelAnalyticsPage() {
             <HourlyUsageChart
               points={data.global_hourly || []}
               mode="weighted"
-              currentHourBytes={
-                data.totals?.weighted_hour != null
+              currentHourBytes={Number(data.totals?.raw_hour || 0)}
+              currentHourRaw={
+                data.totals?.weighted_hour != null &&
+                Math.abs(
+                  Number(data.totals.weighted_hour) -
+                    Number(data.totals?.raw_hour || 0)
+                ) > 1
                   ? Number(data.totals.weighted_hour)
-                  : Number(data.totals?.raw_hour || 0)
+                  : null
               }
-              currentHourRaw={Number(data.totals?.raw_hour || 0)}
             />
           </section>
 

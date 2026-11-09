@@ -348,6 +348,15 @@ async def apply_panel_raw_sample(
         state.peak_bps_at = now
     state.last_raw_total = raw
     state.last_sample_at = now
+    # Keep chart-hour watermark aligned with the sample cursor so overview
+    # never re-seeds mid-hour to the full lifetime total.
+    chart_h = _hour_ts(now)
+    if int(getattr(state, "period_hour_ts", 0) or 0) != chart_h:
+        state.period_hour_ts = chart_h
+        state.period_hour_raw = raw - delta if delta > 0 else raw
+    elif delta > 0:
+        # mark stays; implied hour bytes grow with live
+        pass
 
 
 async def apply_panel_user_sample(
@@ -1164,20 +1173,35 @@ async def _online_breakdown(db: AsyncSession) -> dict[str, Any]:
     }
 
 
+def _chart_hour_bytes(*, live: int, bucket: int, pending: int) -> int:
+    """Bytes for the current chart column (e.g. 19:30→now).
+
+    After a flush, ``pending`` is ~0 and ``bucket`` holds the column total.
+    Before flush, ``bucket + pending`` recovers unsampled live growth without
+    the aggressive caps used elsewhere for stale-cursor safety.
+    """
+    live_i = max(0, int(live or 0))
+    if live_i <= 0:
+        return 0
+    return min(live_i, max(0, int(bucket or 0)) + max(0, int(pending or 0)))
+
+
 async def build_panel_overview(
     db: AsyncSession,
     *,
     tz_offset_min: int = 0,
     sync_astra: bool = True,
-    persist: bool = False,
+    persist: bool = True,
 ) -> dict[str, Any]:
     """Panel analytics overview for the admin UI.
 
-    Always briefly syncs Astra/Xray (short timeout). «این ساعت» matches the
-    chart's current column: from ``grid_hour`` (e.g. 19:30 local in IR) until
-    now, via live PanelAccount − watermark. Day uses local midnight.
-    Pass ``persist=True`` after a full live refresh to also flush pending
-    deltas into the current chart hour bucket.
+    Flow for accurate «این ساعت» (= chart column start → now):
+      1) brief Astra/Xray sync into PanelAccount
+      2) flush live−cursor into the current chart-hour bucket
+      3) read that bucket as the hour total (not a mid-hour watermark seed)
+
+    Day uses local midnight buckets. ``persist=False`` skips the flush
+    (debug only) — default is always flush so the current column stays live.
     """
     now = _utc_now()
     periods = _period_starts(now, tz_offset_min)
@@ -1196,16 +1220,12 @@ async def build_panel_overview(
     if sync_astra:
         try:
             await asyncio.wait_for(
-                sync_astra_panels_live(db, timeout_per_panel=1.5),
-                timeout=3.5,
+                sync_astra_panels_live(db, timeout_per_panel=1.2),
+                timeout=2.8,
             )
         except Exception:  # noqa: BLE001
             logger.debug("astra sync before panel overview failed", exc_info=True)
 
-    states = {
-        int(s.panel_id): s
-        for s in (await db.execute(select(PanelUsageState))).scalars().all()
-    }
     try:
         usage_map = await live_panel_raw_and_weighted(db)
     except Exception:  # noqa: BLE001
@@ -1217,15 +1237,17 @@ async def build_panel_overview(
         live_totals.setdefault(int(p.id), 0)
         weighted_totals.setdefault(int(p.id), 0)
 
+    # Always credit unsampled live growth into the current chart column.
     if persist:
         try:
             await flush_live_deltas_to_hours(db, live_totals, now=now)
-            states = {
-                int(s.panel_id): s
-                for s in (await db.execute(select(PanelUsageState))).scalars().all()
-            }
         except Exception:  # noqa: BLE001
             logger.debug("flush live deltas before overview failed", exc_info=True)
+
+    states = {
+        int(s.panel_id): s
+        for s in (await db.execute(select(PanelUsageState))).scalars().all()
+    }
 
     accounts_by_panel: dict[int, int] = {
         int(pid): int(cnt or 0)
@@ -1246,7 +1268,7 @@ async def build_panel_overview(
         ).all()
     }
 
-    # Buckets: 24h chart + floors for current chart-hour / local day
+    # Buckets: 24h chart + current chart-hour / local day
     bucket_rows = (
         await db.execute(
             select(
@@ -1298,41 +1320,20 @@ async def build_panel_overview(
         cursor = int(st.last_raw_total or 0)
         seeded = bool(st.last_sample_at is not None)
         pending = _pending_bytes(live=live, cursor=cursor, seeded=seeded)
-        # «این ساعت» = chart column start (مثلاً ۱۹:۳۰) → الان
-        prev_hour_mark = int(getattr(st, "period_hour_ts", 0) or 0)
-        prev_day_mark = int(getattr(st, "period_day_ts", 0) or 0)
-        wm_h, wm_d = apply_live_period_marks(
-            st, live, hour_ts=chart_hour, day_ts=day
-        )
-        marks_touched = True
-        # On first seed / hour rollover, backdate mark so known bucket
-        # bytes since chart_hour are included immediately (not lost as 0).
         bucket_h = int(hour_map.get(pid, 0))
-        if prev_hour_mark != chart_hour and live > 0:
-            known_h = min(live, bucket_h + pending)
-            if known_h > 0:
-                st.period_hour_raw = max(0, live - known_h)
-                wm_h = known_h
         bucket_d = int(day_map.get(pid, 0))
-        if prev_day_mark != day and live > 0:
-            known_d = min(live, bucket_d + pending)
-            if known_d > 0:
-                st.period_day_raw = max(0, live - known_d)
-                wm_d = known_d
-        h = _period_bytes_from_panel(
-            live=live,
-            pending=pending,
-            bucket=bucket_h,
-            watermark=wm_h,
-        )
-        d = _period_bytes_from_panel(
-            live=live,
-            pending=pending,
-            bucket=bucket_d,
-            watermark=wm_d,
-        )
+        # Authoritative: flushed chart-hour bucket (+ residual pending)
+        h = _chart_hour_bytes(live=live, bucket=bucket_h, pending=pending)
+        d = _chart_hour_bytes(live=live, bucket=bucket_d, pending=pending)
         if d < h:
             d = h
+        # Keep watermarks aligned to the chart column so later live growth
+        # between flushes stays consistent (never seed mid-hour to full live).
+        st.period_hour_ts = chart_hour
+        st.period_hour_raw = max(0, live - h)
+        st.period_day_ts = day
+        st.period_day_raw = max(0, live - d)
+        marks_touched = True
         h_w = _scale_weighted(h, live, live_w)
         d_w = _scale_weighted(d, live, live_w)
         total_live += live
@@ -1387,9 +1388,9 @@ async def build_panel_overview(
             except Exception:  # noqa: BLE001
                 pass
 
-    # Chart current bar = authoritative local-hour totals (not UTC bucket+pending)
-    raw_by_ts[grid_hour] = max(int(raw_by_ts.get(grid_hour, 0)), int(total_hour))
-    w_by_ts[grid_hour] = max(int(w_by_ts.get(grid_hour, 0)), int(total_hour_w))
+    # Chart current bar must equal «این ساعت» totals
+    raw_by_ts[grid_hour] = int(total_hour)
+    w_by_ts[grid_hour] = int(total_hour_w)
 
     rows.sort(
         key=lambda r: (-int(r["raw"]["current_total"] or 0), r["name"])
@@ -1489,7 +1490,7 @@ async def build_panel_overview(
         "chart_hour_end_ts": chart_hour_end,
         "note": (
             "بدون ضریب = Σ خام اکانت‌های Astra. با ضریب = ترافیک مصرفی داشبورد. "
-            "«این ساعت» = از شروع ستون فعلی نمودار تا الان (شمارندهٔ زنده Astra)."
+            "«این ساعت» = باکت همان ستون نمودار (مثلاً ۱۹:۳۰) بعد از همگام‌سازی Xray."
         ),
     }
 
@@ -1539,26 +1540,30 @@ async def build_panel_detail(
         usage_map = {}
     live_total = int(usage_map.get(int(panel_id), {}).get("raw", 0))
     live_weighted = int(usage_map.get(int(panel_id), {}).get("weighted", 0))
+    try:
+        await flush_live_deltas_to_hours(
+            db, {int(panel_id): live_total}, now=now
+        )
+        st = await _get_or_create_panel_state(db, int(panel_id))
+    except Exception:  # noqa: BLE001
+        logger.debug("flush before panel detail failed", exc_info=True)
     cursor = int(st.last_raw_total or 0)
     seeded = bool(st.last_sample_at is not None)
     pending = _pending_bytes(live=live_total, cursor=cursor, seeded=seeded)
-    prev_hour_mark = int(getattr(st, "period_hour_ts", 0) or 0)
-    prev_day_mark = int(getattr(st, "period_day_ts", 0) or 0)
-    wm_h, wm_d = apply_live_period_marks(
-        st, live_total, hour_ts=hour, day_ts=day
-    )
     bucket_h = await _sum_panel_hours(db, panel_id, hour, hour_end)
     bucket_d = await _sum_panel_hours(db, panel_id, day, day_end)
-    if prev_hour_mark != hour and live_total > 0:
-        known_h = min(live_total, bucket_h + pending)
-        if known_h > 0:
-            st.period_hour_raw = max(0, live_total - known_h)
-            wm_h = known_h
-    if prev_day_mark != day and live_total > 0:
-        known_d = min(live_total, bucket_d + pending)
-        if known_d > 0:
-            st.period_day_raw = max(0, live_total - known_d)
-            wm_d = known_d
+    cur_h = _chart_hour_bytes(
+        live=live_total, bucket=bucket_h, pending=pending
+    )
+    cur_d = _chart_hour_bytes(
+        live=live_total, bucket=bucket_d, pending=pending
+    )
+    if cur_d < cur_h:
+        cur_d = cur_h
+    st.period_hour_ts = hour
+    st.period_hour_raw = max(0, live_total - cur_h)
+    st.period_day_ts = day
+    st.period_day_raw = max(0, live_total - cur_d)
     try:
         await db.commit()
     except Exception:  # noqa: BLE001
@@ -1567,14 +1572,6 @@ async def build_panel_detail(
             await db.rollback()
         except Exception:  # noqa: BLE001
             pass
-    cur_h = _period_bytes_from_panel(
-        live=live_total, pending=pending, bucket=bucket_h, watermark=wm_h
-    )
-    cur_d = _period_bytes_from_panel(
-        live=live_total, pending=pending, bucket=bucket_d, watermark=wm_d
-    )
-    if cur_d < cur_h:
-        cur_d = cur_h
     cur_h_w = _scale_weighted(cur_h, live_total, live_weighted)
     cur_d_w = _scale_weighted(cur_d, live_total, live_weighted)
     prev_h = min(await _sum_panel_hours(db, panel_id, hour - 3600, hour), live_total)
