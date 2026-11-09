@@ -476,21 +476,22 @@ export default function PanelAnalyticsPage() {
     queryKey: ["analytics-panels", tz],
     queryFn: () =>
       api<Overview>(`/api/analytics/panels?tz_offset=${tz}`, {
-        timeoutMs: 45_000,
+        timeoutMs: 20_000,
       }),
-    refetchInterval: 45_000,
-    refetchOnWindowFocus: true,
+    refetchInterval: 60_000,
+    refetchOnWindowFocus: false,
     retry: 1,
+    staleTime: 15_000,
   });
 
   const detail = useQuery({
     queryKey: ["analytics-panel", focusId, tz],
     queryFn: () =>
       api<Detail>(`/api/analytics/panels/${focusId}?tz_offset=${tz}`, {
-        timeoutMs: 45_000,
+        timeoutMs: 20_000,
       }),
     enabled: focusId != null,
-    refetchInterval: focusId != null ? 45_000 : false,
+    refetchInterval: false,
   });
 
   const liveRefresh = useMutation({
@@ -510,18 +511,6 @@ export default function PanelAnalyticsPage() {
       }
     },
   });
-
-  // After fast overview paints, refresh live Xray/remotes in background once
-  useEffect(() => {
-    if (!overview.isSuccess || liveRefresh.isPending || liveRefresh.isSuccess) {
-      return;
-    }
-    const t = window.setTimeout(() => {
-      liveRefresh.mutate();
-    }, 400);
-    return () => window.clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [overview.isSuccess]);
 
   const data = overview.data;
   const maxPanelTotal = useMemo(() => {

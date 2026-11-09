@@ -225,7 +225,7 @@ async def analytics_panels_refresh(
     # Fresh session so we see commits from the live-pull session
     async with AsyncSessionLocal() as db:
         overview = await panel_analytics_svc.build_panel_overview(
-            db, tz_offset_min=tz_offset
+            db, tz_offset_min=tz_offset, persist=True
         )
     return {"ok": True, "stats": stats, "overview": overview}
 

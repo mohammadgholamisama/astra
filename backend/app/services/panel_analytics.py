@@ -1154,30 +1154,28 @@ async def build_panel_overview(
     *,
     tz_offset_min: int = 0,
     sync_astra: bool = False,
+    persist: bool = False,
 ) -> dict[str, Any]:
-    """Build panel analytics overview.
+    """Fast panel analytics overview for the admin UI.
 
-    Keep ``sync_astra=False`` on plain GET — Xray statsquery can hang the page.
-    Live refresh already syncs Astra before calling this with fresh account rows.
+    Default GET path is read-only and cheap (no Xray, no flush, no online/tests).
+    Pass ``persist=True`` after live refresh to write pending deltas into the
+    current hour bucket.
     """
     now = _utc_now()
     periods = _period_starts(now, tz_offset_min)
-    hour = int(periods["hour"])
-    hour_end = int(periods["hour_end"])
     day = int(periods["day"])
     day_end = int(periods["day_end"])
-    week = int(periods["week"])
-    week_end = int(periods["week_end"])
-    month = int(periods["month"])
-    next_month_ts = int(periods["next_month"])
     grid_hour = int(periods["grid_hour"])
     tz_off = int(periods["tz_offset_min"])
+    g_start = grid_hour - 23 * 3600
 
-    panels = list((await db.execute(select(Panel).order_by(Panel.id.asc()))).scalars().all())
-    # Optional short Astra sync (only when caller asks — never block default GET)
+    panels = list(
+        (await db.execute(select(Panel).order_by(Panel.id.asc()))).scalars().all()
+    )
     if sync_astra:
         try:
-            await asyncio.wait_for(sync_astra_panels_live(db), timeout=6.0)
+            await asyncio.wait_for(sync_astra_panels_live(db), timeout=4.0)
         except Exception:  # noqa: BLE001
             logger.debug("astra sync before panel overview failed", exc_info=True)
 
@@ -1185,7 +1183,6 @@ async def build_panel_overview(
         int(s.panel_id): s
         for s in (await db.execute(select(PanelUsageState))).scalars().all()
     }
-    # Live cumulative from PanelAccount rows (raw + weighted with coeff)
     try:
         usage_map = await live_panel_raw_and_weighted(db)
     except Exception:  # noqa: BLE001
@@ -1196,137 +1193,87 @@ async def build_panel_overview(
     for p in panels:
         live_totals.setdefault(int(p.id), 0)
         weighted_totals.setdefault(int(p.id), 0)
-    # Materialize growth into current hour bucket (DB-only, fast)
-    try:
-        await flush_live_deltas_to_hours(db, live_totals, now=now)
-        states = {
-            int(s.panel_id): s
-            for s in (await db.execute(select(PanelUsageState))).scalars().all()
-        }
-    except Exception:  # noqa: BLE001
-        logger.debug("flush live deltas before overview failed", exc_info=True)
-    accounts_by_panel: dict[int, int] = {}
-    for pid, cnt in (
-        await db.execute(
-            select(PanelAccount.panel_id, func.count())
-            .where(
-                PanelAccount.status.in_(
-                    (
-                        PanelAccountStatus.active,
-                        PanelAccountStatus.error,
-                        PanelAccountStatus.pending,
+
+    if persist:
+        try:
+            await flush_live_deltas_to_hours(db, live_totals, now=now)
+            states = {
+                int(s.panel_id): s
+                for s in (await db.execute(select(PanelUsageState))).scalars().all()
+            }
+        except Exception:  # noqa: BLE001
+            logger.debug("flush live deltas before overview failed", exc_info=True)
+
+    accounts_by_panel: dict[int, int] = {
+        int(pid): int(cnt or 0)
+        for pid, cnt in (
+            await db.execute(
+                select(PanelAccount.panel_id, func.count())
+                .where(
+                    PanelAccount.status.in_(
+                        (
+                            PanelAccountStatus.active,
+                            PanelAccountStatus.error,
+                            PanelAccountStatus.pending,
+                        )
                     )
                 )
-            )
-            .group_by(PanelAccount.panel_id)
-        )
-    ).all():
-        accounts_by_panel[int(pid)] = int(cnt or 0)
-
-    try:
-        online_info = await _online_breakdown(db)
-    except Exception:  # noqa: BLE001
-        logger.exception("panel online breakdown failed")
-        online_info = {
-            "available": False,
-            "source": "none",
-            "total_online": 0,
-            "panel_online_total": 0,
-            "by_panel": [],
-            "operators": {},
-            "brands": {},
-        }
-    online_by_pid = {
-        int(x["panel_id"]): int(x["online"]) for x in online_info["by_panel"]
-    }
-    show_online = bool(online_info.get("available"))
-
-    # Batch period sums with overlap proration
-    async def _batched_overlap(a: int, b: int) -> dict[int, int]:
-        lo = _align_down_hour(a)
-        hi = _align_up_hour(b)
-        rows_q = (
-            await db.execute(
-                select(
-                    PanelUsageHourBucket.panel_id,
-                    PanelUsageHourBucket.hour_ts,
-                    PanelUsageHourBucket.raw_bytes,
-                ).where(
-                    PanelUsageHourBucket.hour_ts >= lo,
-                    PanelUsageHourBucket.hour_ts < hi,
-                )
+                .group_by(PanelAccount.panel_id)
             )
         ).all()
-        out: dict[int, int] = {}
-        for pid, ts, raw in rows_q:
-            out[int(pid)] = out.get(int(pid), 0) + _overlap_bytes(
-                int(ts), int(raw or 0), a, b
-            )
-        return out
+    }
 
-    hour_map = await _batched_overlap(hour, hour_end)
-    prev_hour_map = await _batched_overlap(hour - 3600, hour)
-    day_map = await _batched_overlap(day, day_end)
-    week_map = await _batched_overlap(week, week_end)
-    month_map = await _batched_overlap(month, next_month_ts)
-
-    # Latest test run per panel (recent rows only)
-    last_runs: dict[int, PanelTestRun] = {}
-    for tr in (
+    # One bucket query covers 24h chart + today's rough sum
+    bucket_rows = (
         await db.execute(
-            select(PanelTestRun).order_by(PanelTestRun.ts.desc()).limit(800)
+            select(
+                PanelUsageHourBucket.panel_id,
+                PanelUsageHourBucket.hour_ts,
+                PanelUsageHourBucket.raw_bytes,
+            ).where(
+                PanelUsageHourBucket.hour_ts >= min(g_start, day),
+                PanelUsageHourBucket.hour_ts <= grid_hour,
+            )
         )
-    ).scalars().all():
-        pid = int(tr.panel_id)
-        if pid not in last_runs:
-            last_runs[pid] = tr
+    ).all()
+    day_map: dict[int, int] = {}
+    hour_map: dict[int, int] = {}
+    raw_by_ts: dict[int, int] = {g_start + i * 3600: 0 for i in range(24)}
+    w_by_ts: dict[int, int] = {g_start + i * 3600: 0 for i in range(24)}
+    for pid, ts, raw in bucket_rows:
+        pid_i, ts_i, raw_i = int(pid), int(ts), max(0, int(raw or 0))
+        live_r = int(live_totals.get(pid_i, 0))
+        live_w = int(weighted_totals.get(pid_i, 0))
+        if day <= ts_i < day_end:
+            day_map[pid_i] = day_map.get(pid_i, 0) + raw_i
+        if ts_i == grid_hour:
+            hour_map[pid_i] = hour_map.get(pid_i, 0) + raw_i
+        if ts_i in raw_by_ts:
+            raw_by_ts[ts_i] += raw_i
+            w_by_ts[ts_i] += _scale_weighted(raw_i, live_r, live_w)
 
-    rows = []
-    total_hour = 0
-    total_day = 0
+    rows: list[dict[str, Any]] = []
     total_live = 0
     total_weighted = 0
+    total_pending = 0
+    total_hour = 0
+    total_day = 0
     total_hour_w = 0
     total_day_w = 0
-    total_pending = 0
-    marks_dirty = False
     for p in panels:
         pid = int(p.id)
         st = states.get(pid)
-        if st is None:
-            st = await _get_or_create_panel_state(db, pid)
-            states[pid] = st
-            marks_dirty = True
         live = int(live_totals.get(pid, 0))
         live_w = int(weighted_totals.get(pid, 0))
-        cursor = int(st.last_raw_total or 0)
-        seeded = bool(st.last_sample_at is not None)
+        cursor = int(st.last_raw_total or 0) if st else 0
+        seeded = bool(st and st.last_sample_at is not None)
         pending = _pending_bytes(live=live, cursor=cursor, seeded=seeded)
-        wm_h, wm_d = apply_live_period_marks(st, live, hour_ts=hour, day_ts=day)
-        marks_dirty = True
-        # Prefer our sampled hour buckets (+pending); watermark fills gaps
-        h = _period_bytes_from_panel(
-            live=live,
-            pending=pending,
-            bucket=int(hour_map.get(pid, 0)),
-            watermark=wm_h,
-        )
-        d = _period_bytes_from_panel(
-            live=live,
-            pending=pending,
-            bucket=int(day_map.get(pid, 0)),
-            watermark=wm_d,
-        )
+        h = min(int(hour_map.get(pid, 0)) + pending, live) if live else 0
+        d = min(int(day_map.get(pid, 0)) + pending, live) if live else 0
         if d < h:
             d = h
         h_w = _scale_weighted(h, live, live_w)
         d_w = _scale_weighted(d, live, live_w)
-        # Week/month still from buckets but never exceed live on panel
-        w = min(int(week_map.get(pid, 0)) + pending, live)
-        m = min(int(month_map.get(pid, 0)) + pending, live)
-        # Bucket-based previous hour for compare only (clamped)
-        prev_h = min(int(prev_hour_map.get(pid, 0)), live)
-        online_n = online_by_pid.get(pid, 0) if show_online else 0
         total_live += live
         total_weighted += live_w
         total_pending += pending
@@ -1334,7 +1281,11 @@ async def build_panel_overview(
         total_day += d
         total_hour_w += h_w
         total_day_w += d_w
-        last_run = last_runs.get(pid)
+        if pending > 0:
+            raw_by_ts[grid_hour] = raw_by_ts.get(grid_hour, 0) + pending
+            w_by_ts[grid_hour] = w_by_ts.get(grid_hour, 0) + _scale_weighted(
+                pending, live, live_w
+            )
         rows.append(
             {
                 "panel_id": pid,
@@ -1342,14 +1293,14 @@ async def build_panel_overview(
                 "type": getattr(p.type, "value", p.type),
                 "is_active": bool(getattr(p, "is_active", True)),
                 "accounts": accounts_by_panel.get(pid, 0),
-                "online": online_n,
+                "online": 0,
                 "raw": {
                     "current_total": live,
                     "pending": pending,
                     "hour": h,
                     "day": d,
-                    "week": w,
-                    "month": m,
+                    "week": 0,
+                    "month": 0,
                     "lifetime_cursor": cursor,
                 },
                 "weighted": {
@@ -1357,52 +1308,21 @@ async def build_panel_overview(
                     "hour": h_w,
                     "day": d_w,
                 },
-                "compare_hour_pct": _pct_change(h, prev_h),
+                "compare_hour_pct": None,
                 "tests": {
                     "runs": int(getattr(st, "tests_total", 0) or 0) if st else 0,
-                    "configs_tested": int(getattr(st, "configs_tested_total", 0) or 0)
-                    if st
-                    else 0,
-                    "top100": int(getattr(st, "top100_total", 0) or 0) if st else 0,
-                    "good": int(getattr(st, "good_total", 0) or 0) if st else 0,
-                    "all_ops_ok": int(getattr(st, "all_ops_ok_total", 0) or 0)
-                    if st
-                    else 0,
-                    "last_test_at": st.last_test_at.isoformat()
-                    if st and st.last_test_at
-                    else None,
-                    "last_run": {
-                        "tested": int(last_run.tested or 0),
-                        "in_top100": int(last_run.in_top100 or 0),
-                        "good": int(last_run.good or 0),
-                        "all_ops_ok": int(last_run.all_ops_ok or 0),
-                        "avg_ping": float(last_run.avg_ping or -1),
-                        "ts": last_run.ts.isoformat() if last_run.ts else None,
-                    }
-                    if last_run
-                    else None,
+                    "configs_tested": 0,
+                    "top100": 0,
+                    "good": 0,
+                    "all_ops_ok": 0,
+                    "last_test_at": None,
+                    "last_run": None,
                 },
             }
         )
 
-    if marks_dirty:
-        try:
-            await db.commit()
-        except Exception:  # noqa: BLE001
-            logger.debug("panel period mark commit failed", exc_info=True)
-            try:
-                await db.rollback()
-            except Exception:  # noqa: BLE001
-                pass
-
-    # Prefer live cumulative so panels with real usage never look "empty"
     rows.sort(
-        key=lambda r: (
-            -int(r["raw"]["current_total"] or 0),
-            -int(r["raw"]["hour"] or 0),
-            -int(r["online"] or 0),
-            r["name"],
-        )
+        key=lambda r: (-int(r["raw"]["current_total"] or 0), r["name"])
     )
 
     def _top_row(key: str) -> dict[str, Any] | None:
@@ -1419,55 +1339,11 @@ async def build_panel_overview(
             "metric": key,
         }
 
-    top_current = _top_row("current_total")
-    top_hour = _top_row("hour")
-    top_day = _top_row("day")
-
-    # Global hourly 24h: buckets already flushed; scale raw → weighted per panel
-    g_start = grid_hour - 23 * 3600
-    g_rows = (
-        await db.execute(
-            select(
-                PanelUsageHourBucket.panel_id,
-                PanelUsageHourBucket.hour_ts,
-                PanelUsageHourBucket.raw_bytes,
-            ).where(
-                PanelUsageHourBucket.hour_ts >= g_start,
-                PanelUsageHourBucket.hour_ts <= grid_hour,
-            )
-        )
-    ).all()
-    raw_by_ts: dict[int, int] = {g_start + i * 3600: 0 for i in range(24)}
-    w_by_ts: dict[int, int] = {g_start + i * 3600: 0 for i in range(24)}
-    for pid, ts, raw in g_rows:
-        ts_i = int(ts)
-        if ts_i not in raw_by_ts:
-            continue
-        raw_i = max(0, int(raw or 0))
-        live_r = int(live_totals.get(int(pid), 0))
-        live_w = int(weighted_totals.get(int(pid), 0))
-        raw_by_ts[ts_i] = raw_by_ts.get(ts_i, 0) + raw_i
-        w_by_ts[ts_i] = w_by_ts.get(ts_i, 0) + _scale_weighted(
-            raw_i, live_r, live_w
-        )
-    # Residual pending (flush miss) → current hour, full amount
-    for r in rows:
-        pending_i = max(0, int(r["raw"].get("pending") or 0))
-        if pending_i <= 0:
-            continue
-        live_r = int(r["raw"].get("current_total") or 0)
-        live_w = int((r.get("weighted") or {}).get("current_total") or 0)
-        raw_by_ts[grid_hour] = raw_by_ts.get(grid_hour, 0) + pending_i
-        w_by_ts[grid_hour] = w_by_ts.get(grid_hour, 0) + _scale_weighted(
-            pending_i, live_r, live_w
-        )
-
     global_hourly = []
     for i in range(24):
         ts = g_start + i * 3600
         raw_i = int(raw_by_ts.get(ts, 0))
         w_i = int(w_by_ts.get(ts, 0))
-        # Coeff >= 1 ⇒ weighted must not be below raw
         if w_i < raw_i:
             w_i = raw_i
         global_hourly.append(
@@ -1479,47 +1355,34 @@ async def build_panel_overview(
             }
         )
 
-    # Peak hour-of-day last 7d — client local clock
-    heat_start = grid_hour - 7 * 86400
-    heat = (
-        await db.execute(
-            select(PanelUsageHourBucket.hour_ts, PanelUsageHourBucket.raw_bytes).where(
-                PanelUsageHourBucket.hour_ts >= heat_start
-            )
-        )
-    ).all()
     by_hod = [0] * 24
-    for ts, raw in heat:
+    for ts, raw in raw_by_ts.items():
         by_hod[_hod_index(int(ts), tz_off)] += int(raw or 0)
-    if total_pending:
-        by_hod[_hod_index(grid_hour, tz_off)] += total_pending
     peak_hod = max(range(24), key=lambda h: by_hod[h]) if any(by_hod) else None
 
-    # Top panels by day for the 24h section list
-    top_day_list = [
-        {
-            "panel_id": r["panel_id"],
-            "name": r["name"],
-            "raw_bytes": int(r["raw"]["day"] or 0),
-            "current_total": int(r["raw"]["current_total"] or 0),
-            "online": int(r["online"] or 0),
-        }
-        for r in sorted(rows, key=lambda x: -int(x["raw"]["day"] or 0))
-        if int(r["raw"]["day"] or 0) > 0 or int(r["raw"]["current_total"] or 0) > 0
-    ][:12]
-
-    # Authoritative weighted total = same as dashboard «ترافیک مصرفی»
     try:
         dash_weighted = await dashboard_weighted_total(db)
     except Exception:  # noqa: BLE001
         logger.exception("dashboard weighted total failed")
         dash_weighted = total_weighted
 
+    top_day_list = [
+        {
+            "panel_id": r["panel_id"],
+            "name": r["name"],
+            "raw_bytes": int(r["raw"]["current_total"] or 0),
+            "current_total": int(r["raw"]["current_total"] or 0),
+            "online": 0,
+        }
+        for r in rows
+        if int(r["raw"]["current_total"] or 0) > 0
+    ][:12]
+
     return {
         "generated_at": now.isoformat(),
         "tz_offset_min": tz_off,
-        "show_online": show_online,
-        "online": online_info if show_online else {
+        "show_online": False,
+        "online": {
             "available": False,
             "source": "none",
             "total_online": 0,
@@ -1540,9 +1403,9 @@ async def build_panel_overview(
             "panels": len(panels),
         },
         "top": {
-            "by_current": top_current,
-            "by_hour": top_hour,
-            "by_day": top_day,
+            "by_current": _top_row("current_total"),
+            "by_hour": _top_row("hour"),
+            "by_day": _top_row("day"),
         },
         "top_day_panels": top_day_list,
         "global_hourly": global_hourly,
@@ -1553,9 +1416,8 @@ async def build_panel_overview(
         },
         "panels": rows,
         "note": (
-            "بدون ضریب = Σ خام اکانت‌های Astra. "
-            "با ضریب کل = همان «ترافیک مصرفی» داشبورد (Σ User.used_traffic). "
-            "نمودار ۲۴س با ضریب هر پنل از نمونه‌برداری Astra است."
+            "بدون ضریب = Σ خام اکانت‌ها. با ضریب = ترافیک مصرفی داشبورد. "
+            "لود سریع؛ برای همگام‌سازی Xray از «تازه‌سازی زنده» استفاده کنید."
         ),
     }
 
@@ -1583,7 +1445,6 @@ async def build_panel_detail(
     grid_hour = int(periods["grid_hour"])
     tz_off = int(periods["tz_offset_min"])
 
-    # Do not block detail on Xray — use current PanelAccount + flush (fast)
     st = await _get_or_create_panel_state(db, int(panel_id))
     try:
         usage_map = await live_panel_raw_and_weighted(db)
@@ -1592,13 +1453,6 @@ async def build_panel_detail(
         usage_map = {}
     live_total = int(usage_map.get(int(panel_id), {}).get("raw", 0))
     live_weighted = int(usage_map.get(int(panel_id), {}).get("weighted", 0))
-    try:
-        await flush_live_deltas_to_hours(
-            db, {int(panel_id): live_total}, now=now
-        )
-        st = await _get_or_create_panel_state(db, int(panel_id))
-    except Exception:  # noqa: BLE001
-        logger.debug("flush before panel detail failed", exc_info=True)
     cursor = int(st.last_raw_total or 0)
     seeded = bool(st.last_sample_at is not None)
     pending = _pending_bytes(live=live_total, cursor=cursor, seeded=seeded)
