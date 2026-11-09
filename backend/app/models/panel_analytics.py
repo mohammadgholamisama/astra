@@ -32,6 +32,11 @@ class PanelUsageState(Base):
     last_sample_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Live watermarks for accurate local hour/day (bytes = live - mark_raw)
+    period_hour_ts: Mapped[int] = mapped_column(BigInteger, default=0)
+    period_hour_raw: Mapped[int] = mapped_column(BigInteger, default=0)
+    period_day_ts: Mapped[int] = mapped_column(BigInteger, default=0)
+    period_day_raw: Mapped[int] = mapped_column(BigInteger, default=0)
     peak_bps: Mapped[float] = mapped_column(Float, default=0.0)
     peak_bps_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

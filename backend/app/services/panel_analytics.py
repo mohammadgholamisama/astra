@@ -163,6 +163,54 @@ def _pending_bytes(*, live: int, cursor: int, seeded: bool) -> int:
     return max(0, int(live) - int(cursor))
 
 
+def _period_from_live_mark(
+    live: int,
+    *,
+    mark_ts: int | None,
+    mark_raw: int | None,
+    period_ts: int,
+) -> tuple[int, int, int]:
+    """Authoritative bytes in the current local period from a live counter.
+
+    Returns (bytes_in_period, new_mark_ts, new_mark_raw).
+    On period rollover or counter reset, the mark is re-seeded to ``live``
+    so we never dump lifetime into «امروز» / «این ساعت».
+    """
+    live_i = max(0, int(live or 0))
+    period_i = int(period_ts)
+    prev_ts = int(mark_ts or 0)
+    prev_raw = max(0, int(mark_raw or 0))
+    if prev_ts != period_i or live_i < prev_raw:
+        return 0, period_i, live_i
+    return live_i - prev_raw, period_i, prev_raw
+
+
+def apply_live_period_marks(
+    state: PanelUsageState,
+    live: int,
+    *,
+    hour_ts: int,
+    day_ts: int,
+) -> tuple[int, int]:
+    """Update hour/day watermarks on ``state``; return (hour_bytes, day_bytes)."""
+    h, state.period_hour_ts, state.period_hour_raw = _period_from_live_mark(
+        live,
+        mark_ts=int(getattr(state, "period_hour_ts", 0) or 0),
+        mark_raw=int(getattr(state, "period_hour_raw", 0) or 0),
+        period_ts=hour_ts,
+    )
+    d, state.period_day_ts, state.period_day_raw = _period_from_live_mark(
+        live,
+        mark_ts=int(getattr(state, "period_day_ts", 0) or 0),
+        mark_raw=int(getattr(state, "period_day_raw", 0) or 0),
+        period_ts=day_ts,
+    )
+    # Day must include this hour; never show day < hour
+    if d < h:
+        d = h
+    return int(h), int(d)
+
+
 def parse_device_brand(user_agent: str) -> str:
     ua = (user_agent or "").strip()
     if not ua:
@@ -1064,21 +1112,29 @@ async def build_panel_overview(
     total_day = 0
     total_live = 0
     total_pending = 0
+    marks_dirty = False
     for p in panels:
         pid = int(p.id)
         st = states.get(pid)
+        if st is None:
+            st = await _get_or_create_panel_state(db, pid)
+            states[pid] = st
+            marks_dirty = True
         live = int(live_totals.get(pid, 0))
-        cursor = int(st.last_raw_total or 0) if st else 0
-        seeded = bool(st and st.last_sample_at is not None)
+        cursor = int(st.last_raw_total or 0)
+        seeded = bool(st.last_sample_at is not None)
         pending = _pending_bytes(live=live, cursor=cursor, seeded=seeded)
+        # Authoritative hour/day from live watermarks (not poisoned hour buckets)
+        h, d = apply_live_period_marks(st, live, hour_ts=hour, day_ts=day)
+        marks_dirty = True
+        # Week/month still from buckets but never exceed live on panel
+        w = min(int(week_map.get(pid, 0)) + pending, live)
+        m = min(int(month_map.get(pid, 0)) + pending, live)
+        # Bucket-based previous hour for compare only (clamped)
+        prev_h = min(int(prev_hour_map.get(pid, 0)), live)
+        online_n = online_by_pid.get(pid, 0)
         total_live += live
         total_pending += pending
-        h = int(hour_map.get(pid, 0)) + pending
-        d = int(day_map.get(pid, 0)) + pending
-        w = int(week_map.get(pid, 0)) + pending
-        m = int(month_map.get(pid, 0)) + pending
-        prev_h = int(prev_hour_map.get(pid, 0))
-        online_n = online_by_pid.get(pid, 0)
         total_hour += h
         total_day += d
         last_run = last_runs.get(pid)
@@ -1126,6 +1182,16 @@ async def build_panel_overview(
                 },
             }
         )
+
+    if marks_dirty:
+        try:
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            logger.debug("panel period mark commit failed", exc_info=True)
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
 
     # Prefer live cumulative so panels with real usage never look "empty"
     rows.sort(
@@ -1231,9 +1297,9 @@ async def build_panel_overview(
         },
         "panels": rows,
         "note": (
-            "مصرف فعلی = جمع خام اکانت‌ها (دقیق). "
-            "ساعت/روز شامل مصرف تازهٔ هنوز نمونه‌نشده هم هست. "
-            "ساعت‌ها بر اساس زمان محلی دستگاه شماست."
+            "مصرف فعلی = جمع خام اکانت‌ها. "
+            "این ساعت / امروز از اختلاف شمارنده زنده نسبت به ابتدای بازهٔ محلی است (دقیق). "
+            "نمودارها از نمونه‌برداری ساعتی‌اند."
         ),
     }
 
@@ -1261,20 +1327,36 @@ async def build_panel_detail(
     grid_hour = int(periods["grid_hour"])
     tz_off = int(periods["tz_offset_min"])
 
-    st = await db.get(PanelUsageState, int(panel_id))
+    st = await _get_or_create_panel_state(db, int(panel_id))
     live_map = await live_panel_totals(db)
     live_total = int(live_map.get(int(panel_id), 0))
-    cursor = int(st.last_raw_total or 0) if st else 0
-    seeded = bool(st and st.last_sample_at is not None)
+    cursor = int(st.last_raw_total or 0)
+    seeded = bool(st.last_sample_at is not None)
     pending = _pending_bytes(live=live_total, cursor=cursor, seeded=seeded)
-    cur_h = (await _sum_panel_hours(db, panel_id, hour, hour_end)) + pending
-    prev_h = await _sum_panel_hours(db, panel_id, hour - 3600, hour)
-    cur_d = (await _sum_panel_hours(db, panel_id, day, day_end)) + pending
-    prev_d = await _sum_panel_hours(db, panel_id, day - 86400, day)
-    cur_w = (await _sum_panel_hours(db, panel_id, week, week_end)) + pending
-    prev_w = await _sum_panel_hours(db, panel_id, week - 7 * 86400, week)
-    cur_m = (await _sum_panel_hours(db, panel_id, month, next_month_ts)) + pending
-    prev_m = await _sum_panel_hours(db, panel_id, prev_month, month)
+    cur_h, cur_d = apply_live_period_marks(
+        st, live_total, hour_ts=hour, day_ts=day
+    )
+    try:
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        logger.debug("panel detail mark commit failed", exc_info=True)
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+    prev_h = min(await _sum_panel_hours(db, panel_id, hour - 3600, hour), live_total)
+    prev_d = min(await _sum_panel_hours(db, panel_id, day - 86400, day), live_total)
+    cur_w = min(
+        (await _sum_panel_hours(db, panel_id, week, week_end)) + pending, live_total
+    )
+    prev_w = min(
+        await _sum_panel_hours(db, panel_id, week - 7 * 86400, week), live_total
+    )
+    cur_m = min(
+        (await _sum_panel_hours(db, panel_id, month, next_month_ts)) + pending,
+        live_total,
+    )
+    prev_m = min(await _sum_panel_hours(db, panel_id, prev_month, month), live_total)
 
     series_start = grid_hour - 47 * 3600
     buckets = await _hour_rows_panel(db, panel_id, series_start, grid_hour + 3600)

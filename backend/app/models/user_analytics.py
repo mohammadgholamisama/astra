@@ -32,6 +32,11 @@ class UserUsageState(Base):
     last_sample_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Live watermarks for accurate local hour/day (bytes = live - mark_raw)
+    period_hour_ts: Mapped[int] = mapped_column(BigInteger, default=0)
+    period_hour_raw: Mapped[int] = mapped_column(BigInteger, default=0)
+    period_day_ts: Mapped[int] = mapped_column(BigInteger, default=0)
+    period_day_raw: Mapped[int] = mapped_column(BigInteger, default=0)
     # Contiguous online window start (UTC); None = currently offline
     online_since: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

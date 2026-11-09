@@ -825,6 +825,46 @@ def _pending_bytes(
     return max(0, int(live) - int(cursor))
 
 
+def _period_from_live_mark(
+    live: int,
+    *,
+    mark_ts: int | None,
+    mark_raw: int | None,
+    period_ts: int,
+) -> tuple[int, int, int]:
+    live_i = max(0, int(live or 0))
+    period_i = int(period_ts)
+    prev_ts = int(mark_ts or 0)
+    prev_raw = max(0, int(mark_raw or 0))
+    if prev_ts != period_i or live_i < prev_raw:
+        return 0, period_i, live_i
+    return live_i - prev_raw, period_i, prev_raw
+
+
+def apply_live_period_marks(
+    state: UserUsageState,
+    live: int,
+    *,
+    hour_ts: int,
+    day_ts: int,
+) -> tuple[int, int]:
+    h, state.period_hour_ts, state.period_hour_raw = _period_from_live_mark(
+        live,
+        mark_ts=int(getattr(state, "period_hour_ts", 0) or 0),
+        mark_raw=int(getattr(state, "period_hour_raw", 0) or 0),
+        period_ts=hour_ts,
+    )
+    d, state.period_day_ts, state.period_day_raw = _period_from_live_mark(
+        live,
+        mark_ts=int(getattr(state, "period_day_ts", 0) or 0),
+        mark_raw=int(getattr(state, "period_day_raw", 0) or 0),
+        period_ts=day_ts,
+    )
+    if d < h:
+        d = h
+    return int(h), int(d)
+
+
 async def _hour_rows(
     db: AsyncSession, user_id: int, start_ts: int, end_ts: int
 ) -> list[UsageHourBucket]:
@@ -896,19 +936,32 @@ async def build_user_analytics(
         ).scalar()
         or 0
     )
-    cursor = int(state.last_raw_total or 0) if state else 0
-    seeded = bool(state and state.last_sample_at is not None)
+    if state is None:
+        state = await _get_or_create_state(db, uid)
+    cursor = int(state.last_raw_total or 0)
+    seeded = bool(state.last_sample_at is not None)
     pending = _pending_bytes(live=live_raw, cursor=cursor, seeded=seeded)
 
-    # Periods (exact local bounds + proration) + pending only if seeded
-    cur_hour = (await _sum_hours(db, uid, hour, hour_end)) + pending
-    prev_hour = await _sum_hours(db, uid, hour - 3600, hour)
-    cur_day = (await _sum_hours(db, uid, day, day_end)) + pending
-    prev_day = await _sum_hours(db, uid, day - 86400, day)
-    cur_week = (await _sum_hours(db, uid, week, week_end)) + pending
-    prev_week = await _sum_hours(db, uid, week - 7 * 86400, week)
-    cur_month = (await _sum_hours(db, uid, month, next_month_ts)) + pending
-    prev_month_bytes = await _sum_hours(db, uid, prev_month, month)
+    # Authoritative hour/day from live watermarks
+    cur_hour, cur_day = apply_live_period_marks(
+        state, live_raw, hour_ts=hour, day_ts=day
+    )
+    try:
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        logger.debug("user period mark commit failed", exc_info=True)
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+    prev_hour = min(await _sum_hours(db, uid, hour - 3600, hour), live_raw)
+    prev_day = min(await _sum_hours(db, uid, day - 86400, day), live_raw)
+    cur_week = min((await _sum_hours(db, uid, week, week_end)) + pending, live_raw)
+    prev_week = min(await _sum_hours(db, uid, week - 7 * 86400, week), live_raw)
+    cur_month = min(
+        (await _sum_hours(db, uid, month, next_month_ts)) + pending, live_raw
+    )
+    prev_month_bytes = min(await _sum_hours(db, uid, prev_month, month), live_raw)
 
     # Last 48h series on UTC hour grid (labels converted locally in UI)
     series_start = grid_hour - 47 * 3600

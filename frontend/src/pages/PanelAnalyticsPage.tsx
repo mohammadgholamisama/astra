@@ -690,15 +690,18 @@ export default function PanelAnalyticsPage() {
                   : "از اکانت‌ها — دقیق"}
               </small>
             </article>
-            <article className="an-stat">
+            <article
+              className="an-stat"
+              title="از شمارنده زنده نسبت به ابتدای ساعت/روز محلی"
+            >
               <span>
-                <Activity size={13} /> این ساعت / امروز
+                <Activity size={13} /> این ساعت
               </span>
               <strong>{formatTraffic(data.totals.raw_hour)}</strong>
               <small>
                 امروز: {formatTraffic(data.totals.raw_day)}
                 {data.top?.by_hour
-                  ? ` · اوج ساعت: ${data.top.by_hour.name}`
+                  ? ` · بیشترین این ساعت: ${data.top.by_hour.name}`
                   : ""}
               </small>
             </article>
