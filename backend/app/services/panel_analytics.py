@@ -563,6 +563,44 @@ async def live_panel_totals(db: AsyncSession) -> dict[int, int]:
     return {pid: int(v["raw"]) for pid, v in usage.items()}
 
 
+async def flush_live_deltas_to_hours(
+    db: AsyncSession,
+    live_totals: dict[int, int],
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Write unflushed live growth into hour buckets and advance cursors.
+
+    Called on every overview/refresh so the current hour bar is up to date
+    from Astra PanelAccount counters without waiting for the background loop.
+    """
+    now = _as_utc(now) or _utc_now()
+    touched = 0
+    for pid, live in live_totals.items():
+        try:
+            async with db.begin_nested():
+                await apply_panel_raw_sample(
+                    db,
+                    int(pid),
+                    int(live),
+                    online_n=0,
+                    now=now,
+                )
+            touched += 1
+        except Exception:  # noqa: BLE001
+            logger.debug("flush live hour p=%s failed", pid, exc_info=True)
+    if touched:
+        try:
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            logger.debug("flush live hour commit failed", exc_info=True)
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+    return touched
+
+
 def _scale_weighted(raw_part: int, raw_total: int, weighted_total: int) -> int:
     """Map a raw period slice to weighted using the panel's live raw→weighted ratio."""
     r = max(0, int(raw_part or 0))
@@ -1075,6 +1113,16 @@ async def build_panel_overview(
     usage_map = await live_panel_raw_and_weighted(db)
     live_totals = {pid: int(v["raw"]) for pid, v in usage_map.items()}
     weighted_totals = {pid: int(v["weighted"]) for pid, v in usage_map.items()}
+    # Materialize growth into hour buckets so «این ساعت» on the chart is live
+    try:
+        await flush_live_deltas_to_hours(db, live_totals, now=now)
+        # Reload states after cursor advance
+        states = {
+            int(s.panel_id): s
+            for s in (await db.execute(select(PanelUsageState))).scalars().all()
+        }
+    except Exception:  # noqa: BLE001
+        logger.debug("flush live deltas before overview failed", exc_info=True)
     accounts_by_panel: dict[int, int] = {}
     for pid, cnt in (
         await db.execute(
@@ -1293,7 +1341,7 @@ async def build_panel_overview(
     top_hour = _top_row("hour")
     top_day = _top_row("day")
 
-    # Global hourly 24h: scale each panel's sampled raw → weighted, then sum
+    # Global hourly 24h: buckets already flushed; scale raw → weighted per panel
     g_start = grid_hour - 23 * 3600
     g_rows = (
         await db.execute(
@@ -1301,13 +1349,18 @@ async def build_panel_overview(
                 PanelUsageHourBucket.panel_id,
                 PanelUsageHourBucket.hour_ts,
                 PanelUsageHourBucket.raw_bytes,
-            ).where(PanelUsageHourBucket.hour_ts >= g_start)
+            ).where(
+                PanelUsageHourBucket.hour_ts >= g_start,
+                PanelUsageHourBucket.hour_ts <= grid_hour,
+            )
         )
     ).all()
-    raw_by_ts: dict[int, int] = {}
-    w_by_ts: dict[int, int] = {}
+    raw_by_ts: dict[int, int] = {g_start + i * 3600: 0 for i in range(24)}
+    w_by_ts: dict[int, int] = {g_start + i * 3600: 0 for i in range(24)}
     for pid, ts, raw in g_rows:
         ts_i = int(ts)
+        if ts_i not in raw_by_ts:
+            continue
         raw_i = max(0, int(raw or 0))
         live_r = int(live_totals.get(int(pid), 0))
         live_w = int(weighted_totals.get(int(pid), 0))
@@ -1315,14 +1368,14 @@ async def build_panel_overview(
         w_by_ts[ts_i] = w_by_ts.get(ts_i, 0) + _scale_weighted(
             raw_i, live_r, live_w
         )
-    # Unflushed growth into current grid hour (per panel, safely capped)
+    # Tiny residual pending (if flush skipped a panel) into current hour only
     for r in rows:
-        pid = int(r["panel_id"])
+        pending_i = max(0, int(r["raw"].get("pending") or 0))
+        if pending_i <= 0:
+            continue
         live_r = int(r["raw"].get("current_total") or 0)
         live_w = int((r.get("weighted") or {}).get("current_total") or 0)
-        pending_i = max(0, int(r["raw"].get("pending") or 0))
-        pending_cap = max(64 * 1024 * 1024, int(live_r * 0.05))
-        safe_p = min(pending_i, pending_cap)
+        safe_p = min(pending_i, max(8 * 1024 * 1024, int(live_r * 0.01)))
         if safe_p <= 0:
             continue
         raw_by_ts[grid_hour] = raw_by_ts.get(grid_hour, 0) + safe_p
@@ -1337,6 +1390,7 @@ async def build_panel_overview(
                 "hour_ts": ts,
                 "raw_bytes": int(raw_by_ts.get(ts, 0)),
                 "weighted_bytes": int(w_by_ts.get(ts, 0)),
+                "is_current": ts == grid_hour,
             }
         )
 

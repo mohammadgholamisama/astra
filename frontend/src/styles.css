@@ -10659,11 +10659,16 @@ html.dark .an-search-lg input::placeholder,
   border-radius: 6px 6px 2px 2px;
   background: linear-gradient(180deg, #5ed4a8 0%, #2aa889 70%, #1e7a64 100%);
   box-shadow: 0 0 0 1px rgba(42, 168, 137, 0.2);
-  transition: height 0.25s ease, filter 0.15s ease, background 0.15s ease;
+  transition: height 0.45s cubic-bezier(0.22, 1, 0.36, 1), filter 0.15s ease,
+    background 0.2s ease, box-shadow 0.2s ease;
 }
 .pan-chart-col.is-peak > i {
   background: linear-gradient(180deg, #f5d78e 0%, #e0a93a 55%, #2aa889 100%);
   box-shadow: 0 0 0 1px rgba(224, 169, 58, 0.35);
+}
+.pan-chart-col.is-now > i {
+  background: linear-gradient(180deg, #7dd3fc 0%, #38bdf8 45%, #2aa889 100%);
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.45);
 }
 .pan-chart-col.is-hover > i,
 .pan-chart-col:focus-visible > i {
@@ -10676,6 +10681,10 @@ html.dark .an-search-lg input::placeholder,
   white-space: nowrap;
   line-height: 1;
   height: 14px;
+}
+.pan-chart-col > span.is-now-label {
+  color: #7dd3fc;
+  font-weight: 700;
 }
 .pan-chart-tick {
   width: 3px;

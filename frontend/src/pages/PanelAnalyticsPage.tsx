@@ -109,6 +109,7 @@ type Overview = {
     hour_ts: number;
     raw_bytes: number;
     weighted_bytes?: number;
+    is_current?: boolean;
   }[];
   hour_of_day: { bytes: number[]; peak_hour: number | null; peak_bytes: number };
   panels: PanelRow[];
@@ -202,12 +203,21 @@ type HourPoint = {
   hour_ts: number;
   raw_bytes: number;
   weighted_bytes?: number;
+  is_current?: boolean;
 };
 
 function hourValue(p: HourPoint, mode: "weighted" | "raw"): number {
   if (mode === "raw") return Number(p.raw_bytes || 0);
   const w = Number(p.weighted_bytes ?? 0);
   return w > 0 ? w : Number(p.raw_bytes || 0);
+}
+
+function clockLabel(ts: number): string {
+  return new Date(ts * 1000).toLocaleTimeString("fa-IR", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
 }
 
 /** Vertical 24h column chart — local time; primary = با ضریب. */
@@ -230,47 +240,57 @@ function HourlyUsageChart({
     (best, v, i, arr) => (v > arr[best] ? i : best),
     0
   );
+  const nowIdx = points.findIndex((p) => p.is_current);
+  const currentIdx = nowIdx >= 0 ? nowIdx : points.length - 1;
   const peak = points[peakIdx];
   const peakVal = vals[peakIdx];
-  const avg = total / points.length;
-  const tip = hover != null ? points[hover] : null;
+  const currentVal = vals[currentIdx] || 0;
+  const tipIdx = hover != null ? hover : currentIdx;
+  const tip = points[tipIdx];
   const tipVal = tip ? hourValue(tip, mode) : 0;
+  const tipIsNow = Boolean(tip?.is_current);
 
   return (
     <div className="pan-chart">
       <div className="pan-chart-meta">
         <div>
-          <span>{mode === "weighted" ? "جمع با ضریب" : "جمع خام"}</span>
+          <span>{mode === "weighted" ? "جمع ۲۴س · با ضریب" : "جمع ۲۴س · خام"}</span>
           <b>{formatTraffic(total)}</b>
-          {mode === "weighted" && totalRaw > 0 && Math.abs(totalRaw - total) > 1 ? (
+          {mode === "weighted" &&
+          totalRaw > 0 &&
+          Math.abs(totalRaw - total) > 1 ? (
             <small>خام {formatTraffic(totalRaw)}</small>
           ) : null}
         </div>
         <div>
-          <span>اوج</span>
+          <span>این ساعت</span>
+          <b>{formatTraffic(currentVal)}</b>
+          <small>زنده · {clockLabel(points[currentIdx]?.hour_ts || 0)}</small>
+        </div>
+        <div>
+          <span>اوج ۲۴س</span>
           <b>
             {peakVal > 0 ? formatTraffic(peakVal) : "—"}
             {peak && peakVal > 0 ? (
-              <small> · {hourLabelLocal(peak.hour_ts)}</small>
+              <small> · {clockLabel(peak.hour_ts)}</small>
             ) : null}
           </b>
-        </div>
-        <div>
-          <span>میانگین ساعتی</span>
-          <b>{formatTraffic(avg)}</b>
         </div>
       </div>
 
       <div className="pan-chart-tip" aria-live="polite">
         {tip ? (
           <>
-            <b>{hourLabelLocal(tip.hour_ts)}</b>
+            <b>
+              {tipIsNow ? "اکنون · " : ""}
+              {hourLabelLocal(tip.hour_ts)}
+            </b>
             <span>{formatTraffic(tipVal)}</span>
             {mode === "weighted" &&
             Number(tip.raw_bytes || 0) > 0 &&
             Math.abs(Number(tip.raw_bytes || 0) - tipVal) > 1 ? (
               <small>خام {formatTraffic(Number(tip.raw_bytes || 0))}</small>
-            ) : max > 0 ? (
+            ) : max > 0 && tipVal > 0 ? (
               <small>
                 {toFaDigits(((tipVal / max) * 100).toFixed(0))}٪ از اوج
               </small>
@@ -290,17 +310,22 @@ function HourlyUsageChart({
         <div className="pan-chart-cols">
           {points.map((p, i) => {
             const v = vals[i];
-            const h = Math.max(v > 0 ? 4 : 0, (v / max) * 100);
+            const h = Math.max(v > 0 ? 5 : 0, (v / max) * 100);
             const isPeak = i === peakIdx && v > 0;
+            const isNow = Boolean(p.is_current);
             const isHover = hover === i;
-            const showLabel = i % 3 === 0 || i === points.length - 1;
+            const showLabel =
+              i === 0 ||
+              i === points.length - 1 ||
+              i % 2 === 0 ||
+              isNow;
             return (
               <button
                 type="button"
                 key={p.hour_ts}
                 className={`pan-chart-col${isPeak ? " is-peak" : ""}${
-                  isHover ? " is-hover" : ""
-                }`}
+                  isNow ? " is-now" : ""
+                }${isHover ? " is-hover" : ""}`}
                 style={{ ["--h" as string]: `${h}%` }}
                 onMouseEnter={() => setHover(i)}
                 onMouseLeave={() => setHover(null)}
@@ -310,12 +335,8 @@ function HourlyUsageChart({
               >
                 <i />
                 {showLabel ? (
-                  <span>
-                    {new Date(p.hour_ts * 1000).toLocaleTimeString("fa-IR", {
-                      hour: "2-digit",
-                      minute: "2-digit",
-                      hour12: false,
-                    })}
+                  <span className={isNow ? "is-now-label" : undefined}>
+                    {clockLabel(p.hour_ts)}
                   </span>
                 ) : (
                   <span className="pan-chart-tick" />
@@ -453,10 +474,12 @@ export default function PanelAnalyticsPage() {
   const overview = useQuery({
     queryKey: ["analytics-panels", tz],
     queryFn: () =>
-      api<Overview>(`/api/analytics/panels?tz_offset=${tz}`, {
-        timeoutMs: 45_000,
-      }),
-    refetchInterval: 60_000,
+      api<Overview>(
+        `/api/analytics/panels?tz_offset=${tz}&sample=1`,
+        { timeoutMs: 45_000 }
+      ),
+    refetchInterval: 30_000,
+    refetchOnWindowFocus: true,
     retry: 1,
   });
 
@@ -730,18 +753,15 @@ export default function PanelAnalyticsPage() {
             </article>
           </div>
 
-          {data.global_hourly.some(
-            (p) =>
-              Number(p.weighted_bytes || 0) > 0 || Number(p.raw_bytes || 0) > 0
-          ) ? (
-            <section className="an-block pan-chart-block">
-              <div className="an-block-head">
-                <h3>مصرف کل پنل‌ها — ۲۴ ساعت</h3>
-                <span className="muted">با ضریب · از پنل Astra · زمان محلی</span>
-              </div>
-              <HourlyUsageChart points={data.global_hourly} mode="weighted" />
-            </section>
-          ) : null}
+          <section className="an-block pan-chart-block">
+            <div className="an-block-head">
+              <h3>مصرف کل پنل‌ها — ۲۴ ساعت</h3>
+              <span className="muted">
+                با ضریب · زنده با هر رفرش · زمان محلی
+              </span>
+            </div>
+            <HourlyUsageChart points={data.global_hourly} mode="weighted" />
+          </section>
 
           <section className="an-block">
             <div className="an-block-head">
