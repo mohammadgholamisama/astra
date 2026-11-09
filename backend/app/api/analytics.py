@@ -206,7 +206,7 @@ async def analytics_panels(
                     sync_astra=False,
                     persist=False,
                 ),
-                timeout=4.0,
+                timeout=10.0,
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning("build_panel_overview failed/timed out: %s", exc)
@@ -219,13 +219,13 @@ async def analytics_panels(
                         sync_astra=False,
                         persist=False,
                     ),
-                    timeout=2.5,
+                    timeout=8.0,
                 )
         except Exception:  # noqa: BLE001
             logger.exception("build_panel_overview fallback failed")
-            return panel_analytics_svc._empty_panel_overview(
-                tz_offset_min=tz_offset
-            )
+            raise HTTPException(
+                status_code=500, detail="خطا در ساخت آمار پنل‌ها"
+            ) from exc
 
 
 @router.post("/api/analytics/panels/refresh")

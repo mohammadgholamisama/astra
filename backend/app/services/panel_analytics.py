@@ -1415,16 +1415,22 @@ async def build_panel_overview(
     """Panel analytics overview for the admin UI.
 
     ``persist=False`` / ``sync_astra=False`` = pure read path for the page load
-    (no commits, short SQLite busy wait). Refresh uses a separate sync+flush.
+    (no commits). Refresh uses a separate sync+flush.
     """
-    # Fail fast on SQLite lock instead of waiting up to 60s (page timeout)
+    # SQLite-only: shorten lock wait. Never run PRAGMA on Postgres — it aborts
+    # the transaction and the whole overview collapses to empty stats.
     if not persist and not sync_astra:
         try:
+            from app.core.database import _IS_SQLITE
             from sqlalchemy import text as _sql_text
 
-            await db.execute(_sql_text("PRAGMA busy_timeout=2500"))
+            if _IS_SQLITE:
+                await db.execute(_sql_text("PRAGMA busy_timeout=2500"))
         except Exception:  # noqa: BLE001
-            pass
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
 
     now = _utc_now()
     periods = _period_starts(now, tz_offset_min)
