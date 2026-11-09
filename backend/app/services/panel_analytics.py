@@ -572,7 +572,9 @@ async def live_panel_totals(db: AsyncSession) -> dict[int, int]:
     return {pid: int(v["raw"]) for pid, v in usage.items()}
 
 
-async def sync_astra_panels_live(db: AsyncSession) -> int:
+async def sync_astra_panels_live(
+    db: AsyncSession, *, timeout_per_panel: float = 2.0
+) -> int:
     """Pull fresh Xray traffic into PanelAccount for all active Astra panels."""
     from app.models.panel import PanelType
     from app.services import astra_node as astra_node_svc
@@ -589,22 +591,33 @@ async def sync_astra_panels_live(db: AsyncSession) -> int:
         .scalars()
         .all()
     )
-    updated = 0
-    for panel in panels:
+    if not panels:
+        return 0
+
+    async def _one(panel: Panel) -> int:
         try:
-            n = await astra_node_svc.sync_traffic_from_xray(db, panel)
-            updated += int(n or 0)
+            return int(
+                await astra_node_svc.sync_traffic_from_xray(
+                    db, panel, timeout=timeout_per_panel
+                )
+                or 0
+            )
         except Exception:  # noqa: BLE001
             logger.debug("astra analytics sync panel=%s failed", panel.id, exc_info=True)
-    if panels:
+            return 0
+
+    # Sequential is safer on shared AsyncSession; keep each call short.
+    updated = 0
+    for panel in panels:
+        updated += await _one(panel)
+    try:
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        logger.debug("astra analytics sync commit failed", exc_info=True)
         try:
-            await db.commit()
+            await db.rollback()
         except Exception:  # noqa: BLE001
-            logger.debug("astra analytics sync commit failed", exc_info=True)
-            try:
-                await db.rollback()
-            except Exception:  # noqa: BLE001
-                pass
+            pass
     return updated
 
 
@@ -738,7 +751,9 @@ async def refresh_panels_live(*, pull_remotes: bool = True) -> dict[str, Any]:
                 )
                 for panel in astra_panels:
                     try:
-                        n = await astra_node_svc.sync_traffic_from_xray(db, panel)
+                        n = await astra_node_svc.sync_traffic_from_xray(
+                            db, panel, timeout=3.0
+                        )
                         astra_synced += int(n or 0)
                     except Exception:  # noqa: BLE001
                         logger.debug(
@@ -1153,20 +1168,25 @@ async def build_panel_overview(
     db: AsyncSession,
     *,
     tz_offset_min: int = 0,
-    sync_astra: bool = False,
+    sync_astra: bool = True,
     persist: bool = False,
 ) -> dict[str, Any]:
-    """Fast panel analytics overview for the admin UI.
+    """Panel analytics overview for the admin UI.
 
-    Default GET path is read-only and cheap (no Xray, no flush, no online/tests).
-    Pass ``persist=True`` after live refresh to write pending deltas into the
-    current hour bucket.
+    Always briefly syncs Astra/Xray (short timeout). «این ساعت» matches the
+    chart's current column: from ``grid_hour`` (e.g. 19:30 local in IR) until
+    now, via live PanelAccount − watermark. Day uses local midnight.
+    Pass ``persist=True`` after a full live refresh to also flush pending
+    deltas into the current chart hour bucket.
     """
     now = _utc_now()
     periods = _period_starts(now, tz_offset_min)
     day = int(periods["day"])
     day_end = int(periods["day_end"])
+    # Same bucket as the chart's current column (UTC-aligned hour start).
     grid_hour = int(periods["grid_hour"])
+    chart_hour = grid_hour
+    chart_hour_end = grid_hour + 3600
     tz_off = int(periods["tz_offset_min"])
     g_start = grid_hour - 23 * 3600
 
@@ -1175,7 +1195,10 @@ async def build_panel_overview(
     )
     if sync_astra:
         try:
-            await asyncio.wait_for(sync_astra_panels_live(db), timeout=4.0)
+            await asyncio.wait_for(
+                sync_astra_panels_live(db, timeout_per_panel=1.5),
+                timeout=3.5,
+            )
         except Exception:  # noqa: BLE001
             logger.debug("astra sync before panel overview failed", exc_info=True)
 
@@ -1223,7 +1246,7 @@ async def build_panel_overview(
         ).all()
     }
 
-    # One bucket query covers 24h chart + today's rough sum
+    # Buckets: 24h chart + floors for current chart-hour / local day
     bucket_rows = (
         await db.execute(
             select(
@@ -1231,7 +1254,7 @@ async def build_panel_overview(
                 PanelUsageHourBucket.hour_ts,
                 PanelUsageHourBucket.raw_bytes,
             ).where(
-                PanelUsageHourBucket.hour_ts >= min(g_start, day),
+                PanelUsageHourBucket.hour_ts >= min(g_start, day) - 3600,
                 PanelUsageHourBucket.hour_ts <= grid_hour,
             )
         )
@@ -1244,10 +1267,12 @@ async def build_panel_overview(
         pid_i, ts_i, raw_i = int(pid), int(ts), max(0, int(raw or 0))
         live_r = int(live_totals.get(pid_i, 0))
         live_w = int(weighted_totals.get(pid_i, 0))
-        if day <= ts_i < day_end:
-            day_map[pid_i] = day_map.get(pid_i, 0) + raw_i
-        if ts_i == grid_hour:
+        # Exact chart column (grid hour), e.g. 19:30→20:30 local in IR
+        if ts_i == chart_hour:
             hour_map[pid_i] = hour_map.get(pid_i, 0) + raw_i
+        od = _overlap_bytes(ts_i, raw_i, day, day_end)
+        if od:
+            day_map[pid_i] = day_map.get(pid_i, 0) + od
         if ts_i in raw_by_ts:
             raw_by_ts[ts_i] += raw_i
             w_by_ts[ts_i] += _scale_weighted(raw_i, live_r, live_w)
@@ -1260,16 +1285,52 @@ async def build_panel_overview(
     total_day = 0
     total_hour_w = 0
     total_day_w = 0
+    marks_touched = False
     for p in panels:
         pid = int(p.id)
         st = states.get(pid)
+        if st is None:
+            st = await _get_or_create_panel_state(db, pid)
+            states[pid] = st
+            marks_touched = True
         live = int(live_totals.get(pid, 0))
         live_w = int(weighted_totals.get(pid, 0))
-        cursor = int(st.last_raw_total or 0) if st else 0
-        seeded = bool(st and st.last_sample_at is not None)
+        cursor = int(st.last_raw_total or 0)
+        seeded = bool(st.last_sample_at is not None)
         pending = _pending_bytes(live=live, cursor=cursor, seeded=seeded)
-        h = min(int(hour_map.get(pid, 0)) + pending, live) if live else 0
-        d = min(int(day_map.get(pid, 0)) + pending, live) if live else 0
+        # «این ساعت» = chart column start (مثلاً ۱۹:۳۰) → الان
+        prev_hour_mark = int(getattr(st, "period_hour_ts", 0) or 0)
+        prev_day_mark = int(getattr(st, "period_day_ts", 0) or 0)
+        wm_h, wm_d = apply_live_period_marks(
+            st, live, hour_ts=chart_hour, day_ts=day
+        )
+        marks_touched = True
+        # On first seed / hour rollover, backdate mark so known bucket
+        # bytes since chart_hour are included immediately (not lost as 0).
+        bucket_h = int(hour_map.get(pid, 0))
+        if prev_hour_mark != chart_hour and live > 0:
+            known_h = min(live, bucket_h + pending)
+            if known_h > 0:
+                st.period_hour_raw = max(0, live - known_h)
+                wm_h = known_h
+        bucket_d = int(day_map.get(pid, 0))
+        if prev_day_mark != day and live > 0:
+            known_d = min(live, bucket_d + pending)
+            if known_d > 0:
+                st.period_day_raw = max(0, live - known_d)
+                wm_d = known_d
+        h = _period_bytes_from_panel(
+            live=live,
+            pending=pending,
+            bucket=bucket_h,
+            watermark=wm_h,
+        )
+        d = _period_bytes_from_panel(
+            live=live,
+            pending=pending,
+            bucket=bucket_d,
+            watermark=wm_d,
+        )
         if d < h:
             d = h
         h_w = _scale_weighted(h, live, live_w)
@@ -1281,11 +1342,6 @@ async def build_panel_overview(
         total_day += d
         total_hour_w += h_w
         total_day_w += d_w
-        if pending > 0:
-            raw_by_ts[grid_hour] = raw_by_ts.get(grid_hour, 0) + pending
-            w_by_ts[grid_hour] = w_by_ts.get(grid_hour, 0) + _scale_weighted(
-                pending, live, live_w
-            )
         rows.append(
             {
                 "panel_id": pid,
@@ -1310,7 +1366,7 @@ async def build_panel_overview(
                 },
                 "compare_hour_pct": None,
                 "tests": {
-                    "runs": int(getattr(st, "tests_total", 0) or 0) if st else 0,
+                    "runs": int(getattr(st, "tests_total", 0) or 0),
                     "configs_tested": 0,
                     "top100": 0,
                     "good": 0,
@@ -1320,6 +1376,20 @@ async def build_panel_overview(
                 },
             }
         )
+
+    if marks_touched:
+        try:
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            logger.debug("panel period mark commit failed", exc_info=True)
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # Chart current bar = authoritative local-hour totals (not UTC bucket+pending)
+    raw_by_ts[grid_hour] = max(int(raw_by_ts.get(grid_hour, 0)), int(total_hour))
+    w_by_ts[grid_hour] = max(int(w_by_ts.get(grid_hour, 0)), int(total_hour_w))
 
     rows.sort(
         key=lambda r: (-int(r["raw"]["current_total"] or 0), r["name"])
@@ -1415,9 +1485,11 @@ async def build_panel_overview(
             "peak_bytes": by_hod[peak_hod] if peak_hod is not None else 0,
         },
         "panels": rows,
+        "chart_hour_ts": chart_hour,
+        "chart_hour_end_ts": chart_hour_end,
         "note": (
-            "بدون ضریب = Σ خام اکانت‌ها. با ضریب = ترافیک مصرفی داشبورد. "
-            "لود سریع؛ برای همگام‌سازی Xray از «تازه‌سازی زنده» استفاده کنید."
+            "بدون ضریب = Σ خام اکانت‌های Astra. با ضریب = ترافیک مصرفی داشبورد. "
+            "«این ساعت» = از شروع ستون فعلی نمودار تا الان (شمارندهٔ زنده Astra)."
         ),
     }
 
@@ -1433,8 +1505,6 @@ async def build_panel_detail(
         raise KeyError("panel")
     now = _utc_now()
     periods = _period_starts(now, tz_offset_min)
-    hour = int(periods["hour"])
-    hour_end = int(periods["hour_end"])
     day = int(periods["day"])
     day_end = int(periods["day_end"])
     week = int(periods["week"])
@@ -1443,9 +1513,25 @@ async def build_panel_detail(
     next_month_ts = int(periods["next_month"])
     prev_month = int(periods["prev_month"])
     grid_hour = int(periods["grid_hour"])
+    # Match overview/chart: current column start → now
+    hour = grid_hour
+    hour_end = grid_hour + 3600
     tz_off = int(periods["tz_offset_min"])
 
     st = await _get_or_create_panel_state(db, int(panel_id))
+    try:
+        from app.models.panel import PanelType
+
+        if panel.type == PanelType.astra:
+            from app.services import astra_node as astra_node_svc
+
+            await astra_node_svc.sync_traffic_from_xray(
+                db, panel, timeout=1.5
+            )
+            await db.commit()
+            st = await _get_or_create_panel_state(db, int(panel_id))
+    except Exception:  # noqa: BLE001
+        logger.debug("astra sync before panel detail failed", exc_info=True)
     try:
         usage_map = await live_panel_raw_and_weighted(db)
     except Exception:  # noqa: BLE001
@@ -1456,9 +1542,23 @@ async def build_panel_detail(
     cursor = int(st.last_raw_total or 0)
     seeded = bool(st.last_sample_at is not None)
     pending = _pending_bytes(live=live_total, cursor=cursor, seeded=seeded)
+    prev_hour_mark = int(getattr(st, "period_hour_ts", 0) or 0)
+    prev_day_mark = int(getattr(st, "period_day_ts", 0) or 0)
     wm_h, wm_d = apply_live_period_marks(
         st, live_total, hour_ts=hour, day_ts=day
     )
+    bucket_h = await _sum_panel_hours(db, panel_id, hour, hour_end)
+    bucket_d = await _sum_panel_hours(db, panel_id, day, day_end)
+    if prev_hour_mark != hour and live_total > 0:
+        known_h = min(live_total, bucket_h + pending)
+        if known_h > 0:
+            st.period_hour_raw = max(0, live_total - known_h)
+            wm_h = known_h
+    if prev_day_mark != day and live_total > 0:
+        known_d = min(live_total, bucket_d + pending)
+        if known_d > 0:
+            st.period_day_raw = max(0, live_total - known_d)
+            wm_d = known_d
     try:
         await db.commit()
     except Exception:  # noqa: BLE001
@@ -1467,8 +1567,6 @@ async def build_panel_detail(
             await db.rollback()
         except Exception:  # noqa: BLE001
             pass
-    bucket_h = await _sum_panel_hours(db, panel_id, hour, hour_end)
-    bucket_d = await _sum_panel_hours(db, panel_id, day, day_end)
     cur_h = _period_bytes_from_panel(
         live=live_total, pending=pending, bucket=bucket_h, watermark=wm_h
     )

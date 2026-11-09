@@ -1421,7 +1421,9 @@ async def _push_client_usage_to_accounts(
     return n
 
 
-async def sync_traffic_from_xray(db: AsyncSession, panel: Panel) -> int:
+async def sync_traffic_from_xray(
+    db: AsyncSession, panel: Panel, *, timeout: float = 8.0
+) -> int:
     """Pull per-email uplink+downlink from Xray StatsService and accumulate usage."""
     api_port = int((panel.meta or {}).get("xray_api_port") or (10085 + int(panel.id)))
     xray_bin = os.environ.get("ASTRA_XRAY_BIN", "/usr/local/bin/xray")
@@ -1438,7 +1440,9 @@ async def sync_traffic_from_xray(db: AsyncSession, panel: Panel) -> int:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=8)
+        out_b, err_b = await asyncio.wait_for(
+            proc.communicate(), timeout=max(0.5, float(timeout))
+        )
         if proc.returncode != 0 or not out_b:
             if err_b:
                 logger.debug(

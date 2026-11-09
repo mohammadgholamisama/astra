@@ -200,7 +200,7 @@ async def analytics_panels(
             logger.debug("panel sample before overview failed", exc_info=True)
     try:
         return await panel_analytics_svc.build_panel_overview(
-            db, tz_offset_min=tz_offset
+            db, tz_offset_min=tz_offset, sync_astra=True
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("build_panel_overview failed")
@@ -225,7 +225,7 @@ async def analytics_panels_refresh(
     # Fresh session so we see commits from the live-pull session
     async with AsyncSessionLocal() as db:
         overview = await panel_analytics_svc.build_panel_overview(
-            db, tz_offset_min=tz_offset, persist=True
+            db, tz_offset_min=tz_offset, sync_astra=True, persist=True
         )
     return {"ok": True, "stats": stats, "overview": overview}
 

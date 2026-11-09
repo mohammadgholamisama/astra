@@ -224,9 +224,14 @@ function clockLabel(ts: number): string {
 function HourlyUsageChart({
   points,
   mode = "weighted",
+  currentHourBytes,
+  currentHourRaw,
 }: {
   points?: HourPoint[] | null;
   mode?: "weighted" | "raw";
+  /** Authoritative «این ساعت» from Astra live watermarks (overrides chart bar). */
+  currentHourBytes?: number | null;
+  currentHourRaw?: number | null;
 }) {
   const [hover, setHover] = useState<number | null>(null);
   const series = points ?? [];
@@ -245,11 +250,27 @@ function HourlyUsageChart({
   const currentIdx = nowIdx >= 0 ? nowIdx : series.length - 1;
   const peak = series[peakIdx];
   const peakVal = vals[peakIdx];
-  const currentVal = vals[currentIdx] || 0;
+  const barCurrent = vals[currentIdx] || 0;
+  const currentVal =
+    currentHourBytes != null && Number.isFinite(Number(currentHourBytes))
+      ? Math.max(0, Number(currentHourBytes))
+      : barCurrent;
   const tipIdx = hover != null ? hover : currentIdx;
   const tip = series[tipIdx];
-  const tipVal = tip ? hourValue(tip, mode) : 0;
+  const tipVal =
+    tip && tip.is_current && currentHourBytes != null
+      ? Math.max(0, Number(currentHourBytes))
+      : tip
+        ? hourValue(tip, mode)
+        : 0;
   const tipIsNow = Boolean(tip?.is_current);
+  const hourRawHint =
+    currentHourRaw != null &&
+    Number(currentHourRaw) > 0 &&
+    mode === "weighted" &&
+    Math.abs(Number(currentHourRaw) - currentVal) > 1
+      ? Number(currentHourRaw)
+      : null;
 
   return (
     <div className="pan-chart">
@@ -266,7 +287,10 @@ function HourlyUsageChart({
         <div>
           <span>این ساعت</span>
           <b>{formatTraffic(currentVal)}</b>
-          <small>زنده · {clockLabel(series[currentIdx]?.hour_ts || 0)}</small>
+          <small>
+            از {clockLabel(series[currentIdx]?.hour_ts || 0)} تا الان
+            {hourRawHint != null ? ` · خام ${formatTraffic(hourRawHint)}` : ""}
+          </small>
         </div>
         <div>
           <span>اوج ۲۴س</span>
@@ -764,6 +788,12 @@ export default function PanelAnalyticsPage() {
             <HourlyUsageChart
               points={data.global_hourly || []}
               mode="weighted"
+              currentHourBytes={
+                data.totals?.weighted_hour != null
+                  ? Number(data.totals.weighted_hour)
+                  : Number(data.totals?.raw_hour || 0)
+              }
+              currentHourRaw={Number(data.totals?.raw_hour || 0)}
             />
           </section>
 
