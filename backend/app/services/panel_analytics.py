@@ -557,10 +557,10 @@ async def _astra_client_raw_by_panel(db: AsyncSession) -> dict[int, int]:
 async def live_panel_raw_and_weighted(
     db: AsyncSession,
 ) -> dict[int, dict[str, int]]:
-    """Σ raw and Σ (raw × group coefficient) per panel.
+    """Σ raw and Σ (raw × coefficient) per panel — SQL-aggregated (fast).
 
-    For Astra panels, ``AstraNodeClient`` cumulatives win when they are ahead
-    of ``PanelAccount`` (covers email-mismatch push gaps).
+    Fetching 180k+ PanelAccount rows in Python timed out live refresh and
+    returned empty totals. Group-by collapses to a few hundred rows.
     """
     from app.models.group import GroupPanel
     from app.services.quota import norm_coeff, weighted_bytes
@@ -577,15 +577,15 @@ async def live_panel_raw_and_weighted(
         claim[(int(pid), int(gid))] = c
         panel_max[int(pid)] = max(float(panel_max.get(int(pid), 0.0)), c)
 
-    # Same statuses as User.used_traffic / dashboard (pending does not count)
     rows = (
         await db.execute(
             select(
                 PanelAccount.panel_id,
                 PanelAccount.group_id,
-                PanelAccount.used_traffic,
                 PanelAccount.applied_coefficient,
-            ).where(
+                func.coalesce(func.sum(PanelAccount.used_traffic), 0),
+            )
+            .where(
                 PanelAccount.status.in_(
                     (
                         PanelAccountStatus.active,
@@ -594,11 +594,16 @@ async def live_panel_raw_and_weighted(
                     )
                 )
             )
+            .group_by(
+                PanelAccount.panel_id,
+                PanelAccount.group_id,
+                PanelAccount.applied_coefficient,
+            )
         )
     ).all()
 
     out: dict[int, dict[str, int]] = {}
-    for pid, gid, raw, applied in rows:
+    for pid, gid, applied, raw in rows:
         pid_i = int(pid)
         raw_i = max(0, int(raw or 0))
         if applied is not None:
@@ -611,9 +616,7 @@ async def live_panel_raw_and_weighted(
         slot["raw"] += raw_i
         slot["weighted"] += int(weighted_bytes(raw_i, coeff))
 
-    # Fill gaps only: stale AstraNodeClient totals used to OVERRIDE growing
-    # PanelAccount rows and freeze «این ساعت» for hours. PanelAccount (mirrored
-    # from Xray on sync) is the analytics source of truth.
+    # Fill empty Astra panels only (never override growing PanelAccount totals)
     try:
         client_raw = await _astra_client_raw_by_panel(db)
     except Exception:  # noqa: BLE001
@@ -1088,8 +1091,11 @@ async def refresh_panel_analytics_fast(
                         )
                         for pid in set(pre_live) | set(post_live)
                     )
-                    await flush_live_deltas_to_hours(
-                        db, post_live, now=_utc_now()
+                    await asyncio.wait_for(
+                        flush_live_deltas_to_hours(
+                            db, post_live, now=_utc_now()
+                        ),
+                        timeout=2.0,
                     )
                 except Exception as exc:  # noqa: BLE001
                     err = err or f"flush:{type(exc).__name__}"
