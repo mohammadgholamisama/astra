@@ -616,8 +616,9 @@ async def live_panel_raw_and_weighted(
         slot["raw"] += raw_i
         slot["weighted"] += int(weighted_bytes(raw_i, coeff))
 
-    # Astra: AstraNodeClient (per-user Xray counters) is the source of truth.
-    # Prefer client Σ whenever present so «این ساعت» = growth of all users.
+    # Astra clients fill ONLY when a panel has no account rows yet.
+    # Never prefer client Σ over accounts — sampler/marks use account Σ, and a
+    # higher client total would dump the historical gap into «این ساعت».
     try:
         client_raw = await _astra_client_raw_by_panel(db)
     except Exception:  # noqa: BLE001
@@ -626,49 +627,12 @@ async def live_panel_raw_and_weighted(
     for pid, craw in client_raw.items():
         pid_i = int(pid)
         craw_i = max(0, int(craw or 0))
-        if craw_i <= 0:
-            continue
         slot = out.setdefault(pid_i, {"raw": 0, "weighted": 0})
-        acc_raw = int(slot["raw"] or 0)
-        acc_w = int(slot["weighted"] or 0)
+        if int(slot["raw"] or 0) > 0 or craw_i <= 0:
+            continue
         coeff = panel_max.get(pid_i, 1.0) or 1.0
-        if acc_raw > 0 and acc_w > 0:
-            slot["weighted"] = int(round(acc_w * (craw_i / acc_raw)))
-        else:
-            slot["weighted"] = int(weighted_bytes(craw_i, coeff))
         slot["raw"] = craw_i
-
-    try:
-        from app.models.panel import PanelType
-
-        astra_panels = list(
-            (
-                await db.execute(
-                    select(Panel).where(Panel.type == PanelType.astra)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for p in astra_panels:
-            meta = p.meta if isinstance(p.meta, dict) else {}
-            inbound_cum = max(0, int(meta.get("inbound_cum") or 0))
-            if inbound_cum <= 0:
-                continue
-            pid_i = int(p.id)
-            slot = out.setdefault(pid_i, {"raw": 0, "weighted": 0})
-            acc_raw = int(slot["raw"] or 0)
-            if inbound_cum <= acc_raw:
-                continue
-            coeff = panel_max.get(pid_i, 1.0) or 1.0
-            if acc_raw > 0:
-                ratio = inbound_cum / acc_raw
-                slot["weighted"] = int(round(int(slot["weighted"] or 0) * ratio))
-            else:
-                slot["weighted"] = int(weighted_bytes(inbound_cum, coeff))
-            slot["raw"] = inbound_cum
-    except Exception:  # noqa: BLE001
-        logger.debug("astra inbound_cum overlay failed", exc_info=True)
+        slot["weighted"] = int(weighted_bytes(craw_i, coeff))
     return out
 
 
