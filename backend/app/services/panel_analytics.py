@@ -1078,12 +1078,13 @@ async def refresh_panel_analytics_fast(
     tz_offset_min: int = 0,
     budget_s: float = 5.5,
 ) -> dict[str, Any]:
-    """«تازه‌سازی زنده» — hard-capped (~5s). Always returns an overview."""
+    """«تازه‌سازی زنده» — hard-capped. Always returns an overview."""
     from app.core.database import AsyncSessionLocal
 
     t0 = time.monotonic()
-    budget = min(6.0, max(4.0, float(budget_s or 5.5)))
+    budget = min(16.0, max(4.0, float(budget_s or 5.5)))
     astra_synced = 0
+    users_pulled = 0
     bytes_hint = 0
     err: str | None = None
 
@@ -1148,12 +1149,26 @@ async def refresh_panel_analytics_fast(
             err = err or f"sync:{type(exc).__name__}"
             logger.debug("fast refresh astra sync failed", exc_info=True)
 
-        # Sample Σ used_traffic for ALL panels into hour buckets (DB totals).
+        # Pull a slice of remote panel usage so non-Astra account totals move,
+        # then sample/flush into the current chart hour.
         try:
-            await asyncio.wait_for(sample_all_panels_once(force=True), timeout=2.0)
+            pull = await asyncio.wait_for(
+                refresh_panels_live(pull_remotes=True, astra_only=False),
+                timeout=min(8.0, max(3.0, budget * 0.7)),
+            )
+            users_pulled = int((pull or {}).get("users_pulled") or 0)
+            astra_synced = max(
+                astra_synced, int((pull or {}).get("astra_synced") or 0)
+            )
         except Exception as exc:  # noqa: BLE001
-            err = err or f"sample:{type(exc).__name__}"
-            logger.debug("fast refresh panel sample failed", exc_info=True)
+            err = err or f"pull:{type(exc).__name__}"
+            logger.debug("fast refresh remote pull failed", exc_info=True)
+            try:
+                await asyncio.wait_for(
+                    sample_all_panels_once(force=True), timeout=2.0
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
         try:
             async with AsyncSessionLocal() as db:
@@ -1211,8 +1226,8 @@ async def refresh_panel_analytics_fast(
             "ok": True,
             "stats": {
                 "astra_synced": astra_synced,
-                "astra_only": True,
-                "users_pulled": 0,
+                "astra_only": False,
+                "users_pulled": int(users_pulled),
                 "bytes_added": int(bytes_hint),
                 "ms": int((time.monotonic() - t0) * 1000),
                 "error": err,

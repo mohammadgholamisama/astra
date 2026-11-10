@@ -233,7 +233,7 @@ async def analytics_panels_refresh(
     tz_offset: int = Query(0, ge=-840, le=840),
     _admin=Depends(get_current_admin),
 ):
-    """Fast Astra live refresh — always returns overview (never 500/timeout to UI)."""
+    """Live refresh for all panels — always returns overview (never 500 to UI)."""
     import asyncio
 
     from app.core.database import AsyncSessionLocal
@@ -241,9 +241,9 @@ async def analytics_panels_refresh(
     try:
         return await asyncio.wait_for(
             panel_analytics_svc.refresh_panel_analytics_fast(
-                tz_offset_min=tz_offset, budget_s=5.5
+                tz_offset_min=tz_offset, budget_s=14.0
             ),
-            timeout=7.0,
+            timeout=18.0,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("panel analytics fast refresh failed: %s", exc)
