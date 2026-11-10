@@ -435,7 +435,7 @@ function PanelDetailModal({
           <article>
             <span>مصرف فعلی · بدون ضریب</span>
             <b>{formatTraffic(current)}</b>
-            <small>جمع خام اکانت‌های Astra · کل عمر</small>
+            <small>جمع خام اکانت‌های همهٔ پنل‌ها · کل عمر</small>
           </article>
           <article>
             <span>مصرف فعلی · با ضریب</span>
@@ -668,7 +668,7 @@ export default function PanelAnalyticsPage() {
           <p className="an-kicker">تحلیل زیر‌ساخت</p>
           <h1>آمار پنل‌ها</h1>
           <p className="an-sub">
-            فقط آمار دقیق از اکانت‌های Astra — خام و با ضریب
+            مصرف همهٔ یوزرها روی همهٔ پنل‌ها — خام و با ضریب · «این ساعت» از شروع ستون تا الان
           </p>
           <div className="an-hero-actions">
             <button
@@ -983,7 +983,7 @@ export default function PanelAnalyticsPage() {
               </p>
             ) : null}
             <p className="muted" style={{ marginTop: 10 }}>
-              فقط اعداد دقیق از اکانت‌های Astra · کلیک روی ردیف = جزئیات
+              جمع مصرف یوزرها روی هر پنل · کلیک روی ردیف = جزئیات
             </p>
           </section>
         </>

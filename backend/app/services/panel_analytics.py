@@ -1148,6 +1148,13 @@ async def refresh_panel_analytics_fast(
             err = err or f"sync:{type(exc).__name__}"
             logger.debug("fast refresh astra sync failed", exc_info=True)
 
+        # Sample Σ used_traffic for ALL panels into hour buckets (DB totals).
+        try:
+            await asyncio.wait_for(sample_all_panels_once(force=True), timeout=2.0)
+        except Exception as exc:  # noqa: BLE001
+            err = err or f"sample:{type(exc).__name__}"
+            logger.debug("fast refresh panel sample failed", exc_info=True)
+
         try:
             async with AsyncSessionLocal() as db:
                 try:
@@ -1617,21 +1624,22 @@ async def build_panel_overview(
     tz_off = int(periods["tz_offset_min"])
     g_start = grid_hour - 23 * 3600
 
-    from app.models.panel import PanelType
-
-    # This page is Astra-only: chart columns + «این ساعت» = Astra panel traffic
-    # for each UTC grid hour (shown as local :30 labels).
+    # All panels: «این ساعت» = Σ (مصرف‌الان همهٔ یوزرها − مصرف اول ساعت)
+    # for every panel. Astra still gets a live Xray sync below.
     panels = list(
         (
-            await db.execute(
-                select(Panel)
-                .where(Panel.type == PanelType.astra)
-                .order_by(Panel.id.asc())
-            )
+            await db.execute(select(Panel).order_by(Panel.id.asc()))
         )
         .scalars()
         .all()
     )
+    from app.models.panel import PanelType
+
+    astra_panel_ids = {
+        int(p.id)
+        for p in panels
+        if getattr(p.type, "value", p.type) == "astra"
+    }
 
     if sync_astra:
         # Seed before sync so Xray growth lands in the current chart hour
@@ -1658,22 +1666,22 @@ async def build_panel_overview(
     except Exception:  # noqa: BLE001
         logger.exception("live_panel_raw_and_weighted failed")
         usage_map = {}
-    astra_ids = {int(p.id) for p in panels}
+    panel_ids = {int(p.id) for p in panels}
     live_totals = {
         pid: int(v["raw"])
         for pid, v in usage_map.items()
-        if int(pid) in astra_ids
+        if int(pid) in panel_ids
     }
     weighted_totals = {
         pid: int(v["weighted"])
         for pid, v in usage_map.items()
-        if int(pid) in astra_ids
+        if int(pid) in panel_ids
     }
     for p in panels:
         live_totals.setdefault(int(p.id), 0)
         weighted_totals.setdefault(int(p.id), 0)
 
-    # Credit unsampled Astra growth into the current chart column
+    # Flush unsampled growth (all panels) into the current chart column
     if persist:
         try:
             if not sync_astra:
@@ -1685,7 +1693,7 @@ async def build_panel_overview(
     states = {
         int(s.panel_id): s
         for s in (await db.execute(select(PanelUsageState))).scalars().all()
-        if int(s.panel_id) in astra_ids
+        if int(s.panel_id) in panel_ids
     }
 
     accounts_by_panel: dict[int, int] = {
@@ -1707,7 +1715,7 @@ async def build_panel_overview(
         ).all()
     }
 
-    # Buckets: 24h chart + current chart-hour — Astra panels only
+    # Buckets: 24h chart + current chart-hour — every panel
     bucket_rows = (
         await db.execute(
             select(
@@ -1715,7 +1723,7 @@ async def build_panel_overview(
                 PanelUsageHourBucket.hour_ts,
                 PanelUsageHourBucket.raw_bytes,
             ).where(
-                PanelUsageHourBucket.panel_id.in_(list(astra_ids) or [0]),
+                PanelUsageHourBucket.panel_id.in_(list(panel_ids) or [0]),
                 PanelUsageHourBucket.hour_ts >= min(g_start, day) - 3600,
                 PanelUsageHourBucket.hour_ts <= grid_hour,
             )
@@ -1727,7 +1735,7 @@ async def build_panel_overview(
     w_by_ts: dict[int, int] = {g_start + i * 3600: 0 for i in range(24)}
     for pid, ts, raw in bucket_rows:
         pid_i, ts_i, raw_i = int(pid), int(ts), max(0, int(raw or 0))
-        if pid_i not in astra_ids:
+        if pid_i not in panel_ids:
             continue
         live_r = int(live_totals.get(pid_i, 0))
         live_w = int(weighted_totals.get(pid_i, 0))
@@ -1771,24 +1779,25 @@ async def build_panel_overview(
         mark_d_raw = (
             max(0, int(getattr(st, "period_day_raw", 0) or 0)) if st else 0
         )
-        # Keep cursor on the same scale as live (client Σ). Never let a stale
-        # account-scale cursor invent pending megabytes for «این ساعت».
-        if st is not None and live > 0 and seeded:
+        # Astra only: client Σ can sit above an old account-scale cursor.
+        if (
+            st is not None
+            and live > 0
+            and seeded
+            and pid in astra_panel_ids
+        ):
             if mark_h_ts == chart_hour and mark_h_raw > cursor and live >= mark_h_raw:
                 st.last_raw_total = live
                 cursor = live
                 marks_touched = True
             elif live > cursor and (live - cursor) > 5_000_000:
-                # Large jump while mark already near live → rebase cursor only
                 if mark_h_ts == chart_hour and mark_h_raw + 5_000_000 >= cursor:
-                    gap = live - cursor
-                    if mark_h_raw < live and (live - mark_h_raw) < gap:
+                    if mark_h_raw < live and (live - mark_h_raw) < (live - cursor):
                         st.last_raw_total = live
                         cursor = live
                         marks_touched = True
         pending = _pending_bytes(live=live, cursor=cursor, seeded=seeded)
-        # «این ساعت» = live − watermark at chart-hour start (sum of all users).
-        # Do NOT floor with hour buckets — corrupted buckets inflated MB falsely.
+        # «این ساعت» = Σ(مصرف‌الان − مصرف‌شروع‌ساعت) برای همهٔ یوزرهای پنل
         if st is not None and mark_h_ts == chart_hour and mark_h_raw > live > 0:
             mark_h_raw = live
         h, new_h_ts, new_h_raw = _period_from_live_mark(
@@ -1806,7 +1815,6 @@ async def build_panel_overview(
             bucket=0,
         )
         d = max(d, h)
-        # Keep historical day floor from flushed buckets only when sane
         if bucket_d > 0 and bucket_d <= max(d, 1) * 2 + pending:
             d = max(d, min(live, bucket_d + pending) if live else bucket_d)
         # Persist watermarks — baseline must NOT chase live during the hour
@@ -1968,9 +1976,9 @@ async def build_panel_overview(
         "chart_hour_ts": chart_hour,
         "chart_hour_end_ts": chart_hour_end,
         "note": (
-            "فقط پنل‌های Astra. خام = Σ مصرف همهٔ یوزرهای هر پنل (Xray). "
-            "با ضریب = همان × ضریب گروه. "
-            "«این ساعت» = Σ (مصرف‌الان − مصرف‌شروع‌ساعت) از ابتدای ستون نمودار تا الان."
+            "همهٔ پنل‌ها. خام = Σ مصرف همهٔ یوزرهای هر پنل. با ضریب = همان × ضریب گروه. "
+            "«این ساعت» = از شروع ستون نمودار تا الان: برای هر پنل (مصرف‌الان − مصرف‌اول‌ساعت) "
+            "جمع زده می‌شود."
         ),
     }
 
