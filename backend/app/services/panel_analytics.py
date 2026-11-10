@@ -616,7 +616,8 @@ async def live_panel_raw_and_weighted(
         slot["raw"] += raw_i
         slot["weighted"] += int(weighted_bytes(raw_i, coeff))
 
-    # AstraNodeClient is the Xray source of truth — take max(account, client).
+    # Astra: AstraNodeClient (per-user Xray counters) is the source of truth.
+    # Prefer client Σ whenever present so «این ساعت» = growth of all users.
     try:
         client_raw = await _astra_client_raw_by_panel(db)
     except Exception:  # noqa: BLE001
@@ -624,15 +625,15 @@ async def live_panel_raw_and_weighted(
         client_raw = {}
     for pid, craw in client_raw.items():
         pid_i = int(pid)
+        craw_i = max(0, int(craw or 0))
+        if craw_i <= 0:
+            continue
         slot = out.setdefault(pid_i, {"raw": 0, "weighted": 0})
         acc_raw = int(slot["raw"] or 0)
-        craw_i = max(0, int(craw or 0))
-        if craw_i <= acc_raw:
-            continue
+        acc_w = int(slot["weighted"] or 0)
         coeff = panel_max.get(pid_i, 1.0) or 1.0
-        if acc_raw > 0:
-            ratio = craw_i / acc_raw
-            slot["weighted"] = int(round(int(slot["weighted"] or 0) * ratio))
+        if acc_raw > 0 and acc_w > 0:
+            slot["weighted"] = int(round(acc_w * (craw_i / acc_raw)))
         else:
             slot["weighted"] = int(weighted_bytes(craw_i, coeff))
         slot["raw"] = craw_i
@@ -659,7 +660,6 @@ async def live_panel_raw_and_weighted(
             acc_raw = int(slot["raw"] or 0)
             if inbound_cum <= acc_raw:
                 continue
-            # Inbound meter is ahead of mirrored accounts — use it for the chart hour
             coeff = panel_max.get(pid_i, 1.0) or 1.0
             if acc_raw > 0:
                 ratio = inbound_cum / acc_raw
@@ -832,17 +832,29 @@ async def flush_live_deltas_to_hours(
                     continue
                 delta = 0 if raw < prev else (raw - prev)
                 dt = max(1.0, (now - last_at).total_seconds())
-                # >30MB since last sample with implied rate that can't be real
-                # Xray growth in a short refresh → live-source rebase, not traffic.
+                mark_h = int(getattr(state, "period_hour_raw", 0) or 0)
+                mark_h_ts = int(getattr(state, "period_hour_ts", 0) or 0)
+                # Cursor still on an older scale (e.g. accounts) while live/mark
+                # already on client Σ → rebase cursor only, never credit the gap.
+                if (
+                    delta > 1_000_000
+                    and mark_h_ts == hour_ts
+                    and mark_h >= prev
+                    and raw >= mark_h
+                    and (raw - mark_h) < delta
+                ):
+                    state.last_raw_total = raw
+                    state.last_sample_at = now
+                    touched += 1
+                    continue
+                # Absurd jump vs elapsed time → live-source rebase, not traffic.
                 max_natural = max(30 * 1024 * 1024, int(dt * (500_000_000 / 8)))
                 if delta > max_natural:
                     gap = delta
                     state.last_raw_total = raw
                     state.last_sample_at = now
-                    if int(getattr(state, "period_hour_ts", 0) or 0) == hour_ts:
-                        state.period_hour_raw = int(
-                            getattr(state, "period_hour_raw", 0) or 0
-                        ) + gap
+                    if mark_h_ts == hour_ts:
+                        state.period_hour_raw = mark_h + gap
                     if int(getattr(state, "period_day_ts", 0) or 0):
                         state.period_day_raw = int(
                             getattr(state, "period_day_raw", 0) or 0
@@ -1759,47 +1771,44 @@ async def build_panel_overview(
         mark_d_raw = (
             max(0, int(getattr(st, "period_day_raw", 0) or 0)) if st else 0
         )
-        # Live source can jump (account → client/inbound). Shift cursor + marks
-        # by the same delta so historical gap is NOT dumped into «این ساعت».
-        if st is not None and live > cursor:
-            raised = live - cursor
-            if raised > max(bucket_h, 1) * 3 + 1_000_000:
+        # Keep cursor on the same scale as live (client Σ). Never let a stale
+        # account-scale cursor invent pending megabytes for «این ساعت».
+        if st is not None and live > 0 and seeded:
+            if mark_h_ts == chart_hour and mark_h_raw > cursor and live >= mark_h_raw:
                 st.last_raw_total = live
                 cursor = live
-                if mark_h_ts == chart_hour:
-                    mark_h_raw += raised
-                if mark_d_ts == day:
-                    mark_d_raw += raised
                 marks_touched = True
+            elif live > cursor and (live - cursor) > 5_000_000:
+                # Large jump while mark already near live → rebase cursor only
+                if mark_h_ts == chart_hour and mark_h_raw + 5_000_000 >= cursor:
+                    gap = live - cursor
+                    if mark_h_raw < live and (live - mark_h_raw) < gap:
+                        st.last_raw_total = live
+                        cursor = live
+                        marks_touched = True
         pending = _pending_bytes(live=live, cursor=cursor, seeded=seeded)
-        # Floor from flushed bucket + unflushed pending (live − cursor)
-        from_bucket_h = _chart_hour_bytes(
-            live=live, bucket=bucket_h, pending=pending
-        )
-        from_bucket_d = _chart_hour_bytes(
-            live=live, bucket=bucket_d, pending=pending
-        )
-        # Repair only truly chased marks (baseline >= live → hour stuck at 0)
-        if st is not None and mark_h_ts == chart_hour and live > 0:
-            if mark_h_raw >= live:
-                mark_h_raw = max(0, live - max(bucket_h, from_bucket_h, pending))
+        # «این ساعت» = live − watermark at chart-hour start (sum of all users).
+        # Do NOT floor with hour buckets — corrupted buckets inflated MB falsely.
+        if st is not None and mark_h_ts == chart_hour and mark_h_raw > live > 0:
+            mark_h_raw = live
         h, new_h_ts, new_h_raw = _period_from_live_mark(
             live,
             mark_ts=mark_h_ts,
             mark_raw=mark_h_raw,
             period_ts=chart_hour,
-            bucket=max(bucket_h, from_bucket_h),
+            bucket=0,
         )
-        # «این ساعت» = max(live − mark از ابتدای ستون نمودار, bucket + pending)
-        h = max(h, from_bucket_h)
         d, new_d_ts, new_d_raw = _period_from_live_mark(
             live,
             mark_ts=mark_d_ts,
             mark_raw=mark_d_raw,
             period_ts=day,
-            bucket=max(bucket_d, from_bucket_d),
+            bucket=0,
         )
-        d = max(d, from_bucket_d, h)
+        d = max(d, h)
+        # Keep historical day floor from flushed buckets only when sane
+        if bucket_d > 0 and bucket_d <= max(d, 1) * 2 + pending:
+            d = max(d, min(live, bucket_d + pending) if live else bucket_d)
         # Persist watermarks — baseline must NOT chase live during the hour
         if persist and st is not None:
             st.period_hour_ts = new_h_ts
@@ -1959,8 +1968,9 @@ async def build_panel_overview(
         "chart_hour_ts": chart_hour,
         "chart_hour_end_ts": chart_hour_end,
         "note": (
-            "فقط پنل‌های Astra. خام = Σ اکانت/ورود Xray. با ضریب = همان × ضریب گروه. "
-            "«این ساعت» = مصرف از ابتدای ستون نمودار (مثلاً ۱۰:۳۰) تا الان."
+            "فقط پنل‌های Astra. خام = Σ مصرف همهٔ یوزرهای هر پنل (Xray). "
+            "با ضریب = همان × ضریب گروه. "
+            "«این ساعت» = Σ (مصرف‌الان − مصرف‌شروع‌ساعت) از ابتدای ستون نمودار تا الان."
         ),
     }
 
