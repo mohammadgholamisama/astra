@@ -1608,8 +1608,6 @@ async def build_panel_overview(
         }
         for p in panel_orm
     ]
-    astra_panel_ids = {p["id"] for p in panels if p["type"] == "astra"}
-
     if sync_astra:
         # Seed before sync so Xray growth lands in the current chart hour
         try:
