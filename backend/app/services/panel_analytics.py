@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -35,6 +36,38 @@ _refresh_lock = asyncio.Lock()
 _GOOD_PING_MS = 180.0
 _GOOD_STABILITY = 70.0
 _GOOD_PACKET_LOSS = 5.0
+
+_BRAND_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("iPhone", re.compile(r"iphone", re.I)),
+    ("iPad", re.compile(r"ipad", re.I)),
+    ("Samsung", re.compile(r"samsung|\bsm-[a-z0-9]+", re.I)),
+    ("Xiaomi", re.compile(r"xiaomi|\bredmi\b|\bpoco\b|\bmi\s?\d", re.I)),
+    ("Huawei", re.compile(r"huawei|\bhuawei|\balphabet", re.I)),
+    ("Honor", re.compile(r"\bhonor\b|\bhry-", re.I)),
+    ("OnePlus", re.compile(r"oneplus|\bop\d{2}", re.I)),
+    ("OPPO", re.compile(r"\boppo\b|\bcph\d+", re.I)),
+    ("vivo", re.compile(r"\bvivo\b", re.I)),
+    ("Realme", re.compile(r"realme", re.I)),
+    ("Nokia", re.compile(r"nokia", re.I)),
+    ("Google Pixel", re.compile(r"pixel", re.I)),
+    ("Sony", re.compile(r"sony|xperia", re.I)),
+    ("LG", re.compile(r"\blg[- ]", re.I)),
+    ("Motorola", re.compile(r"motorola|\bmoto\b", re.I)),
+    ("Windows", re.compile(r"windows nt|windows phone", re.I)),
+    ("macOS", re.compile(r"mac os x|macintosh", re.I)),
+    ("Linux", re.compile(r"linux(?!.*android)", re.I)),
+    ("Android", re.compile(r"android", re.I)),
+]
+
+
+def parse_device_brand(user_agent: str) -> str:
+    ua = (user_agent or "").strip()
+    if not ua:
+        return "نامشخص"
+    for name, pat in _BRAND_PATTERNS:
+        if pat.search(ua):
+            return name
+    return "سایر"
 
 
 def _utc_now() -> datetime:
@@ -422,12 +455,15 @@ async def apply_panel_user_sample(
 
 
 async def _sample_panels_with_db(db: AsyncSession, *, now: datetime | None = None) -> dict[str, int]:
-    """Advance panel + user×panel cursors from current PanelAccount counters."""
+    """Advance panel hour cursors from Σ PanelAccount — panel-level only.
+
+    Per-(user,panel) online sampling over 100k+ rows previously took ~40 minutes
+    and starved live refresh / the whole API. Hour stats only need panel totals.
+    """
     now = _as_utc(now) or _utc_now()
-    up_rows = (
+    panel_rows = (
         await db.execute(
             select(
-                PanelAccount.user_id,
                 PanelAccount.panel_id,
                 func.coalesce(func.sum(PanelAccount.used_traffic), 0),
             )
@@ -440,32 +476,16 @@ async def _sample_panels_with_db(db: AsyncSession, *, now: datetime | None = Non
                     )
                 )
             )
-            .group_by(PanelAccount.user_id, PanelAccount.panel_id)
+            .group_by(PanelAccount.panel_id)
         )
     ).all()
 
-    online_by_panel: dict[int, int] = {}
-    raw_by_panel: dict[int, int] = {}
-    n_up = 0
-    for uid, pid, total in up_rows:
-        uid_i, pid_i = int(uid), int(pid)
-        raw_i = int(total or 0)
-        raw_by_panel[pid_i] = raw_by_panel.get(pid_i, 0) + raw_i
-        try:
-            async with db.begin_nested():
-                is_on = await apply_panel_user_sample(db, uid_i, pid_i, raw_i, now=now)
-            if is_on:
-                online_by_panel[pid_i] = online_by_panel.get(pid_i, 0) + 1
-            n_up += 1
-        except Exception:  # noqa: BLE001
-            logger.exception("panel user sample u=%s p=%s failed", uid_i, pid_i)
-        if n_up % 80 == 0:
-            await db.commit()
-
+    raw_by_panel: dict[int, int] = {
+        int(pid): int(total or 0) for pid, total in panel_rows
+    }
     all_pids = {int(r[0]) for r in (await db.execute(select(Panel.id))).all()}
     for pid in all_pids:
         raw_by_panel.setdefault(int(pid), 0)
-        online_by_panel.setdefault(int(pid), 0)
 
     n_p = 0
     for pid, raw in raw_by_panel.items():
@@ -475,14 +495,14 @@ async def _sample_panels_with_db(db: AsyncSession, *, now: datetime | None = Non
                     db,
                     int(pid),
                     int(raw),
-                    online_n=int(online_by_panel.get(int(pid), 0)),
+                    online_n=0,
                     now=now,
                 )
             n_p += 1
         except Exception:  # noqa: BLE001
             logger.exception("panel sample p=%s failed", pid)
     await db.commit()
-    return {"panels": n_p, "user_panel": n_up}
+    return {"panels": n_p, "user_panel": 0}
 
 
 async def sample_all_panels_once(*, force: bool = False) -> dict[str, int]:
@@ -668,32 +688,32 @@ async def live_panel_totals(db: AsyncSession) -> dict[int, int]:
 
 
 async def sync_astra_panels_live(
-    db: AsyncSession,
+    db: AsyncSession | None = None,
     *,
     timeout_per_panel: float = 2.0,
     rebuild_on_limit: bool = False,
 ) -> int:
     """Pull fresh Xray traffic into PanelAccount for all active Astra panels.
 
-    Each panel uses its own DB session and runs in parallel so a short UI
-    budget still covers many nodes (sequential sync under a 2–3s cap left most
-    panels unsynced → frozen «این ساعت»). ``rebuild_on_limit=False`` by default.
+    Fully isolated from the caller session (avoids PendingRollbackError after a
+    failed seed/query). Each panel uses its own session in parallel.
     """
     from app.core.database import AsyncSessionLocal
     from app.models.panel import PanelType
     from app.services import astra_node as astra_node_svc
 
-    panel_ids = [
-        int(pid)
-        for (pid,) in (
-            await db.execute(
-                select(Panel.id).where(
-                    Panel.type == PanelType.astra,
-                    Panel.is_active.is_(True),
+    async with AsyncSessionLocal() as list_db:
+        panel_ids = [
+            int(pid)
+            for (pid,) in (
+                await list_db.execute(
+                    select(Panel.id).where(
+                        Panel.type == PanelType.astra,
+                        Panel.is_active.is_(True),
+                    )
                 )
-            )
-        ).all()
-    ]
+            ).all()
+        ]
     if not panel_ids:
         return 0
 
@@ -726,11 +746,15 @@ async def sync_astra_panels_live(
 
     results = await asyncio.gather(*[_one(pid) for pid in panel_ids])
     updated = int(sum(int(x or 0) for x in results))
-    # Caller session must re-read rows committed by the worker sessions
-    try:
-        db.expire_all()
-    except Exception:  # noqa: BLE001
-        pass
+    if db is not None:
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            db.expire_all()
+        except Exception:  # noqa: BLE001
+            pass
     return updated
 
 
@@ -1012,40 +1036,49 @@ async def refresh_panel_analytics_fast(
 
     async with _refresh_lock:
         pre_live: dict[int, int] = {}
+        # Each phase uses a fresh session so one failure cannot PendingRollback
+        # the rest of the refresh (root cause of astra_synced=0 forever).
         try:
             async with AsyncSessionLocal() as db:
                 try:
                     pre = await asyncio.wait_for(
-                        live_panel_raw_and_weighted(db), timeout=1.0
+                        live_panel_raw_and_weighted(db), timeout=1.2
                     )
                     pre_live = {pid: int(v["raw"]) for pid, v in pre.items()}
-                    await asyncio.wait_for(
-                        ensure_panel_cursors_seeded(db, pre_live, now=_utc_now()),
-                        timeout=0.8,
+                    await ensure_panel_cursors_seeded(
+                        db, pre_live, now=_utc_now()
                     )
                 except Exception:  # noqa: BLE001
                     logger.debug("fast refresh pre-seed failed", exc_info=True)
+                    try:
+                        await db.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception as exc:  # noqa: BLE001
+            err = f"pre:{type(exc).__name__}"
 
-                sync_budget = min(2.8, max(1.5, budget * 0.45))
-                try:
-                    astra_synced = int(
-                        await asyncio.wait_for(
-                            sync_astra_panels_live(
-                                db,
-                                timeout_per_panel=1.2,
-                                rebuild_on_limit=False,
-                            ),
-                            timeout=sync_budget,
-                        )
-                        or 0
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    err = f"sync:{type(exc).__name__}"
-                    logger.debug("fast refresh astra sync failed", exc_info=True)
+        sync_budget = min(2.8, max(1.5, budget * 0.45))
+        try:
+            astra_synced = int(
+                await asyncio.wait_for(
+                    sync_astra_panels_live(
+                        None,
+                        timeout_per_panel=1.2,
+                        rebuild_on_limit=False,
+                    ),
+                    timeout=sync_budget,
+                )
+                or 0
+            )
+        except Exception as exc:  # noqa: BLE001
+            err = err or f"sync:{type(exc).__name__}"
+            logger.debug("fast refresh astra sync failed", exc_info=True)
 
+        try:
+            async with AsyncSessionLocal() as db:
                 try:
                     post = await asyncio.wait_for(
-                        live_panel_raw_and_weighted(db), timeout=1.0
+                        live_panel_raw_and_weighted(db), timeout=1.2
                     )
                     post_live = {pid: int(v["raw"]) for pid, v in post.items()}
                     bytes_hint = sum(
@@ -1055,17 +1088,18 @@ async def refresh_panel_analytics_fast(
                         )
                         for pid in set(pre_live) | set(post_live)
                     )
-                    await asyncio.wait_for(
-                        flush_live_deltas_to_hours(
-                            db, post_live, now=_utc_now()
-                        ),
-                        timeout=1.2,
+                    await flush_live_deltas_to_hours(
+                        db, post_live, now=_utc_now()
                     )
                 except Exception as exc:  # noqa: BLE001
                     err = err or f"flush:{type(exc).__name__}"
                     logger.debug("fast refresh flush failed", exc_info=True)
+                    try:
+                        await db.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
         except Exception as exc:  # noqa: BLE001
-            err = f"phase1:{type(exc).__name__}"
+            err = err or f"phase1:{type(exc).__name__}"
             logger.exception("fast refresh phase1 failed")
 
         overview: dict[str, Any] | None = None
@@ -1643,14 +1677,14 @@ async def build_panel_overview(
         mark_d_raw = (
             max(0, int(getattr(st, "period_day_raw", 0) or 0)) if st else 0
         )
-        # Repair chased / broken marks that locked hour to a fixed bucket
-        if (
-            st is not None
-            and mark_h_ts == chart_hour
-            and live > 0
-            and mark_h_raw >= live
-        ):
-            mark_h_raw = max(0, live - max(bucket_h, from_bucket_h))
+        # Repair chased marks: period_hour_raw was advanced to == live/cursor
+        # so «این ساعت» stayed 0 forever while lifetime grew.
+        if st is not None and mark_h_ts == chart_hour and live > 0:
+            cursor_i = int(cursor)
+            if mark_h_raw >= live or (
+                cursor_i > 0 and mark_h_raw >= cursor_i and from_bucket_h >= 0
+            ):
+                mark_h_raw = max(0, live - max(bucket_h, from_bucket_h, pending))
         h, new_h_ts, new_h_raw = _period_from_live_mark(
             live,
             mark_ts=mark_h_ts,
