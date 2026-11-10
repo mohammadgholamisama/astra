@@ -810,6 +810,9 @@ async def flush_live_deltas_to_hours(
     Unlike the background sampler, catch-up after Xray sync is credited entirely
     to the current hour — spreading a multi-hour idle gap would invent fake
     traffic in empty past hours and under-count the active hour.
+
+    Source-switch jumps (e.g. account Σ → Astra client Σ) are adopted as a new
+    baseline and never written into the chart hour.
     """
     now = _as_utc(now) or _utc_now()
     hour_ts = _hour_ts(now)
@@ -828,6 +831,24 @@ async def flush_live_deltas_to_hours(
                     touched += 1
                     continue
                 delta = 0 if raw < prev else (raw - prev)
+                dt = max(1.0, (now - last_at).total_seconds())
+                # >30MB since last sample with implied rate that can't be real
+                # Xray growth in a short refresh → live-source rebase, not traffic.
+                max_natural = max(30 * 1024 * 1024, int(dt * (500_000_000 / 8)))
+                if delta > max_natural:
+                    gap = delta
+                    state.last_raw_total = raw
+                    state.last_sample_at = now
+                    if int(getattr(state, "period_hour_ts", 0) or 0) == hour_ts:
+                        state.period_hour_raw = int(
+                            getattr(state, "period_hour_raw", 0) or 0
+                        ) + gap
+                    if int(getattr(state, "period_day_ts", 0) or 0):
+                        state.period_day_raw = int(
+                            getattr(state, "period_day_raw", 0) or 0
+                        ) + gap
+                    touched += 1
+                    continue
                 if delta > 0:
                     await _bump_panel_hour(
                         db,
