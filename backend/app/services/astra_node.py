@@ -1455,13 +1455,13 @@ async def sync_traffic_from_xray(
         return 0
     proc = None
     try:
+        # Do NOT pass -pattern user>>> — on this Xray build it often returns {}
+        # even when user counters exist; fetch all stats and filter in Python.
         proc = await asyncio.create_subprocess_exec(
             xray_bin,
             "api",
             "statsquery",
             f"--server=127.0.0.1:{api_port}",
-            "-pattern",
-            "user>>>",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -1488,6 +1488,7 @@ async def sync_traffic_from_xray(
         return 0
 
     totals = _parse_xray_user_traffic(text)
+    inbound_live = _parse_xray_inbound_astra(text)
     updated = 0
     need_rebuild = False
     clients = (
@@ -1520,10 +1521,82 @@ async def sync_traffic_from_xray(
         await _push_client_usage_to_accounts(db, panel.id, by_email)
     except Exception:  # noqa: BLE001
         logger.debug("push client usage to accounts failed", exc_info=True)
+    # Panel-level inbound meter (survives missing per-user stats)
+    try:
+        if _accumulate_panel_inbound(panel, inbound_live):
+            updated += 1
+    except Exception:  # noqa: BLE001
+        logger.debug("inbound accumulate panel=%s failed", panel.id, exc_info=True)
     await db.flush()
     if need_rebuild and rebuild_on_limit:
         await rebuild_xray_config(db, panel)
     return updated
+
+
+def _parse_xray_inbound_astra(text: str) -> int:
+    """Σ inbound>>>astra-in>>>traffic>>>uplink/downlink from statsquery JSON."""
+    raw = (text or "").strip()
+    if not raw:
+        return 0
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    stats = payload.get("stat") if isinstance(payload, dict) else None
+    if stats is None and isinstance(payload, list):
+        stats = payload
+    if isinstance(stats, dict):
+        stats = [stats]
+    if not isinstance(stats, list):
+        return 0
+    total = 0
+    for item in stats:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "")
+        if name not in (
+            "inbound>>>astra-in>>>traffic>>>uplink",
+            "inbound>>>astra-in>>>traffic>>>downlink",
+        ):
+            continue
+        try:
+            total += max(0, int(item.get("value") or 0))
+        except (TypeError, ValueError):
+            continue
+    return int(total)
+
+
+def _accumulate_panel_inbound(panel: Panel, inbound_live: int) -> bool:
+    """Accumulate Xray inbound counter into panel.meta inbound_cum.
+
+    Xray counters reset; we only ADD positive deltas onto a durable cumulative
+    used as the Astra panel live total when account rows lag.
+    """
+    live = max(0, int(inbound_live or 0))
+    meta = dict(panel.meta or {})
+    prev = meta.get("inbound_counter")
+    cum = max(0, int(meta.get("inbound_cum") or 0))
+    if prev is None:
+        meta["inbound_counter"] = live
+        # First sight: if cum empty, adopt live so the chart is not stuck at 0
+        if cum <= 0 and live > 0:
+            meta["inbound_cum"] = live
+            panel.meta = meta
+            return True
+        panel.meta = meta
+        return False
+    prev_i = max(0, int(prev))
+    if live >= prev_i:
+        delta = live - prev_i
+    else:
+        delta = live  # counter reset
+    meta["inbound_counter"] = live
+    if delta > 0:
+        meta["inbound_cum"] = cum + delta
+        panel.meta = meta
+        return True
+    panel.meta = meta
+    return False
 
 
 async def apply_usage_delta(

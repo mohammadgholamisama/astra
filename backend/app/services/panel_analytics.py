@@ -616,7 +616,7 @@ async def live_panel_raw_and_weighted(
         slot["raw"] += raw_i
         slot["weighted"] += int(weighted_bytes(raw_i, coeff))
 
-    # Fill empty Astra panels only (never override growing PanelAccount totals)
+    # Fill empty Astra panels from clients; prefer inbound_cum when ahead of accounts
     try:
         client_raw = await _astra_client_raw_by_panel(db)
     except Exception:  # noqa: BLE001
@@ -631,6 +631,39 @@ async def live_panel_raw_and_weighted(
         coeff = panel_max.get(int(pid), 1.0) or 1.0
         slot["raw"] = craw_i
         slot["weighted"] = int(weighted_bytes(craw_i, coeff))
+
+    try:
+        from app.models.panel import PanelType
+
+        astra_panels = list(
+            (
+                await db.execute(
+                    select(Panel).where(Panel.type == PanelType.astra)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for p in astra_panels:
+            meta = p.meta if isinstance(p.meta, dict) else {}
+            inbound_cum = max(0, int(meta.get("inbound_cum") or 0))
+            if inbound_cum <= 0:
+                continue
+            pid_i = int(p.id)
+            slot = out.setdefault(pid_i, {"raw": 0, "weighted": 0})
+            acc_raw = int(slot["raw"] or 0)
+            if inbound_cum <= acc_raw:
+                continue
+            # Inbound meter is ahead of mirrored accounts — use it for the chart hour
+            coeff = panel_max.get(pid_i, 1.0) or 1.0
+            if acc_raw > 0:
+                ratio = inbound_cum / acc_raw
+                slot["weighted"] = int(round(int(slot["weighted"] or 0) * ratio))
+            else:
+                slot["weighted"] = int(weighted_bytes(inbound_cum, coeff))
+            slot["raw"] = inbound_cum
+    except Exception:  # noqa: BLE001
+        logger.debug("astra inbound_cum overlay failed", exc_info=True)
     return out
 
 
@@ -1546,8 +1579,20 @@ async def build_panel_overview(
     tz_off = int(periods["tz_offset_min"])
     g_start = grid_hour - 23 * 3600
 
+    from app.models.panel import PanelType
+
+    # This page is Astra-only: chart columns + «این ساعت» = Astra panel traffic
+    # for each UTC grid hour (shown as local :30 labels).
     panels = list(
-        (await db.execute(select(Panel).order_by(Panel.id.asc()))).scalars().all()
+        (
+            await db.execute(
+                select(Panel)
+                .where(Panel.type == PanelType.astra)
+                .order_by(Panel.id.asc())
+            )
+        )
+        .scalars()
+        .all()
     )
 
     if sync_astra:
@@ -1575,13 +1620,22 @@ async def build_panel_overview(
     except Exception:  # noqa: BLE001
         logger.exception("live_panel_raw_and_weighted failed")
         usage_map = {}
-    live_totals = {pid: int(v["raw"]) for pid, v in usage_map.items()}
-    weighted_totals = {pid: int(v["weighted"]) for pid, v in usage_map.items()}
+    astra_ids = {int(p.id) for p in panels}
+    live_totals = {
+        pid: int(v["raw"])
+        for pid, v in usage_map.items()
+        if int(pid) in astra_ids
+    }
+    weighted_totals = {
+        pid: int(v["weighted"])
+        for pid, v in usage_map.items()
+        if int(pid) in astra_ids
+    }
     for p in panels:
         live_totals.setdefault(int(p.id), 0)
         weighted_totals.setdefault(int(p.id), 0)
 
-    # Credit unsampled live growth into the current chart column
+    # Credit unsampled Astra growth into the current chart column
     if persist:
         try:
             if not sync_astra:
@@ -1593,6 +1647,7 @@ async def build_panel_overview(
     states = {
         int(s.panel_id): s
         for s in (await db.execute(select(PanelUsageState))).scalars().all()
+        if int(s.panel_id) in astra_ids
     }
 
     accounts_by_panel: dict[int, int] = {
@@ -1614,7 +1669,7 @@ async def build_panel_overview(
         ).all()
     }
 
-    # Buckets: 24h chart + current chart-hour / local day
+    # Buckets: 24h chart + current chart-hour — Astra panels only
     bucket_rows = (
         await db.execute(
             select(
@@ -1622,6 +1677,7 @@ async def build_panel_overview(
                 PanelUsageHourBucket.hour_ts,
                 PanelUsageHourBucket.raw_bytes,
             ).where(
+                PanelUsageHourBucket.panel_id.in_(list(astra_ids) or [0]),
                 PanelUsageHourBucket.hour_ts >= min(g_start, day) - 3600,
                 PanelUsageHourBucket.hour_ts <= grid_hour,
             )
@@ -1633,9 +1689,11 @@ async def build_panel_overview(
     w_by_ts: dict[int, int] = {g_start + i * 3600: 0 for i in range(24)}
     for pid, ts, raw in bucket_rows:
         pid_i, ts_i, raw_i = int(pid), int(ts), max(0, int(raw or 0))
+        if pid_i not in astra_ids:
+            continue
         live_r = int(live_totals.get(pid_i, 0))
         live_w = int(weighted_totals.get(pid_i, 0))
-        # Exact chart column (grid hour), e.g. 19:30→20:30 local in IR
+        # Exact chart column (grid hour), e.g. 10:30→11:30 local in IR
         if ts_i == chart_hour:
             hour_map[pid_i] = hour_map.get(pid_i, 0) + raw_i
         od = _overlap_bytes(ts_i, raw_i, day, day_end)
@@ -1768,28 +1826,10 @@ async def build_panel_overview(
             except Exception:  # noqa: BLE001
                 pass
 
-    if persist or sync_astra:
-        try:
-            dash_weighted = await dashboard_weighted_total(db)
-        except Exception:  # noqa: BLE001
-            logger.exception("dashboard weighted total failed")
-            dash_weighted = total_weighted
-    else:
-        dash_weighted = total_weighted
+    # Weighted totals for Astra panels only (not whole-dashboard scaling)
+    dash_weighted = int(total_weighted)
 
-    # Tie «این ساعت» با ضریب to dashboard «ترافیک مصرفی» so when consumption
-    # moves on the dashboard, the hour column moves too (same live ratio).
-    if total_live > 0 and dash_weighted > 0:
-        total_hour_w = max(
-            int(total_hour_w),
-            _scale_weighted(total_hour, total_live, int(dash_weighted)),
-        )
-        total_day_w = max(
-            int(total_day_w),
-            _scale_weighted(total_day, total_live, int(dash_weighted)),
-        )
-
-    # Chart current bar must equal «این ساعت» totals
+    # Chart current bar must equal «این ساعت» = Σ Astra (live − mark) since grid hour
     raw_by_ts[grid_hour] = int(total_hour)
     w_by_ts[grid_hour] = int(total_hour_w)
 
@@ -1884,8 +1924,8 @@ async def build_panel_overview(
         "chart_hour_ts": chart_hour,
         "chart_hour_end_ts": chart_hour_end,
         "note": (
-            "بدون ضریب = Σ خام اکانت‌های Astra. با ضریب = ترافیک مصرفی داشبورد. "
-            "«این ساعت» = باکت همان ستون نمودار (مثلاً ۱۹:۳۰) بعد از همگام‌سازی Xray."
+            "فقط پنل‌های Astra. خام = Σ اکانت/ورود Xray. با ضریب = همان × ضریب گروه. "
+            "«این ساعت» = مصرف از ابتدای ستون نمودار (مثلاً ۱۰:۳۰) تا الان."
         ),
     }
 
