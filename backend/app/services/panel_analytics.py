@@ -1113,26 +1113,16 @@ async def refresh_panel_analytics_fast(
             err = err or f"sync:{type(exc).__name__}"
             logger.debug("fast refresh astra sync failed", exc_info=True)
 
-        # Pull a slice of remote panel usage so non-Astra account totals move,
-        # then sample/flush into the current chart hour.
+        # Sample Σ used_traffic for ALL panels (DB) into the current hour.
+        # Remote pulls stay in the background loop — they timeout inside the
+        # short live-refresh budget and must not block «این ساعت».
         try:
-            pull = await asyncio.wait_for(
-                refresh_panels_live(pull_remotes=True, astra_only=False),
-                timeout=min(8.0, max(3.0, budget * 0.7)),
-            )
-            users_pulled = int((pull or {}).get("users_pulled") or 0)
-            astra_synced = max(
-                astra_synced, int((pull or {}).get("astra_synced") or 0)
+            await asyncio.wait_for(
+                sample_all_panels_once(force=True), timeout=2.5
             )
         except Exception as exc:  # noqa: BLE001
-            err = err or f"pull:{type(exc).__name__}"
-            logger.debug("fast refresh remote pull failed", exc_info=True)
-            try:
-                await asyncio.wait_for(
-                    sample_all_panels_once(force=True), timeout=2.0
-                )
-            except Exception:  # noqa: BLE001
-                pass
+            err = err or f"sample:{type(exc).__name__}"
+            logger.debug("fast refresh panel sample failed", exc_info=True)
 
         try:
             async with AsyncSessionLocal() as db:
@@ -1605,20 +1595,20 @@ async def build_panel_overview(
 
     # All panels: «این ساعت» = Σ (مصرف‌الان همهٔ یوزرها − مصرف اول ساعت)
     # for every panel. Astra still gets a live Xray sync below.
-    panels = list(
-        (
-            await db.execute(select(Panel).order_by(Panel.id.asc()))
-        )
-        .scalars()
-        .all()
+    panel_orm = list(
+        (await db.execute(select(Panel).order_by(Panel.id.asc()))).scalars().all()
     )
-    from app.models.panel import PanelType
-
-    astra_panel_ids = {
-        int(p.id)
-        for p in panels
-        if getattr(p.type, "value", p.type) == "astra"
-    }
+    # Snapshot attrs now — later sync/commit can expire ORM instances.
+    panels = [
+        {
+            "id": int(p.id),
+            "name": str(p.name or ""),
+            "type": str(getattr(p.type, "value", p.type)),
+            "is_active": bool(getattr(p, "is_active", True)),
+        }
+        for p in panel_orm
+    ]
+    astra_panel_ids = {p["id"] for p in panels if p["type"] == "astra"}
 
     if sync_astra:
         # Seed before sync so Xray growth lands in the current chart hour
@@ -1626,7 +1616,7 @@ async def build_panel_overview(
             pre_map = await live_panel_raw_and_weighted(db)
             pre_live = {pid: int(v["raw"]) for pid, v in pre_map.items()}
             for p in panels:
-                pre_live.setdefault(int(p.id), 0)
+                pre_live.setdefault(int(p["id"]), 0)
             await ensure_panel_cursors_seeded(db, pre_live, now=now)
         except Exception:  # noqa: BLE001
             logger.debug("ensure panel cursors seeded failed", exc_info=True)
@@ -1645,7 +1635,7 @@ async def build_panel_overview(
     except Exception:  # noqa: BLE001
         logger.exception("live_panel_raw_and_weighted failed")
         usage_map = {}
-    panel_ids = {int(p.id) for p in panels}
+    panel_ids = {int(p["id"]) for p in panels}
     live_totals = {
         pid: int(v["raw"])
         for pid, v in usage_map.items()
@@ -1657,8 +1647,8 @@ async def build_panel_overview(
         if int(pid) in panel_ids
     }
     for p in panels:
-        live_totals.setdefault(int(p.id), 0)
-        weighted_totals.setdefault(int(p.id), 0)
+        live_totals.setdefault(int(p["id"]), 0)
+        weighted_totals.setdefault(int(p["id"]), 0)
 
     # Flush unsampled growth (all panels) into the current chart column
     if persist:
@@ -1738,7 +1728,7 @@ async def build_panel_overview(
     total_day_w = 0
     marks_touched = False
     for p in panels:
-        pid = int(p.id)
+        pid = int(p["id"])
         st = states.get(pid)
         if st is None and persist:
             st = await _get_or_create_panel_state(db, pid)
@@ -1748,7 +1738,6 @@ async def build_panel_overview(
         live_w = int(weighted_totals.get(pid, 0))
         cursor = int(st.last_raw_total or 0) if st else 0
         seeded = bool(st and st.last_sample_at is not None)
-        bucket_h = int(hour_map.get(pid, 0))
         bucket_d = int(day_map.get(pid, 0))
         mark_h_ts = int(getattr(st, "period_hour_ts", 0) or 0) if st else 0
         mark_h_raw = (
@@ -1758,25 +1747,8 @@ async def build_panel_overview(
         mark_d_raw = (
             max(0, int(getattr(st, "period_day_raw", 0) or 0)) if st else 0
         )
-        # Astra only: client Σ can sit above an old account-scale cursor.
-        if (
-            st is not None
-            and live > 0
-            and seeded
-            and pid in astra_panel_ids
-        ):
-            if mark_h_ts == chart_hour and mark_h_raw > cursor and live >= mark_h_raw:
-                st.last_raw_total = live
-                cursor = live
-                marks_touched = True
-            elif live > cursor and (live - cursor) > 5_000_000:
-                if mark_h_ts == chart_hour and mark_h_raw + 5_000_000 >= cursor:
-                    if mark_h_raw < live and (live - mark_h_raw) < (live - cursor):
-                        st.last_raw_total = live
-                        cursor = live
-                        marks_touched = True
         pending = _pending_bytes(live=live, cursor=cursor, seeded=seeded)
-        # «این ساعت» = Σ(مصرف‌الان − مصرف‌شروع‌ساعت) برای همهٔ یوزرهای پنل
+        # «این ساعت» = live − watermark at chart-hour start (all users on panel)
         if st is not None and mark_h_ts == chart_hour and mark_h_raw > live > 0:
             mark_h_raw = live
         h, new_h_ts, new_h_raw = _period_from_live_mark(
@@ -1796,7 +1768,6 @@ async def build_panel_overview(
         d = max(d, h)
         if bucket_d > 0 and bucket_d <= max(d, 1) * 2 + pending:
             d = max(d, min(live, bucket_d + pending) if live else bucket_d)
-        # Persist watermarks — baseline must NOT chase live during the hour
         if persist and st is not None:
             st.period_hour_ts = new_h_ts
             st.period_hour_raw = new_h_raw
@@ -1815,9 +1786,9 @@ async def build_panel_overview(
         rows.append(
             {
                 "panel_id": pid,
-                "name": p.name,
-                "type": getattr(p.type, "value", p.type),
-                "is_active": bool(getattr(p, "is_active", True)),
+                "name": p["name"],
+                "type": p["type"],
+                "is_active": p["is_active"],
                 "accounts": accounts_by_panel.get(pid, 0),
                 "online": 0,
                 "raw": {
