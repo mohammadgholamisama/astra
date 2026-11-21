@@ -1,4 +1,7 @@
 # Allow astra user to run astra-helper (nginx / SSL / env / update) without password
 astra ALL=(root) NOPASSWD: /usr/local/bin/astra-helper *
+# --no-block avoids deadlock: panel waits on oneshot while oneshot restarts panel
+astra ALL=(root) NOPASSWD: /bin/systemctl start --no-block astra-update.service
+astra ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block astra-update.service
 astra ALL=(root) NOPASSWD: /bin/systemctl start astra-update.service
 astra ALL=(root) NOPASSWD: /usr/bin/systemctl start astra-update.service

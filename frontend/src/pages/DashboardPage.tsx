@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
@@ -385,6 +385,8 @@ export default function DashboardPage() {
   const [updateOpen, setUpdateOpen] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<UpdateStatus | null>(null);
   const [updateErr, setUpdateErr] = useState("");
+  const [updateInstalling, setUpdateInstalling] = useState(false);
+  const updateTargetRef = useRef("");
 
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["system"],
@@ -442,18 +444,53 @@ export default function DashboardPage() {
 
   const applyUpdate = useMutation({
     mutationFn: () =>
-      api<{ ok: boolean; message: string }>("/api/system/update", {
+      api<{ ok: boolean; started?: boolean; message: string }>("/api/system/update", {
         method: "POST",
+        // kickoff only — install runs in background (avoids deadlock/504)
+        timeoutMs: 60_000,
       }),
-    onSuccess: () => {
+    onSuccess: async (res) => {
       setUpdateErr("");
-      window.setTimeout(() => {
-        qc.invalidateQueries({ queryKey: ["system"] });
-        void refetch();
-        void checkUpdate.mutateAsync().catch(() => undefined);
-      }, 4000);
+      setUpdateInstalling(true);
+      setUpdateInfo((prev) =>
+        prev
+          ? {
+              ...prev,
+              message: res.message || "آپدیت شروع شد…",
+              update_available: true,
+            }
+          : prev
+      );
+      const target = updateTargetRef.current;
+      const startedAt = Date.now();
+      try {
+        while (Date.now() - startedAt < 10 * 60_000) {
+          await new Promise((r) => window.setTimeout(r, 8000));
+          try {
+            qc.invalidateQueries({ queryKey: ["system"] });
+            await refetch();
+            const st = await checkUpdate.mutateAsync();
+            if (st && !st.update_available && st.check_ok !== false) {
+              setUpdateErr("");
+              return;
+            }
+            if (target && st?.local_version && st.local_version === target) {
+              setUpdateErr("");
+              return;
+            }
+          } catch {
+            // panel may be restarting — keep waiting
+          }
+        }
+        setUpdateErr(
+          "آپدیت هنوز تمام نشده یا پنل بالا نیامده — چند دقیقه دیگر رفرش کنید"
+        );
+      } finally {
+        setUpdateInstalling(false);
+      }
     },
     onError: (e: Error) => {
+      setUpdateInstalling(false);
       setUpdateErr(e instanceof ApiError ? e.message : e.message);
     },
   });
@@ -466,7 +503,8 @@ export default function DashboardPage() {
   }
 
   const healthOk = !!data && data.sync_errors === 0 && !(data.users_with_errors || 0);
-  const busy = checkUpdate.isPending || applyUpdate.isPending;
+  const busy =
+    checkUpdate.isPending || applyUpdate.isPending || updateInstalling;
   const checkOk = updateInfo?.check_ok !== false;
   const hasUpdate = !!updateInfo?.update_available && checkOk;
   const isLatest =
@@ -741,11 +779,17 @@ export default function DashboardPage() {
                       ) {
                         return;
                       }
+                      updateTargetRef.current =
+                        updateInfo?.remote_version || "";
+                      setUpdateInstalling(true);
+                      setUpdateErr("");
                       applyUpdate.mutate();
                     }}
                   >
                     <Download size={14} />
-                    {applyUpdate.isPending ? "در حال نصب…" : "نصب آپدیت"}
+                    {applyUpdate.isPending || updateInstalling
+                      ? "در حال نصب…"
+                      : "نصب آپدیت"}
                   </button>
                 ) : (
                   <button

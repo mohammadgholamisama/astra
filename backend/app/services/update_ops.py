@@ -288,63 +288,74 @@ async def check_update() -> dict:
 
 
 async def apply_update() -> dict:
+    """Kick off update without waiting — waiting deadlocks with astra restart.
+
+    Panel used to `systemctl start astra-update` (blocking). The oneshot runs
+    apply-update → restart astra while uvicorn is still waiting on that start →
+    systemd deadlock / nginx 504, so the dashboard looked like "نصب نشد".
+    """
     if not available():
         raise ValueError(
             "آپدیت از پنل فقط روی سرور با نصب رسمی Astra فعال است (astra-helper)"
         )
 
-    # Prefer dedicated oneshot unit (waits until finished; runs as root)
+    from app.services.version_info import clear_version_cache, get_version
+
+    local_before = get_version()
+    started = False
+    last_err = ""
+
+    # 1) oneshot --no-block (never blocking start — that deadlocks with astra restart)
     for systemctl in ("/bin/systemctl", "/usr/bin/systemctl", "systemctl"):
         code, out, err = await _run(
-            ["sudo", "-n", systemctl, "start", "astra-update.service"],
-            timeout=900,
+            ["sudo", "-n", systemctl, "start", "--no-block", "astra-update.service"],
+            timeout=30,
         )
-        combined = err + out
+        combined = (err or "") + (out or "")
         if _sudo_blocked(combined):
             raise RuntimeError(_NNP_HINT)
         if code == 0:
-            from app.services.version_info import clear_version_cache, get_version
-
-            clear_version_cache()
-            return {
-                "ok": True,
-                "message": "آپدیت نصب شد. دیتابیس و تنظیمات حفظ شدند.",
-                "local_version": get_version(),
-                "remote_version": get_version(),
-            }
-        if code == 5 or "not found" in combined.lower() or "could not be found" in combined.lower():
-            # unit missing → fall through to direct helper
+            started = True
             break
-        if code != 0:
-            # try next systemctl path / fallback
-            continue
+        last_err = combined.strip() or f"exit {code}"
+        if "not allowed" in combined.lower() or "a password is required" in combined.lower():
+            # old sudoers without --no-block — fall through to detached helper
+            break
+        if code == 5 or "not found" in combined.lower() or "could not be found" in combined.lower():
+            last_err = "astra-update.service missing"
+            break
 
-    code, out, err = await _helper(["apply-update"], timeout=900, as_root=True)
-    if code != 0:
-        msg = (err or out or "update failed").strip()
-        logger.error("apply-update failed: %s", msg)
-        if _sudo_blocked(msg):
-            raise RuntimeError(_NNP_HINT)
-        raise RuntimeError(msg[:1500])
+    # 2) Detached helper (works with existing sudoers: astra-helper *)
+    if not started:
+        helper = helper_path()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "sudo",
+                "-n",
+                helper,
+                "apply-update",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            await asyncio.sleep(0.3)
+            if proc.returncode is not None and proc.returncode != 0:
+                raise RuntimeError(last_err or "failed to start update")
+            started = True
+        except FileNotFoundError as exc:
+            raise RuntimeError(last_err or str(exc)) from exc
 
-    remote = ""
-    local = ""
-    for line in reversed(out.strip().splitlines() or [""]):
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                data = json.loads(line)
-                remote = str(data.get("remote_version") or "")
-                local = str(data.get("local_version") or "")
-                break
-            except json.JSONDecodeError:
-                continue
-    from app.services.version_info import clear_version_cache, get_version
+    if not started:
+        raise RuntimeError(last_err or "failed to start update")
 
     clear_version_cache()
     return {
         "ok": True,
-        "message": "آپدیت نصب شد. دیتابیس و تنظیمات حفظ شدند.",
-        "local_version": local or get_version(),
-        "remote_version": remote or get_version(),
+        "started": True,
+        "message": (
+            "آپدیت شروع شد. ۱ تا ۳ دقیقه صبر کنید تا بیلد تمام شود؛ "
+            "سپس صفحه را رفرش کنید. دیتابیس و تنظیمات حفظ می‌شوند."
+        ),
+        "local_version": local_before,
+        "remote_version": "",
     }
