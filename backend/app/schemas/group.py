@@ -64,9 +64,17 @@ class GroupOut(ORMModel):
     order_kind: str = "other"
     notices: list[str] = Field(default_factory=list)
     category_id: int | None = None
+    sort_order: int = 0
     inbound_tags: list[str] = Field(default_factory=list)
     panels: list[GroupPanelOut] = Field(default_factory=list)
     created_at: datetime
+
+
+class GroupReorderBody(BaseModel):
+    """Reorder groups inside one UI tab (category or «همه گروه‌ها»)."""
+
+    group_ids: list[int] = Field(min_length=1)
+    category_id: int | None = None
 
 
 class GroupCategoryCreate(BaseModel):

@@ -145,6 +145,12 @@ async def probe_locations(
     """
     if not body.items:
         raise HTTPException(status_code=400, detail="لیست کانفیگ خالی است")
+    # Drop request-scoped transaction before long DNS/GeoIP so Postgres does not
+    # kill the checkout mid-probe (idle_in_transaction → connection is closed).
+    try:
+        await db.rollback()
+    except Exception:  # noqa: BLE001
+        pass
     try:
         raw = await probe_svc.probe_config_flags(
             db,

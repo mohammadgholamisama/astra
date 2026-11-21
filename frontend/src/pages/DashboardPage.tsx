@@ -16,11 +16,14 @@ import {
   KeyRound,
   Layers,
   ListOrdered,
+  Loader2,
   MemoryStick,
   Network,
+  Plus,
   RefreshCw,
   Server,
   Sparkles,
+  Trash2,
   TrendingUp,
   Users,
   Wifi,
@@ -29,13 +32,239 @@ import {
 import {
   ApiError,
   api,
+  BackgroundOps,
   formatBytes,
   HostMetrics,
+  OpsJob,
+  OpsPhase,
   SystemStats,
   TopUserStat,
   UpdateStatus,
 } from "../lib/api";
 import { formatTraffic, toFaDigits, usagePercent } from "../lib/format";
+
+const OPS_PHASE_ICON: Record<string, ReactNode> = {
+  delete: <Trash2 size={15} strokeWidth={2.1} />,
+  add: <Plus size={15} strokeWidth={2.1} />,
+  retry: <RefreshCw size={15} strokeWidth={2.1} />,
+};
+
+const OPS_KIND_ICON: Record<string, ReactNode> = {
+  delete: <Trash2 size={15} strokeWidth={2.1} />,
+  add: <Plus size={15} strokeWidth={2.1} />,
+  retry: <RefreshCw size={15} strokeWidth={2.1} />,
+  heal: <Activity size={15} strokeWidth={2.1} />,
+  group: <Layers size={15} strokeWidth={2.1} />,
+  sync: <RefreshCw size={15} strokeWidth={2.1} />,
+};
+
+function opsPhasePct(ph: OpsPhase): number {
+  const total = Math.max(0, Number(ph.total) || 0);
+  const done = Math.max(0, Number(ph.done) || 0);
+  if (ph.status === "done" || ph.status === "skipped") return 100;
+  if (total <= 0) return ph.status === "running" ? 8 : 0;
+  return Math.min(100, Math.round((done / total) * 100));
+}
+
+function opsJobPct(job: OpsJob): number {
+  const phases = job.phases || [];
+  if (phases.length > 0) {
+    const sum = phases.reduce((a, p) => a + opsPhasePct(p), 0);
+    return Math.round(sum / phases.length);
+  }
+  const total = Math.max(0, Number(job.total) || 0);
+  const done = Math.max(0, Number(job.done) || 0);
+  if (!job.active) return 100;
+  if (total <= 0) return 12;
+  return Math.min(100, Math.round((done / total) * 100));
+}
+
+function OpsJobCard({ job }: { job: OpsJob }) {
+  // Only show nested steps when there are 2+ real phases (group apply).
+  // Single duplicate phase made «۲ کار» look like ۴ آیتم.
+  const phases = (job.phases || []).filter((p) => p.status !== "skipped");
+  const showPhases = phases.length >= 2;
+  const active = !!job.active;
+  const pct = opsJobPct(job);
+  const iconKey = job.icon || "sync";
+  const kindLabel = job.kind_label || "";
+  const total = Math.max(0, Number(job.total) || 0);
+  const done = Math.max(0, Number(job.done) || 0);
+  // Show 3/40 as soon as total is known (category/group apply)
+  const showCount = total > 0;
+
+  return (
+    <article className={`board-ops-job ${active ? "running" : "done"}`}>
+      <header className="board-ops-job-head">
+        <span className="board-ops-phase-icon" aria-hidden>
+          {OPS_KIND_ICON[iconKey] || <Activity size={15} />}
+        </span>
+        <div className="board-ops-phase-copy">
+          {kindLabel ? (
+            <span className="board-ops-kind">{kindLabel}</span>
+          ) : null}
+          <strong>{job.title || "کار پس‌زمینه"}</strong>
+          <span className="board-ops-phase-stat">
+            {job.message || (active ? "در حال اجرا…" : "تمام شد")}
+          </span>
+        </div>
+        <div className="board-ops-job-side">
+          {showCount ? (
+            <span className="board-ops-job-count">
+              {toFaDigits(done)} / {toFaDigits(total)}
+              {!active && job.failed
+                ? ` · خطا ${toFaDigits(job.failed)}`
+                : ""}
+            </span>
+          ) : active ? (
+            <span className="board-ops-job-count">در حال کار…</span>
+          ) : job.ok || job.failed ? (
+            <span className="board-ops-job-count">
+              موفق {toFaDigits(job.ok || 0)}
+              {job.failed ? ` · خطا ${toFaDigits(job.failed)}` : ""}
+            </span>
+          ) : null}
+          {active ? (
+            <Loader2 size={14} className="spin" aria-hidden />
+          ) : (
+            <CheckCircle2 size={14} aria-hidden />
+          )}
+        </div>
+      </header>
+      <div
+        className={`board-ops-track${active && total <= 0 ? " indeterminate" : ""}`}
+        aria-hidden
+      >
+        <div
+          className="board-ops-fill"
+          style={active && total <= 0 ? undefined : { width: `${pct}%` }}
+        />
+      </div>
+      {!active && Array.isArray(job.errors) && job.errors.length > 0 ? (
+        <ul className="board-ops-errors">
+          {job.errors.slice(0, 6).map((err, i) => (
+            <li key={`${job.id}-err-${i}`}>{err}</li>
+          ))}
+        </ul>
+      ) : null}
+      {showPhases ? (
+        <ol className="board-ops-phases">
+          {phases.map((ph, idx) => {
+            const pPct = opsPhasePct(ph);
+            const st = ph.status || "pending";
+            const pTotal = Math.max(0, Number(ph.total) || 0);
+            const pDone = Math.max(0, Number(ph.done) || 0);
+            return (
+              <li key={ph.id} className={`board-ops-phase ${st}`}>
+                <div className="board-ops-phase-top">
+                  <span className="board-ops-phase-icon" aria-hidden>
+                    {OPS_PHASE_ICON[ph.id] || <Activity size={15} />}
+                  </span>
+                  <div className="board-ops-phase-copy">
+                    <strong>
+                      <span className="board-ops-step">
+                        {toFaDigits(idx + 1)}
+                      </span>
+                      {ph.label}
+                    </strong>
+                    <span className="board-ops-phase-stat">
+                      {st === "pending"
+                        ? "در صف"
+                        : st === "running"
+                          ? pTotal > 0
+                            ? `${toFaDigits(pDone)} از ${toFaDigits(pTotal)} کاربر`
+                            : "در حال اجرا…"
+                          : st === "done"
+                            ? ph.failed > 0
+                              ? `تمام · ${toFaDigits(ph.ok)} موفق · ${toFaDigits(ph.failed)} خطا`
+                              : `تمام · ${toFaDigits(ph.ok || ph.done)} کاربر`
+                            : st}
+                    </span>
+                  </div>
+                  {st === "running" ? (
+                    <Loader2 size={14} className="spin" aria-hidden />
+                  ) : st === "done" ? (
+                    <CheckCircle2 size={14} aria-hidden />
+                  ) : null}
+                </div>
+                <div className="board-ops-track" aria-hidden>
+                  <div
+                    className="board-ops-fill"
+                    style={{ width: `${pPct}%` }}
+                  />
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+      ) : null}
+    </article>
+  );
+}
+
+function BackgroundOpsCard({ ops }: { ops: BackgroundOps }) {
+  const jobs: OpsJob[] = (ops.jobs || []).filter((j) => {
+    if (j.active) return true;
+    if (!j.finished_at || !j.title) return false;
+    const age = Date.now() / 1000 - Number(j.finished_at);
+    // Keep failed jobs longer so «خطای موج» details stay readable
+    const hold =
+      (Array.isArray(j.errors) && j.errors.length > 0) || (j.failed || 0) > 0
+        ? 180
+        : 90;
+    return age < hold;
+  });
+  // Legacy fallback if API has no jobs array yet
+  if (jobs.length === 0 && ops.title && (ops.active || ops.finished_at)) {
+    jobs.push({
+      id: "legacy",
+      active: !!ops.active,
+      kind: ops.kind,
+      title: ops.title,
+      message: ops.message,
+      phases: ops.phases,
+      users_total: ops.users_total,
+      started_at: ops.started_at,
+      updated_at: ops.updated_at,
+      finished_at: ops.finished_at,
+      ok: ops.ok,
+      failed: ops.failed,
+    });
+  }
+  if (jobs.length === 0) return null;
+
+  const activeCount = jobs.filter((j) => j.active).length;
+  return (
+    <section
+      className={`board-ops ${activeCount > 0 ? "running" : "done"}`}
+      aria-live="polite"
+      aria-label="وضعیت کارهای پس‌زمینه"
+    >
+      <header className="board-ops-head">
+        <div className="board-ops-title">
+          {activeCount > 0 ? (
+            <Loader2 size={16} className="spin" aria-hidden />
+          ) : (
+            <CheckCircle2 size={16} aria-hidden />
+          )}
+          <div>
+            <strong>کارهای پس‌زمینه</strong>
+            <span>
+              {activeCount > 0
+                ? `${toFaDigits(activeCount)} مورد در حال اجرا — هر کارت یک کار است`
+                : "آخرین کارها تمام شد"}
+            </span>
+          </div>
+        </div>
+      </header>
+      <div className="board-ops-jobs">
+        {jobs.map((job) => (
+          <OpsJobCard key={job.id} job={job} />
+        ))}
+      </div>
+    </section>
+  );
+}
 
 function fmtHostBytes(n: number): string {
   if (!n || n < 0) return "۰ B";
@@ -166,6 +395,17 @@ export default function DashboardPage() {
     refetchOnWindowFocus: false,
   });
 
+  const { data: opsLive } = useQuery({
+    queryKey: ["ops-status"],
+    queryFn: () => api<BackgroundOps>("/api/ops/status", { timeoutMs: 5_000 }),
+    refetchInterval: (q) => (q.state.data?.active ? 1_500 : 8_000),
+    staleTime: 0,
+    refetchOnMount: true,
+    refetchOnWindowFocus: true,
+  });
+
+  const backgroundOps = opsLive || data?.background_ops || null;
+
   const {
     data: host,
     isLoading: hostLoading,
@@ -174,11 +414,14 @@ export default function DashboardPage() {
     refetch: refetchHost,
   } = useQuery({
     queryKey: ["system-host"],
-    queryFn: () => api<HostMetrics>("/api/system/host", { timeoutMs: 6_000 }),
+    queryFn: () => api<HostMetrics>("/api/system/host", { timeoutMs: 10_000 }),
     refetchInterval: 12_000,
     staleTime: 8_000,
     refetchOnWindowFocus: false,
-    retry: 1,
+    retry: 2,
+    retryDelay: (n) => Math.min(1500 * (n + 1), 4000),
+    // Keep last good snapshot while a poll fails (pool pressure / blip)
+    placeholderData: (prev) => prev,
   });
 
   const checkUpdate = useMutation({
@@ -375,6 +618,8 @@ export default function DashboardPage() {
         </div>
       </header>
 
+      {backgroundOps ? <BackgroundOpsCard ops={backgroundOps} /> : null}
+
       {isLoading && (
         <div className="board-skel board-skel-v2" aria-hidden>
           <div className="board-skel-metrics">
@@ -560,11 +805,18 @@ export default function DashboardPage() {
               <div className="board-skel-block metric" />
               <div className="board-skel-block metric" />
             </div>
-          ) : hostError && !host ? (
+          ) : null}
+          {hostError && !host ? (
             <p className="error" style={{ margin: 0 }}>
               وضعیت سرور لود نشد — دکمهٔ زنده را بزنید
             </p>
-          ) : host ? (
+          ) : null}
+          {hostError && host ? (
+            <p className="muted" style={{ margin: "0 0 10px", fontSize: "0.85rem" }}>
+              آخرین نمونه نمایش داده می‌شود — تازه کردن ممکن نشد
+            </p>
+          ) : null}
+          {host ? (
             <>
               <div className="board-host-gauges">
                 {(

@@ -4,10 +4,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowRightLeft,
   FolderPlus,
+  GripVertical,
   Layers,
+  ListOrdered,
   Pencil,
   Plus,
   RefreshCw,
+  Search,
   Trash2,
   X,
 } from "lucide-react";
@@ -225,6 +228,12 @@ export default function GroupsPage() {
   const [open, setOpen] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [activeTab, setActiveTab] = useState<CatTab>(null);
+  const [search, setSearch] = useState("");
+  const [reorderMode, setReorderMode] = useState(false);
+  const [reorderIds, setReorderIds] = useState<number[]>([]);
+  const [dragOverId, setDragOverId] = useState<number | null>(null);
+  const [draggingId, setDraggingId] = useState<number | null>(null);
+  const dragGroupId = useRef<number | null>(null);
   const [highlightId, setHighlightId] = useState<number | null>(null);
   const deepLinkDone = useRef<string | null>(null);
   const [moveGroup, setMoveGroup] = useState<Group | null>(null);
@@ -269,16 +278,104 @@ export default function GroupsPage() {
     () => groups.filter((g) => g.category_id == null).length,
     [groups],
   );
+  const catNameById = useMemo(
+    () => new Map(categories.map((c) => [c.id, c.name])),
+    [categories],
+  );
+  const searchQ = search.trim().toLowerCase();
   const visibleGroups = useMemo(() => {
-    if (activeTab == null) return groups.filter((g) => g.category_id == null);
-    return groups.filter((g) => g.category_id === activeTab);
-  }, [groups, activeTab]);
+    const inTab =
+      activeTab == null
+        ? groups.filter((g) => g.category_id == null)
+        : groups.filter((g) => g.category_id === activeTab);
+    const pool = searchQ ? groups : inTab;
+    const filtered = !searchQ
+      ? pool
+      : pool.filter((g) => {
+          const panelBits = (g.panels || [])
+            .map(
+              (p) =>
+                p.panel_name ||
+                panelMap[p.panel_id]?.name ||
+                (p.panel_type ? String(p.panel_type) : "") ||
+                `#${p.panel_id}`,
+            )
+            .join(" ");
+          const catLabel =
+            g.category_id == null
+              ? "همه گروه ها همه گروه‌ها بدون دسته"
+              : catNameById.get(g.category_id) || "";
+          const hay = [
+            g.name,
+            g.description || "",
+            g.config_tag || "",
+            g.order_kind || "",
+            panelBits,
+            catLabel,
+            String(g.id),
+          ]
+            .join(" ")
+            .toLowerCase();
+          return hay.includes(searchQ);
+        });
+    return [...filtered].sort((a, b) => {
+      const sa = a.sort_order ?? 0;
+      const sb = b.sort_order ?? 0;
+      if (sa !== sb) return sa - sb;
+      return a.id - b.id;
+    });
+  }, [groups, activeTab, searchQ, panelMap, catNameById]);
 
   // If active category was deleted, fall back to default tab
   useEffect(() => {
     if (activeTab == null) return;
     if (!categories.some((c) => c.id === activeTab)) setActiveTab(null);
   }, [categories, activeTab]);
+
+  useEffect(() => {
+    if (!reorderMode) return;
+    setReorderMode(false);
+    setReorderIds([]);
+    setDragOverId(null);
+    setDraggingId(null);
+    dragGroupId.current = null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab]);
+
+  function beginReorder() {
+    if (searchQ) setSearch("");
+    setReorderIds(visibleGroups.map((g) => g.id));
+    setReorderMode(true);
+    setDragOverId(null);
+    setDraggingId(null);
+    dragGroupId.current = null;
+  }
+
+  function cancelReorder() {
+    setReorderMode(false);
+    setReorderIds([]);
+    setDragOverId(null);
+    setDraggingId(null);
+    dragGroupId.current = null;
+  }
+
+  function moveReorderId(fromId: number, toId: number) {
+    if (fromId === toId) return;
+    setReorderIds((prev) => {
+      const next = [...prev];
+      const from = next.indexOf(fromId);
+      const to = next.indexOf(toId);
+      if (from < 0 || to < 0) return prev;
+      next.splice(from, 1);
+      next.splice(to, 0, fromId);
+      return next;
+    });
+  }
+
+  const reorderGroups = useMemo(() => {
+    const byId = new Map(groups.map((g) => [g.id, g]));
+    return reorderIds.map((id) => byId.get(id)).filter(Boolean) as Group[];
+  }, [groups, reorderIds]);
 
   const loadCatalog = useCallback(async (panel: Panel, force = false) => {
     if (loadingRef.current.has(panel.id)) return;
@@ -462,16 +559,26 @@ export default function GroupsPage() {
         body: JSON.stringify(payload),
       });
     },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["groups"] });
-      qc.invalidateQueries({ queryKey: ["group-categories"] });
+    onSuccess: (saved) => {
+      // Paint list immediately — don't wait for refetch (felt like slow create).
+      qc.setQueryData<Group[]>(["groups"], (prev) => {
+        const list = prev ? [...prev] : [];
+        const idx = list.findIndex((g) => g.id === saved.id);
+        if (idx >= 0) list[idx] = saved;
+        else list.push(saved);
+        return list;
+      });
+      void qc.invalidateQueries({ queryKey: ["groups"] });
+      void qc.invalidateQueries({ queryKey: ["group-categories"] });
       resetModal();
     },
   });
 
   const remove = useMutation({
     mutationFn: (id: number) =>
-      api(`/api/group/${id}`, { method: "DELETE", timeoutMs: 20_000 }),
+      // Local wipe is bulk SQL; remotes finish in background. Keep headroom
+      // for large membership tables (was 20s — timed out after panel unlink).
+      api(`/api/group/${id}`, { method: "DELETE", timeoutMs: 60_000 }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["groups"] });
       qc.invalidateQueries({ queryKey: ["group-categories"] });
@@ -553,7 +660,13 @@ export default function GroupsPage() {
       setResyncingGroupId(id);
     },
     onSuccess: (res) => {
-      window.alert(res.detail || "اعمال تغییرات پنل شروع شد");
+      window.alert(
+        (res.detail || "اعمال تغییرات پنل شروع شد") +
+          "\n\nپیشرفت زنده در داشبورد:\n" +
+          "۱) عضویت همه کاربران دسته\n" +
+          "۲) حذف → اضافه → تلاش خطاها\n" +
+          "در پایان تعداد اکانت فعال / در انتظار / خطا را می‌بینید"
+      );
     },
     onError: (e: unknown) => {
       window.alert(
@@ -562,6 +675,31 @@ export default function GroupsPage() {
     },
     onSettled: () => {
       setResyncingGroupId(null);
+    },
+  });
+
+  const reorderMut = useMutation({
+    mutationFn: (group_ids: number[]) =>
+      api<Group[]>("/api/groups/reorder", {
+        method: "PUT",
+        body: JSON.stringify({
+          group_ids,
+          category_id: activeTab,
+        }),
+        timeoutMs: 15_000,
+      }),
+    onSuccess: (rows) => {
+      qc.setQueryData<Group[]>(["groups"], (prev) => {
+        if (!prev) return rows;
+        const byId = new Map(rows.map((g) => [g.id, g]));
+        return prev.map((g) => byId.get(g.id) || g);
+      });
+      setReorderMode(false);
+      setReorderIds([]);
+      window.alert("ترتیب گروه‌ها ذخیره شد");
+    },
+    onError: (e: unknown) => {
+      window.alert(e instanceof Error ? e.message : "ذخیره ترتیب ناموفق بود");
     },
   });
 
@@ -813,16 +951,91 @@ export default function GroupsPage() {
       </p>
 
       <div className="toolbar">
+        <div className="admin-search">
+          <Search size={16} strokeWidth={2} />
+          <input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="جستجوی گروه (نام، تگ، پنل، دسته…)"
+            aria-label="جستجوی گروه"
+            dir="auto"
+          />
+          {!!search.trim() && (
+            <button
+              type="button"
+              className="admin-search-clear"
+              onClick={() => setSearch("")}
+              aria-label="پاک کردن جستجو"
+            >
+              <X size={14} />
+            </button>
+          )}
+        </div>
         <span className="muted">
-          {toFaDigits(visibleGroups.length)} گروه
-          {activeCat ? ` در «${activeCat.name}»` : " بدون دسته"}
-          <span className="groups-total-hint"> · کل {toFaDigits(groups.length)}</span>
+          {searchQ
+            ? `${toFaDigits(visibleGroups.length)} از ${toFaDigits(groups.length)} گروه`
+            : (
+              <>
+                {toFaDigits(visibleGroups.length)} گروه
+                {activeCat ? ` در «${activeCat.name}»` : " بدون دسته"}
+                <span className="groups-total-hint"> · کل {toFaDigits(groups.length)}</span>
+              </>
+            )}
         </span>
-        <button className="btn toolbar-primary" onClick={openCreate}>
-          <Plus size={16} />
-          گروه جدید
-        </button>
+        {reorderMode ? (
+          <>
+            <button
+              type="button"
+              className="btn ghost"
+              disabled={reorderMut.isPending}
+              onClick={cancelReorder}
+            >
+              انصراف
+            </button>
+            <button
+              type="button"
+              className="btn toolbar-primary"
+              disabled={reorderMut.isPending || reorderIds.length < 2}
+              onClick={() => reorderMut.mutate(reorderIds)}
+            >
+              <ListOrdered size={16} />
+              {reorderMut.isPending ? "در حال ذخیره…" : "ذخیره ترتیب"}
+            </button>
+          </>
+        ) : (
+          <>
+            <button
+              type="button"
+              className="btn"
+              disabled={visibleGroups.length < 2 || !!searchQ}
+              title={
+                searchQ
+                  ? "برای مرتب‌سازی، جستجو را پاک کنید"
+                  : visibleGroups.length < 2
+                    ? "حداقل دو گروه در این تب لازم است"
+                    : "جابه‌جایی گروه‌های این تب با درگ"
+              }
+              onClick={beginReorder}
+            >
+              <ListOrdered size={16} />
+              ترتیب گروه‌ها
+            </button>
+            <button className="btn toolbar-primary" onClick={openCreate}>
+              <Plus size={16} />
+              گروه جدید
+            </button>
+          </>
+        )}
       </div>
+
+      {reorderMode ? (
+        <div className="panels-reorder-banner" role="status">
+          <GripVertical size={16} />
+          <span>
+            ترتیب «{activeCat?.name || "همه گروه‌ها"}» — ردیف را بکشید و رها کنید، بعد ذخیره کنید
+          </span>
+        </div>
+      ) : null}
 
       <div className="groups-cat-bar" role="tablist" aria-label="دسته‌بندی گروه‌ها">
         <button
@@ -909,13 +1122,86 @@ export default function GroupsPage() {
         <div className="admin-empty groups-empty-tab">
           <Layers size={32} strokeWidth={1.4} />
           <p>
-            {activeTab == null
-              ? "گروه بدون دسته‌ای نیست — از دکمه جابه‌جایی گروه را به اینجا برگردانید"
-              : `در «${activeCat?.name || "این دسته"}» گروهی نیست`}
+            {searchQ
+              ? `نتیجه‌ای برای «${search.trim()}» پیدا نشد`
+              : activeTab == null
+                ? "گروه بدون دسته‌ای نیست — از دکمه جابه‌جایی گروه را به اینجا برگردانید"
+                : `در «${activeCat?.name || "این دسته"}» گروهی نیست`}
           </p>
-          <button className="btn" onClick={openCreate}>
-            ساخت گروه در این تب
-          </button>
+          {searchQ ? (
+            <button className="btn ghost" type="button" onClick={() => setSearch("")}>
+              پاک کردن جستجو
+            </button>
+          ) : (
+            <button className="btn" onClick={openCreate}>
+              ساخت گروه در این تب
+            </button>
+          )}
+        </div>
+      ) : reorderMode ? (
+        <div className="panels-reorder-list" role="list" aria-label="مرتب‌سازی گروه‌ها">
+          {reorderGroups.map((g, index) => {
+            const panelN = (g.panels || []).length;
+            const kind = String(g.order_kind || "other").toLowerCase();
+            const kindLabel =
+              kind === "direct"
+                ? "مستقیم"
+                : kind === "tunnel"
+                  ? "تانل"
+                  : kind === "gaming"
+                    ? "گیمینگ"
+                    : "سایر";
+            return (
+              <div
+                key={g.id}
+                role="listitem"
+                className={`panels-reorder-row${dragOverId === g.id ? " is-over" : ""}${
+                  draggingId === g.id ? " is-dragging" : ""
+                }`}
+                draggable={!reorderMut.isPending}
+                onDragStart={() => {
+                  dragGroupId.current = g.id;
+                  setDraggingId(g.id);
+                }}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setDragOverId(g.id);
+                }}
+                onDragLeave={() => {
+                  setDragOverId((cur) => (cur === g.id ? null : cur));
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  const from = dragGroupId.current;
+                  dragGroupId.current = null;
+                  setDraggingId(null);
+                  setDragOverId(null);
+                  if (from != null) moveReorderId(from, g.id);
+                }}
+                onDragEnd={() => {
+                  dragGroupId.current = null;
+                  setDraggingId(null);
+                  setDragOverId(null);
+                }}
+              >
+                <span className="panels-reorder-handle" aria-hidden>
+                  <GripVertical size={18} />
+                </span>
+                <span className="panels-reorder-index">{toFaDigits(index + 1)}</span>
+                <div className="panels-reorder-main">
+                  <b>{g.name}</b>
+                  <small>
+                    {g.description?.trim() ||
+                      `${toFaDigits(panelN)} پنل · ${kindLabel}`}
+                  </small>
+                </div>
+                <span className="badge muted">{toFaDigits(panelN)} پنل</span>
+                <span className={`badge ${g.is_disabled ? "err" : "ok"}`}>
+                  {g.is_disabled ? "غیرفعال" : "فعال"}
+                </span>
+              </div>
+            );
+          })}
         </div>
       ) : (
         <div className="groups-list">
@@ -936,6 +1222,13 @@ export default function GroupsPage() {
                   <span className={`badge ${g.is_disabled ? "err" : "ok"}`}>
                     {g.is_disabled ? "غیرفعال" : "فعال"}
                   </span>
+                  {searchQ ? (
+                    <span className="badge muted">
+                      {g.category_id == null
+                        ? "بدون دسته"
+                        : catNameById.get(g.category_id) || `دسته #${g.category_id}`}
+                    </span>
+                  ) : null}
                   <span className="badge muted">{toFaDigits((g.panels || []).length)} پنل</span>
                   {(g.config_tag || "").trim() ? (
                     <span className="badge muted" dir="ltr">
@@ -995,10 +1288,14 @@ export default function GroupsPage() {
                   title="پنل اضافه‌شده ساخته می‌شود؛ پنل حذف‌شده از ساب و پنل اصلی پاک می‌شود. حتی اگر طول بکشد در پس‌زمینه تمام می‌شود."
                   onClick={() => {
                     const n = (g.panels || []).length;
+                    const inCat = g.category_id != null;
                     const ok = window.confirm(
-                      `اعمال تغییرات پنل‌های گروه «${g.name}» روی ساب همه کاربران؟\n` +
+                      `اعمال تغییرات پنل‌های گروه «${g.name}» روی ساب؟\n` +
                         `• پنل‌های فعلی گروه (${toFaDigits(n)}): کانفیگ ساخته/همگام می‌شود\n` +
                         `• پنل‌های حذف‌شده: از پنل اصلی و ساب کاربران پاک می‌شود\n` +
+                        (inCat
+                          ? `• این گروه در دسته است — همه کاربران همان دسته هم عضویت/پنل می‌گیرند\n`
+                          : "") +
                         `اگر حجم کاربر تمام باشد، کانفیگ‌های جدید هم خاموش می‌مانند.`
                     );
                     if (ok) resyncGroup.mutate(g.id);

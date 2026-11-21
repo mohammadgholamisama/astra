@@ -5,16 +5,21 @@ import {
   ArrowRightLeft,
   CheckCircle2,
   FolderPlus,
+  Gauge,
+  GripVertical,
+  ListOrdered,
   Pencil,
   Plus,
   Power,
   Search,
   Server,
   ShieldCheck,
+  Timer,
   Trash2,
   Wifi,
   X,
   XCircle,
+  Zap,
 } from "lucide-react";
 import Select from "../components/Select";
 import { api, ApiError, Panel, PanelCategory, PanelType } from "../lib/api";
@@ -148,6 +153,11 @@ export default function PanelsPage() {
   const [form, setForm] = useState(emptyForm);
   const [activeTab, setActiveTab] = useState<CatTab>(null);
   const [search, setSearch] = useState("");
+  const [reorderMode, setReorderMode] = useState(false);
+  const [reorderIds, setReorderIds] = useState<number[]>([]);
+  const [dragOverId, setDragOverId] = useState<number | null>(null);
+  const [draggingId, setDraggingId] = useState<number | null>(null);
+  const dragPanelId = useRef<number | null>(null);
   const [highlightId, setHighlightId] = useState<number | null>(null);
   const deepLinkDone = useRef<string | null>(null);
   const [movePanel, setMovePanel] = useState<Panel | null>(null);
@@ -221,7 +231,12 @@ export default function PanelsPage() {
     } else {
       list = data.filter((p) => p.category_id === activeTab);
     }
-    return list;
+    return [...list].sort((a, b) => {
+      const sa = a.sort_order ?? 0;
+      const sb = b.sort_order ?? 0;
+      if (sa !== sb) return sa - sb;
+      return a.id - b.id;
+    });
   }, [data, activeTab, searchQ]);
   const activeCat = useMemo(
     () => (activeTab == null ? null : categories.find((c) => c.id === activeTab) || null),
@@ -232,6 +247,52 @@ export default function PanelsPage() {
     if (activeTab == null) return;
     if (!categories.some((c) => c.id === activeTab)) setActiveTab(null);
   }, [activeTab, categories]);
+
+  useEffect(() => {
+    // Leaving a tab cancels unfinished reorder draft
+    if (!reorderMode) return;
+    setReorderMode(false);
+    setReorderIds([]);
+    setDragOverId(null);
+    setDraggingId(null);
+    dragPanelId.current = null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab]);
+
+  function beginReorder() {
+    if (searchQ) setSearch("");
+    setReorderIds(visiblePanels.map((p) => p.id));
+    setReorderMode(true);
+    setDragOverId(null);
+    setDraggingId(null);
+    dragPanelId.current = null;
+  }
+
+  function cancelReorder() {
+    setReorderMode(false);
+    setReorderIds([]);
+    setDragOverId(null);
+    setDraggingId(null);
+    dragPanelId.current = null;
+  }
+
+  function moveReorderId(fromId: number, toId: number) {
+    if (fromId === toId) return;
+    setReorderIds((prev) => {
+      const next = [...prev];
+      const from = next.indexOf(fromId);
+      const to = next.indexOf(toId);
+      if (from < 0 || to < 0) return prev;
+      next.splice(from, 1);
+      next.splice(to, 0, fromId);
+      return next;
+    });
+  }
+
+  const reorderPanels = useMemo(() => {
+    const byId = new Map(data.map((p) => [p.id, p]));
+    return reorderIds.map((id) => byId.get(id)).filter(Boolean) as Panel[];
+  }, [data, reorderIds]);
 
   // Deep-link from config lookup: /panels?panel=ID
   useEffect(() => {
@@ -547,18 +608,30 @@ export default function PanelsPage() {
     mutationFn: async () => {
       const meta = buildMeta();
       if (isEdit && editing) {
-        const body: Record<string, unknown> = {
-          name: form.name,
-          base_url: normalizeBaseUrl(form.base_url),
-          username: form.username || null,
-          is_active: form.is_active,
-          meta,
-        };
-        if (form.password.trim()) body.password = form.password;
-        if (form.api_token.trim()) body.api_token = form.api_token;
+        // Patch only dirty fields — backend skips remote probe when URL/creds unchanged.
+        const body: Record<string, unknown> = {};
+        const nextName = form.name.trim();
+        const nextUrl = normalizeBaseUrl(form.base_url);
+        const nextUser = form.username.trim() || null;
+        if (nextName !== editing.name) body.name = nextName;
+        if (nextUrl !== normalizeBaseUrl(editing.base_url || "")) body.base_url = nextUrl;
+        if (nextUser !== (editing.username || null)) body.username = nextUser;
+        if (form.is_active !== editing.is_active) body.is_active = form.is_active;
+        if (form.password.trim()) body.password = form.password.trim();
+        if (form.api_token.trim()) body.api_token = form.api_token.trim();
+        const prevMeta = JSON.stringify(editing.meta || {});
+        const nextMeta = JSON.stringify(meta);
+        if (prevMeta !== nextMeta) body.meta = meta;
+        if (Object.keys(body).length === 0) {
+          return editing;
+        }
+        const needsProbe = Boolean(
+          body.base_url || body.username || body.password || body.api_token
+        );
         return api<Panel>(`/api/admin/panels/${editing.id}`, {
           method: "PUT",
           body: JSON.stringify(body),
+          timeoutMs: needsProbe ? 45_000 : 12_000,
         });
       }
       return api<Panel>("/api/admin/panels", {
@@ -574,11 +647,22 @@ export default function PanelsPage() {
           category_id: activeTab,
           meta,
         }),
+        timeoutMs: 45_000,
       });
     },
     onSuccess: (p) => {
-      qc.invalidateQueries({ queryKey: ["panels"] });
-      qc.invalidateQueries({ queryKey: ["panel-categories"] });
+      qc.setQueryData<Panel[]>(["panels"], (prev) => {
+        if (!prev) return [p];
+        const idx = prev.findIndex((x) => x.id === p.id);
+        if (idx >= 0) {
+          const next = [...prev];
+          next[idx] = p;
+          return next;
+        }
+        return [...prev, p];
+      });
+      void qc.invalidateQueries({ queryKey: ["panels"] });
+      void qc.invalidateQueries({ queryKey: ["panel-categories"] });
       resetModal();
       if (!isEdit && p?.type === "astra") {
         setMsg("پنل آسترا ساخته شد — اوتباندها را اضافه کنید");
@@ -587,6 +671,29 @@ export default function PanelsPage() {
       }
     },
     onError: (e: Error) => setMsg(e.message),
+  });
+
+  const reorderMut = useMutation({
+    mutationFn: (panel_ids: number[]) =>
+      api<Panel[]>("/api/admin/panels/reorder", {
+        method: "PUT",
+        body: JSON.stringify({
+          panel_ids,
+          category_id: activeTab,
+        }),
+        timeoutMs: 15_000,
+      }),
+    onSuccess: (rows) => {
+      qc.setQueryData<Panel[]>(["panels"], (prev) => {
+        if (!prev) return rows;
+        const byId = new Map(rows.map((p) => [p.id, p]));
+        return prev.map((p) => byId.get(p.id) || p);
+      });
+      setReorderMode(false);
+      setReorderIds([]);
+      setMsg("ترتیب پنل‌ها ذخیره شد");
+    },
+    onError: (e: Error) => setMsg(e.message || "ذخیره ترتیب ناموفق بود"),
   });
 
   const remove = useMutation({
@@ -677,37 +784,11 @@ export default function PanelsPage() {
   }, []);
 
   const [testAllOpen, setTestAllOpen] = useState(false);
+  const [testAllFilter, setTestAllFilter] = useState<
+    "all" | "fail" | "slow" | "ok" | "fast" | "off"
+  >("all");
 
-  const test = useMutation({
-    mutationFn: (id: number) =>
-      api<{ success: boolean; error?: string; latency_ms?: number }>(
-        `/api/admin/panels/${id}/test`,
-        {
-          method: "POST",
-          timeoutMs: 22_000,
-        }
-      ),
-    onSuccess: (res, id) => {
-      const panelName = data.find((p) => p.id === id)?.name;
-      const ms =
-        typeof res.latency_ms === "number" && res.latency_ms >= 0
-          ? ` · ${toFaDigits(res.latency_ms)}ms`
-          : "";
-      showTestToast(
-        !!res.success,
-        res.success
-          ? panelName
-            ? `تست «${panelName}» موفق بود${ms}`
-            : `اتصال موفق بود${ms}`
-          : res.error || "اتصال ناموفق"
-      );
-      qc.invalidateQueries({ queryKey: ["panels"] });
-    },
-    onError: (e: Error) => {
-      showTestToast(false, e.message || "خطای تست");
-    },
-  });
-
+  type PanelTestGrade = "fast" | "ok" | "slow" | "fail";
   type PanelTestAll = {
     results: {
       id: number;
@@ -716,26 +797,121 @@ export default function PanelsPage() {
       is_active: boolean;
       success: boolean;
       error?: string | null;
+      latency_ms?: number | null;
+      grade?: PanelTestGrade | string;
+      base_url?: string | null;
     }[];
     ok: number;
     fail: number;
+    stats?: {
+      total: number;
+      ok: number;
+      fail: number;
+      active_ok: number;
+      active_fail: number;
+      inactive_ok: number;
+      inactive_fail: number;
+      fast: number;
+      normal: number;
+      slow: number;
+      avg_latency_ms?: number | null;
+      median_latency_ms?: number | null;
+      best_latency_ms?: number | null;
+      worst_latency_ms?: number | null;
+      duration_ms: number;
+    };
+    tested_at?: string | null;
   };
+
+  function formatLatency(ms: number | null | undefined): string {
+    if (ms == null || !Number.isFinite(ms) || ms < 0) return "—";
+    if (ms < 1000) return `${toFaDigits(Math.round(ms))}ms`;
+    return `${toFaDigits((Math.round(ms / 10) / 100).toFixed(2))}s`;
+  }
+
+  function gradeLabel(grade: string | undefined, success: boolean): string {
+    if (!success || grade === "fail") return "قطع";
+    if (grade === "fast") return "سریع";
+    if (grade === "slow") return "کند";
+    return "معمولی";
+  }
+
+  function gradeClass(grade: string | undefined, success: boolean): string {
+    if (!success || grade === "fail") return "fail";
+    if (grade === "fast") return "fast";
+    if (grade === "slow") return "slow";
+    return "ok";
+  }
+
+  const test = useMutation({
+    mutationFn: (id: number) =>
+      api<{ success: boolean; error?: string; latency_ms?: number }>(
+        `/api/admin/panels/${id}/test`,
+        {
+          method: "POST",
+          timeoutMs: 28_000,
+        }
+      ),
+    onSuccess: (res, id) => {
+      const panelName = data.find((p) => p.id === id)?.name;
+      const ms =
+        typeof res.latency_ms === "number" && res.latency_ms >= 0
+          ? ` · ${formatLatency(res.latency_ms)}`
+          : "";
+      const grade =
+        res.success && typeof res.latency_ms === "number"
+          ? res.latency_ms <= 1000
+            ? "سریع"
+            : res.latency_ms <= 3000
+              ? "معمولی"
+              : "کند"
+          : "";
+      showTestToast(
+        !!res.success,
+        res.success
+          ? panelName
+            ? `اتصال «${panelName}» برقرار است${ms}${grade ? ` · ${grade}` : ""}`
+            : `اتصال برقرار است${ms}${grade ? ` · ${grade}` : ""}`
+          : res.error || "اتصال به پنل ریموت برقرار نشد"
+      );
+      qc.invalidateQueries({ queryKey: ["panels"] });
+    },
+    onError: (e: Error) => {
+      const msg = e.message || "خطای تست";
+      // Never show opaque 500 — probe path must return JSON success/error.
+      showTestToast(
+        false,
+        /500|Internal Server Error/i.test(msg)
+          ? "خطای داخلی هنگام تست — صفحه را یک‌بار رفرش کنید و دوباره بزنید"
+          : msg
+      );
+    },
+  });
 
   const testAll = useMutation({
     mutationFn: () =>
       api<PanelTestAll>("/api/admin/panels/test-all", {
         method: "POST",
-        timeoutMs: 90_000,
+        timeoutMs: 120_000,
       }),
     onSuccess: (res) => {
+      setTestAllFilter("all");
       setTestAllOpen(true);
       qc.invalidateQueries({ queryKey: ["panels"] });
+      const st = res.stats;
+      const avg =
+        st?.avg_latency_ms != null
+          ? ` · میانگین ${formatLatency(st.avg_latency_ms)}`
+          : "";
       if (res.fail === 0) {
-        showTestToast(true, `اتصال همه ${toFaDigits(res.ok)} پنل برقرار است`);
+        showTestToast(
+          true,
+          `همه ${toFaDigits(res.ok)} پنل وصل‌اند${avg}`
+        );
       } else {
         showTestToast(
           false,
-          `${toFaDigits(res.fail)} پنل مشکل اتصال دارد`
+          `${toFaDigits(res.ok)} وصل · ${toFaDigits(res.fail)} قطع${avg}`
         );
       }
     },
@@ -743,6 +919,17 @@ export default function PanelsPage() {
       showTestToast(false, e.message || "تست کلی ناموفق بود");
     },
   });
+
+  const testAllFiltered = useMemo(() => {
+    const rows = testAll.data?.results || [];
+    if (testAllFilter === "all") return rows;
+    if (testAllFilter === "off") return rows.filter((r) => !r.is_active);
+    if (testAllFilter === "fail") return rows.filter((r) => !r.success);
+    if (testAllFilter === "fast") return rows.filter((r) => r.grade === "fast");
+    if (testAllFilter === "slow") return rows.filter((r) => r.grade === "slow");
+    if (testAllFilter === "ok") return rows.filter((r) => r.grade === "ok");
+    return rows;
+  }, [testAll.data, testAllFilter]);
 
   const issueNodeSsl = useMutation({
     mutationFn: (domain: string) =>
@@ -898,17 +1085,64 @@ export default function PanelsPage() {
         <button
           type="button"
           className="btn ghost"
-          disabled={testAll.isPending || data.length === 0}
+          disabled={testAll.isPending || data.length === 0 || reorderMode}
           onClick={() => testAll.mutate()}
         >
           <Wifi size={16} />
           {testAll.isPending ? "در حال تست همه…" : "تست کلی اتصال"}
         </button>
-        <button className="btn toolbar-primary" onClick={openCreate}>
-          <Plus size={16} />
-          افزودن پنل
-        </button>
+        {reorderMode ? (
+          <>
+            <button
+              type="button"
+              className="btn ghost"
+              disabled={reorderMut.isPending}
+              onClick={cancelReorder}
+            >
+              انصراف
+            </button>
+            <button
+              type="button"
+              className="btn toolbar-primary"
+              disabled={reorderMut.isPending || reorderIds.length < 2}
+              onClick={() => reorderMut.mutate(reorderIds)}
+            >
+              <ListOrdered size={16} />
+              {reorderMut.isPending ? "در حال ذخیره…" : "ذخیره ترتیب"}
+            </button>
+          </>
+        ) : (
+          <>
+            <button
+              type="button"
+              className="btn ghost"
+              disabled={visiblePanels.length < 2 || !!searchQ}
+              title={
+                searchQ
+                  ? "برای مرتب‌سازی، جستجو را پاک کنید"
+                  : "جابه‌جایی پنل‌های این تب با درگ"
+              }
+              onClick={beginReorder}
+            >
+              <ListOrdered size={16} />
+              ترتیب پنل‌ها
+            </button>
+            <button className="btn toolbar-primary" onClick={openCreate}>
+              <Plus size={16} />
+              افزودن پنل
+            </button>
+          </>
+        )}
       </div>
+
+      {reorderMode ? (
+        <div className="panels-reorder-banner" role="status">
+          <GripVertical size={16} />
+          <span>
+            ترتیب «{activeCat?.name || "همه پنل‌ها"}» — ردیف را بکشید و رها کنید، بعد ذخیره کنید
+          </span>
+        </div>
+      ) : null}
 
       <div className="groups-cat-bar" role="tablist" aria-label="دسته‌بندی پنل‌ها">
         <button
@@ -992,12 +1226,15 @@ export default function PanelsPage() {
       {testAllOpen && testAll.data && (
         <div className="panels-test-all">
           <div className="panels-test-all-head">
-            <strong>
-              نتیجه تست کلی — {toFaDigits(testAll.data.ok)} سالم
-              {testAll.data.fail > 0
-                ? ` · ${toFaDigits(testAll.data.fail)} مشکل`
-                : ""}
-            </strong>
+            <div className="panels-test-all-title">
+              <strong>نتیجه تست کلی اتصال</strong>
+              <span className="muted">
+                {toFaDigits(testAll.data.stats?.total ?? testAll.data.results.length)} پنل
+                {testAll.data.stats?.duration_ms != null
+                  ? ` · ${formatLatency(testAll.data.stats.duration_ms)}`
+                  : ""}
+              </span>
+            </div>
             <button
               type="button"
               className="modal-close"
@@ -1007,17 +1244,149 @@ export default function PanelsPage() {
               ×
             </button>
           </div>
-          <ul className="panels-test-all-list">
-            {testAll.data.results.map((r) => (
-              <li key={r.id} className={r.success ? "ok" : "err"}>
-                <span>
-                  {r.success ? <CheckCircle2 size={15} /> : <XCircle size={15} />}
-                  <b>{r.name}</b>
-                  {!r.is_active ? <em>خاموش</em> : null}
-                </span>
-                <small>{r.success ? "اتصال برقرار است" : r.error || "اتصال ناموفق"}</small>
-              </li>
+
+          <div className="panels-test-stats" aria-label="آمار اتصال">
+            <div className="panels-test-stat ok">
+              <CheckCircle2 size={16} />
+              <div>
+                <b>{toFaDigits(testAll.data.stats?.ok ?? testAll.data.ok)}</b>
+                <span>وصل</span>
+              </div>
+            </div>
+            <div className="panels-test-stat fail">
+              <XCircle size={16} />
+              <div>
+                <b>{toFaDigits(testAll.data.stats?.fail ?? testAll.data.fail)}</b>
+                <span>قطع</span>
+              </div>
+            </div>
+            <div className="panels-test-stat fast">
+              <Zap size={16} />
+              <div>
+                <b>{toFaDigits(testAll.data.stats?.fast ?? 0)}</b>
+                <span>سریع ≤۱s</span>
+              </div>
+            </div>
+            <div className="panels-test-stat normal">
+              <Gauge size={16} />
+              <div>
+                <b>{toFaDigits(testAll.data.stats?.normal ?? 0)}</b>
+                <span>معمولی</span>
+              </div>
+            </div>
+            <div className="panels-test-stat slow">
+              <Timer size={16} />
+              <div>
+                <b>{toFaDigits(testAll.data.stats?.slow ?? 0)}</b>
+                <span>کند (+۳s)</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="panels-test-meta">
+            <span>
+              روشن وصل: {toFaDigits(testAll.data.stats?.active_ok ?? 0)}
+              {(testAll.data.stats?.active_fail ?? 0) > 0
+                ? ` · روشن قطع: ${toFaDigits(testAll.data.stats?.active_fail ?? 0)}`
+                : ""}
+            </span>
+            <span>
+              {(testAll.data.stats?.inactive_ok ?? 0) +
+                (testAll.data.stats?.inactive_fail ?? 0) >
+              0
+                ? `خاموش: ${toFaDigits(
+                    (testAll.data.stats?.inactive_ok ?? 0) +
+                      (testAll.data.stats?.inactive_fail ?? 0)
+                  )} (${toFaDigits(testAll.data.stats?.inactive_ok ?? 0)} وصل)`
+                : "خاموشی در لیست نیست"}
+            </span>
+            {testAll.data.stats?.avg_latency_ms != null ? (
+              <span>
+                میانگین {formatLatency(testAll.data.stats.avg_latency_ms)}
+                {testAll.data.stats.median_latency_ms != null
+                  ? ` · میانه ${formatLatency(testAll.data.stats.median_latency_ms)}`
+                  : ""}
+              </span>
+            ) : null}
+            {testAll.data.stats?.best_latency_ms != null ? (
+              <span>
+                بهترین {formatLatency(testAll.data.stats.best_latency_ms)}
+                {testAll.data.stats.worst_latency_ms != null
+                  ? ` · بدترین ${formatLatency(testAll.data.stats.worst_latency_ms)}`
+                  : ""}
+              </span>
+            ) : null}
+          </div>
+
+          <div className="panels-test-filters" role="tablist" aria-label="فیلتر نتیجه">
+            {(
+              [
+                ["all", "همه", testAll.data.stats?.total ?? testAll.data.results.length],
+                ["fail", "قطع", testAll.data.stats?.fail ?? testAll.data.fail],
+                ["slow", "کند", testAll.data.stats?.slow ?? 0],
+                ["ok", "معمولی", testAll.data.stats?.normal ?? 0],
+                ["fast", "سریع", testAll.data.stats?.fast ?? 0],
+                [
+                  "off",
+                  "خاموش",
+                  (testAll.data.stats?.inactive_ok ?? 0) +
+                    (testAll.data.stats?.inactive_fail ?? 0),
+                ],
+              ] as const
+            ).map(([key, label, count]) => (
+              <button
+                key={key}
+                type="button"
+                role="tab"
+                aria-selected={testAllFilter === key}
+                className={`panels-test-filter${testAllFilter === key ? " active" : ""}`}
+                onClick={() => setTestAllFilter(key)}
+              >
+                {label}
+                <em>{toFaDigits(count)}</em>
+              </button>
             ))}
+          </div>
+
+          <ul className="panels-test-all-list">
+            {testAllFiltered.length === 0 ? (
+              <li className="empty">
+                <span>موردی در این فیلتر نیست</span>
+              </li>
+            ) : (
+              testAllFiltered.map((r) => {
+                const typeLabel =
+                  TYPES.find((t) => t.value === r.type)?.label || r.type;
+                const gClass = gradeClass(r.grade, r.success);
+                return (
+                  <li key={r.id} className={gClass}>
+                    <div className="panels-test-row-main">
+                      <span className="panels-test-row-name">
+                        {r.success ? (
+                          <CheckCircle2 size={15} />
+                        ) : (
+                          <XCircle size={15} />
+                        )}
+                        <b>{r.name}</b>
+                        <em className="panels-test-type">{typeLabel}</em>
+                        {!r.is_active ? <em className="panels-test-off">خاموش</em> : null}
+                      </span>
+                      <span className={`panels-test-grade ${gClass}`}>
+                        {gradeLabel(r.grade, r.success)}
+                        {r.latency_ms != null ? ` · ${formatLatency(r.latency_ms)}` : ""}
+                      </span>
+                    </div>
+                    <small>
+                      {r.success
+                        ? r.base_url
+                          ? r.base_url
+                          : "اتصال برقرار است"
+                        : r.error || "اتصال ناموفق"}
+                    </small>
+                  </li>
+                );
+              })
+            )}
           </ul>
         </div>
       )}
@@ -1054,6 +1423,59 @@ export default function PanelsPage() {
               افزودن پنل
             </button>
           )}
+        </div>
+      ) : reorderMode ? (
+        <div className="panels-reorder-list" role="list" aria-label="مرتب‌سازی پنل‌ها">
+          {reorderPanels.map((p, index) => {
+            const typeLabel = TYPES.find((t) => t.value === p.type)?.label || p.type;
+            return (
+              <div
+                key={p.id}
+                role="listitem"
+                className={`panels-reorder-row${dragOverId === p.id ? " is-over" : ""}${
+                  draggingId === p.id ? " is-dragging" : ""
+                }`}
+                draggable={!reorderMut.isPending}
+                onDragStart={() => {
+                  dragPanelId.current = p.id;
+                  setDraggingId(p.id);
+                }}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setDragOverId(p.id);
+                }}
+                onDragLeave={() => {
+                  setDragOverId((cur) => (cur === p.id ? null : cur));
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  const from = dragPanelId.current;
+                  dragPanelId.current = null;
+                  setDraggingId(null);
+                  setDragOverId(null);
+                  if (from != null) moveReorderId(from, p.id);
+                }}
+                onDragEnd={() => {
+                  dragPanelId.current = null;
+                  setDraggingId(null);
+                  setDragOverId(null);
+                }}
+              >
+                <span className="panels-reorder-handle" aria-hidden>
+                  <GripVertical size={18} />
+                </span>
+                <span className="panels-reorder-index">{toFaDigits(index + 1)}</span>
+                <div className="panels-reorder-main">
+                  <b>{p.name}</b>
+                  <small dir="ltr">{p.base_url}</small>
+                </div>
+                <span className="badge muted">{typeLabel}</span>
+                <span className={`badge ${p.is_active ? "ok" : "err"}`}>
+                  {p.is_active ? "فعال" : "خاموش"}
+                </span>
+              </div>
+            );
+          })}
         </div>
       ) : (
         <div className="admin-grid">
@@ -1725,7 +2147,9 @@ export default function PanelsPage() {
                 </button>
                 <button className="btn" disabled={save.isPending}>
                   {save.isPending
-                    ? "در حال تست اتصال…"
+                    ? isEdit
+                      ? "در حال ذخیره…"
+                      : "در حال تست اتصال…"
                     : isEdit
                       ? "ذخیره تغییرات"
                       : "تست و افزودن"}

@@ -22,8 +22,8 @@ _URL = (settings.DATABASE_URL or "").strip()
 _IS_SQLITE = _URL.startswith("sqlite")
 
 # Background jobs (quota / heal / outbound ping) share this cap so interactive
-# login/API always keep headroom in the pool.
-DB_BACKGROUND_SLOTS = 4
+# login/API always keep headroom in the pool. Keep low vs pool_size.
+DB_BACKGROUND_SLOTS = 3
 _bg_sem: asyncio.Semaphore | None = None
 
 
@@ -53,9 +53,11 @@ def _build_engine_kwargs() -> dict[str, Any]:
         return kwargs
 
     # Postgres / other servers — sized for shared hosts, fail-fast on starve.
-    pool_size = max(2, int(getattr(settings, "DB_POOL_SIZE", 8) or 8))
-    max_overflow = max(0, int(getattr(settings, "DB_MAX_OVERFLOW", 12) or 12))
-    pool_timeout = float(getattr(settings, "DB_POOL_TIMEOUT", 3.0) or 3.0)
+    # Sub HTML + bg usage + quota watch need headroom or /sub falls back to
+    # «در حال آماده‌سازی».
+    pool_size = max(2, int(getattr(settings, "DB_POOL_SIZE", 12) or 12))
+    max_overflow = max(0, int(getattr(settings, "DB_MAX_OVERFLOW", 20) or 20))
+    pool_timeout = float(getattr(settings, "DB_POOL_TIMEOUT", 5.0) or 5.0)
     pool_recycle = max(60, int(getattr(settings, "DB_POOL_RECYCLE", 300) or 300))
     kwargs.update(
         {
@@ -74,7 +76,11 @@ def _build_engine_kwargs() -> dict[str, Any]:
             "command_timeout": 60,
             "server_settings": {
                 "statement_timeout": "60000",
-                "idle_in_transaction_session_timeout": "30000",
+                # Kill leaked idle-in-transaction checkouts (pool starve → /sub 503).
+                # Must cover long admin jobs that hold one session across remote HTTP
+                # (ساخت نمونه ترتیب کانفیگ / استعلام پرچم GeoIP / اعمال گروه).
+                # 4s–60s still killed mid-job → empty sample + «connection is closed».
+                "idle_in_transaction_session_timeout": "300000",
             },
         }
     return kwargs

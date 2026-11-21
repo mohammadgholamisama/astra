@@ -620,12 +620,12 @@ export default function ConfigOrderPage() {
     [items]
   );
 
-  /** Same #N as subscription page (visible configs only, global order). */
+  /** Same #N as subscription page (live + visible only — not missing/hidden). */
   const subNumByKey = useMemo(() => {
     const map = new Map<string, number>();
     let n = 0;
     for (const it of items) {
-      if (it.hidden) continue;
+      if (it.hidden || !it.in_sample) continue;
       n += 1;
       map.set(itemKey(it), n);
     }
@@ -683,7 +683,8 @@ export default function ConfigOrderPage() {
             <strong>گزینهٔ «نوع ترتیب ساب»</strong> روی گروه می‌آید (نه از اسم کانفیگ).
             چیدمان تست: <strong>۲۰ مستقیم</strong> → <strong>۳۵ تانل</strong> به‌ازای هر
             هزینه → <strong>۹ گیمینگ</strong> → بقیه. ساب کاربر حداکثر{" "}
-            <strong>۹۹</strong>؛ اپ تست همه را می‌گیرد.
+            <strong>۹۹</strong>؛ اپ تست با هر ساب، کل موجودی نمونهٔ پنل‌ها را
+            می‌گیرد (نه فقط گروه‌های همان کاربر).
           </p>
         </div>
         <div className="config-order-hero-actions">
@@ -727,15 +728,24 @@ export default function ConfigOrderPage() {
           <ListOrdered size={14} aria-hidden />
           {toFaDigits(items.length)} کانفیگ یکتا
         </span>
-        <span>{toFaDigits(totalSample)} از نمونه پنل‌ها</span>
+        <span>
+          {totalSample > 0
+            ? `${toFaDigits(totalSample)} از نمونه پنل‌ها`
+            : "نمونه خالی — اول «ساخت کانفیگ‌ها»"}
+        </span>
         {hiddenCount > 0 ? (
           <span className="warn">
             {toFaDigits(hiddenCount)} مخفی از ساب
           </span>
         ) : null}
-        {missingCount > 0 ? (
+        {totalSample > 0 && missingCount > 0 ? (
           <span className="warn">
             {toFaDigits(missingCount)} فعلاً در نمونه نیست
+          </span>
+        ) : null}
+        {totalSample <= 0 && items.length > 0 ? (
+          <span className="warn">
+            ترتیب ذخیره‌شده هست؛ لینک زندهٔ نمونه هنوز ساخته نشده
           </span>
         ) : null}
         {dirty ? <span className="dirty">تغییرات ذخیره‌نشده</span> : null}
@@ -903,15 +913,17 @@ export default function ConfigOrderPage() {
                 </span>
                 <span
                   className={`config-order-num${
-                    it.hidden ? " is-hidden-num" : ""
+                    it.hidden || !it.in_sample ? " is-hidden-num" : ""
                   }`}
                   title={
-                    it.hidden
-                      ? "مخفی از ساب — شماره‌ای در ساب ندارد"
-                      : `شماره در ساب: #${toFaDigits(subN ?? 0)}`
+                    !it.in_sample
+                      ? "دیگر در نمونه نیست — در اپ/ساب نمی‌آید"
+                      : it.hidden
+                        ? "مخفی از ساب — شماره‌ای در ساب ندارد"
+                        : `شماره در ساب: #${toFaDigits(subN ?? 0)}`
                   }
                 >
-                  {it.hidden
+                  {it.hidden || !it.in_sample
                     ? "—"
                     : `#${toFaDigits(subN ?? 0)}`}
                 </span>
@@ -925,14 +937,13 @@ export default function ConfigOrderPage() {
                     {it.protocol ? (
                       <span className="badge muted">{it.protocol}</span>
                     ) : null}
-                    {it.hidden ? (
+                    {!it.in_sample ? (
+                      <span className="badge warn">دیگر در نمونه نیست</span>
+                    ) : it.hidden ? (
                       <span className="badge warn">مخفی از ساب</span>
                     ) : (
                       <span className="badge ok">در ساب</span>
                     )}
-                    {!it.in_sample ? (
-                      <span className="badge warn">دیگر در نمونه نیست</span>
-                    ) : null}
                   </div>
                   {it.source_remark &&
                   (it.source_remark || "").trim() !== (it.label || "").trim() ? (

@@ -342,8 +342,30 @@ async def probe_config_flags(
 
     saved = 0
     if upserts:
-        outs = await upsert_endpoint_locations_many(db, upserts)
-        saved = len(outs)
+        # Never reuse the request session after DNS/GeoIP — it often sat idle in
+        # a transaction and Postgres already closed it («connection is closed»).
+        from app.core.database import AsyncSessionLocal
+
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                async with AsyncSessionLocal() as sdb:
+                    outs = await upsert_endpoint_locations_many(sdb, upserts)
+                    saved = len(outs)
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                logger.warning(
+                    "flag upsert attempt=%s failed: %s", attempt + 1, exc
+                )
+                await asyncio.sleep(0.25)
+        if last_exc is not None and saved <= 0:
+            raise last_exc
 
     ok_n = sum(1 for r in results if r.get("ok") and r.get("country_code"))
     fail_n = sum(1 for r in results if not r.get("ok"))

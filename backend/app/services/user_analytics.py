@@ -10,16 +10,28 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.user import PanelAccount, PanelAccountStatus, User, UserStatus
+from app.models.user import User, UserStatus
 from app.models.user_analytics import (
     SubClientProfile,
     SubFetchEvent,
     UsageHourBucket,
     UsageSession,
     UserUsageState,
+)
+from app.services.client_ua import (
+    ACCEPT_CH_HEADERS as _ACCEPT_CH_HEADERS,
+    KNOWN_APP_NAMES as _KNOWN_APP_NAMES,
+    detect_client_channel,
+    device_label as _device_label,
+    parse_browser_name,
+    parse_client_app,
+    parse_client_device,
+    parse_client_os,
+    parse_device_brand,
+    parse_device_model,
 )
 
 logger = logging.getLogger("astra.analytics")
@@ -34,30 +46,10 @@ _HOUR_RETENTION_DAYS = 120
 _SESSION_RETENTION_DAYS = 120
 
 # In-process debounce for sub-fetch logging
-_sub_log_last: dict[tuple[int, str], float] = {}
-_SUB_LOG_DEBOUNCE = 180.0  # seconds per (user, device_key)
+# (user_id, device_key, network_key) → monotonic ts — network switches always log
+_sub_log_last: dict[tuple[int, str, str], float] = {}
+_SUB_LOG_DEBOUNCE = 45.0  # seconds per same device + same network
 _sample_lock = asyncio.Lock()
-
-_CLIENT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("v2rayNG", re.compile(r"v2rayng", re.I)),
-    ("v2rayN", re.compile(r"v2rayn(?!g)", re.I)),
-    ("Streisand", re.compile(r"streisand", re.I)),
-    ("Hiddify", re.compile(r"hiddify", re.I)),
-    ("HiddifyNext", re.compile(r"hiddifynext|hiddify.?next", re.I)),
-    ("ClashMeta", re.compile(r"clash.?meta|mihomo", re.I)),
-    ("Clash", re.compile(r"clash", re.I)),
-    ("Shadowrocket", re.compile(r"shadowrocket", re.I)),
-    ("Quantumult", re.compile(r"quantumult", re.I)),
-    ("Surge", re.compile(r"surge", re.I)),
-    ("NekoBox", re.compile(r"nekobox|nekoray", re.I)),
-    ("v2box", re.compile(r"v2box", re.I)),
-    ("FairVPN", re.compile(r"fairvpn", re.I)),
-    ("FoXray", re.compile(r"foxray", re.I)),
-    ("Stash", re.compile(r"stash", re.I)),
-    ("SingBox", re.compile(r"sing-?box|sfa|sfm", re.I)),
-    ("OkHttp", re.compile(r"okhttp", re.I)),
-    ("AstraPing", re.compile(r"astraping", re.I)),
-]
 
 
 def _utc_now() -> datetime:
@@ -175,26 +167,131 @@ def _overlap_bytes(hour_ts: int, raw: int, start_ts: int, end_ts: int) -> int:
     return int(round(int(raw) * ((o1 - o0) / 3600.0)))
 
 
-def parse_client_app(user_agent: str) -> str:
-    ua = (user_agent or "").strip()
-    if not ua:
-        return "نامشخص"
-    for name, pat in _CLIENT_PATTERNS:
-        if pat.search(ua):
-            return name
-    # Generic mobile / desktop hints
-    low = ua.lower()
-    if "android" in low:
-        return "Android"
-    if "iphone" in low or "ios" in low or "ipad" in low:
-        return "iOS"
-    if "windows" in low:
-        return "Windows"
-    if "mac os" in low or "macintosh" in low:
-        return "macOS"
-    if "linux" in low:
-        return "Linux"
-    return "سایر"
+# Iran-edge / tunnel peers — never treat as the end-user client IP
+_INFRA_IPS = {
+    "5.202.8.221",  # primary Iran sub edge
+    "85.9.105.116",  # secondary Iran edge
+}
+
+
+def _ser_sub_fetch(e: SubFetchEvent) -> dict[str, Any]:
+    from app.services.iran_operators import classify_operator, operator_label
+
+    ua = e.user_agent or ""
+    # Re-parse live so older rows pick up better brand/model/OS/browser labels
+    info = parse_client_device(ua)
+    stored_brand = (e.device_brand or "").strip()
+    stored_model = (getattr(e, "device_model", None) or "").strip()
+    stored_os = (getattr(e, "client_os", None) or "").strip()
+    brand = info["brand"]
+    model = info["model"] or (stored_model or None)
+    # Prefer richer stored brand when live parse is generic
+    if stored_brand and brand in ("Android", "سایر", "نامشخص"):
+        if stored_brand not in ("Android", "سایر", "نامشخص"):
+            brand = stored_brand
+    app = info["app"] or e.client_app or parse_client_app(ua)
+    # Prefer stored OS (may include Client-Hint version from fetch time)
+    os_name = stored_os or info["os"]
+    # If stored is bare "Android" but live parse found a plausible version, use live
+    if stored_os in ("Android", "iOS", "iPadOS", "macOS", "Windows") and info[
+        "os"
+    ] not in (stored_os, "نامشخص"):
+        if any(ch.isdigit() for ch in info["os"]):
+            os_name = info["os"]
+    channel = info["channel"]
+    browser = info["browser"]
+    label = _device_label(brand=brand, model=model, os_name=os_name)
+    op = (e.operator or "").strip() or "other"
+    ip = (e.client_ip or "").strip()
+    ip_ok = _ip_usable(ip)
+    if not ip_ok:
+        op_label = "لوکال / تشخیص‌نشده"
+        op = "other"
+        ip_out = None
+    else:
+        # Re-classify from IP: Iranian ISP, or VPN/خارج for foreign public exits
+        live = classify_operator(ip)
+        if live != "other":
+            op = live
+        elif (op or "").strip().lower() in ("", "other", "isp"):
+            # Should not happen for public IPs (classify → vpn); keep safe
+            op = "other"
+        op_label = operator_label(op)
+        ip_out = ip
+    return {
+        "ts": e.ts.isoformat() if e.ts else None,
+        "ip": ip_out,
+        "network": e.network_key if ip_ok else "local",
+        "app": app,
+        "browser": browser,
+        "country": e.country,
+        "ua": ua,
+        "operator": op,
+        "operator_label": op_label,
+        "device_brand": brand,
+        "device_model": model,
+        "device_label": label,
+        "os": os_name,
+        "channel": channel,
+        "channel_label": (
+            "اپلیکیشن"
+            if channel == "app"
+            else "مرورگر"
+            if channel == "browser"
+            else "نامشخص"
+        ),
+        "ip_ok": ip_ok,
+    }
+
+
+def _best_sub_client(items: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Latest real sub open/update (public IP) — always by time, not old ISP bias.
+
+    Returns ``None`` when every row lacks a usable public IP so the UI does
+    not keep showing stale «تشخیص‌نشده / 127.0.0.1» from admin previews.
+    """
+    if not items:
+        return None
+    usable = [row for row in items if row.get("ip_ok")]
+    if not usable:
+        return None
+
+    def sort_key(row: dict[str, Any]) -> tuple:
+        from app.services.iran_operators import is_known_operator
+
+        ts = str(row.get("ts") or "")
+        op = (row.get("operator") or "other").strip()
+        # Tie-break only when timestamps match: prefer known ISP / app channel
+        known = (
+            2
+            if op in ("irancell", "mci", "rightel")
+            else 1
+            if is_known_operator(op)
+            else 0
+        )
+        app = 1 if row.get("channel") == "app" else 0
+        return (ts, known, app)
+
+    return max(usable, key=sort_key)
+
+
+def _profile_is_local_junk(p: SubClientProfile) -> bool:
+    key = (p.key or "").strip().lower()
+    detail = (p.detail or "").strip().lower()
+    label = (p.label or "").strip()
+    if key in ("local",):
+        return True
+    if "127.0.0.1" in detail or "::1" in detail:
+        return True
+    if key == "other" and (
+        "لوکال" in label
+        or "تشخیص" in label
+        or detail in ("", "unknown", "127.0.0.1 · browser", "127.0.0.1 · app", "127.0.0.1 · unknown")
+        or detail.startswith("127.0.0.1")
+        or detail.startswith("unknown")
+    ):
+        return True
+    return False
 
 
 def _device_key(client_app: str, user_agent: str) -> str:
@@ -203,9 +300,44 @@ def _device_key(client_app: str, user_agent: str) -> str:
     return hashlib.sha256(base.encode("utf-8", errors="ignore")).hexdigest()[:20]
 
 
+def _ip_usable(ip: str | None) -> bool:
+    """True for a routable public client IP (not loopback/private/unknown)."""
+    raw = (ip or "").strip().split(",")[0].strip()
+    if not raw or raw.lower() in ("unknown", "null", "none", "-"):
+        return False
+    if raw in _INFRA_IPS:
+        return False
+    try:
+        import ipaddress
+
+        addr = ipaddress.ip_address(raw)
+    except ValueError:
+        return False
+    return not (
+        addr.is_loopback
+        or addr.is_private
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+    )
+
+
+def _ip_non_loopback(ip: str | None) -> bool:
+    raw = (ip or "").strip().split(",")[0].strip()
+    if not raw or raw.lower() in ("unknown", "null", "none", "-", "127.0.0.1", "::1"):
+        return False
+    try:
+        import ipaddress
+
+        return not ipaddress.ip_address(raw).is_loopback
+    except ValueError:
+        return False
+
+
 def _network_key(ip: str) -> str:
     ip = (ip or "").strip()
-    if not ip or ip in ("127.0.0.1", "::1", "unknown"):
+    if not ip or not _ip_non_loopback(ip):
         return "local"
     # IPv4 /24
     if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
@@ -219,24 +351,50 @@ def _network_key(ip: str) -> str:
 
 
 def extract_client_ip(headers: dict[str, str], fallback: str | None = None) -> str:
+    """Best-effort public client IP behind nginx / CF / Iran edge.
+
+    Skips loopback and private addresses so operator detection is not polluted
+    by ``127.0.0.1`` from local proxies or admin previews.
+    """
+
     def _h(name: str) -> str:
         for k, v in headers.items():
             if k.lower() == name.lower():
                 return (v or "").strip()
         return ""
 
+    candidates: list[str] = []
+    # Prefer X-Astra-Client-IP first: Iran edge sets the real subscriber IP.
+    # CF-Connecting-IP through our topology is often the edge itself
+    # (5.202.8.221), which would wrongly classify everyone as one ISP and
+    # freeze sub order to global/pishgaman.
     for key in (
-        "cf-connecting-ip",
+        "x-astra-client-ip",
         "true-client-ip",
+        "cf-connecting-ip",
         "x-real-ip",
+        "x-client-ip",
+        "x-forwarded-for",
     ):
         v = _h(key)
-        if v:
-            return v.split(",")[0].strip()
-    xff = _h("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
-    return (fallback or "").strip() or "unknown"
+        if not v:
+            continue
+        for part in v.split(","):
+            p = part.strip()
+            if p:
+                candidates.append(p)
+    if fallback:
+        fb = str(fallback).strip()
+        if fb:
+            candidates.append(fb)
+
+    for ip in candidates:
+        if _ip_usable(ip):
+            return ip
+    for ip in candidates:
+        if _ip_non_loopback(ip):
+            return ip
+    return "unknown"
 
 
 def format_bps(bps: float) -> str:
@@ -506,7 +664,11 @@ async def apply_raw_sample(
     *,
     now: datetime | None = None,
 ) -> None:
-    """Ingest one raw-total sample for a user (idempotent per call)."""
+    """Ingest one usage-total sample for a user (idempotent per call).
+
+    ``raw_total`` is the live Astra usage counter (weighted Σ raw×coeff —
+    same number as the users page).
+    """
     now = _as_utc(now) or _utc_now()
     state = await _get_or_create_state(db, user_id)
     prev = int(state.last_raw_total or 0)
@@ -527,6 +689,15 @@ async def apply_raw_sample(
         delta = 0
     else:
         delta = raw - prev
+
+    # Source/scale jump (bulk panel sync, raw→weighted, cursor heal): rebase
+    # ONLY. Never credit hour/day buckets — that invented multi-TB «این ساعت».
+    # Cap ≈ 80Mbps sustained over the gap (was 500Mbps and still too loose).
+    max_natural = max(80 * 1024 * 1024, int(dt * (80_000_000 / 8)))
+    if delta > max_natural:
+        state.last_raw_total = raw
+        state.last_sample_at = now
+        return
 
     rate_bps = (delta * 8.0) / dt_rate if delta > 0 else 0.0
     active = delta >= _ONLINE_MIN_BYTES
@@ -577,32 +748,181 @@ async def apply_raw_sample(
     state.last_sample_at = now
 
 
+_weighted_rebase_done = False
+
+
+async def rebase_cursors_to_weighted_usage() -> dict[str, int]:
+    """Align analytics cursors with ``User.used_traffic`` (weighted).
+
+    Old sampler tracked Σ PanelAccount.used_traffic (incl. deleted). Switching
+    without rebase dumps the scale gap into «این ساعت». Idempotent when already
+    aligned (~5%).
+    """
+    global _weighted_rebase_done
+    if _weighted_rebase_done:
+        return {"skipped": 1}
+    from app.core.database import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        live_all = int(
+            (
+                await db.execute(
+                    select(func.coalesce(func.sum(User.used_traffic), 0))
+                )
+            ).scalar()
+            or 0
+        )
+        cursor_all = int(
+            (
+                await db.execute(
+                    select(
+                        func.coalesce(func.sum(UserUsageState.last_raw_total), 0)
+                    ).where(UserUsageState.last_sample_at.is_not(None))
+                )
+            ).scalar()
+            or 0
+        )
+        denom = max(live_all, cursor_all, 1)
+        gap_ratio = abs(live_all - cursor_all) / float(denom)
+        if cursor_all > 0 and gap_ratio < 0.05:
+            _weighted_rebase_done = True
+            return {"aligned": 1, "live": live_all, "cursor": cursor_all}
+
+        now = _utc_now()
+        hour_ts = _hour_ts(now)
+        day_ts = int(
+            now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        )
+        users = (
+            await db.execute(
+                select(User.id, func.coalesce(User.used_traffic, 0))
+            )
+        ).all()
+        n = 0
+        for uid, total in users:
+            state = await _get_or_create_state(db, int(uid))
+            live = int(total or 0)
+            state.last_raw_total = live
+            state.last_sample_at = now
+            state.period_hour_ts = hour_ts
+            state.period_hour_raw = live
+            state.period_day_ts = day_ts
+            state.period_day_raw = live
+            n += 1
+            if n % 80 == 0:
+                await db.commit()
+
+        # Clear polluted current-hour buckets so «این ساعت» starts clean
+        cleared = await db.execute(
+            delete(UsageHourBucket).where(UsageHourBucket.hour_ts >= hour_ts)
+        )
+        await db.commit()
+        _weighted_rebase_done = True
+        logger.info(
+            "analytics cursors rebased to weighted: users=%s live=%s old_cursor=%s "
+            "cleared_hours=%s",
+            n,
+            live_all,
+            cursor_all,
+            cleared.rowcount if cleared is not None else 0,
+        )
+        return {
+            "rebased": n,
+            "live": live_all,
+            "old_cursor": cursor_all,
+            "cleared_hour_rows": int(cleared.rowcount or 0)
+            if cleared is not None
+            else 0,
+        }
+
+
+async def align_analytics_cursors(user_ids: list[int]) -> int:
+    """Set analytics cursors to current ``User.used_traffic`` without crediting hours.
+
+    Call after bulk panel usage pulls so the next sample does not treat the
+    catch-up jump as organic «این ساعت» traffic.
+    """
+    ids = list(dict.fromkeys(int(x) for x in user_ids if x))
+    if not ids:
+        return 0
+    from app.core.database import AsyncSessionLocal
+
+    now = _utc_now()
+    n = 0
+    async with AsyncSessionLocal() as db:
+        rows = (
+            await db.execute(
+                select(User.id, func.coalesce(User.used_traffic, 0)).where(
+                    User.id.in_(ids)
+                )
+            )
+        ).all()
+        for uid, total in rows:
+            state = await _get_or_create_state(db, int(uid))
+            state.last_raw_total = max(0, int(total or 0))
+            state.last_sample_at = now
+            n += 1
+            if n % 80 == 0:
+                await db.commit()
+        await db.commit()
+    return n
+
+
+async def scrub_inflated_hour_buckets(
+    *, since_hour_ts: int, min_user_bytes: int = 1024**3
+) -> dict[str, int]:
+    """Zero absurd per-user hour rows (bulk-sync dumps), keep small organic ones."""
+    from app.core.database import AsyncSessionLocal
+    from sqlalchemy import update
+
+    async with AsyncSessionLocal() as db:
+        # Zero giant rows
+        big = await db.execute(
+            update(UsageHourBucket)
+            .where(
+                UsageHourBucket.hour_ts >= int(since_hour_ts),
+                UsageHourBucket.raw_bytes >= int(min_user_bytes),
+            )
+            .values(raw_bytes=0, peak_bps=0.0)
+        )
+        # Also zero mid junk: >200MB in those hours is almost always catch-up
+        mid = await db.execute(
+            update(UsageHourBucket)
+            .where(
+                UsageHourBucket.hour_ts >= int(since_hour_ts),
+                UsageHourBucket.raw_bytes >= 200 * 1024 * 1024,
+            )
+            .values(raw_bytes=0, peak_bps=0.0)
+        )
+        await db.commit()
+        return {
+            "zeroed_ge_1gb": int(big.rowcount or 0),
+            "zeroed_ge_200mb": int(mid.rowcount or 0),
+        }
+
+
 async def sample_all_users_once() -> dict[str, int]:
-    """Read local raw counters and advance analytics (no remote I/O)."""
+    """Advance analytics from each user's live Astra usage (weighted).
+
+    Uses ``User.used_traffic`` — same counter as the users page
+    (Σ raw×coeff, no superseded deleted double-count). No remote I/O.
+    """
     from app.core.database import AsyncSessionLocal
 
     if _sample_lock.locked():
         return {"skipped": 1, "busy": 1}
     async with _sample_lock:
         t0 = time.monotonic()
+        try:
+            rebase = await rebase_cursors_to_weighted_usage()
+            if rebase.get("rebased"):
+                logger.info("analytics weighted rebase: %s", rebase)
+        except Exception:  # noqa: BLE001
+            logger.exception("analytics weighted rebase failed")
         async with AsyncSessionLocal() as db:
             rows = (
                 await db.execute(
-                    select(
-                        PanelAccount.user_id,
-                        func.coalesce(func.sum(PanelAccount.used_traffic), 0),
-                    )
-                    .where(
-                        PanelAccount.status.in_(
-                            (
-                                PanelAccountStatus.active,
-                                PanelAccountStatus.error,
-                                PanelAccountStatus.pending,
-                                PanelAccountStatus.deleted,
-                            )
-                        )
-                    )
-                    .group_by(PanelAccount.user_id)
+                    select(User.id, func.coalesce(User.used_traffic, 0))
                 )
             ).all()
             n = 0
@@ -613,9 +933,25 @@ async def sample_all_users_once() -> dict[str, int]:
                     n += 1
                 except Exception:  # noqa: BLE001
                     logger.exception("analytics sample user=%s failed", uid)
+                    try:
+                        await db.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
                 if n % 40 == 0:
-                    await db.commit()
-            await db.commit()
+                    try:
+                        await db.commit()
+                    except Exception:  # noqa: BLE001
+                        try:
+                            await db.rollback()
+                        except Exception:  # noqa: BLE001
+                            pass
+            try:
+                await db.commit()
+            except Exception:  # noqa: BLE001
+                try:
+                    await db.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
         return {"users": n, "ms": int((time.monotonic() - t0) * 1000)}
 
 
@@ -662,21 +998,37 @@ async def record_sub_fetch(
         return
 
     ip = extract_client_ip(headers, client_host)
-    app = parse_client_app(ua)
+    ip_ok = _ip_usable(ip)
+    from app.services.iran_operators import classify_operator, operator_label
+
+    info = parse_client_device(ua, headers)
+    app = info["app"]
+    brand = info["brand"]
+    model = info["model"]
+    os_name = info["os"]
+    channel = info["channel"]
     dkey = _device_key(app, ua)
     nkey = _network_key(ip)
-    from app.services.iran_operators import classify_operator
-    from app.services.panel_analytics import parse_device_brand
 
-    op_code = classify_operator(ip)
-    brand = parse_device_brand(ua)
+    # Browser preview without a public IP (admin open / broken edge) — skip noise
+    if channel == "browser" and not ip_ok:
+        return
+
+    # Local / unknown IP → do not invent an Iranian operator
+    op_code = classify_operator(ip) if ip_ok else "other"
+    if not ip_ok:
+        op_label = "لوکال / تشخیص‌نشده"
+    else:
+        op_label = operator_label(op_code)
+    device_label = info["device_label"] or app
     uid = int(user_id)
     now_m = time.monotonic()
-    debounce_key = (uid, dkey)
+    # Include network so switching ISP/Wi‑Fi always creates a fresh event
+    debounce_key = (uid, dkey, nkey)
     last = _sub_log_last.get(debounce_key)
-    if last is not None and (now_m - last) < _SUB_LOG_DEBOUNCE:
-        return
-    _sub_log_last[debounce_key] = now_m
+    skip_event = last is not None and (now_m - last) < _SUB_LOG_DEBOUNCE
+    if not skip_event:
+        _sub_log_last[debounce_key] = now_m
     # Cap debounce map
     if len(_sub_log_last) > 8000:
         oldest = sorted(_sub_log_last.items(), key=lambda kv: kv[1])[:2000]
@@ -692,54 +1044,76 @@ async def record_sub_fetch(
     now = _utc_now()
     try:
         async with AsyncSessionLocal() as db:
-            db.add(
-                SubFetchEvent(
-                    user_id=uid,
-                    ts=now,
-                    client_ip=ip[:64],
-                    network_key=nkey[:64],
-                    device_key=dkey[:64],
-                    client_app=app[:64],
-                    user_agent=ua,
-                    country=country,
-                    operator=op_code[:16],
-                    device_brand=brand[:32],
+            if not skip_event:
+                db.add(
+                    SubFetchEvent(
+                        user_id=uid,
+                        ts=now,
+                        client_ip=(ip if ip_ok else "unknown")[:64],
+                        network_key=nkey[:64],
+                        device_key=dkey[:64],
+                        client_app=(app or "")[:64],
+                        user_agent=ua,
+                        country=country,
+                        operator=op_code[:16],
+                        device_brand=(brand or "")[:64],
+                        device_model=(model or "")[:96] if model else None,
+                        client_os=(os_name or "")[:64] if os_name else None,
+                    )
                 )
-            )
             await _upsert_profile(
                 db,
                 uid,
                 kind="device",
                 key=dkey,
-                label=app,
-                detail=(ua[:240] if ua else None),
+                label=device_label[:200],
+                detail=(f"{os_name} · {channel}" if os_name else channel),
                 now=now,
             )
-            await _upsert_profile(
-                db,
-                uid,
-                kind="network",
-                key=nkey,
-                label=nkey if nkey != "local" else "لوکال",
-                detail=ip,
-                now=now,
-            )
+            # Skip junk local network rows (admin preview / loopback proxy)
+            if nkey != "local" and ip_ok:
+                net_key = op_code if op_code != "other" else nkey
+                net_label = op_label if op_code != "other" else nkey
+                await _upsert_profile(
+                    db,
+                    uid,
+                    kind="network",
+                    key=net_key[:64],
+                    label=net_label[:200],
+                    detail=ip[:64],
+                    now=now,
+                )
             await _upsert_profile(
                 db,
                 uid,
                 kind="brand",
                 key=brand.lower()[:64],
-                label=brand,
-                detail=ua[:240] if ua else None,
+                label=(info["device_label"] or brand)[:200],
+                # Keep UA when model is missing so online/brand reclassify can mine it
+                detail=(
+                    (model[:500] if model else None)
+                    or (ua[:500] if ua else None)
+                ),
                 now=now,
             )
+            # Only store operator when we have a real public IP
+            if ip_ok:
+                await _upsert_profile(
+                    db,
+                    uid,
+                    kind="operator",
+                    key=op_code[:64],
+                    label=op_label[:200],
+                    detail=ip[:64],
+                    now=now,
+                )
             await _upsert_profile(
                 db,
                 uid,
-                kind="operator",
-                key=op_code[:64],
-                label=op_code,
-                detail=ip,
+                kind="os",
+                key=os_name.lower()[:64],
+                label=os_name[:200],
+                detail=None,
                 now=now,
             )
             st = await _get_or_create_state(db, uid)
@@ -788,6 +1162,24 @@ async def _upsert_profile(
             row.label = label[:200]
         if detail:
             row.detail = detail[:500]
+
+
+def _sum_from_map(
+    by_h: dict[int, int], start_ts: int, end_ts: int
+) -> int:
+    """Sum overlapping bytes from an in-memory hour_ts → raw map."""
+    if int(end_ts) <= int(start_ts):
+        return 0
+    lo = _align_down_hour(int(start_ts))
+    hi = _align_up_hour(int(end_ts))
+    total = 0
+    ts = lo
+    while ts < hi:
+        raw = int(by_h.get(ts, 0) or 0)
+        if raw:
+            total += _overlap_bytes(ts, raw, int(start_ts), int(end_ts))
+        ts += 3600
+    return int(total)
 
 
 async def _sum_hours(
@@ -888,6 +1280,160 @@ def _pct_change(cur: int | float, prev: int | float) -> float | None:
     return round(((c - p) / p) * 100.0, 1)
 
 
+def _contiguous_ranges(
+    hours: list[dict[str, Any]],
+    pred,
+) -> list[dict[str, Any]]:
+    """Merge consecutive hour slots matching ``pred(raw_bytes)`` into ranges."""
+    ranges: list[dict[str, Any]] = []
+    i = 0
+    n = len(hours)
+    while i < n:
+        raw = int(hours[i].get("raw_bytes") or 0)
+        if not pred(raw):
+            i += 1
+            continue
+        j = i
+        total = 0
+        while j < n and pred(int(hours[j].get("raw_bytes") or 0)):
+            total += int(hours[j].get("raw_bytes") or 0)
+            j += 1
+        start_ts = int(hours[i]["hour_ts"])
+        end_ts = int(hours[j - 1]["hour_ts"]) + 3600
+        ranges.append(
+            {
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "hours": j - i,
+                "raw_bytes": int(total),
+                "avg_bytes": int(total // max(1, j - i)),
+            }
+        )
+        i = j
+    ranges.sort(key=lambda r: -int(r["raw_bytes"]))
+    return ranges
+
+
+def _analyze_24h_window(hours_24: list[dict[str, Any]]) -> dict[str, Any]:
+    """Peak / low slots and contiguous high/low ranges for last 24h."""
+    hours = [
+        {
+            "hour_ts": int(h["hour_ts"]),
+            "raw_bytes": max(0, int(h.get("raw_bytes") or 0)),
+            "active_seconds": int(h.get("active_seconds") or 0),
+        }
+        for h in hours_24
+    ]
+    if not hours:
+        return {
+            "total_bytes": 0,
+            "hours": [],
+            "peak": None,
+            "low": None,
+            "high_ranges": [],
+            "low_ranges": [],
+            "quiet_hours": 0,
+            "active_hours": 0,
+            "top_hours": [],
+            "bottom_hours": [],
+        }
+
+    total = sum(int(h["raw_bytes"]) for h in hours)
+    peak_h = max(hours, key=lambda h: int(h["raw_bytes"]))
+    active = [h for h in hours if int(h["raw_bytes"]) > 0]
+    quiet_n = len(hours) - len(active)
+    if active:
+        low_h = min(active, key=lambda h: int(h["raw_bytes"]))
+    else:
+        low_h = min(hours, key=lambda h: int(h["hour_ts"]))
+
+    peak_bytes = int(peak_h["raw_bytes"] or 0)
+    high_thr = max(64 * 1024, int(peak_bytes * 0.55)) if peak_bytes > 0 else 0
+    low_thr = (
+        max(1024, min(int(peak_bytes * 0.12), 8 * 1024 * 1024))
+        if peak_bytes > 0
+        else 1024
+    )
+
+    high_ranges = (
+        _contiguous_ranges(hours, lambda b: b >= high_thr and b > 0)
+        if peak_bytes > 0
+        else []
+    )
+    low_ranges = _contiguous_ranges(hours, lambda b: b <= low_thr)
+
+    ranked = sorted(hours, key=lambda h: (-int(h["raw_bytes"]), int(h["hour_ts"])))
+    top_hours = ranked[:5]
+    bottom_active = sorted(
+        active, key=lambda h: (int(h["raw_bytes"]), int(h["hour_ts"]))
+    )[:5]
+    bottom_hours = bottom_active if bottom_active else ranked[-5:][::-1]
+
+    def _slot(h: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "hour_ts": int(h["hour_ts"]),
+            "raw_bytes": int(h["raw_bytes"]),
+            "active_seconds": int(h.get("active_seconds") or 0),
+        }
+
+    return {
+        "total_bytes": int(total),
+        "hours": [_slot(h) for h in hours],
+        "peak": _slot(peak_h) if peak_bytes > 0 else None,
+        "low": _slot(low_h) if active else None,
+        "high_ranges": high_ranges[:6],
+        "low_ranges": sorted(
+            low_ranges, key=lambda r: (-int(r["hours"]), int(r["start_ts"]))
+        )[:6],
+        "quiet_hours": int(quiet_n),
+        "active_hours": len(active),
+        "top_hours": [_slot(h) for h in top_hours if int(h["raw_bytes"]) > 0],
+        "bottom_hours": [_slot(h) for h in bottom_hours],
+    }
+
+
+def _hour_over_hour(
+    current: int,
+    previous: int,
+    *,
+    hour_start: int,
+    now_ts: int | None = None,
+) -> dict[str, Any]:
+    """Fair this-hour vs previous-hour comparison.
+
+    Mid-hour ``current`` is incomplete; we project to a full hour and also
+    expose the raw so-far numbers so the UI can show both.
+    """
+    cur = max(0, int(current or 0))
+    prev = max(0, int(previous or 0))
+    start = int(hour_start)
+    now_i = int(now_ts if now_ts is not None else _utc_now().timestamp())
+    elapsed = max(1, min(3600, now_i - start))
+    # Avoid wild projection in the first ~90s of a new hour
+    if elapsed < 90:
+        projected = cur
+        fair_pct = _pct_change(cur, prev) if elapsed >= 30 else None
+    else:
+        projected = int(round(cur * 3600.0 / float(elapsed)))
+        fair_pct = _pct_change(projected, prev)
+    delta = int(projected) - int(prev)
+    return {
+        "current": cur,
+        "previous": prev,
+        "projected": int(projected),
+        "elapsed_seconds": int(elapsed),
+        "elapsed_pct": round(elapsed * 100.0 / 3600.0, 1),
+        "delta_bytes": delta,
+        "change_pct": fair_pct,
+        "change_pct_raw": _pct_change(cur, prev),
+        "hour_start": start,
+        "prev_hour_start": start - 3600,
+        "direction": (
+            "up" if delta > 0 else "down" if delta < 0 else "flat"
+        ),
+    }
+
+
 async def build_user_analytics(
     db: AsyncSession,
     user: User,
@@ -917,25 +1463,8 @@ async def build_user_analytics(
     week_end = int(periods["week_end"])
     grid_hour = int(periods["grid_hour"])
 
-    # Live raw from accounts (authoritative) vs last sample cursor
-    live_raw = int(
-        (
-            await db.execute(
-                select(func.coalesce(func.sum(PanelAccount.used_traffic), 0)).where(
-                    PanelAccount.user_id == uid,
-                    PanelAccount.status.in_(
-                        (
-                            PanelAccountStatus.active,
-                            PanelAccountStatus.error,
-                            PanelAccountStatus.pending,
-                            PanelAccountStatus.deleted,
-                        )
-                    ),
-                )
-            )
-        ).scalar()
-        or 0
-    )
+    # Live usage = User.used_traffic (weighted Σ raw×coeff, same as users page)
+    live_raw = int(user.used_traffic or 0)
     if state is None:
         state = await _get_or_create_state(db, uid)
     cursor = int(state.last_raw_total or 0)
@@ -954,23 +1483,30 @@ async def build_user_analytics(
             await db.rollback()
         except Exception:  # noqa: BLE001
             pass
-    prev_hour = min(await _sum_hours(db, uid, hour - 3600, hour), live_raw)
-    prev_day = min(await _sum_hours(db, uid, day - 86400, day), live_raw)
-    cur_week = min((await _sum_hours(db, uid, week, week_end)) + pending, live_raw)
-    prev_week = min(await _sum_hours(db, uid, week - 7 * 86400, week), live_raw)
+    # One bucket pull covers month compare + 14d heatmap + 48h series
+    series_start = grid_hour - 47 * 3600
+    heat_start = grid_hour - 14 * 86400
+    range_lo = min(prev_month, week - 7 * 86400, heat_start, series_start, hour - 3600)
+    range_hi = max(next_month_ts, week_end, grid_hour + 3600, hour + 3600)
+    all_buckets = await _hour_rows(db, uid, range_lo, range_hi)
+    by_h_obj = {int(b.hour_ts): b for b in all_buckets}
+    by_h_raw = {ts: int(b.raw_bytes or 0) for ts, b in by_h_obj.items()}
+
+    prev_hour = min(_sum_from_map(by_h_raw, hour - 3600, hour), live_raw)
+    prev_day = min(_sum_from_map(by_h_raw, day - 86400, day), live_raw)
+    cur_week = min(_sum_from_map(by_h_raw, week, week_end) + pending, live_raw)
+    prev_week = min(_sum_from_map(by_h_raw, week - 7 * 86400, week), live_raw)
     cur_month = min(
-        (await _sum_hours(db, uid, month, next_month_ts)) + pending, live_raw
+        _sum_from_map(by_h_raw, month, next_month_ts) + pending, live_raw
     )
-    prev_month_bytes = min(await _sum_hours(db, uid, prev_month, month), live_raw)
+    prev_month_bytes = min(_sum_from_map(by_h_raw, prev_month, month), live_raw)
+    raw_24h = min(_sum_from_map(by_h_raw, hour - 23 * 3600, hour + 3600), live_raw)
 
     # Last 48h series on UTC hour grid (labels converted locally in UI)
-    series_start = grid_hour - 47 * 3600
-    buckets = await _hour_rows(db, uid, series_start, grid_hour + 3600)
-    by_h = {int(b.hour_ts): b for b in buckets}
     hourly = []
     for i in range(48):
         ts = series_start + i * 3600
-        b = by_h.get(ts)
+        b = by_h_obj.get(ts)
         raw = int(b.raw_bytes or 0) if b else 0
         if i == 47:
             raw += pending
@@ -984,16 +1520,16 @@ async def build_user_analytics(
         )
 
     # Day-of heatmap: last 14 days by client local hour-of-day
-    heat_start = grid_hour - 14 * 86400
-    heat_rows = await _hour_rows(db, uid, heat_start, grid_hour + 3600)
     by_hod = [0] * 24
-    for b in heat_rows:
-        by_hod[_hod_index(int(b.hour_ts), tz_off)] += int(b.raw_bytes or 0)
+    for ts, raw in by_h_raw.items():
+        if ts < heat_start or ts >= grid_hour + 3600:
+            continue
+        by_hod[_hod_index(int(ts), tz_off)] += int(raw or 0)
     if pending:
         by_hod[_hod_index(grid_hour, tz_off)] += pending
     peak_hod = max(range(24), key=lambda h: by_hod[h]) if any(by_hod) else None
 
-    # Sessions
+    # Sessions + sub profiles / fetches (same session — sequential but fewer roundtrips overall)
     sessions = list(
         (
             await db.execute(
@@ -1041,48 +1577,70 @@ async def build_user_analytics(
             ),
         }
 
-    devices = list(
+    profiles = list(
         (
             await db.execute(
                 select(SubClientProfile)
-                .where(
-                    SubClientProfile.user_id == uid,
-                    SubClientProfile.kind == "device",
-                )
+                .where(SubClientProfile.user_id == uid)
                 .order_by(SubClientProfile.last_seen_at.desc())
             )
         )
         .scalars()
         .all()
     )
-    networks = list(
-        (
-            await db.execute(
-                select(SubClientProfile)
-                .where(
-                    SubClientProfile.user_id == uid,
-                    SubClientProfile.kind == "network",
-                )
-                .order_by(SubClientProfile.last_seen_at.desc())
-            )
-        )
-        .scalars()
-        .all()
-    )
+    devices = [p for p in profiles if p.kind == "device"]
+    networks = [
+        p for p in profiles if p.kind == "network" and not _profile_is_local_junk(p)
+    ]
+    brands = [p for p in profiles if p.kind == "brand"]
+    operators = [
+        p for p in profiles if p.kind == "operator" and not _profile_is_local_junk(p)
+    ]
+    os_profiles = [p for p in profiles if p.kind == "os"]
+    # Drop leftover local junk profiles so the UI stays clean
+    junk = [
+        p
+        for p in profiles
+        if p.kind in ("operator", "network") and _profile_is_local_junk(p)
+    ]
+    for p in junk:
+        try:
+            await db.delete(p)
+        except Exception:  # noqa: BLE001
+            pass
+    if junk:
+        try:
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
     recent_fetches = list(
         (
             await db.execute(
                 select(SubFetchEvent)
                 .where(SubFetchEvent.user_id == uid)
                 .order_by(SubFetchEvent.ts.desc())
-                .limit(30)
+                .limit(40)
             )
         )
         .scalars()
         .all()
     )
-
-    raw_24h = await _sum_hours(db, uid, hour - 23 * 3600, hour + 3600)
+    fetch_items = [_ser_sub_fetch(e) for e in recent_fetches]
+    last_sub_client = _best_sub_client(fetch_items)
+    # Timestamp shown next to the card must match the fetch we picked (newest)
+    if last_sub_client and last_sub_client.get("ts"):
+        try:
+            shown_ts = datetime.fromisoformat(
+                str(last_sub_client["ts"]).replace("Z", "+00:00")
+            )
+            if shown_ts.tzinfo is None:
+                shown_ts = shown_ts.replace(tzinfo=timezone.utc)
+            last_sub = _as_utc(shown_ts) or last_sub
+        except Exception:  # noqa: BLE001
+            pass
     health = _health_label(
         status=user.status,
         raw_24h=raw_24h,
@@ -1096,9 +1654,33 @@ async def build_user_analytics(
     )
 
     def _ser_profile(p: SubClientProfile) -> dict[str, Any]:
+        from app.services.iran_operators import (
+            classify_operator,
+            looks_like_generic_isp_label,
+            operator_label,
+        )
+
+        key = (p.key or "").strip()
+        label = p.label
+        detail = (p.detail or "").strip()
+        ip_guess = detail.split("·")[0].strip().split()[0] if detail else ""
+        # Refresh stale «other» / bare «isp» / نامشخص → ISP یا VPN از روی IP
+        if p.kind in ("operator", "network"):
+            live = classify_operator(ip_guess) if ip_guess else "other"
+            if live not in ("", "other"):
+                key = live
+                label = operator_label(live)
+            elif looks_like_generic_isp_label(label) or key.lower() in (
+                "",
+                "other",
+                "isp",
+                "نامشخص",
+            ):
+                key = "other"
+                label = operator_label("other")
         return {
-            "key": p.key,
-            "label": p.label,
+            "key": key,
+            "label": label,
             "detail": p.detail,
             "hit_count": int(p.hit_count or 0),
             "first_seen_at": p.first_seen_at.isoformat() if p.first_seen_at else None,
@@ -1113,20 +1695,24 @@ async def build_user_analytics(
         "online": online,
         "online_since": online_since,
         "last_sub_fetch_at": last_sub.isoformat() if last_sub else None,
+        "last_sub_client": last_sub_client,
         "last_sample_at": last_sample.isoformat() if last_sample else None,
         "tz_offset_min": tz_off,
         "raw_totals": {
             "current_raw": live_raw,
             "lifetime_raw_cursor": cursor,
             "pending_raw": pending,
-            "weighted_used": int(user.used_traffic or 0),
-            "note": "مصرف‌ها خام و بدون ضریب‌اند؛ بازه‌ها با ساعت محلی دستگاه",
+            "weighted_used": live_raw,
+            "note": "مصرف‌ها با ضریب و مثل صفحه کاربران؛ بازه‌ها با ساعت محلی دستگاه",
         },
         "compare": {
             "hour": {
-                "current": cur_hour,
-                "previous": prev_hour,
-                "change_pct": _pct_change(cur_hour, prev_hour),
+                **_hour_over_hour(
+                    cur_hour,
+                    prev_hour,
+                    hour_start=hour,
+                    now_ts=int(now.timestamp()),
+                ),
             },
             "day": {
                 "current": cur_day,
@@ -1148,6 +1734,8 @@ async def build_user_analytics(
         "previous_session": prev_session,
         "session_vs_previous": session_vs_prev,
         "hourly": hourly,
+        # Exact last-24h window (UTC hour grid; UI labels in local time)
+        "window_24h": _analyze_24h_window(hourly[-24:] if hourly else []),
         "hour_of_day": {
             "bytes": by_hod,
             "peak_hour": peak_hod,
@@ -1161,17 +1749,19 @@ async def build_user_analytics(
             "count": len(networks),
             "items": [_ser_profile(p) for p in networks],
         },
-        "recent_fetches": [
-            {
-                "ts": e.ts.isoformat() if e.ts else None,
-                "ip": e.client_ip,
-                "network": e.network_key,
-                "app": e.client_app,
-                "country": e.country,
-                "ua": e.user_agent,
-            }
-            for e in recent_fetches
-        ],
+        "brands": {
+            "count": len(brands),
+            "items": [_ser_profile(p) for p in brands],
+        },
+        "operators": {
+            "count": len(operators),
+            "items": [_ser_profile(p) for p in operators],
+        },
+        "operating_systems": {
+            "count": len(os_profiles),
+            "items": [_ser_profile(p) for p in os_profiles],
+        },
+        "recent_fetches": fetch_items,
         "sessions": [
             {
                 "started_at": s.started_at.isoformat() if s.started_at else None,
@@ -1183,6 +1773,195 @@ async def build_user_analytics(
             }
             for s in sessions[:12]
         ],
+    }
+
+
+def _sub_event_no_public_ip():
+    """True when client_ip is missing / loopback / unknown (not a real ISP)."""
+    ip = func.coalesce(SubFetchEvent.client_ip, "")
+    private_172 = or_(*[ip.like(f"172.{n}.%") for n in range(16, 32)])
+    return or_(
+        ip == "",
+        ip.in_(("127.0.0.1", "::1", "unknown", "null", "none", "-")),
+        ip.like("10.%"),
+        ip.like("192.168.%"),
+        private_172,
+    )
+
+
+async def build_sub_insights(
+    db: AsyncSession,
+    *,
+    days: int = 7,
+    limit: int = 16,
+) -> dict[str, Any]:
+    """Global subscription open/update rankings across all users.
+
+    Fast SQL aggregates on ``sub_fetch_events`` — hits + distinct users.
+    Operator ranking ignores loopback/unknown IPs (they are not ISPs).
+    """
+    from app.services.iran_operators import operator_label
+
+    now = _utc_now()
+    days_i = max(0, min(int(days or 0), 120))
+    lim = max(5, min(int(limit or 16), 40))
+    since = now - timedelta(days=days_i) if days_i > 0 else None
+
+    hits_q = select(func.count()).select_from(SubFetchEvent)
+    users_q = select(func.count(func.distinct(SubFetchEvent.user_id))).select_from(
+        SubFetchEvent
+    )
+    if since is not None:
+        hits_q = hits_q.where(SubFetchEvent.ts >= since)
+        users_q = users_q.where(SubFetchEvent.ts >= since)
+
+    total_hits = int((await db.execute(hits_q)).scalar_one() or 0)
+    total_users = int((await db.execute(users_q)).scalar_one() or 0)
+
+    no_ip_filt = _sub_event_no_public_ip()
+    no_ip_hits_q = select(func.count()).select_from(SubFetchEvent).where(no_ip_filt)
+    no_ip_users_q = (
+        select(func.count(func.distinct(SubFetchEvent.user_id)))
+        .select_from(SubFetchEvent)
+        .where(no_ip_filt)
+    )
+    if since is not None:
+        no_ip_hits_q = no_ip_hits_q.where(SubFetchEvent.ts >= since)
+        no_ip_users_q = no_ip_users_q.where(SubFetchEvent.ts >= since)
+    no_public_hits = int((await db.execute(no_ip_hits_q)).scalar_one() or 0)
+    no_public_users = int((await db.execute(no_ip_users_q)).scalar_one() or 0)
+    public_hits = max(0, total_hits - no_public_hits)
+
+    app_col = func.coalesce(func.nullif(SubFetchEvent.client_app, ""), "نامشخص")
+    op_col = func.coalesce(func.nullif(SubFetchEvent.operator, ""), "other")
+    brand_col = func.coalesce(func.nullif(SubFetchEvent.device_brand, ""), "نامشخص")
+
+    async def _rank(
+        col,
+        *,
+        relabel=None,
+        extra_where=None,
+        share_of: int | None = None,
+        skip_keys: frozenset[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        base = share_of if share_of is not None else total_hits
+        q = (
+            select(
+                col.label("key"),
+                func.count().label("hits"),
+                func.count(func.distinct(SubFetchEvent.user_id)).label("users"),
+                func.max(SubFetchEvent.ts).label("last_ts"),
+            )
+            .select_from(SubFetchEvent)
+        )
+        if since is not None:
+            q = q.where(SubFetchEvent.ts >= since)
+        if extra_where is not None:
+            q = q.where(extra_where)
+        q = q.group_by(col).order_by(func.count().desc()).limit(lim)
+        rows = (await db.execute(q)).all()
+        out: list[dict[str, Any]] = []
+        skip = skip_keys or frozenset()
+        for key, hits, users, last_ts in rows:
+            k = str(key or "").strip() or "نامشخص"
+            if k in skip:
+                continue
+            label = relabel(k) if relabel else k
+            hits_i = int(hits or 0)
+            users_i = int(users or 0)
+            out.append(
+                {
+                    "key": k,
+                    "label": label,
+                    "hits": hits_i,
+                    "users": users_i,
+                    "share_pct": (
+                        round(hits_i * 100.0 / base, 1) if base else 0.0
+                    ),
+                    "last_ts": last_ts.isoformat() if last_ts else None,
+                }
+            )
+        return out
+
+    apps = await _rank(app_col)
+    operators = await _rank(
+        op_col,
+        relabel=operator_label,
+        extra_where=~no_ip_filt,
+        share_of=public_hits,
+        skip_keys=frozenset({"other", "unknown", "", "نامشخص"}),
+    )
+    brands = await _rank(brand_col)
+
+    # Channel split from every distinct client_app (small cardinality)
+    ch_q = select(
+        app_col.label("key"),
+        func.count().label("hits"),
+        func.count(func.distinct(SubFetchEvent.user_id)).label("users"),
+    ).select_from(SubFetchEvent)
+    if since is not None:
+        ch_q = ch_q.where(SubFetchEvent.ts >= since)
+    ch_q = ch_q.group_by(app_col)
+    ch_rows = (await db.execute(ch_q)).all()
+    channel_hits = {"app": 0, "browser": 0, "unknown": 0}
+    channel_users_n = {"app": 0, "browser": 0, "unknown": 0}
+    for key, hits, users in ch_rows:
+        app_name = str(key or "").strip() or "نامشخص"
+        ch = (
+            "app"
+            if app_name in _KNOWN_APP_NAMES
+            else detect_client_channel("", app_name)
+        )
+        channel_hits[ch] = channel_hits.get(ch, 0) + int(hits or 0)
+        channel_users_n[ch] = channel_users_n.get(ch, 0) + int(users or 0)
+
+    channel_labels = {
+        "app": "اپلیکیشن VPN",
+        "browser": "مرورگر",
+        "unknown": "نامشخص",
+    }
+    channels: list[dict[str, Any]] = []
+    for k in ("app", "browser", "unknown"):
+        hits_i = int(channel_hits.get(k, 0))
+        if hits_i <= 0:
+            continue
+        channels.append(
+            {
+                "key": k,
+                "label": channel_labels[k],
+                "hits": hits_i,
+                "users": int(channel_users_n.get(k, 0)),
+                "share_pct": (
+                    round(hits_i * 100.0 / total_hits, 1) if total_hits else 0.0
+                ),
+            }
+        )
+    channels.sort(key=lambda x: -int(x["hits"]))
+
+    return {
+        "generated_at": now.isoformat(),
+        "days": days_i,
+        "since": since.isoformat() if since else None,
+        "total_hits": total_hits,
+        "total_users": total_users,
+        "public_hits": public_hits,
+        "no_public_ip": {
+            "hits": no_public_hits,
+            "users": no_public_users,
+            "share_pct": (
+                round(no_public_hits * 100.0 / total_hits, 1) if total_hits else 0.0
+            ),
+            "label": "بدون IP عمومی (لوکال / پروکسی)",
+            "detail": "معمولاً 127.0.0.1 یا unknown — IP واقعی کلاینت به پنل نرسیده",
+        },
+        "channels": channels,
+        "apps": apps,
+        "operators": operators,
+        "brands": brands,
+        "note": (
+            "از درخواست‌های واقعی آپدیت/باز شدن لینک ساب · تعداد + کاربران یکتا. "
+            "رتبهٔ اپراتور فقط با IP عمومی؛ لوکال/unknown جداست."
+        ),
     }
 
 
@@ -1219,24 +1998,26 @@ async def build_overview(
             for ts, raw in rows
         )
 
+    week = int(periods["week"])
+    week_end = int(periods["week_end"])
+    month = int(periods["month"])
+    next_month_ts = int(periods["next_month"])
+    prev_month = int(periods["prev_month"])
+
     cur = await _sum_all(hour, hour_end)
     prev = await _sum_all(hour - 3600, hour)
     today = await _sum_all(day, day_end)
+    yesterday = await _sum_all(day - 86400, day)
+    week_bytes = await _sum_all(week, week_end)
+    prev_week_bytes = await _sum_all(week - 7 * 86400, week)
+    month_bytes = await _sum_all(month, next_month_ts)
+    prev_month_bytes = await _sum_all(prev_month, month)
 
-    # Global pending from seeded users only (never dump unseeded lifetime)
+    # Global live = Σ User.used_traffic (weighted, same as users page)
     live_all = int(
         (
             await db.execute(
-                select(func.coalesce(func.sum(PanelAccount.used_traffic), 0)).where(
-                    PanelAccount.status.in_(
-                        (
-                            PanelAccountStatus.active,
-                            PanelAccountStatus.error,
-                            PanelAccountStatus.pending,
-                            PanelAccountStatus.deleted,
-                        )
-                    )
-                )
+                select(func.coalesce(func.sum(User.used_traffic), 0))
             )
         ).scalar()
         or 0
@@ -1252,35 +2033,184 @@ async def build_overview(
         or 0
     )
     pending_all = max(0, live_all - cursor_all)
+    # Cap absurd pending (pre-rebase scale mismatch) so UI never dumps lifetime
+    max_pending = max(500 * 1024 * 1024, int(50_000_000 / 8 * 120))  # ~50MB/s × 2min
+    if pending_all > max_pending:
+        pending_all = 0
     cur += pending_all
     today += pending_all
+    week_bytes += pending_all
+    month_bytes += pending_all
 
-    online_n = int(
-        (
+    # یک جامعه برای همهٔ این اعداد: فقط status=active (بدون نمونه)
+    # تا «صفرمصرف + آنلاین‌شده = کاربران فعال» دقیق دربیاید.
+    def _not_sample_clause():
+        return (
+            ~User.username.startswith("ag"),
+            ~func.coalesce(User.note, "").like("%نمونه کانفیگ%"),
+        )
+
+    eligible_uids = {
+        int(uid)
+        for (uid,) in (
             await db.execute(
-                select(func.count())
-                .select_from(UserUsageState)
-                .where(UserUsageState.online_since.is_not(None))
+                select(User.id).where(
+                    User.status == UserStatus.active,
+                    *_not_sample_clause(),
+                )
             )
-        ).scalar()
-        or 0
-    )
+        ).all()
+        if uid is not None
+    }
+    active_status_n = len(eligible_uids)
 
-    # Peak hour-of-day across all users (last 7d) — client local clock
-    heat_start = grid_hour - 7 * 86400
-    rows = (
+    pending_by_uid: dict[int, int] = {}
+    if eligible_uids:
+        for uid, curs, live in (
+            await db.execute(
+                select(
+                    UserUsageState.user_id,
+                    UserUsageState.last_raw_total,
+                    User.used_traffic,
+                )
+                .join(User, User.id == UserUsageState.user_id)
+                .where(
+                    UserUsageState.last_sample_at.is_not(None),
+                    User.status == UserStatus.active,
+                    *_not_sample_clause(),
+                )
+            )
+        ).all():
+            pend = _pending_bytes(
+                live=int(live or 0),
+                cursor=int(curs or 0),
+                seeded=True,
+            )
+            # Same cap as low-usage so «صفر» و «آنلاین‌شده» overlap نکنند
+            if 0 < pend <= _LOW_USAGE_PENDING_CAP:
+                pending_by_uid[int(uid)] = pend
+
+    async def _used_users(start_ts: int, end_ts: int) -> int:
+        """Active users with real local-period traffic (not «صفر / استفاده نشده»).
+
+        Partition: آنلاین‌شده (≥1KiB) + صفرمصرف(<1KiB) = کاربران فعال.
+        """
+        if end_ts <= start_ts or not eligible_uids:
+            return 0
+        lo = _align_down_hour(start_ts)
+        hi = _align_up_hour(end_ts)
+        bytes_by: dict[int, int] = {uid: 0 for uid in eligible_uids}
+        for uid, ts, raw in (
+            await db.execute(
+                select(
+                    UsageHourBucket.user_id,
+                    UsageHourBucket.hour_ts,
+                    UsageHourBucket.raw_bytes,
+                ).where(
+                    UsageHourBucket.user_id.in_(eligible_uids),
+                    UsageHourBucket.hour_ts >= lo,
+                    UsageHourBucket.hour_ts < hi,
+                )
+            )
+        ).all():
+            uid_i = int(uid)
+            if uid_i not in bytes_by:
+                continue
+            bytes_by[uid_i] += _overlap_bytes(
+                int(ts), int(raw or 0), start_ts, end_ts
+            )
+        if end_ts > int(now.timestamp()) - 1:
+            for uid, pend in pending_by_uid.items():
+                if uid in bytes_by:
+                    bytes_by[uid] += pend
+        return sum(
+            1 for b in bytes_by.values() if int(b) >= _LOW_USAGE_NONE_MAX
+        )
+
+    day_end_live = min(day_end, int(now.timestamp()) + 1)
+    active_today = await _used_users(day, day_end_live)
+    active_week = await _used_users(week, week_end)
+    active_month = await _used_users(month, next_month_ts)
+    # «آمار کل» → تعداد کاربران فعال (status=active)، نه used_traffic>0
+    active_all = active_status_n
+    eligible_n = len(eligible_uids)
+
+    # Same canonical online as panel analytics (host-deduped sys_online).
+    online_n = 0
+    online_source = "local_sample"
+    online_panels: list[dict[str, Any]] = []
+    online_updated_at: str | None = None
+    try:
+        from app.services import panel_analytics as panel_analytics_svc
+
+        snap = await panel_analytics_svc.unified_online_snapshot(
+            db, with_attrs=False
+        )
+        if snap.get("available") and int(snap.get("total_online") or 0) >= 0:
+            online_n = int(snap.get("total_online") or 0)
+            online_source = str(snap.get("source") or "remote_system")
+            online_panels = list(snap.get("panels") or [])
+            online_updated_at = snap.get("updated_at")
+    except Exception:  # noqa: BLE001
+        logger.debug("unified online snapshot failed", exc_info=True)
+    if online_n <= 0 and not online_panels:
+        online_n = int(
+            (
+                await db.execute(
+                    select(func.count())
+                    .select_from(UserUsageState)
+                    .where(UserUsageState.online_since.is_not(None))
+                )
+            ).scalar()
+            or 0
+        )
+        online_source = "local_sample"
+
+    # Hour-of-day heat for day/week/month/all (and legacy 7d peak)
+    oldest_bucket = (
+        await db.execute(select(func.min(UsageHourBucket.hour_ts)))
+    ).scalar()
+    oldest_ts = int(oldest_bucket) if oldest_bucket is not None else grid_hour
+    heat_lo = min(day, week, month, grid_hour - 7 * 86400, oldest_ts)
+    heat_rows = (
         await db.execute(
             select(UsageHourBucket.hour_ts, UsageHourBucket.raw_bytes).where(
-                UsageHourBucket.hour_ts >= heat_start
+                UsageHourBucket.hour_ts >= _align_down_hour(heat_lo)
             )
         )
     ).all()
-    by_hod = [0] * 24
-    for ts, raw in rows:
-        by_hod[_hod_index(int(ts), tz_off)] += int(raw or 0)
-    if pending_all:
-        by_hod[_hod_index(grid_hour, tz_off)] += pending_all
-    peak_hod = max(range(24), key=lambda h: by_hod[h]) if any(by_hod) else None
+
+    def _peak_for(start_ts: int, end_ts: int) -> tuple[list[int], int | None, int]:
+        by = [0] * 24
+        lo = _align_down_hour(start_ts)
+        hi = _align_up_hour(end_ts)
+        for ts, raw in heat_rows:
+            tsi = int(ts)
+            if tsi < lo or tsi >= hi:
+                continue
+            by[_hod_index(tsi, tz_off)] += _overlap_bytes(
+                tsi, int(raw or 0), start_ts, end_ts
+            )
+        if pending_all and end_ts > int(now.timestamp()) - 1:
+            by[_hod_index(grid_hour, tz_off)] += pending_all
+        peak = max(range(24), key=lambda h: by[h]) if any(by) else None
+        return by, peak, (by[peak] if peak is not None else 0)
+
+    by_hod_day, peak_day, peak_day_bytes = _peak_for(day, day_end)
+    by_hod_week, peak_week, peak_week_bytes = _peak_for(week, week_end)
+    by_hod_month, peak_month, peak_month_bytes = _peak_for(month, next_month_ts)
+    by_hod_all, peak_all, peak_all_bytes = _peak_for(
+        oldest_ts, grid_hour + 3600
+    )
+    # Legacy overview card: prefer today's peak; fall back to 7d pattern
+    by_hod_7d, peak_7d, peak_7d_bytes = _peak_for(
+        grid_hour - 7 * 86400, grid_hour + 3600
+    )
+    by_hod = by_hod_day if any(by_hod_day) else by_hod_7d
+    peak_hod = peak_day if peak_day is not None else peak_7d
+    peak_hod_bytes = (
+        peak_day_bytes if peak_day is not None else peak_7d_bytes
+    )
 
     # Top consumers this local hour (overlap-aware via grid + pending later in UI)
     top_lo = _align_down_hour(hour)
@@ -1309,27 +2239,13 @@ async def build_overview(
             int(uid), {"username": uname, "user_id": int(uid), "raw_bytes": 0}
         )
         slot["raw_bytes"] += part
-    # Add per-user pending for seeded users
+    # Add per-user pending for seeded users (weighted User.used_traffic)
     if pending_all > 0:
         live_by_user = {
             int(uid): int(live or 0)
             for uid, live in (
                 await db.execute(
-                    select(
-                        PanelAccount.user_id,
-                        func.coalesce(func.sum(PanelAccount.used_traffic), 0),
-                    )
-                    .where(
-                        PanelAccount.status.in_(
-                            (
-                                PanelAccountStatus.active,
-                                PanelAccountStatus.error,
-                                PanelAccountStatus.pending,
-                                PanelAccountStatus.deleted,
-                            )
-                        )
-                    )
-                    .group_by(PanelAccount.user_id)
+                    select(User.id, func.coalesce(User.used_traffic, 0))
                 )
             ).all()
         }
@@ -1350,7 +2266,7 @@ async def build_overview(
                 cursor=int(curs or 0),
                 seeded=True,
             )
-            if pend <= 0:
+            if pend <= 0 or pend > max_pending:
                 continue
             slot = top_acc.setdefault(
                 int(uid), {"username": uname, "user_id": int(uid), "raw_bytes": 0}
@@ -1475,46 +2391,191 @@ async def build_overview(
     }
     health_users.sort(key=lambda x: (order.get(x["health"]["code"], 9), -x["raw_1h"]))
 
-    # Global hourly last 24h (UTC grid; UI labels locally)
-    g_start = grid_hour - 23 * 3600
-    g_rows = (
-        await db.execute(
-            select(
-                UsageHourBucket.hour_ts,
-                func.coalesce(func.sum(UsageHourBucket.raw_bytes), 0),
+    # Canonical 24h series — SAME source as panel analytics (PanelUsageHourBucket)
+    # so «ترافیک کل پنل» matches «مصرف کل پنل‌ها — ۲۴ ساعت».
+    global_hourly: list[dict[str, Any]] = []
+    global_24h_raw = 0
+    global_24h_weighted = 0
+    try:
+        from app.services import panel_analytics as panel_analytics_svc
+
+        # Same pre-flush as panel overview so current-hour bars land together
+        try:
+            usage_map = await panel_analytics_svc.live_panel_raw_and_weighted(db)
+            live_for_flush = {
+                int(pid): int(v.get("raw") or 0) for pid, v in usage_map.items()
+            }
+            await panel_analytics_svc.flush_live_deltas_to_hours(
+                db, live_for_flush, now=now
             )
-            .where(UsageHourBucket.hour_ts >= g_start)
-            .group_by(UsageHourBucket.hour_ts)
-            .order_by(UsageHourBucket.hour_ts.asc())
+            await panel_analytics_svc.credit_system_bw_hour_deltas(db, now=now)
+        except Exception:  # noqa: BLE001
+            logger.debug("pre-flush before global 24h failed", exc_info=True)
+
+        g24 = await panel_analytics_svc.build_global_hourly_24h(
+            db, tz_offset_min=tz_offset_min
         )
-    ).all()
-    g_map = {int(t): int(v or 0) for t, v in g_rows}
-    global_hourly = []
-    for i in range(24):
-        ts = g_start + i * 3600
-        raw = g_map.get(ts, 0)
-        if i == 23:
-            raw += pending_all
-        global_hourly.append({"hour_ts": ts, "raw_bytes": raw})
+        global_hourly = list(g24.get("global_hourly") or [])
+        global_24h_raw = int(g24.get("raw_24h") or 0)
+        global_24h_weighted = int(g24.get("weighted_24h") or 0)
+    except Exception:  # noqa: BLE001
+        logger.debug("canonical global hourly failed; falling back", exc_info=True)
+        g_start = grid_hour - 23 * 3600
+        g_rows = (
+            await db.execute(
+                select(
+                    UsageHourBucket.hour_ts,
+                    func.coalesce(func.sum(UsageHourBucket.raw_bytes), 0),
+                )
+                .where(UsageHourBucket.hour_ts >= g_start)
+                .group_by(UsageHourBucket.hour_ts)
+                .order_by(UsageHourBucket.hour_ts.asc())
+            )
+        ).all()
+        g_map = {int(t): int(v or 0) for t, v in g_rows}
+        for i in range(24):
+            ts = g_start + i * 3600
+            raw = g_map.get(ts, 0)
+            if i == 23:
+                raw += pending_all
+            global_hourly.append(
+                {
+                    "hour_ts": ts,
+                    "raw_bytes": raw,
+                    "weighted_bytes": raw,
+                    "is_current": i == 23,
+                }
+            )
+        global_24h_raw = sum(int(h.get("raw_bytes") or 0) for h in global_hourly)
+        global_24h_weighted = global_24h_raw
+
+    raw_hour = _hour_over_hour(
+        cur,
+        prev,
+        hour_start=hour,
+        now_ts=int(now.timestamp()),
+    )
+
+    def _range_block(
+        *,
+        key: str,
+        label: str,
+        active: int,
+        usage_cur: int,
+        usage_prev: int,
+        peak_h: int | None,
+        peak_b: int,
+        hod: list[int],
+        hour_cmp: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "key": key,
+            "label": label,
+            "active_users": int(active),
+            "usage": {
+                "current": int(usage_cur),
+                "previous": int(usage_prev),
+                "change_pct": _pct_change(usage_cur, usage_prev),
+            },
+            "hour": hour_cmp,
+            "peak_hour": peak_h,
+            "peak_bytes": int(peak_b),
+            "hour_of_day": {"bytes": hod, "peak_hour": peak_h, "peak_bytes": int(peak_b)},
+        }
+
+    range_stats = {
+        "day": _range_block(
+            key="day",
+            label="امروز",
+            active=active_today,
+            usage_cur=today,
+            usage_prev=yesterday,
+            peak_h=peak_day if peak_day is not None else peak_hod,
+            peak_b=peak_day_bytes if peak_day is not None else peak_hod_bytes,
+            hod=by_hod_day if any(by_hod_day) else by_hod,
+            hour_cmp=raw_hour,
+        ),
+        "week": _range_block(
+            key="week",
+            label="این هفته",
+            active=active_week,
+            usage_cur=week_bytes,
+            usage_prev=prev_week_bytes,
+            peak_h=peak_week,
+            peak_b=peak_week_bytes,
+            hod=by_hod_week,
+        ),
+        "month": _range_block(
+            key="month",
+            label="این ماه",
+            active=active_month,
+            usage_cur=month_bytes,
+            usage_prev=prev_month_bytes,
+            peak_h=peak_month,
+            peak_b=peak_month_bytes,
+            hod=by_hod_month,
+        ),
+        "all": {
+            "key": "all",
+            "label": "آمار کل",
+            "active_users": int(active_all),
+            "eligible_users": int(eligible_n),
+            "usage": {
+                "current": int(live_all),
+                "previous": 0,
+                "change_pct": None,
+            },
+            "hour": None,
+            "peak_hour": peak_all if peak_all is not None else peak_hod,
+            "peak_bytes": int(
+                peak_all_bytes if peak_all is not None else peak_hod_bytes
+            ),
+            "hour_of_day": {
+                "bytes": by_hod_all if any(by_hod_all) else by_hod,
+                "peak_hour": peak_all if peak_all is not None else peak_hod,
+                "peak_bytes": int(
+                    peak_all_bytes if peak_all is not None else peak_hod_bytes
+                ),
+            },
+        },
+    }
 
     return {
         "generated_at": now.isoformat(),
         "tz_offset_min": tz_off,
         "online_users": online_n,
-        "raw_hour": {
-            "current": cur,
-            "previous": prev,
-            "change_pct": _pct_change(cur, prev),
-        },
+        "online_source": online_source,
+        "online_updated_at": online_updated_at,
+        "online_panels": online_panels[:12],
+        "raw_hour": raw_hour,
         "raw_today": today,
+        "raw_week": week_bytes,
+        "raw_month": month_bytes,
         "raw_current": live_all,
         "raw_pending": pending_all,
+        "eligible_users": int(eligible_n),
+        "active_users": {
+            "day": active_today,
+            "week": active_week,
+            "month": active_month,
+            "all": active_all,
+        },
+        "range_stats": range_stats,
         "hour_of_day": {
             "bytes": by_hod,
             "peak_hour": peak_hod,
-            "peak_bytes": by_hod[peak_hod] if peak_hod is not None else 0,
+            "peak_bytes": peak_hod_bytes,
         },
         "global_hourly": global_hourly,
+        "global_24h": {
+            "raw_bytes": int(global_24h_raw),
+            "weighted_bytes": int(global_24h_weighted),
+            "source": "panel_hour_buckets",
+            "note": (
+                "همان منبع آمار پنل‌ها · ۲۴ ساعت غلتان (نه روز تقویمی). "
+                "ساعت جاری زنده است؛ ساعت‌های قبل بعد از اتمام ساعت ثابت می‌مانند."
+            ),
+        },
         "top_hour": [
             {
                 "username": t["username"],
@@ -1526,5 +2587,336 @@ async def build_overview(
         ],
         "health_counts": health_counts,
         "health_users": health_users[:limit_users],
-        "note": "مصرف خام بدون ضریب · بازه‌ها با زمان محلی و تناسب سطل ساعتی",
+        "note": "مصرف با ضریب · مثل صفحه کاربران · بازه‌ها با زمان محلی",
+    }
+
+
+# --- Low / troubled usage (local day / week / month / all) -------------------
+_MB = 1024 * 1024
+_LOW_USAGE_NONE_MAX = 1024  # < 1 KiB ≈ unused in period
+_LOW_USAGE_TINY_MAX = 5 * _MB  # < 5 MiB
+_LOW_USAGE_LOW_MAX = 100 * _MB  # < 100 MiB
+_LOW_USAGE_PENDING_CAP = 200 * _MB  # ignore absurd unsampled deltas
+_LOW_USAGE_PERIODS = ("day", "week", "month", "all")
+_LOW_USAGE_PERIOD_LABEL = {
+    "day": "امروز",
+    "week": "این هفته",
+    "month": "این ماه",
+    "all": "کل",
+}
+
+
+def _low_usage_tier(period_bytes: int) -> str | None:
+    """Return none|tiny|low, or None if ≥100 MiB in the selected period."""
+    n = max(0, int(period_bytes or 0))
+    if n < _LOW_USAGE_NONE_MAX:
+        return "none"
+    if n < _LOW_USAGE_TINY_MAX:
+        return "tiny"
+    if n < _LOW_USAGE_LOW_MAX:
+        return "low"
+    return None
+
+
+def _low_usage_meta(
+    tier: str, *, never_used: bool, period: str = "day"
+) -> dict[str, str]:
+    plabel = _LOW_USAGE_PERIOD_LABEL.get(period, "امروز")
+    if tier == "none":
+        if never_used:
+            return {
+                "code": "none",
+                "label": "اصلاً استفاده نشده",
+                "tone": "danger",
+                "hint": "هیچ مصرفی روی اکانت ثبت نشده",
+            }
+        return {
+            "code": "none",
+            "label": f"{plabel} صفر",
+            "tone": "danger",
+            "hint": f"در بازهٔ {plabel} تقریباً هیچ ترافیکی رد نشده",
+        }
+    if tier == "tiny":
+        return {
+            "code": "tiny",
+            "label": "زیر ۵ مگابایت",
+            "tone": "danger",
+            "hint": f"مصرف {plabel} خیلی کم است — احتمال اختلال",
+        }
+    return {
+        "code": "low",
+        "label": "زیر ۱۰۰ مگابایت",
+        "tone": "warn",
+        "hint": f"مصرف {plabel} کمتر از ۱۰۰ مگ",
+    }
+
+
+async def build_low_usage_today(
+    db: AsyncSession,
+    *,
+    tz_offset_min: int = 0,
+    tier: str = "all",
+    period: str = "day",
+    offset: int = 0,
+    limit: int = 80,
+    summary_only: bool = False,
+) -> dict[str, Any]:
+    """Active users with usage under 100 MiB in the selected local period.
+
+    Same pool as overview «کاربران فعال / آنلاین‌شده» so for ``day``:
+    صفرمصرف(none) + آنلاین‌شده(=not none) = کاربران فعال.
+
+    Tiers (mutually exclusive, absolute thresholds in the selected window):
+    - none: < 1 KiB
+    - tiny: < 5 MiB
+    - low:  < 100 MiB
+
+    ``period``: day | week | month | all (lifetime used_traffic).
+    """
+    now = _utc_now()
+    periods = _period_starts(now, tz_offset_min)
+    day = int(periods["day"])
+    day_end = int(periods["day_end"])
+    week = int(periods["week"])
+    week_end = int(periods["week_end"])
+    month = int(periods["month"])
+    next_month = int(periods["next_month"])
+    now_ts = int(now.timestamp())
+    day_end_live = min(day_end, now_ts + 1)
+    week_end_live = min(week_end, now_ts + 1)
+    month_end_live = min(next_month, now_ts + 1)
+    tz_off = int(periods["tz_offset_min"])
+    want = (tier or "all").strip().lower()
+    if want not in ("all", "none", "tiny", "low"):
+        want = "all"
+    period_key = (period or "day").strip().lower()
+    if period_key not in _LOW_USAGE_PERIODS:
+        period_key = "day"
+    period_label = _LOW_USAGE_PERIOD_LABEL[period_key]
+
+    if period_key == "day":
+        range_start, range_end = day, day_end_live
+    elif period_key == "week":
+        range_start, range_end = week, week_end_live
+    elif period_key == "month":
+        range_start, range_end = month, month_end_live
+    else:
+        range_start, range_end = 0, now_ts + 1
+
+    # فقط active — یکسان با آمار کل / آنلاین‌شده
+    users = list(
+        (
+            await db.execute(
+                select(User).where(
+                    User.status == UserStatus.active,
+                    ~User.username.startswith("ag"),
+                    ~func.coalesce(User.note, "").like("%نمونه کانفیگ%"),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    empty_payload = {
+        "generated_at": now.isoformat(),
+        "tz_offset_min": tz_off,
+        "period": period_key,
+        "period_label": period_label,
+        "day_start": range_start,
+        "day_end": range_end,
+        "range_start": range_start,
+        "range_end": range_end,
+        "thresholds": {
+            "none_max": _LOW_USAGE_NONE_MAX,
+            "tiny_max": _LOW_USAGE_TINY_MAX,
+            "low_max": _LOW_USAGE_LOW_MAX,
+        },
+        "counts": {"none": 0, "tiny": 0, "low": 0, "all": 0},
+        "total": 0,
+        "offset": int(offset),
+        "limit": int(limit),
+        "items": [],
+    }
+    if not users:
+        return empty_payload
+
+    uids = [int(u.id) for u in users]
+    uid_set = set(uids)
+    usage_map: dict[int, int] = {i: 0 for i in uids}
+
+    if period_key == "all":
+        for u in users:
+            usage_map[int(u.id)] = max(0, int(u.used_traffic or 0))
+    else:
+        lo = _align_down_hour(range_start)
+        hi = _align_up_hour(range_end)
+        if uids and hi > lo:
+            for uid, ts, raw in (
+                await db.execute(
+                    select(
+                        UsageHourBucket.user_id,
+                        UsageHourBucket.hour_ts,
+                        UsageHourBucket.raw_bytes,
+                    ).where(
+                        UsageHourBucket.user_id.in_(uids),
+                        UsageHourBucket.hour_ts >= lo,
+                        UsageHourBucket.hour_ts < hi,
+                    )
+                )
+            ).all():
+                uid_i = int(uid)
+                if uid_i not in uid_set:
+                    continue
+                usage_map[uid_i] = usage_map.get(uid_i, 0) + _overlap_bytes(
+                    int(ts), int(raw or 0), range_start, range_end
+                )
+
+    # Unsampled live delta (same pending model as overview, capped)
+    state_rows = (
+        await db.execute(
+            select(
+                UserUsageState.user_id,
+                UserUsageState.last_raw_total,
+                UserUsageState.last_sample_at,
+                UserUsageState.last_sub_fetch_at,
+                UserUsageState.online_since,
+            ).where(UserUsageState.user_id.in_(uids))
+        )
+    ).all()
+    state_by: dict[int, Any] = {}
+    for uid, curs, sampled, sub_at, online_since in state_rows:
+        state_by[int(uid)] = {
+            "cursor": int(curs or 0),
+            "seeded": sampled is not None,
+            "last_sub_fetch_at": sub_at,
+            "online_since": online_since,
+        }
+
+    # Pending only for windows that include "now" (day/week/month — not needed for all)
+    if period_key != "all":
+        for u in users:
+            uid = int(u.id)
+            st = state_by.get(uid)
+            if not st or not st["seeded"]:
+                continue
+            pend = _pending_bytes(
+                live=int(u.used_traffic or 0),
+                cursor=int(st["cursor"]),
+                seeded=True,
+            )
+            if 0 < pend <= _LOW_USAGE_PENDING_CAP:
+                usage_map[uid] = usage_map.get(uid, 0) + pend
+
+    # Device / network counts (batch)
+    device_counts: dict[int, int] = {i: 0 for i in uids}
+    network_counts: dict[int, int] = {i: 0 for i in uids}
+    if uids and not summary_only:
+        for uid, kind, cnt in (
+            await db.execute(
+                select(
+                    SubClientProfile.user_id,
+                    SubClientProfile.kind,
+                    func.count(),
+                )
+                .where(SubClientProfile.user_id.in_(uids))
+                .group_by(SubClientProfile.user_id, SubClientProfile.kind)
+            )
+        ).all():
+            if kind == "device":
+                device_counts[int(uid)] = int(cnt or 0)
+            elif kind == "network":
+                network_counts[int(uid)] = int(cnt or 0)
+
+    counts = {"none": 0, "tiny": 0, "low": 0, "all": 0}
+    items_all: list[dict[str, Any]] = []
+    for u in users:
+        uid = int(u.id)
+        period_b = int(usage_map.get(uid, 0) or 0)
+        tcode = _low_usage_tier(period_b)
+        if tcode is None:
+            continue
+        counts[tcode] += 1
+        counts["all"] += 1
+        if summary_only:
+            continue
+        if want != "all" and tcode != want:
+            continue
+        lifetime = int(u.used_traffic or 0)
+        never_used = lifetime < _LOW_USAGE_NONE_MAX
+        st = state_by.get(uid) or {}
+        meta = _low_usage_meta(tcode, never_used=never_used, period=period_key)
+        sub_at = st.get("last_sub_fetch_at")
+        items_all.append(
+            {
+                "user_id": uid,
+                "username": u.username,
+                "display_name": u.display_name,
+                "status": getattr(u.status, "value", u.status),
+                "tier": tcode,
+                "tier_label": meta["label"],
+                "tone": meta["tone"],
+                "hint": meta["hint"],
+                "today_bytes": period_b,  # legacy field name; period bytes
+                "period_bytes": period_b,
+                "used_traffic": lifetime,
+                "data_limit": int(u.data_limit or 0),
+                "expire": int(u.expire or 0) if u.expire else 0,
+                "never_used": never_used,
+                "online": bool(st.get("online_since")),
+                "last_sub_fetch_at": (
+                    sub_at.isoformat() if sub_at is not None else None
+                ),
+                "devices": int(device_counts.get(uid, 0)),
+                "networks": int(network_counts.get(uid, 0)),
+                "created_at": (
+                    u.created_at.isoformat() if u.created_at is not None else None
+                ),
+            }
+        )
+
+    base_meta = {
+        "generated_at": now.isoformat(),
+        "tz_offset_min": tz_off,
+        "period": period_key,
+        "period_label": period_label,
+        "day_start": range_start,
+        "day_end": range_end,
+        "range_start": range_start,
+        "range_end": range_end,
+        "thresholds": {
+            "none_max": _LOW_USAGE_NONE_MAX,
+            "tiny_max": _LOW_USAGE_TINY_MAX,
+            "low_max": _LOW_USAGE_LOW_MAX,
+        },
+    }
+
+    if summary_only:
+        return {
+            **base_meta,
+            "counts": counts,
+            "total": int(counts["all"]),
+            "offset": 0,
+            "limit": 0,
+            "items": [],
+        }
+
+    severity = {"none": 0, "tiny": 1, "low": 2}
+    items_all.sort(
+        key=lambda x: (
+            severity.get(str(x["tier"]), 9),
+            int(x.get("period_bytes") or x.get("today_bytes") or 0),
+            str(x["username"] or ""),
+        )
+    )
+    total = len(items_all)
+    off = max(0, int(offset))
+    lim = max(1, min(int(limit) or 80, 200))
+    page = items_all[off : off + lim]
+    return {
+        **base_meta,
+        "counts": counts,
+        "total": total,
+        "offset": off,
+        "limit": lim,
+        "items": page,
     }

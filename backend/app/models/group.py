@@ -49,6 +49,8 @@ class Group(Base):
         index=True,
         default=None,
     )
+    # Admin UI order on the Groups page (drag-reorder). Does not affect provision/sub.
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     category = relationship("GroupCategory", back_populates="groups")

@@ -214,6 +214,8 @@ export interface Panel {
   is_active: boolean;
   /** null = default bucket «همه پنل‌ها» (UI only) */
   category_id?: number | null;
+  /** Admin UI order on Panels page (drag-reorder) */
+  sort_order?: number;
   last_ok_at: string | null;
   created_at: string;
 }
@@ -250,6 +252,8 @@ export interface Group {
   notices?: string[];
   /** null = default bucket «همه گروه‌ها» */
   category_id?: number | null;
+  /** Admin UI order on Groups page (drag-reorder) */
+  sort_order?: number;
   panels: GroupPanel[];
   created_at: string;
 }
@@ -304,6 +308,21 @@ export interface User {
   created_at?: string;
 }
 
+export interface UserResetPanelResult {
+  panel_id: number;
+  panel_name: string;
+  ok: boolean;
+  error: string | null;
+}
+
+export interface UserResetResponse {
+  user: User;
+  panels: UserResetPanelResult[];
+  ok_count: number;
+  fail_count: number;
+  message: string;
+}
+
 export interface TopUserStat {
   username: string;
   display_name: string | null;
@@ -311,6 +330,60 @@ export interface TopUserStat {
   data_limit: number;
   status: string;
   expire: number;
+}
+
+export interface OpsPhase {
+  id: string;
+  label: string;
+  status: "pending" | "running" | "done" | "skipped" | "error" | string;
+  done: number;
+  total: number;
+  ok: number;
+  failed: number;
+}
+
+export interface OpsJob {
+  id: string;
+  active: boolean;
+  kind?: string | null;
+  kind_label?: string;
+  icon?: string;
+  title?: string;
+  message?: string;
+  group_id?: number | null;
+  group_name?: string;
+  phase?: string | null;
+  phases?: OpsPhase[];
+  done?: number;
+  total?: number;
+  ok?: number;
+  failed?: number;
+  users_total?: number;
+  /** Short failure lines (username / phase / reason) when wave had errors */
+  errors?: string[];
+  started_at?: number | null;
+  updated_at?: number | null;
+  finished_at?: number | null;
+}
+
+export interface BackgroundOps {
+  active: boolean;
+  count_active?: number;
+  jobs?: OpsJob[];
+  // legacy primary-job fields (still filled by API)
+  kind?: string | null;
+  title?: string;
+  group_id?: number | null;
+  group_name?: string;
+  phase?: string | null;
+  phases?: OpsPhase[];
+  users_total?: number;
+  started_at?: number | null;
+  updated_at?: number | null;
+  finished_at?: number | null;
+  message?: string;
+  ok?: number;
+  failed?: number;
 }
 
 export interface SystemStats {
@@ -328,6 +401,7 @@ export interface SystemStats {
   total_used_traffic: number;
   top_users?: TopUserStat[];
   update_supported?: boolean;
+  background_ops?: BackgroundOps;
 }
 
 export interface HostBytesStat {
