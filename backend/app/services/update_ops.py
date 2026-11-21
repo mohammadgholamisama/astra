@@ -7,7 +7,10 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
+
+import httpx
 
 from app.core.config import get_settings
 
@@ -16,6 +19,12 @@ logger = logging.getLogger(__name__)
 _REPO = "mohammadgholamisama/astra"
 _VERSION_URL = f"https://raw.githubusercontent.com/{_REPO}/main/VERSION"
 _SAFE_VER = re.compile(r"^[0-9A-Za-z._+-]{1,32}$")
+_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+# Check budget: dashboard must answer well under nginx/proxy timeouts.
+_CHECK_HTTP_TIMEOUT = httpx.Timeout(2.5, connect=1.5)
+_CHECK_OVERALL_SEC = 6.0
+_SHA_WAVE_SEC = 2.5
 
 _NNP_HINT = (
     "سرویس astra با NoNewPrivileges اجرا می‌شود و sudo کار نمی‌کند. "
@@ -109,34 +118,6 @@ def _newest_version(*versions: str) -> str:
     return best
 
 
-async def _curl_text(url: str, *, extra_headers: list[str] | None = None) -> str:
-    cmd = [
-        "curl",
-        "-fsSL",
-        "--max-time",
-        "15",
-        "-H",
-        "Cache-Control: no-cache",
-        "-H",
-        "Pragma: no-cache",
-    ]
-    for h in extra_headers or []:
-        cmd.extend(["-H", h])
-    cmd.append(url)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        out_b, _err = await asyncio.wait_for(proc.communicate(), timeout=20)
-        if proc.returncode != 0:
-            return ""
-        return (out_b or b"").decode("utf-8", errors="replace")
-    except Exception:  # noqa: BLE001
-        return ""
-
-
 def _version_from_body(body: str) -> str:
     if not body:
         return ""
@@ -146,125 +127,263 @@ def _version_from_body(body: str) -> str:
     return ""
 
 
-async def _curl_version(url: str, *, extra_headers: list[str] | None = None) -> str:
-    return _version_from_body(await _curl_text(url, extra_headers=extra_headers))
+def _astra_root() -> Path:
+    # Official install; helper lives next to the tree we care about.
+    return Path("/opt/astra")
 
 
-async def _fetch_head_sha() -> str:
-    """Resolve current main tip SHA (bypasses CDN @main cache)."""
-    bust = str(int(__import__("time").time()))
-    # commits API
-    body = await _curl_text(
-        f"https://api.github.com/repos/{_REPO}/commits/main?_={bust}",
-        extra_headers=["Accept: application/vnd.github+json"],
-    )
-    if body:
+async def _http_get_text(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> str:
+    try:
+        res = await client.get(url, headers=headers)
+        if res.status_code != 200:
+            return ""
+        return res.text or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def _http_get_version(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> str:
+    return _version_from_body(await _http_get_text(client, url, headers=headers))
+
+
+async def _fetch_head_sha(client: httpx.AsyncClient, bust: str) -> str:
+    """Resolve main tip SHA — API and git ls-remote race; first valid wins."""
+
+    async def from_api() -> str:
+        body = await _http_get_text(
+            client,
+            f"https://api.github.com/repos/{_REPO}/commits/main?_={bust}",
+            headers={"Accept": "application/vnd.github+json"},
+        )
+        if not body:
+            return ""
         try:
             data = json.loads(body)
             sha = str((data or {}).get("sha") or "").strip()
-            if re.fullmatch(r"[0-9a-f]{7,40}", sha):
-                return sha
+            return sha if _SHA_RE.fullmatch(sha) else ""
         except json.JSONDecodeError:
-            pass
-    # git ls-remote fallback
+            return ""
+
+    async def from_ls_remote() -> str:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                "ls-remote",
+                f"https://github.com/{_REPO}.git",
+                "refs/heads/main",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=2.5)
+            if proc.returncode == 0 and out_b:
+                sha = out_b.decode().split()[0].strip()
+                return sha if _SHA_RE.fullmatch(sha) else ""
+        except Exception:  # noqa: BLE001
+            return ""
+        return ""
+
+    tasks = [
+        asyncio.create_task(from_api()),
+        asyncio.create_task(from_ls_remote()),
+    ]
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "ls-remote",
-            f"https://github.com/{_REPO}.git",
-            "refs/heads/main",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        out_b, _err = await asyncio.wait_for(proc.communicate(), timeout=20)
-        if proc.returncode == 0 and out_b:
-            sha = out_b.decode().split()[0].strip()
-            if re.fullmatch(r"[0-9a-f]{7,40}", sha):
-                return sha
-    except Exception:  # noqa: BLE001
-        pass
+        while tasks:
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED, timeout=_SHA_WAVE_SEC
+            )
+            if not done:
+                break
+            for t in done:
+                try:
+                    sha = t.result()
+                except Exception:  # noqa: BLE001
+                    sha = ""
+                if sha:
+                    for p in pending:
+                        p.cancel()
+                    return sha
+            tasks = list(pending)
+    finally:
+        for t in tasks:
+            t.cancel()
     return ""
 
 
 async def _fetch_remote_version() -> str:
-    """Fetch the newest VERSION from every reachable source; pick the max semver.
-
-    CDN/@main often lags several releases behind. We resolve HEAD SHA first and
-    read VERSION at that exact commit, then still compare against other mirrors
-    and keep the highest number.
-    """
-    bust = str(int(__import__("time").time()))
+    """Fetch newest VERSION from mirrors concurrently; pick max semver within budget."""
+    bust = str(int(time.time()))
     found: list[str] = []
 
-    sha = await _fetch_head_sha()
-    if sha:
-        for url, headers in (
-            (
-                f"https://api.github.com/repos/{_REPO}/contents/VERSION?ref={sha}&_={bust}",
-                ["Accept: application/vnd.github.raw"],
-            ),
-            (f"https://raw.githubusercontent.com/{_REPO}/{sha}/VERSION?_={bust}", None),
-            (f"https://cdn.jsdelivr.net/gh/{_REPO}@{sha}/VERSION", None),
-        ):
-            v = await _curl_version(url, extra_headers=headers)
-            if v:
-                found.append(v)
+    headers_nocache = {
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
 
-    for url, headers in (
-        (
-            f"https://api.github.com/repos/{_REPO}/contents/VERSION?ref=main&_={bust}",
-            ["Accept: application/vnd.github.raw"],
-        ),
-        (f"{_VERSION_URL}?_={bust}", None),
-        (f"https://cdn.jsdelivr.net/gh/{_REPO}@main/VERSION?_={bust}", None),
-        (f"https://fastly.jsdelivr.net/gh/{_REPO}@main/VERSION?_={bust}", None),
-    ):
-        v = await _curl_version(url, extra_headers=headers)
-        if v:
-            found.append(v)
+    async with httpx.AsyncClient(
+        timeout=_CHECK_HTTP_TIMEOUT,
+        follow_redirects=True,
+        headers=headers_nocache,
+        limits=httpx.Limits(max_connections=12, max_keepalive_connections=6),
+    ) as client:
+        main_sources: list[tuple[str, dict[str, str] | None]] = [
+            (
+                f"https://api.github.com/repos/{_REPO}/contents/VERSION?ref=main&_={bust}",
+                {"Accept": "application/vnd.github.raw"},
+            ),
+            (f"{_VERSION_URL}?_={bust}", None),
+            (f"https://cdn.jsdelivr.net/gh/{_REPO}@main/VERSION?_={bust}", None),
+            (f"https://fastly.jsdelivr.net/gh/{_REPO}@main/VERSION?_={bust}", None),
+        ]
+
+        async def collect(sources: list[tuple[str, dict[str, str] | None]]) -> list[str]:
+            results = await asyncio.gather(
+                *[
+                    _http_get_version(client, url, headers=hdrs)
+                    for url, hdrs in sources
+                ],
+                return_exceptions=True,
+            )
+            out: list[str] = []
+            for r in results:
+                if isinstance(r, str) and r:
+                    out.append(r)
+            return out
+
+        async def sha_wave() -> list[str]:
+            sha = await _fetch_head_sha(client, bust)
+            if not sha:
+                return []
+            return await collect(
+                [
+                    (
+                        f"https://api.github.com/repos/{_REPO}/contents/VERSION?ref={sha}&_={bust}",
+                        {"Accept": "application/vnd.github.raw"},
+                    ),
+                    (f"https://raw.githubusercontent.com/{_REPO}/{sha}/VERSION?_={bust}", None),
+                    (f"https://cdn.jsdelivr.net/gh/{_REPO}@{sha}/VERSION", None),
+                ]
+            )
+
+        main_task = asyncio.create_task(collect(main_sources))
+        sha_task = asyncio.create_task(sha_wave())
+        try:
+            done, pending = await asyncio.wait(
+                {main_task, sha_task},
+                timeout=_CHECK_OVERALL_SEC,
+            )
+            for t in pending:
+                t.cancel()
+            for t in done:
+                try:
+                    found.extend(t.result())
+                except Exception:  # noqa: BLE001
+                    continue
+        finally:
+            for t in (main_task, sha_task):
+                if not t.done():
+                    t.cancel()
 
     best = _newest_version(*found)
     if best:
-        logger.info("update check remote candidates=%s → %s (sha=%s)", found, best, sha or "-")
+        logger.info("update check remote candidates=%s → %s", found, best)
     return best
 
 
+async def _git_behind_fast() -> bool:
+    """True if local HEAD ≠ origin/main tip (ls-remote only — no git fetch)."""
+    root = _astra_root()
+    if not (root / ".git").is_dir():
+        return False
+
+    async def local_sha() -> str:
+        code, out, _ = await _run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            timeout=2.0,
+        )
+        sha = (out or "").strip()
+        return sha if code == 0 and _SHA_RE.fullmatch(sha) else ""
+
+    async def remote_sha() -> str:
+        code, out, _ = await _run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-remote",
+                "origin",
+                "refs/heads/main",
+            ],
+            timeout=2.5,
+        )
+        if code != 0 or not out.strip():
+            # public URL fallback when origin remote is missing/broken
+            code, out, _ = await _run(
+                [
+                    "git",
+                    "ls-remote",
+                    f"https://github.com/{_REPO}.git",
+                    "refs/heads/main",
+                ],
+                timeout=2.5,
+            )
+        if code != 0 or not out.strip():
+            return ""
+        sha = out.split()[0].strip()
+        return sha if _SHA_RE.fullmatch(sha) else ""
+
+    local, remote = await asyncio.gather(local_sha(), remote_sha())
+    return bool(local and remote and local != remote)
+
+
 async def check_update() -> dict:
-    """Return update status. Always surfaces the newest remote VERSION available."""
+    """Return update status quickly via concurrent HTTP (+ optional git tip compare)."""
     from app.services.version_info import get_version
 
     local = get_version()
     remote = ""
-    update_available = False
-    check_ok = False
-    message = ""
     git_behind = False
-    candidates: list[str] = []
 
-    if available():
-        code, out, err = await _helper(["check-update"], timeout=60, as_root=False)
-        if code != 0:
-            code, out, err = await _helper(["check-update"], timeout=60, as_root=True)
-        if code == 0 and out.strip():
+    remote_task = asyncio.create_task(_fetch_remote_version())
+    behind_task = asyncio.create_task(_git_behind_fast())
+    try:
+        try:
+            remote = await asyncio.wait_for(
+                asyncio.shield(remote_task), timeout=_CHECK_OVERALL_SEC + 0.5
+            )
+        except asyncio.TimeoutError:
+            remote_task.cancel()
+            remote = ""
+
+        # Don't let git tip compare delay the response once VERSION is known.
+        if behind_task.done():
             try:
-                line = out.strip().splitlines()[-1]
-                data = json.loads(line)
-                helper_remote = str(data.get("remote_version") or "").strip()
-                local = str(data.get("local_version") or local).strip() or local
-                git_behind = bool(data.get("git_behind"))
-                if helper_remote:
-                    candidates.append(helper_remote)
-            except json.JSONDecodeError:
-                logger.warning("check-update bad JSON: %s", out[:400])
+                git_behind = bool(behind_task.result())
+            except Exception:  # noqa: BLE001
+                git_behind = False
+        else:
+            try:
+                git_behind = bool(
+                    await asyncio.wait_for(asyncio.shield(behind_task), timeout=0.4)
+                )
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                behind_task.cancel()
+                git_behind = False
+    finally:
+        for t in (remote_task, behind_task):
+            if not t.done():
+                t.cancel()
 
-    # Always gather fresh HTTP candidates and keep the highest version
-    http_remote = await _fetch_remote_version()
-    if http_remote:
-        candidates.append(http_remote)
-
-    remote = _newest_version(*candidates)
     check_ok = bool(remote)
-
     if check_ok:
         update_available = bool(git_behind) or is_newer(remote, local)
         message = (

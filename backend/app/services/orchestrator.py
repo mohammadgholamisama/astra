@@ -3344,9 +3344,9 @@ async def _delete_panel_accounts_remote(
     """Cut remotes for these accounts and mark them deleted locally.
 
     Share links are wiped first so the sub drops configs immediately.
-    ``fast=True``: ~1s parallel delete, then disable fallback; local row is
-    always marked deleted so quota stays (used_traffic kept) and heal cannot
-    recreate the tunnel. used_traffic is never reset.
+    ``fast=True``: parallel delete with a short-but-real budget (~8s, 2 tries)
+    then disable fallback; local row is always marked deleted so quota stays
+    (``used_traffic`` never reset) and heal cannot recreate the tunnel.
     """
     if not accounts:
         return []
@@ -3360,8 +3360,11 @@ async def _delete_panel_accounts_remote(
 
     sem = _remote_sem()
     t0 = time.monotonic()
-    timeout = 1.15 if fast else 20.0
-    attempts = 1 if fast else 3
+    # 1.15s was too aggressive — Marzban/PasarGuard/Astra rebuild often need
+    # several seconds; failed deletes left ghosts on the main panel while the
+    # sub already looked empty.
+    timeout = 8.0 if fast else 20.0
+    attempts = 2 if fast else 3
 
     async def _disable(account: PanelAccount, panel: Panel, uname: str) -> bool:
         adapter = get_adapter(panel)
@@ -9088,6 +9091,8 @@ async def _resync_users_for_group_locked(
     from sqlalchemy import delete
 
     ops_job_id: str | None = None
+    # Astra panels whose remotes were cut this wave — rebuild Xray after delete.
+    cut_astra_panels: set[int] = set()
 
     removed_hint = {int(p) for p in (removed_panel_ids or []) if p is not None}
     # Membership = all GroupPanel rows (even inactive panels keep remotes until
@@ -9252,20 +9257,53 @@ async def _resync_users_for_group_locked(
         await sdb.flush()
 
         if remote_cut:
-            await _delete_panel_accounts_remote(
+            outcomes = await _delete_panel_accounts_remote(
                 sdb, user, remote_cut, clear_links_always=True, fast=True
             )
+            for row in outcomes:
+                pid = row.get("panel_id")
+                if pid is not None:
+                    try:
+                        cut_astra_panels.add(int(pid))
+                    except (TypeError, ValueError):
+                        pass
+                if row.get("ok"):
+                    continue
+                note_job_error(
+                    ops_job_id or "",
+                    (
+                        f"{user.username}: حذف از پنل "
+                        f"{row.get('panel_name') or row.get('panel_id')}: "
+                        f"{row.get('error') or 'ناموفق'}"
+                    ),
+                )
+            # Remember Astra panels we cut so a post-wave rebuild can flush
+            # Xray even if per-delete rebuild was cancelled by timeout.
+            for a in remote_cut:
+                p = getattr(a, "panel", None)
+                if p is not None and getattr(p, "type", None) == PanelType.astra:
+                    cut_astra_panels.add(int(a.panel_id))
         for a in local_only:
             a.status = PanelAccountStatus.deleted
             a.error_message = None
             a.links = []
             a.links_by_group = {}
-        # Force every stale row retired locally (used_traffic kept)
+        # Force every stale row retired locally (used_traffic kept — never zeroed)
         for a in stale:
             a.status = PanelAccountStatus.deleted
             a.links = []
             a.links_by_group = {}
         await sdb.flush()
+        # Bank deleted meters into user.used_traffic (monotonic — never shrinks)
+        try:
+            await recount_user_used_traffic(sdb, user)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "group %s post-cut recount failed user=%s",
+                gid,
+                user.username,
+                exc_info=True,
+            )
         try:
             from app.api.subscription import invalidate_user_feed_cache
 
@@ -9603,6 +9641,48 @@ async def _resync_users_for_group_locked(
         label_msg="در حال حذف پنل‌های جدا‌شده از ساب و پنل اصلی…",
         handler=_phase_delete_user,
     )
+    # Flush Xray on Astra panels that lost clients (covers timeout mid-rebuild)
+    if cut_astra_panels and not d_cancel:
+        try:
+            from app.services import astra_node as astra_node_svc
+
+            async with AsyncSessionLocal() as sdb:
+                for pid in sorted(cut_astra_panels):
+                    # Only rebuild panels that are no longer in this group
+                    # (still-desired Astra panels get a batch rebuild after add).
+                    if pid in desired_panel_ids:
+                        continue
+                    panel_row = await sdb.get(Panel, int(pid))
+                    if panel_row is None:
+                        continue
+                    if getattr(panel_row, "type", None) != PanelType.astra:
+                        continue
+                    try:
+                        await astra_node_svc.rebuild_xray_config(
+                            sdb, panel_row, sync_nginx=False
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "group %s post-delete astra rebuild panel=%s failed",
+                            gid,
+                            pid,
+                            exc_info=True,
+                        )
+                        note_job_error(
+                            ops_job_id or "",
+                            f"بازسازی نود آسترا پس از حذف پنل #{pid} ناموفق بود",
+                        )
+                try:
+                    await astra_node_svc.sync_nginx_ws_upstreams(sdb)
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "group %s post-delete nginx sync failed", gid, exc_info=True
+                    )
+                await sdb.commit()
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "group %s post-delete astra flush failed", gid, exc_info=True
+            )
     if d_cancel:
         aborted = True
         a_ok = a_fail = r_ok = r_fail = 0

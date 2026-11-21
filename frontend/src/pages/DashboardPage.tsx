@@ -427,7 +427,11 @@ export default function DashboardPage() {
   });
 
   const checkUpdate = useMutation({
-    mutationFn: () => api<UpdateStatus>("/api/system/update"),
+    mutationFn: () =>
+      api<UpdateStatus>("/api/system/update", {
+        // Backend check is concurrent and budgeted (~6s); keep UI tight.
+        timeoutMs: 12_000,
+      }),
     onSuccess: (res) => {
       setUpdateInfo(res);
       if (res.check_ok === false) {
