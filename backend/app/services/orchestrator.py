@@ -3670,14 +3670,42 @@ async def sync_delete_user_group_panel_accounts(
         .where(PanelAccount.user_id == user.id)
         .options(selectinload(PanelAccount.panel))
     )
+    all_acc = list(result.scalars().all())
     accounts = [
         a
-        for a in result.scalars().all()
+        for a in all_acc
         if a.status != PanelAccountStatus.deleted
         and int(a.panel_id) in want_panels
         and getattr(a, "group_id", None) is not None
         and int(a.group_id) == gid
     ]
+    seen = {int(a.id) for a in accounts}
+    # Legacy null-group rows on those panels when no other group still claims them
+    ug = await db.execute(
+        select(UserGroup.group_id).where(UserGroup.user_id == int(user.id))
+    )
+    other_gids = [
+        int(r[0]) for r in ug.all() if r[0] is not None and int(r[0]) != gid
+    ]
+    keep_panels: set[int] = set()
+    if other_gids:
+        kp = await db.execute(
+            select(GroupPanel.panel_id).where(GroupPanel.group_id.in_(other_gids))
+        )
+        keep_panels = {int(p) for (p,) in kp.all() if p is not None}
+    for a in all_acc:
+        if int(a.id) in seen:
+            continue
+        if a.status == PanelAccountStatus.deleted:
+            continue
+        if int(a.panel_id) not in want_panels:
+            continue
+        if getattr(a, "group_id", None) is not None:
+            continue
+        if int(a.panel_id) in keep_panels:
+            continue
+        accounts.append(a)
+        seen.add(int(a.id))
     return await _delete_panel_accounts_remote(db, user, accounts, fast=True)
 
 
@@ -9068,6 +9096,20 @@ async def _resync_users_for_group_locked(
         select(GroupPanel.panel_id).where(GroupPanel.group_id == gid)
     )
     desired_panel_ids = {int(pid) for (pid,) in gp_ids.all() if pid is not None}
+
+    # Manual «اعمال روی ساب» often passes removed_panel_ids=[] after save —
+    # discover panels that still have live rows for THIS group but left GroupPanel.
+    orphan_q = select(PanelAccount.panel_id).where(
+        PanelAccount.group_id == gid,
+        PanelAccount.status != PanelAccountStatus.deleted,
+    )
+    if desired_panel_ids:
+        orphan_q = orphan_q.where(
+            PanelAccount.panel_id.notin_(sorted(desired_panel_ids))
+        )
+    orphan_rows = await db.execute(orphan_q.distinct())
+    removed_hint |= {int(p) for (p,) in orphan_rows.all() if p is not None}
+
     # Provision only active panels (same as create-user / heal).
     targets = await resolve_panels_for_groups(db, [gid])
     # Serializable specs so worker sessions can rebuild Panel objects safely.
@@ -9099,6 +9141,12 @@ async def _resync_users_for_group_locked(
         accounts: list[PanelAccount],
         still_claimed: set[int],
     ) -> list[PanelAccount]:
+        """Accounts that must leave sub + (usually) the upstream panel.
+
+        Always cut rows owned by this sales group when the panel left the group,
+        even if another of the user's groups still claims the same panel
+        (those keep their own PanelAccount rows).
+        """
         stale: list[PanelAccount] = []
         seen_acc: set[int] = set()
         for a in accounts:
@@ -9107,14 +9155,22 @@ async def _resync_users_for_group_locked(
             aid = int(a.id)
             pid = int(a.panel_id)
             agid = getattr(a, "group_id", None)
+            # This group's own row for a panel no longer linked here
             if agid is not None and int(agid) == gid and pid not in desired_panel_ids:
                 stale.append(a)
                 seen_acc.add(aid)
                 continue
-            if pid in removed_hint and pid not in still_claimed and aid not in seen_acc:
-                stale.append(a)
-                seen_acc.add(aid)
-                continue
+            # Explicit / auto-detected remove list — this group's row always
+            if pid in removed_hint and aid not in seen_acc:
+                if agid is not None and int(agid) == gid:
+                    stale.append(a)
+                    seen_acc.add(aid)
+                    continue
+                # Legacy null-group row: only if no other group still needs the panel
+                if agid is None and pid not in still_claimed:
+                    stale.append(a)
+                    seen_acc.add(aid)
+                    continue
             if agid is None and pid not in still_claimed and aid not in seen_acc:
                 stale.append(a)
                 seen_acc.add(aid)
@@ -9158,16 +9214,64 @@ async def _resync_users_for_group_locked(
         stale = _stale_for_user(accounts, still_claimed)
         if not stale:
             return
-        await _delete_panel_accounts_remote(
-            sdb, user, stale, clear_links_always=True, fast=True
-        )
+
+        stale_ids = {int(a.id) for a in stale}
+        keep_alive = [
+            a
+            for a in accounts
+            if int(a.id) not in stale_ids and a.status != PanelAccountStatus.deleted
+        ]
+
+        # If another live account on the same panel shares the remote username,
+        # only retire locally — deleting the upstream user would wipe the sibling.
+        remote_cut: list[PanelAccount] = []
+        local_only: list[PanelAccount] = []
         for a in stale:
-            if int(a.panel_id) not in still_claimed:
-                a.status = PanelAccountStatus.deleted
-                a.links = []
-                a.links_by_group = {}
+            uname = (a.remote_username or "").strip().lower()
+            if not uname:
+                remote_cut.append(a)
+                continue
+            sibling = next(
+                (
+                    o
+                    for o in keep_alive
+                    if int(o.panel_id) == int(a.panel_id)
+                    and (o.remote_username or "").strip().lower() == uname
+                ),
+                None,
+            )
+            if sibling is not None:
+                local_only.append(a)
+            else:
+                remote_cut.append(a)
+
+        # Sub must drop configs immediately even if remote HTTP fails
+        for a in stale:
+            a.links = []
+            a.links_by_group = {}
         await sdb.flush()
 
+        if remote_cut:
+            await _delete_panel_accounts_remote(
+                sdb, user, remote_cut, clear_links_always=True, fast=True
+            )
+        for a in local_only:
+            a.status = PanelAccountStatus.deleted
+            a.error_message = None
+            a.links = []
+            a.links_by_group = {}
+        # Force every stale row retired locally (used_traffic kept)
+        for a in stale:
+            a.status = PanelAccountStatus.deleted
+            a.links = []
+            a.links_by_group = {}
+        await sdb.flush()
+        try:
+            from app.api.subscription import invalidate_user_feed_cache
+
+            invalidate_user_feed_cache(int(user.id))
+        except Exception:  # noqa: BLE001
+            pass
     async def _phase_add_user(
         sdb: AsyncSession,
         user: User,
