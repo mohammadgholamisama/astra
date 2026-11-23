@@ -724,19 +724,41 @@ cmd_xray_restart() {
   local pid="${1:-}"
   [[ "$pid" =~ ^[0-9]+$ ]] || die "usage: xray-restart <panel_id>"
   local unit="astra-xray@${pid}"
+  local cfg="${ASTRA_ROOT}/xray/panel_${pid}/config.json"
   local unit_src="${ASTRA_ROOT}/deploy/astra-xray/astra-xray@.service"
+  local xray_bin="${ASTRA_XRAY_BIN:-/usr/local/bin/xray}"
   if [[ -f "$unit_src" ]]; then
     install -m 644 "$unit_src" /etc/systemd/system/astra-xray@.service
-    systemctl daemon-reload
+    # daemon-reload can hang forever on wedged dbus — never block heal on it.
+    timeout 8 systemctl daemon-reload 2>/dev/null || true
   fi
   mkdir -p "${ASTRA_ROOT}/xray/panel_${pid}"
-  if [[ ! -f "${ASTRA_ROOT}/xray/panel_${pid}/config.json" ]]; then
-    die "missing xray config for panel ${pid}"
+  [[ -f "$cfg" ]] || die "missing xray config for panel ${pid}"
+
+  # Prefer start/restart (fast). enable is optional and timed — hung enable
+  # was freezing PID1/logind and breaking SSH under panel heal storms.
+  if ! timeout 5 systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+    timeout 8 systemctl enable "$unit" 2>/dev/null || true
   fi
-  systemctl enable --now "$unit"
-  systemctl restart "$unit"
-  systemctl is-active --quiet "$unit" || die "xray unit ${unit} failed to start"
-  echo "xray restarted ${unit}"
+  if timeout 10 systemctl restart "$unit" 2>/dev/null \
+    || timeout 10 systemctl start "$unit" 2>/dev/null; then
+    if timeout 5 systemctl is-active --quiet "$unit" 2>/dev/null; then
+      echo "xray restarted ${unit}"
+      return 0
+    fi
+  fi
+
+  # Fallback: direct binary (systemd/dbus wedged)
+  pkill -f "xray run -config .*/panel_${pid}/config.json" 2>/dev/null || true
+  sleep 0.2
+  nohup "$xray_bin" run -config "$cfg" \
+    >>"${ASTRA_ROOT}/xray/panel_${pid}/xray.out" 2>&1 &
+  sleep 0.4
+  if pgrep -f "panel_${pid}/config.json" >/dev/null 2>&1; then
+    echo "xray restarted ${unit} (direct)"
+    return 0
+  fi
+  die "xray unit ${unit} failed to start"
 }
 
 cmd_xray_stop() {
@@ -744,7 +766,9 @@ cmd_xray_stop() {
   local pid="${1:-}"
   [[ "$pid" =~ ^[0-9]+$ ]] || die "usage: xray-stop <panel_id>"
   local unit="astra-xray@${pid}"
-  systemctl disable --now "$unit" 2>/dev/null || systemctl stop "$unit" 2>/dev/null || true
+  timeout 8 systemctl stop "$unit" 2>/dev/null || true
+  timeout 8 systemctl disable "$unit" 2>/dev/null || true
+  pkill -f "xray run -config .*/panel_${pid}/config.json" 2>/dev/null || true
   echo "xray stopped ${unit}"
 }
 

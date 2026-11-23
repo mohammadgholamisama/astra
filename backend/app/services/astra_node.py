@@ -1390,50 +1390,94 @@ async def _run_ctl(cmd: list[str], *, timeout: float = 8.0) -> tuple[int, bytes,
         raise
 
 
-async def _reload_xray(panel: Panel, xdir: Path, cfg_path: Path) -> None:
-    """Restart unit astra-xray@{panel_id} via astra-helper (sudo) or systemctl.
+async def _start_xray_direct(panel_id: int, cfg_path: Path) -> bool:
+    """Start xray binary without systemd — used when D-Bus is wedged."""
+    if _xray_process_up(int(panel_id)):
+        return True
+    xray_bin = os.environ.get("ASTRA_XRAY_BIN", "/usr/local/bin/xray")
+    if not Path(xray_bin).is_file() or not cfg_path.is_file():
+        return False
+    log = cfg_path.parent / "xray.out"
+    try:
+        # Detach fully so uvicorn does not inherit / wait on xray.
+        with open(log, "ab", buffering=0) as lf:
+            proc = await asyncio.create_subprocess_exec(
+                xray_bin,
+                "run",
+                "-config",
+                str(cfg_path),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=lf,
+                stderr=lf,
+                start_new_session=True,
+            )
+        # Don't wait on xray — just confirm it stayed up briefly.
+        await asyncio.sleep(0.35)
+        if proc.returncode is not None:
+            return False
+        return _xray_process_up(int(panel_id))
+    except Exception:  # noqa: BLE001
+        logger.debug("direct xray start failed panel=%s", panel_id, exc_info=True)
+        return False
 
-    Never use ``enable --now`` in a heal loop — when D-Bus/systemd is slow it
-    piles up hung ``systemctl`` children, pegs PID1/logind, and freezes SSH.
+
+async def _reload_xray(panel: Panel, xdir: Path, cfg_path: Path) -> None:
+    """Bring astra-xray@{id} up as fast as possible without wedging systemd.
+
+    Order: already-up → helper/start (timed) → direct binary. Never
+    ``enable --now`` here (that stormed PID1/logind and froze SSH).
     """
+    pid = int(panel.id)
+    if _xray_process_up(pid):
+        return
+
     helper = "/usr/local/bin/astra-helper"
-    unit = f"astra-xray@{panel.id}"
-    # Prefer helper / restart|start — enable is one-shot install, not heal.
+    unit = f"astra-xray@{pid}"
     cmds = [
-        ["sudo", "-n", helper, "xray-restart", str(panel.id)],
-        [helper, "xray-restart", str(panel.id)],
-        ["sudo", "-n", "systemctl", "restart", unit],
-        ["systemctl", "restart", unit],
+        ["sudo", "-n", helper, "xray-restart", str(pid)],
+        [helper, "xray-restart", str(pid)],
         ["sudo", "-n", "systemctl", "start", unit],
         ["systemctl", "start", unit],
     ]
     async with _XRAY_CTL_LOCK:
+        if _xray_process_up(pid):
+            return
+        dbus_ok = True
         try:
             for cmd in cmds:
                 try:
-                    rc, out, err = await _run_ctl(cmd, timeout=8.0)
-                    if rc == 0:
+                    rc, out, err = await _run_ctl(cmd, timeout=6.0)
+                    if rc == 0 and (
+                        _xray_process_up(pid)
+                        or node_health(panel).get("listen_open")
+                    ):
                         logger.info("xray reload ok via %s", " ".join(cmd))
-                        await asyncio.sleep(0.2)
                         return
                     logger.debug(
                         "xray reload %s → rc=%s %s",
                         cmd,
                         rc,
-                        ((err or out)[-200:]).decode("utf-8", "replace"),
+                        ((err or out)[-160:]).decode("utf-8", "replace"),
                     )
                 except FileNotFoundError:
                     continue
                 except asyncio.TimeoutError:
                     logger.warning(
                         "xray reload timed out (killed) panel=%s cmd=%s",
-                        panel.id,
+                        pid,
                         " ".join(cmd),
                     )
-                    # D-Bus likely wedged — stop trying more systemctl this round.
+                    dbus_ok = False
                     break
         except Exception as exc:  # noqa: BLE001
             logger.warning("xray reload failed: %s", exc)
+            dbus_ok = False
+
+        # Fast path when systemd is wedged or start did not stick.
+        if not _xray_process_up(pid):
+            if await _start_xray_direct(pid, cfg_path):
+                logger.info("xray started direct panel=%s dbus_ok=%s", pid, dbus_ok)
+                return
 
     marker = xdir / "NEED_RELOAD"
     try:
@@ -1990,22 +2034,28 @@ async def cleanup_panel_node(panel_id: int, meta: dict | None = None) -> None:
     pid = int(panel_id)
     helper = "/usr/local/bin/astra-helper"
     for cmd in (
-        ["sudo", helper, "xray-stop", str(pid)],
+        ["sudo", "-n", helper, "xray-stop", str(pid)],
         [helper, "xray-stop", str(pid)],
-        ["sudo", "systemctl", "disable", "--now", f"astra-xray@{pid}"],
+        ["sudo", "-n", "systemctl", "stop", f"astra-xray@{pid}"],
         ["systemctl", "stop", f"astra-xray@{pid}"],
     ):
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(proc.communicate(), timeout=20)
-            if proc.returncode == 0:
-                break
+            await _run_ctl(cmd, timeout=8.0)
+            break
         except Exception:  # noqa: BLE001
             continue
+    # Ensure process gone even if systemctl hung/failed.
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "pkill",
+            "-f",
+            f"panel_{pid}/config.json",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=3)
+    except Exception:  # noqa: BLE001
+        pass
 
     # Prefer path from meta; fall back to default layout
     xdir: Path | None = None
