@@ -9339,10 +9339,10 @@ async def run_quota_watch_cycle() -> dict[str, int]:
     from app.services import panel_usage_bulk as bulk_usage
 
     t0 = time.monotonic()
-    try:
-        await heal_users_missing_panel_accounts(limit_users=6)
-    except Exception:  # noqa: BLE001
-        logger.debug("quota-watch missing-account heal skipped", exc_info=True)
+        try:
+            await heal_users_missing_panel_accounts(limit_users=3)
+        except Exception:  # noqa: BLE001
+            logger.debug("quota-watch missing-account heal skipped", exc_info=True)
 
     stats = {
         "astra_panels": 0,
@@ -9382,8 +9382,8 @@ async def run_quota_watch_cycle() -> dict[str, int]:
         logger.debug("quota-watch recent sub list failed", exc_info=True)
 
     priority_ids = list(
-        dict.fromkeys(take_live_usage_priority(300.0, 48) + recent_sub_ids)
-    )[:40]
+        dict.fromkeys(take_live_usage_priority(300.0, 24) + recent_sub_ids)
+    )[:20]
     # Drop expired/disabled / wall-clock-expired before remote usage pulls.
     if priority_ids:
         try:
@@ -9410,13 +9410,13 @@ async def run_quota_watch_cycle() -> dict[str, int]:
                         )
                     )
                 ).all()
-                priority_ids = [int(r[0]) for r in live][:24]
+                priority_ids = [int(r[0]) for r in live][:12]
                 await db.rollback()
         except Exception:  # noqa: BLE001
-            priority_ids = priority_ids[:24]
+            priority_ids = priority_ids[:12]
     extra_flip = await _quota_pull_users(
         priority_ids,
-        deadline=t0 + 24.0,
+        deadline=t0 + 18.0,
         stats=stats,
         flipped_ids=flipped_ids,
         activate_ids=activate_ids,
@@ -9451,8 +9451,8 @@ async def run_quota_watch_cycle() -> dict[str, int]:
         ok_n, fail_n = await _freeze_quota_users(
             expire_freeze_ids,
             remote_timeout=10.0,
-            concurrency=14,
-            wall=40.0,
+            concurrency=6,
+            wall=30.0,
         )
         stats["freeze_ok"] += ok_n
         stats["freeze_fail"] += fail_n

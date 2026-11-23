@@ -874,8 +874,8 @@ async def run_fleet_usage_cycle() -> dict[str, int]:
 
     t0 = time.monotonic()
     _FLEET_CYCLE_N += 1
-    # Full recount of every user is the heavy path — every 8th cycle only.
-    full_pass = _FLEET_CYCLE_N % 8 == 1
+    # Full recount of every user is the heavy path — rare so API stays snappy.
+    full_pass = _FLEET_CYCLE_N % 12 == 1
     stats: dict[str, int] = {
         "astra_panels": 0,
         "panels": 0,
@@ -886,13 +886,23 @@ async def run_fleet_usage_cycle() -> dict[str, int]:
         "full_pass": int(full_pass),
     }
     try:
+        from app.core.database import pool_pressure_blocks_background
+
+        if pool_pressure_blocks_background():
+            stats["skipped_pool"] = 1
+            stats["dt"] = int(time.monotonic() - t0)
+            logger.warning("fleet usage skipped — db pool under pressure")
+            return stats
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         stats["astra_panels"] = int(await sync_all_astra_traffic() or 0)
     except Exception:  # noqa: BLE001
         logger.warning("fleet astra sync failed", exc_info=True)
 
     try:
         bulk = await sync_all_panels_bulk(
-            concurrency=4, recount=True, recount_concurrency=6
+            concurrency=2, recount=True, recount_concurrency=3
         )
         stats["panels"] = int(bulk.get("panels") or 0)
         stats["listed"] = int(bulk.get("listed") or 0)
@@ -903,7 +913,7 @@ async def run_fleet_usage_cycle() -> dict[str, int]:
 
     if full_pass:
         try:
-            full = await recount_all_live_users(concurrency=6, chunk=400)
+            full = await recount_all_live_users(concurrency=3, chunk=300)
             stats["recount_users"] = int(full.get("users") or 0)
             stats["flipped"] += int(full.get("flipped") or 0)
         except Exception:  # noqa: BLE001

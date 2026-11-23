@@ -22,8 +22,9 @@ _URL = (settings.DATABASE_URL or "").strip()
 _IS_SQLITE = _URL.startswith("sqlite")
 
 # Background jobs (quota / heal / outbound ping) share this cap so interactive
-# login/API always keep headroom in the pool. Keep low vs pool_size (~16+8).
-DB_BACKGROUND_SLOTS = 2
+# login/API always keep headroom in the pool. One slot only — concurrent bg
+# sessions were exhausting QueuePool and stalling the whole panel UI.
+DB_BACKGROUND_SLOTS = 1
 _bg_sem: asyncio.Semaphore | None = None
 
 
@@ -76,8 +77,9 @@ def _build_engine_kwargs() -> dict[str, Any]:
             "server_settings": {
                 "statement_timeout": "45000",
                 # Kill leaked idle-in-transaction checkouts fast. Callers must
-                # release_db_txn() before remote HTTP; 60s is a safety net only.
-                "idle_in_transaction_session_timeout": "60000",
+                # release_db_txn() before remote HTTP; 15s is the safety net —
+                # 60s let 14+ stuck backends starve the API pool.
+                "idle_in_transaction_session_timeout": "15000",
             },
         }
     return kwargs
@@ -255,18 +257,64 @@ async def ping_db() -> bool:
         return False
 
 
-async def pool_guardian_loop(interval: float = 30.0) -> None:
-    """Watch pool pressure; drop idle pooled sockets when stuck near capacity."""
+def pool_pressure_blocks_background() -> bool:
+    """True when interactive API should get exclusive pool headroom."""
+    st = pool_status()
+    pressure = st.get("pressure") or "ok"
+    if pressure == "critical":
+        return True
+    if pressure == "high":
+        return True
+    checked = int(st.get("checkedout") or st.get("in_use") or 0)
+    cap = int(st.get("capacity") or 0)
+    return bool(cap > 0 and checked >= max(1, cap - 2))
+
+
+async def _terminate_stale_idle_in_txn(*, older_than_sec: float = 12.0) -> int:
+    """Best-effort: kill Postgres backends stuck idle-in-transaction."""
+    if _IS_SQLITE:
+        return 0
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT count(pg_terminate_backend(pid)) "
+                    "FROM pg_stat_activity "
+                    "WHERE datname = current_database() "
+                    "AND pid <> pg_backend_pid() "
+                    "AND state = 'idle in transaction' "
+                    "AND xact_start < now() - (:sec * interval '1 second')"
+                ),
+                {"sec": float(older_than_sec)},
+            )
+            await conn.commit()
+            return int(result.scalar() or 0)
+    except Exception:  # noqa: BLE001
+        logger.debug("idle-in-txn terminate skipped", exc_info=True)
+        return 0
+
+
+async def pool_guardian_loop(interval: float = 15.0) -> None:
+    """Watch pool pressure; recycle idle sockets + kill stuck idle-in-txn."""
     await asyncio.sleep(20)
     high_streak = 0
     while True:
         try:
             st = pool_status()
             pressure = st.get("pressure") or "ok"
-            if pressure == "critical":
+            if pressure in ("critical", "high"):
                 high_streak += 1
-                logger.warning("db pool critical: %s", st)
-                if high_streak >= 2:
+                logger.warning("db pool %s: %s", pressure, st)
+                killed = await _terminate_stale_idle_in_txn(
+                    older_than_sec=8.0 if pressure == "critical" else 12.0
+                )
+                if killed:
+                    logger.error(
+                        "terminated %s idle-in-transaction backends under pool %s",
+                        killed,
+                        pressure,
+                    )
+                if pressure == "critical" or high_streak >= 2:
                     # Invalidate idle pooled connections only (checked-out keep
                     # working). Shrinks postgres backends without killing requests.
                     try:
@@ -278,9 +326,6 @@ async def pool_guardian_loop(interval: float = 30.0) -> None:
                     except Exception:  # noqa: BLE001
                         logger.exception("db pool idle recycle failed")
                     high_streak = 0
-            elif pressure == "high":
-                high_streak = min(high_streak + 1, 2)
-                logger.info("db pool high pressure: %s", st)
             else:
                 high_streak = 0
         except asyncio.CancelledError:

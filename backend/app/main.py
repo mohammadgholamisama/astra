@@ -284,6 +284,12 @@ async def _usage_sync_loop() -> None:
         t0 = _time.monotonic()
         elapsed = 0.0
         try:
+            from app.core.database import pool_pressure_blocks_background
+
+            if pool_pressure_blocks_background():
+                logger.warning("quota watch deferred — db pool under pressure")
+                await asyncio.sleep(45)
+                continue
             sem = background_db_sem()
             await sem.acquire()
             try:
@@ -329,10 +335,16 @@ async def _fleet_usage_loop() -> None:
     from app.services.panel_usage_bulk import run_fleet_usage_cycle
 
     # Boot delay — let quota/hot settle before the heavy fleet pass.
-    await asyncio.sleep(25)
+    await asyncio.sleep(45)
     while True:
         t0 = _time.monotonic()
         try:
+            from app.core.database import pool_pressure_blocks_background
+
+            if pool_pressure_blocks_background():
+                logger.warning("fleet usage deferred — db pool under pressure")
+                await asyncio.sleep(60)
+                continue
             sem = background_db_sem()
             await sem.acquire()
             try:
@@ -354,10 +366,10 @@ async def _fleet_usage_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("fleet usage loop failed")
-        interval = max(300, int(getattr(settings, "USAGE_FLEET_SECONDS", 300) or 300))
+        interval = max(300, int(getattr(settings, "USAGE_FLEET_SECONDS", 360) or 360))
         elapsed = _time.monotonic() - t0
         # After a long fleet pass, always rest so API/SSH keep CPU headroom.
-        await asyncio.sleep(max(90.0, float(interval) - elapsed))
+        await asyncio.sleep(max(120.0, float(interval) - elapsed))
 
 
 async def _hot_usage_loop() -> None:

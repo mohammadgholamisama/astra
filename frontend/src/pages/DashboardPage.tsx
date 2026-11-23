@@ -161,9 +161,9 @@ export default function DashboardPage() {
 
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["system"],
-    queryFn: () => api<SystemStats>("/api/system", { timeoutMs: 20_000 }),
-    staleTime: 20_000,
-    refetchInterval: 45_000,
+    queryFn: () => api<SystemStats>("/api/system", { timeoutMs: 12_000 }),
+    staleTime: 15_000,
+    refetchInterval: 60_000,
     refetchOnMount: true,
     refetchOnWindowFocus: false,
     placeholderData: (prev) => prev,
@@ -178,8 +178,8 @@ export default function DashboardPage() {
   } = useQuery({
     queryKey: ["system-host"],
     queryFn: () => api<HostMetrics>("/api/system/host", { timeoutMs: 8_000 }),
-    refetchInterval: 20_000,
-    staleTime: 12_000,
+    refetchInterval: 45_000,
+    staleTime: 20_000,
     refetchOnWindowFocus: false,
     retry: 1,
     retryDelay: 1200,

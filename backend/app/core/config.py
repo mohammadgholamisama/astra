@@ -39,14 +39,14 @@ class Settings(BaseSettings):
     ADAPTER_TIMEOUT: float = 35.0
     # Max concurrent HTTP ops to remotes (create/delete/modify). Caps FD/TLS storm
     # when a user spans many panels; wall time still ≈ ceil(N/limit)×slowest.
-    PANEL_REMOTE_CONCURRENCY: int = 6
+    PANEL_REMOTE_CONCURRENCY: int = 4
     # Background quota watch cadence (seconds). Exhausted users are frozen
     # on every remote in the same cycle. ~5 min keeps CPU calm; accuracy via
     # remaining caps + live /sub pulls for active clients.
     USAGE_REFRESH_SECONDS: int = 300
     # Full-fleet usage pull (all panels + dirty recount), seconds.
-    USAGE_FLEET_SECONDS: int = 300
-    # Hot loop for recent /sub users (seconds). Same ~5 min cadence.
+    USAGE_FLEET_SECONDS: int = 360
+    # Hot loop for recent /sub users (seconds). Same calm cadence.
     USAGE_HOT_SECONDS: int = 300
     # Auto «رفع خطا» on Users page — off by default; use the button manually.
     AUTO_RETRY_ERRORS: bool = False
