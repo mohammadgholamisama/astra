@@ -385,12 +385,17 @@ async def check_update() -> dict:
 
     check_ok = bool(remote)
     if check_ok:
-        update_available = bool(git_behind) or is_newer(remote, local)
-        message = (
-            f"آخرین نسخه: {remote}"
-            if update_available
-            else "پنل به‌روز است"
-        )
+        # Same VERSION must NOT show «نسخه جدید» just because git tip differs
+        # (unpushed/ops commits). Only a higher remote VERSION is an update.
+        ver_newer = is_newer(remote, local)
+        same_ver = _parse_semver(remote) == _parse_semver(local)
+        update_available = bool(ver_newer)
+        if update_available:
+            message = f"آخرین نسخه: {remote}"
+        elif same_ver and git_behind:
+            message = "پنل به‌روز است (نسخه یکسان)"
+        else:
+            message = "پنل به‌روز است"
     else:
         update_available = False
         message = "دریافت نسخه از گیت‌هاب ناموفق — دوباره تلاش کنید"

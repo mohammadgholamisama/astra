@@ -1,0 +1,13 @@
+[Unit]
+Description=Astra boot heal (panel + sub tunnels after reboot)
+After=network-online.target astra.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/astra-boot-heal
+RemainAfterExit=yes
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

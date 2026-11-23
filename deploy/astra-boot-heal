@@ -1,0 +1,46 @@
+#!/bin/bash
+# After reboot: bring panel + sub tunnels up quickly and verify health.
+set +e
+logger -t astra-boot-heal "start"
+
+# Wait for network a bit (DNS / routes)
+for i in $(seq 1 30); do
+  ping -c1 -W1 1.1.1.1 >/dev/null 2>&1 && break
+  sleep 1
+done
+
+systemctl start astra 2>/dev/null || true
+for i in $(seq 1 40); do
+  curl -sm2 http://127.0.0.1:2086/health >/dev/null 2>&1 && break
+  systemctl start astra 2>/dev/null || true
+  sleep 1
+done
+
+# Sub reverse tunnel + CF quick tunnel
+if [ -x /usr/local/bin/astra-sub-rtunnel-run ]; then
+  sed -i 's/\r$//' /usr/local/bin/astra-sub-rtunnel-run 2>/dev/null || true
+  chmod +x /usr/local/bin/astra-sub-rtunnel-run
+fi
+systemctl reset-failed astra-sub-rtunnel 2>/dev/null || true
+systemctl start astra-sub-rtunnel 2>/dev/null || true
+systemctl start astra-cf-sub 2>/dev/null || true
+
+# Refresh CF URL file locally (never SSH to Iran from here)
+if [ -x /usr/local/bin/astra-cf-url-sync ]; then
+  /usr/local/bin/astra-cf-url-sync >/dev/null 2>&1 || true
+fi
+
+# If astra still down, hard bounce once
+if ! curl -sm3 http://127.0.0.1:2086/health >/dev/null 2>&1; then
+  logger -t astra-boot-heal "astra unhealthy — hard restart"
+  systemctl kill -s SIGKILL astra 2>/dev/null || true
+  pkill -9 -f /opt/astra/backend/.venv/bin/uvicorn 2>/dev/null || true
+  sleep 2
+  systemctl start astra
+  sleep 5
+fi
+
+ok=0
+curl -sm3 http://127.0.0.1:2086/health >/dev/null 2>&1 && ok=1
+logger -t astra-boot-heal "done health=$ok astra=$(systemctl is-active astra) rt=$(systemctl is-active astra-sub-rtunnel) cf=$(systemctl is-active astra-cf-sub)"
+exit 0
