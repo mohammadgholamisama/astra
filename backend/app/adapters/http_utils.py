@@ -54,7 +54,8 @@ def normalize_panel_base_url(url: str) -> str:
 _SHARED_CLIENTS: dict[str, httpx.AsyncClient] = {}
 _SHARED_LOCK = asyncio.Lock()
 # Cap sockets per panel; default httpx limits are huge and exhaust process FDs.
-_HTTP_LIMITS = httpx.Limits(max_connections=16, max_keepalive_connections=8)
+# Enough for parallel test-all / usage waves without exhausting FDs.
+_HTTP_LIMITS = httpx.Limits(max_connections=32, max_keepalive_connections=16)
 
 
 def _shared_client_key(base_url: str, verify_ssl: bool, xhr: bool) -> str:
@@ -79,9 +80,8 @@ def make_client(
     """
     root = normalize_panel_base_url(base_url).rstrip("/") + "/"
     t = float(timeout if timeout is not None else settings.ADAPTER_TIMEOUT)
-    # Keep connect short so flaky hosts (Marzban Cloud) fail fast and retry,
-    # instead of burning 30s×N inside a single attempt.
-    connect_t = min(8.0, max(4.0, t * 0.25))
+    # Fail-fast connect — slow handshakes must not block test-all / usage waves.
+    connect_t = min(4.0, max(2.0, t * 0.15))
     timeout_cfg = httpx.Timeout(t, connect=connect_t)
     headers = {
         "User-Agent": "AstraPanel/1.1 (httpx)",

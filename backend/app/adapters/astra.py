@@ -51,24 +51,22 @@ class AstraAdapter(BasePanelAdapter):
         raise RuntimeError("پنل Astra پیدا نشد — panel_id در meta لازم است")
 
     async def test_connection(self) -> AdapterResult:
+        """Fast local probe — never rebuild Xray config (that froze test-all)."""
         try:
             panel = await self._load_panel()
             health = node.node_health(panel)
-            if health.get("ok"):
-                return AdapterResult(success=True, raw=health)
-            # Still OK if we can write config dir — xray may install later
-            async with AsyncSessionLocal() as db:
-                p = await db.get(Panel, panel.id)
-                if p:
-                    await node.rebuild_xray_config(db, p)
-                    await db.commit()
-            health = node.node_health(panel)
+            if health.get("ok") or health.get("listen_open") or health.get("config_exists"):
+                return AdapterResult(
+                    success=True,
+                    raw=health,
+                    error=None
+                    if (health.get("ok") or health.get("listen_open"))
+                    else "config هست؛ سرویس xray را استارت کنید",
+                )
             return AdapterResult(
-                success=True,
-                raw=health,
-                error=None
-                if health.get("config_exists")
-                else "config نوشته شد؛ سرویس xray را نصب/استارت کنید",
+                success=False,
+                error="نود Astra آماده نیست (config/xray)",
+                raw=health if isinstance(health, dict) else {},
             )
         except Exception as e:  # noqa: BLE001
             return AdapterResult(success=False, error=str(e).strip() or e.__class__.__name__)

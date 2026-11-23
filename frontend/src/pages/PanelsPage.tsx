@@ -929,8 +929,8 @@ export default function PanelsPage() {
     mutationFn: () =>
       api<PanelTestAll>("/api/admin/panels/test-all", {
         method: "POST",
-        // Active panels only; each may need ~20s behind CF — keep headroom.
-        timeoutMs: 200_000,
+        // Parallel quick probes (~9s each, 16 at a time).
+        timeoutMs: 90_000,
       }),
     onSuccess: (res) => {
       setTestAllFilter("all");

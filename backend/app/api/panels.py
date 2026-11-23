@@ -89,11 +89,12 @@ async def _live_test_panel(
     panel: Panel,
     *,
     overall_timeout: float = 18.0,
+    quick: bool = False,
 ) -> dict:
-    """Accurate connectivity probe for the admin Test button / test-all.
+    """Connectivity probe for Test / test-all.
 
-    Clears cached tokens, retries soft failures, and gives Marzban-family
-    enough wall time (login + /api/admin can exceed 10s behind CF).
+    ``quick=True`` (test-all): fail-fast connect budget so dozens of panels
+    finish in seconds, not minutes. Single-panel Test keeps fuller retries.
     """
     import time as _time
 
@@ -101,24 +102,29 @@ async def _live_test_panel(
 
     t0 = _time.monotonic()
     last_err = "اتصال ناموفق"
-    # Always allow at least 2 tries for remote panels (token refresh / CF blip).
-    tries = 3 if panel.type in (
-        PanelType.marzban,
-        PanelType.rebecca,
-        PanelType.guard,
-        PanelType.pasarguard,
-        PanelType.sanaei,
-    ) else 2
+    if quick:
+        tries = 2
+        overall_timeout = min(float(overall_timeout), 9.0)
+    else:
+        # Single Test button — allow a soft retry for CF/token blips.
+        tries = 2 if panel.type in (
+            PanelType.marzban,
+            PanelType.rebecca,
+            PanelType.guard,
+            PanelType.pasarguard,
+            PanelType.sanaei,
+        ) else 2
 
     for attempt in range(tries):
         remaining = overall_timeout - (_time.monotonic() - t0)
-        if remaining < 1.0:
+        if remaining < 0.8:
             break
-        # First try gets most of the budget; later tries use what's left.
-        if attempt == 0:
-            per_try = min(14.0, remaining)
+        if quick:
+            per_try = min(7.0 if attempt == 0 else 4.0, remaining)
+        elif attempt == 0:
+            per_try = min(12.0, remaining)
         else:
-            per_try = min(10.0, remaining)
+            per_try = min(8.0, remaining)
         adapter = get_adapter(panel)
         result: AdapterResult | None = None
         try:
@@ -153,7 +159,7 @@ async def _live_test_panel(
         if _is_hard_auth_fail(last_err):
             break
         if attempt + 1 < tries:
-            await asyncio.sleep(0.35 + attempt * 0.25)
+            await asyncio.sleep(0.15 if quick else 0.3)
 
     ms = int((_time.monotonic() - t0) * 1000)
     # Clarify path: browser OK ≠ Astra server can reach the panel
@@ -1247,6 +1253,8 @@ async def test_all_panels(
     """Probe every *active* panel in parallel — off panels are skipped."""
     import time as _time
 
+    from app.core.database import release_db_txn
+
     rows = await db.execute(
         select(Panel)
         .where(Panel.is_active.is_(True))
@@ -1288,15 +1296,18 @@ async def test_all_panels(
                 "panel": probe_panel,
             }
         )
+    # Free Postgres before remote fan-out (idle-in-transaction / SSH rule).
+    await release_db_txn(db)
 
-    # Fewer concurrent probes + longer per-panel budget so slow CF/hosts
-    # (e.g. real.takrofast.xyz) are not false-failed by a 7s wall clock.
-    sem = asyncio.Semaphore(6)
+    # I/O-bound probes — high concurrency + short per-panel budget.
+    sem = asyncio.Semaphore(16)
     t0 = _time.monotonic()
 
     async def _one(snap: dict) -> PanelTestOut:
         async with sem:
-            probe = await _live_test_panel(snap["panel"], overall_timeout=22.0)
+            probe = await _live_test_panel(
+                snap["panel"], overall_timeout=9.0, quick=True
+            )
         ok = bool(probe.get("success"))
         ms = probe.get("latency_ms")
         latency = int(ms) if isinstance(ms, (int, float)) and ms >= 0 else None

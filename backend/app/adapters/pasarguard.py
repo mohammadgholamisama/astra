@@ -446,13 +446,14 @@ class PasarGuardAdapter(MarzbanAdapter):
         import httpx
 
         last_err = "اتصال ناموفق"
-        for attempt in range(3):
+        probe_t = httpx.Timeout(8.0, connect=3.0)
+        for attempt in range(2):
             try:
                 client, headers = await self._authed()
                 resp = await client.get(
                     "/api/admin",
                     headers=headers,
-                    timeout=httpx.Timeout(18.0, connect=10.0),
+                    timeout=probe_t,
                 )
                 ok, data = ok_json(resp)
                 if ok:
@@ -466,15 +467,15 @@ class PasarGuardAdapter(MarzbanAdapter):
 
                     _TOKEN_CACHE.pop(self._cache_key(), None)
                     await self.close()
-                    if attempt < 2:
-                        await asyncio.sleep(0.4 + attempt * 0.3)
+                    if attempt < 1:
+                        await asyncio.sleep(0.2)
                         continue
                     return AdapterResult(success=False, error=last_err)
                 # some builds expose /api/system
                 resp2 = await client.get(
                     "/api/system",
                     headers=headers,
-                    timeout=httpx.Timeout(14.0, connect=8.0),
+                    timeout=probe_t,
                 )
                 ok2, data2 = ok_json(resp2)
                 if ok2:
@@ -483,9 +484,9 @@ class PasarGuardAdapter(MarzbanAdapter):
                         raw=data2 if isinstance(data2, dict) else {},
                     )
                 last_err = err_msg(data2, err_msg(data, f"HTTP {resp.status_code}"))
-                if attempt < 2:
+                if attempt < 1:
                     await self.close()
-                    await asyncio.sleep(0.4 + attempt * 0.3)
+                    await asyncio.sleep(0.2)
                     continue
                 return AdapterResult(success=False, error=last_err)
             except Exception as e:

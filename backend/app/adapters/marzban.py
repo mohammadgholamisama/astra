@@ -536,13 +536,15 @@ class MarzbanAdapter(BasePanelAdapter):
         cloud/proxy setups flake on /api/admin while inbounds still works.
         """
         last_err = "اتصال ناموفق"
-        for attempt in range(3):
+        # Fast probe: short connect, 2 tries — test-all must stay snappy.
+        probe_t = httpx.Timeout(8.0, connect=3.0)
+        for attempt in range(2):
             try:
                 client, headers = await self._authed()
                 resp = await client.get(
                     "/api/admin",
                     headers=headers,
-                    timeout=httpx.Timeout(18.0, connect=10.0),
+                    timeout=probe_t,
                 )
                 ok, data = ok_json(resp)
                 if ok:
@@ -554,8 +556,8 @@ class MarzbanAdapter(BasePanelAdapter):
                     self._token = None
                     _TOKEN_CACHE.pop(self._cache_key(), None)
                     await self.close()
-                    if attempt < 2:
-                        await asyncio.sleep(0.4 + attempt * 0.3)
+                    if attempt < 1:
+                        await asyncio.sleep(0.2)
                         continue
                     return AdapterResult(success=False, error=last_err)
 
@@ -564,7 +566,7 @@ class MarzbanAdapter(BasePanelAdapter):
                     resp2 = await client2.get(
                         "/api/inbounds",
                         headers=headers2,
-                        timeout=httpx.Timeout(18.0, connect=10.0),
+                        timeout=probe_t,
                     )
                     ok2, data2 = ok_json(resp2)
                     if ok2 and isinstance(data2, dict):
@@ -573,9 +575,9 @@ class MarzbanAdapter(BasePanelAdapter):
                 except Exception as inner:
                     last_err = str(inner).strip() or err_msg(data, f"HTTP {resp.status_code}")
 
-                if attempt < 2:
+                if attempt < 1:
                     await self.close()
-                    await asyncio.sleep(0.45 + attempt * 0.35)
+                    await asyncio.sleep(0.2)
                     continue
                 return AdapterResult(success=False, error=last_err)
             except Exception as e:

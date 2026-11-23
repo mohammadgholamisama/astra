@@ -402,9 +402,10 @@ class SanaeiAdapter(BasePanelAdapter):
                 except httpx.HTTPError as exc:
                     logger.warning("sanaei test_connection error on %s: %s", path, exc)
                     continue
+            # Short curl fallback only — never 90s (that froze «تست کلی»).
             if self._token():
                 ok_c, data_c, _st = await self._curl_json(
-                    "panel/api/inbounds/list/slim", max_time=90
+                    "panel/api/inbounds/list/slim", max_time=8
                 )
                 if ok_c:
                     return AdapterResult(success=True, raw=data_c)
