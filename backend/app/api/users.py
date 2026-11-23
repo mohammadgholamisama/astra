@@ -1130,7 +1130,6 @@ async def reset_user_traffic(
     import logging
 
     from app.core.database import AsyncSessionLocal
-    from app.models.panel import PanelType
 
     logger = logging.getLogger("astra.users")
     user = await load_user(db, username)
@@ -1138,7 +1137,7 @@ async def reset_user_traffic(
         raise HTTPException(status_code=404, detail="User not found")
     user_id = int(user.id)
 
-    # 1) Local zero immediately (what the admin sees)
+    # 1) Local zero immediately (what the admin sees) — must stay sub-second.
     user.lifetime_used_traffic = int(user.lifetime_used_traffic or 0) + int(
         user.used_traffic or 0
     )
@@ -1154,29 +1153,11 @@ async def reset_user_traffic(
         acc.used_traffic = 0
         acc.coeff_anchor_raw = 0
         acc.coeff_anchor_weighted = 0
-    await db.flush()
-
-    # 2) Same-server Astra panels only (no network) — keep request snappy
-    try:
-        await orchestrator.reset_user_traffic_on_panels(
-            db,
-            user,
-            prefer_types={PanelType.astra},
-            remote_timeout=4,
-            sync_after=False,
-            concurrency=4,
-        )
-        # Local zeros again (helper may recount)
-        user.used_traffic = 0
-        if user.status == UserStatus.limited:
-            user.status = UserStatus.active
-    except Exception:  # noqa: BLE001
-        logger.exception("astra-local reset failed user=%s", username)
-
     await db.commit()
 
-    # 3) All foreign remotes + re-enable/push caps — concurrent background
-    async def _bg_remote_reset() -> None:
+    # 2) Astra + all remotes + re-enable/push caps — concurrent background.
+    # Never await remotes on the HTTP path (CF/browser → Failed to fetch).
+    async def _bg_full_reset() -> None:
         try:
             async with AsyncSessionLocal() as sdb:
                 u = await load_user(sdb, username)
@@ -1203,7 +1184,6 @@ async def reset_user_traffic(
                         len(failed),
                         len(results),
                     )
-                    # One more focused retry on failures
                     fail_ids = {
                         int(r["panel_id"])
                         for r in failed
@@ -1231,7 +1211,7 @@ async def reset_user_traffic(
             logger.exception("background reset remotes failed user=%s", username)
 
     asyncio.create_task(
-        _bg_remote_reset(),
+        _bg_full_reset(),
         name=f"astra-reset-remotes-{username}",
     )
 
