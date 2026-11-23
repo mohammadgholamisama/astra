@@ -1571,38 +1571,62 @@ async def _users_list_chip_counts(
     group_id: int | None,
     now_ts: int,
 ) -> UsersListCounts:
-    """One round-trip for chip totals — was 4×COUNT and dominated list latency.
+    """Chip totals for the board.
 
-    Error chip uses a cheap EXISTS (status=error on active panel) instead of the
-    full actionable-error clause with JSON/ILIKE filters — that path scanned too
-    hard under bot load and stalled the panel board.
+    Default (no search/group): indexed aggregates — error chip is
+    ``COUNT(DISTINCT user_id)`` from ``panel_accounts`` (status index) joined to
+    active users, not a correlated EXISTS over every user row.
     """
+    from sqlalchemy import text
+
     filters, needs_group_join, group_filter = _user_list_scope(
         search=search, group_id=group_id
     )
+    # Fast default board path.
+    if not filters and not needs_group_join:
+        row = (
+            await db.execute(
+                text(
+                    """
+                    SELECT
+                      (SELECT count(*) FROM users) AS all_c,
+                      (SELECT count(*) FROM users
+                         WHERE status = 'active'
+                           AND (expire IS NULL OR expire <= 0 OR expire > :now_ts)
+                      ) AS active_c,
+                      (SELECT count(*) FROM users
+                         WHERE status = 'expired'
+                            OR (expire IS NOT NULL AND expire > 0 AND expire <= :now_ts)
+                      ) AS expired_c,
+                      (SELECT count(DISTINCT pa.user_id)
+                         FROM panel_accounts pa
+                         JOIN panels p ON p.id = pa.panel_id
+                         JOIN users u ON u.id = pa.user_id
+                        WHERE pa.status = 'error'
+                          AND p.is_active IS TRUE
+                          AND u.status = 'active'
+                          AND (u.expire IS NULL OR u.expire <= 0 OR u.expire > :now_ts)
+                      ) AS error_c
+                    """
+                ),
+                {"now_ts": int(now_ts)},
+            )
+        ).one()
+        return UsersListCounts(
+            all=int(row[0] or 0),
+            active=int(row[1] or 0),
+            expired=int(row[2] or 0),
+            error=int(row[3] or 0),
+        )
+
     active_c = _active_user_clause(now_ts)
     expired_c = _expired_user_clause(now_ts)
-    cheap_error = and_(
-        active_c,
-        exists(
-            select(PanelAccount.id)
-            .join(Panel, Panel.id == PanelAccount.panel_id)
-            .where(
-                PanelAccount.user_id == User.id,
-                PanelAccount.status == PanelAccountStatus.error,
-                Panel.is_active.is_(True),
-            )
-        ),
-    )
-    # No group join → plain count(*) (users.id is PK). Distinct only when join
-    # can duplicate rows — cheaper plan for the default Users board.
     id_count = (
         func.count(func.distinct(User.id)) if needs_group_join else func.count()
     )
     q = select(
         id_count,
         id_count.filter(active_c),
-        id_count.filter(cheap_error),
         id_count.filter(expired_c),
     )
     if needs_group_join:
@@ -1612,11 +1636,28 @@ async def _users_list_chip_counts(
     if filters:
         q = q.where(*filters)
     row = (await db.execute(q)).one()
+    # Error chip scoped: start from error accounts (indexed), intersect scope.
+    err_q = (
+        select(func.count(func.distinct(User.id)))
+        .select_from(PanelAccount)
+        .join(Panel, Panel.id == PanelAccount.panel_id)
+        .join(User, User.id == PanelAccount.user_id)
+        .where(
+            PanelAccount.status == PanelAccountStatus.error,
+            Panel.is_active.is_(True),
+            active_c,
+        )
+    )
+    if needs_group_join:
+        err_q = err_q.join(UserGroup, UserGroup.user_id == User.id)
+    if filters:
+        err_q = err_q.where(*filters)
+    err_n = int((await db.execute(err_q)).scalar() or 0)
     return UsersListCounts(
         all=int(row[0] or 0),
         active=int(row[1] or 0),
-        error=int(row[2] or 0),
-        expired=int(row[3] or 0),
+        error=err_n,
+        expired=int(row[2] or 0),
     )
 
 
