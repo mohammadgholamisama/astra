@@ -75,9 +75,9 @@ def _build_engine_kwargs() -> dict[str, Any]:
             "command_timeout": 45,
             "server_settings": {
                 "statement_timeout": "45000",
-                # Kill leaked idle-in-transaction checkouts (pool starve → /sub 503).
-                # Cap below old 300s so CLOSE-WAIT / stuck sessions free faster.
-                "idle_in_transaction_session_timeout": "120000",
+                # Kill leaked idle-in-transaction checkouts fast. Callers must
+                # release_db_txn() before remote HTTP; 60s is a safety net only.
+                "idle_in_transaction_session_timeout": "60000",
             },
         }
     return kwargs
@@ -149,8 +149,39 @@ def pool_status() -> dict[str, Any]:
     return info
 
 
+async def release_db_txn(session: AsyncSession) -> None:
+    """End the open transaction so Postgres is not left ``idle in transaction``.
+
+    Call this before any slow non-DB await (remote HTTP, sleep, subprocess)
+    while still holding a request-scoped session. Read-only → rollback;
+    dirty → commit. ``expire_on_commit=False`` keeps loaded attrs in memory.
+    """
+    try:
+        in_txn = bool(session.in_transaction())
+    except Exception:  # noqa: BLE001
+        in_txn = True
+    if not in_txn:
+        return
+    dirty = bool(session.new or session.dirty or session.deleted)
+    try:
+        if dirty:
+            await session.commit()
+        else:
+            await session.rollback()
+    except Exception:  # noqa: BLE001
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """Request-scoped session — always closed, even on CancelledError."""
+    """Request-scoped session — always closed, even on CancelledError.
+
+    Does not auto-commit: handlers that mutate must ``await db.commit()``.
+    Always ends any open txn on exit so Postgres never keeps
+    ``idle in transaction`` after the response.
+    """
     session = AsyncSessionLocal()
     try:
         yield session
@@ -161,6 +192,11 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             pass
         raise
     finally:
+        try:
+            if session.in_transaction():
+                await session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
         try:
             await session.close()
         except Exception:  # noqa: BLE001

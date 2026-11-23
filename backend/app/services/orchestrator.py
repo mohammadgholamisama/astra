@@ -8463,6 +8463,7 @@ async def refresh_usage_pool_safe(
 
     pullable: list[tuple[int, Panel, str, str | None, int]] = []
     username = ""
+    astra_panel_ids: list[int] = []
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(User)
@@ -8482,56 +8483,18 @@ async def refresh_usage_pool_safe(
         ):
             return (-1, False, False, str(getattr(user.status, "value", user.status)))
         username = str(user.username or "")
-        # Inline Astra sync while we still have a session (local SQL, short).
-        try:
-            from app.services import astra_node as astra_node_svc
-
-            astra_synced: set[int] = set()
-            for account in user.panel_accounts or []:
-                panel = account.panel
-                if (
-                    not panel
-                    or panel.type != PanelType.astra
-                    or not _panel_is_active(panel)
-                ):
-                    continue
-                pid = int(panel.id)
-                if pid in astra_synced:
-                    continue
-                try:
-                    await astra_node_svc.sync_traffic_from_xray(db, panel)
-                    astra_synced.add(pid)
-                except Exception:  # noqa: BLE001
-                    pass
-            for account in user.panel_accounts or []:
-                panel = account.panel
-                if not panel or panel.type != PanelType.astra:
-                    continue
-                if account.status not in (
-                    PanelAccountStatus.active,
-                    PanelAccountStatus.error,
-                ):
-                    continue
-                email = (account.remote_username or user.username or "").strip()
-                if not email:
-                    continue
-                client = await astra_node_svc.get_client(db, panel.id, email)
-                if not client:
-                    continue
-                got = int(client.used_up or 0) + int(client.used_down or 0)
-                account.used_traffic = got
-                account.last_sync_at = datetime.now(timezone.utc)
-        except Exception:  # noqa: BLE001
-            pass
-
         for account in user.panel_accounts or []:
             panel = account.panel
-            if (
-                not panel
-                or not _panel_is_active(panel)
-                or panel.type == PanelType.astra
-                or account.status
-                not in (PanelAccountStatus.active, PanelAccountStatus.error)
+            if not panel or not _panel_is_active(panel):
+                continue
+            if panel.type == PanelType.astra:
+                pid = int(panel.id)
+                if pid not in astra_panel_ids:
+                    astra_panel_ids.append(pid)
+                continue
+            if account.status not in (
+                PanelAccountStatus.active,
+                PanelAccountStatus.error,
             ):
                 continue
             uname = (account.remote_username or user.username or "").strip()
@@ -8560,8 +8523,67 @@ async def refresh_usage_pool_safe(
                     int(account.used_traffic or 0),
                 )
             )
-        await db.commit()
-    # Session closed → pool connection returned before remote HTTP.
+        # End read txn before any xray/OS/remote await (idle-in-transaction fix).
+        await db.rollback()
+    # Session closed → pool connection returned.
+
+    # Astra local sync in its own short sessions (no hold across awaits).
+    if astra_panel_ids:
+        try:
+            from app.services import astra_node as astra_node_svc
+
+            for pid in astra_panel_ids:
+                try:
+                    async with AsyncSessionLocal() as sdb:
+                        panel = await sdb.get(Panel, int(pid))
+                        if (
+                            panel is None
+                            or panel.type != PanelType.astra
+                            or not _panel_is_active(panel)
+                        ):
+                            continue
+                        await astra_node_svc.sync_traffic_from_xray(sdb, panel)
+                        email = (username or "").strip()
+                        if email:
+                            # Mirror this user's Astra meters onto accounts.
+                            result = await sdb.execute(
+                                select(PanelAccount)
+                                .where(
+                                    PanelAccount.user_id == int(user_id),
+                                    PanelAccount.panel_id == int(pid),
+                                    PanelAccount.status.in_(
+                                        (
+                                            PanelAccountStatus.active,
+                                            PanelAccountStatus.error,
+                                        )
+                                    ),
+                                )
+                            )
+                            now = datetime.now(timezone.utc)
+                            for account in result.scalars().all():
+                                em = (
+                                    account.remote_username or username or ""
+                                ).strip() or email
+                                client = await astra_node_svc.get_client(
+                                    sdb, int(pid), em
+                                )
+                                if not client:
+                                    continue
+                                got = int(client.used_up or 0) + int(
+                                    client.used_down or 0
+                                )
+                                account.used_traffic = got
+                                account.last_sync_at = now
+                        await sdb.commit()
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "pool-safe astra sync failed user=%s panel=%s",
+                        username,
+                        pid,
+                        exc_info=True,
+                    )
+        except Exception:  # noqa: BLE001
+            pass
 
     # Cover EVERY live remote. Old quick=3s/sem=8 dropped slow PasarGuard
     # meters → Astra under-reported vs «پنل اصلی» (e.g. 58MB vs 155MB).

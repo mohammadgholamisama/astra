@@ -312,10 +312,9 @@ async def _release_db_txn(db: AsyncSession) -> None:
     idle_in_transaction killers close the socket → PendingRollback → false
     «دیتابیس شلوغ است» on save.
     """
-    try:
-        await db.rollback()
-    except Exception:  # noqa: BLE001
-        pass
+    from app.core.database import release_db_txn
+
+    await release_db_txn(db)
 
 
 def _is_db_conn_dead(exc: BaseException) -> bool:

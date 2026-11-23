@@ -1631,9 +1631,13 @@ async def list_users(
             pass
 
     if refresh and users:
-        # Parallel live pull for this page — keep UI meters level with remotes
+        # End list-read txn before parallel remote pulls (idle-in-transaction).
+        from app.core.database import release_db_txn
+
+        await release_db_txn(db)
+        # Isolated pool-safe pulls — never hold list request txn across remotes.
         await orchestrator.refresh_users_usage_batch(
-            db, users, force=True, concurrency=8, push_remotes=False, quick=True
+            db, users, force=True, concurrency=4, push_remotes=False, quick=True
         )
         await db.commit()
         ids = [u.id for u in users]

@@ -919,9 +919,9 @@ async def sample_all_users_once() -> dict[str, int]:
                 logger.info("analytics weighted rebase: %s", rebase)
         except Exception:  # noqa: BLE001
             logger.exception("analytics weighted rebase failed")
+        # Load ids in a short read txn, then sample in small sessions so we
+        # never sit ``idle in transaction`` across event-loop yields.
         async with AsyncSessionLocal() as db:
-            # Skip idle/zero users — samples of 0 don't advance buckets and
-            # were pegging CPU on large installs (10k+ nested txns/min).
             rows = (
                 await db.execute(
                     select(User.id, func.coalesce(User.used_traffic, 0)).where(
@@ -937,35 +937,33 @@ async def sample_all_users_once() -> dict[str, int]:
                     )
                 )
             ).all()
-            n = 0
-            for uid, total in rows:
-                try:
-                    async with db.begin_nested():
-                        await apply_raw_sample(db, int(uid), int(total or 0))
-                    n += 1
-                except Exception:  # noqa: BLE001
-                    logger.exception("analytics sample user=%s failed", uid)
+            await db.rollback()
+        pairs = [(int(uid), int(total or 0)) for uid, total in rows]
+        n = 0
+        chunk = 40
+        for i in range(0, len(pairs), chunk):
+            batch = pairs[i : i + chunk]
+            async with AsyncSessionLocal() as db:
+                for uid, total in batch:
                     try:
-                        await db.rollback()
+                        async with db.begin_nested():
+                            await apply_raw_sample(db, uid, total)
+                        n += 1
                     except Exception:  # noqa: BLE001
-                        pass
-                if n % 80 == 0:
-                    try:
-                        await db.commit()
-                    except Exception:  # noqa: BLE001
+                        logger.exception("analytics sample user=%s failed", uid)
                         try:
                             await db.rollback()
                         except Exception:  # noqa: BLE001
                             pass
-                    # Yield so API / hot usage keep the event loop.
-                    await asyncio.sleep(0)
-            try:
-                await db.commit()
-            except Exception:  # noqa: BLE001
                 try:
-                    await db.rollback()
+                    await db.commit()
                 except Exception:  # noqa: BLE001
-                    pass
+                    try:
+                        await db.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+            # Session closed → connection returned before yielding the loop.
+            await asyncio.sleep(0)
         return {"users": n, "ms": int((time.monotonic() - t0) * 1000)}
 
 

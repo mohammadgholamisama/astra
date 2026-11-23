@@ -219,7 +219,7 @@ async def _astra_xray_heal_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logging.getLogger("astra").exception("xray heal loop failed")
-        await asyncio.sleep(90)
+        await asyncio.sleep(180)
 
 
 async def _outbound_health_loop() -> None:
@@ -265,7 +265,7 @@ async def _outbound_health_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("outbound health loop failed")
-        await asyncio.sleep(180)
+        await asyncio.sleep(300)
 
 
 async def _usage_sync_loop() -> None:
