@@ -1661,7 +1661,7 @@ def _get_account_prov_sem() -> asyncio.Semaphore:
     """
     global _account_prov_sem
     if _account_prov_sem is None:
-        _account_prov_sem = asyncio.Semaphore(20)
+        _account_prov_sem = asyncio.Semaphore(4)
     return _account_prov_sem
 
 
@@ -9226,6 +9226,44 @@ async def _freeze_pasarguard_limited_accounts(
     return ok_n, fail_n
 
 
+_FREEZE_INFLIGHT: set[int] = set()
+_FREEZE_KICK_LOCK: asyncio.Lock | None = None
+
+
+def _freeze_kick_lock() -> asyncio.Lock:
+    global _FREEZE_KICK_LOCK
+    if _FREEZE_KICK_LOCK is None:
+        _FREEZE_KICK_LOCK = asyncio.Lock()
+    return _FREEZE_KICK_LOCK
+
+
+async def kick_freeze_user(user_id: int, *, remote_timeout: float = 10.0) -> None:
+    """Deduped background freeze — /sub used to spawn concurrency=14 per hit."""
+    uid = int(user_id)
+    async with _freeze_kick_lock():
+        if uid in _FREEZE_INFLIGHT:
+            return
+        _FREEZE_INFLIGHT.add(uid)
+
+    async def _run() -> None:
+        try:
+            await _freeze_quota_users(
+                [uid],
+                remote_timeout=remote_timeout,
+                concurrency=1,
+                wall=40.0,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("kick freeze failed user_id=%s", uid, exc_info=True)
+        finally:
+            _FREEZE_INFLIGHT.discard(uid)
+
+    try:
+        asyncio.create_task(_run(), name=f"astra-freeze-{uid}")
+    except Exception:  # noqa: BLE001
+        _FREEZE_INFLIGHT.discard(uid)
+
+
 async def _freeze_quota_users(
     user_ids: list[int],
     *,
@@ -9244,8 +9282,8 @@ async def _freeze_quota_users(
     ids = list(dict.fromkeys(int(x) for x in user_ids if x))
     if not ids:
         return 0, 0
-    # Hard cap — callers sometimes pass 12–16; that starved /api/system.
-    sem = asyncio.Semaphore(max(1, min(int(concurrency), 3)))
+    # Hard cap — /sub used to pass 14 and starve the panel UI.
+    sem = asyncio.Semaphore(max(1, min(int(concurrency), 2)))
     ok_n = 0
     fail_n = 0
 

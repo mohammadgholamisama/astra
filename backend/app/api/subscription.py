@@ -1527,16 +1527,9 @@ async def _serve_subscription_db(
         except Exception:  # noqa: BLE001
             pass
         try:
-            from app.services.orchestrator import _freeze_quota_users
+            from app.services.orchestrator import kick_freeze_user
 
-            asyncio.create_task(
-                _freeze_quota_users(
-                    [uid_safe],
-                    remote_timeout=12.0,
-                    concurrency=14,
-                    wall=90.0,
-                )
-            )
+            await kick_freeze_user(uid_safe, remote_timeout=10.0)
         except Exception:  # noqa: BLE001
             pass
     if (
@@ -1763,16 +1756,9 @@ async def _serve_subscription_db(
             invalidate_user_feed_cache(int(user.id))
             # Kick remote disable NOW — status remark only, no live share links.
             try:
-                from app.services.orchestrator import _freeze_quota_users
+                from app.services.orchestrator import kick_freeze_user
 
-                asyncio.create_task(
-                    _freeze_quota_users(
-                        [int(user.id)],
-                        remote_timeout=12.0,
-                        concurrency=14,
-                        wall=90.0,
-                    )
-                )
+                await kick_freeze_user(int(user.id), remote_timeout=10.0)
             except Exception:  # noqa: BLE001
                 pass
             if curated:
