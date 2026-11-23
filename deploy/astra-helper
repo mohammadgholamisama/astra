@@ -941,6 +941,9 @@ cmd_apply_update() {
     cd '${ASTRA_ROOT}/backend'
     . .venv/bin/activate
     pip install -r requirements.txt
+    # Dashboard host stats — ensure even if requirements sync was partial
+    python -c 'import psutil' 2>/dev/null || pip install -q psutil==6.1.1
+    python -c 'import psutil; print(\"psutil\", psutil.__version__)'
   "
 
   echo "astra-helper: frontend build…"

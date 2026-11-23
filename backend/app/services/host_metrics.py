@@ -24,6 +24,8 @@ _CACHE_AT = 0.0
 _CACHE_TTL = 2.0
 _SYSTEMCTL_OK: bool | None = None
 _SYSTEMCTL_PROBE_AT = 0.0
+_prev_proc_cpu: tuple[int, int] | None = None  # idle, total jiffies
+_psutil_repair_tried = False
 
 
 def _bytes_dict(total: int, used: int, free: int, percent: float) -> dict[str, Any]:
@@ -347,9 +349,93 @@ def _collect_with_psutil() -> dict[str, Any]:
     }
 
 
+def _cpu_percent_from_proc() -> float:
+    """Non-blocking CPU% via /proc/stat deltas (needs ≥2 samples)."""
+    global _prev_proc_cpu
+    try:
+        with open("/proc/stat", encoding="utf-8") as f:
+            parts = f.readline().split()
+        nums = [int(x) for x in parts[1:8]]
+        idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
+        total = sum(nums)
+        if _prev_proc_cpu is None:
+            _prev_proc_cpu = (idle, total)
+            # Approximate from load when first sample
+            la1, _, _ = _load_avg()
+            cores = max(1, os.cpu_count() or 1)
+            return round(min(100.0, max(0.0, (la1 / cores) * 100.0)), 1)
+        di = idle - _prev_proc_cpu[0]
+        dt = total - _prev_proc_cpu[1]
+        _prev_proc_cpu = (idle, total)
+        if dt <= 0:
+            return 0.0
+        return round(max(0.0, min(100.0, (1.0 - (di / dt)) * 100.0)), 1)
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def _net_from_proc() -> dict[str, int]:
+    sent = recv = ps = pr = 0
+    try:
+        with open("/proc/net/dev", encoding="utf-8") as f:
+            for line in f:
+                if ":" not in line:
+                    continue
+                name, rest = line.split(":", 1)
+                iface = name.strip()
+                if iface in ("lo",) or iface.startswith(("veth", "br-", "docker")):
+                    continue
+                cols = rest.split()
+                if len(cols) < 16:
+                    continue
+                recv += int(cols[0])
+                pr += int(cols[1])
+                sent += int(cols[8])
+                ps += int(cols[9])
+    except (OSError, ValueError):
+        pass
+    return {
+        "bytes_sent": sent,
+        "bytes_recv": recv,
+        "packets_sent": ps,
+        "packets_recv": pr,
+    }
+
+
+def _process_count_proc() -> int:
+    try:
+        return sum(1 for p in Path("/proc").iterdir() if p.name.isdigit())
+    except OSError:
+        return 0
+
+
+def _try_install_psutil() -> bool:
+    """One-shot self-heal: install psutil into the running venv if missing."""
+    global _psutil_repair_tried
+    if _psutil_repair_tried:
+        return False
+    _psutil_repair_tried = True
+    try:
+        import sys
+
+        logger.warning("psutil missing — attempting pip install into %s", sys.executable)
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "psutil==6.1.1"],
+            check=True,
+            timeout=180,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("psutil auto-install failed: %s", exc)
+        return False
+
+
 def _collect_fallback() -> dict[str, Any]:
-    """Minimal metrics without psutil (Linux /proc)."""
+    """Full-enough metrics from Linux /proc when psutil is unavailable."""
     mem_total = mem_avail = mem_free = 0
+    swap_total = swap_free = 0
     try:
         with open("/proc/meminfo", encoding="utf-8") as f:
             kv: dict[str, int] = {}
@@ -360,14 +446,19 @@ def _collect_fallback() -> dict[str, Any]:
             mem_total = kv.get("MemTotal", 0)
             mem_avail = kv.get("MemAvailable", kv.get("MemFree", 0))
             mem_free = kv.get("MemFree", 0)
+            swap_total = kv.get("SwapTotal", 0)
+            swap_free = kv.get("SwapFree", 0)
     except OSError:
         pass
     mem_used = max(0, mem_total - mem_avail)
     mem_pct = round((mem_used / mem_total) * 100, 1) if mem_total else 0.0
+    swap_used = max(0, swap_total - swap_free)
+    swap_pct = round((swap_used / swap_total) * 100, 1) if swap_total else 0.0
 
     cpu_count = os.cpu_count() or 0
     la1, la5, la15 = _load_avg()
     uptime = _read_uptime_seconds()
+    cpu_pct = _cpu_percent_from_proc()
 
     disk_total = disk_used = disk_free = 0
     disk_pct = 0.0
@@ -380,8 +471,29 @@ def _collect_fallback() -> dict[str, Any]:
     except OSError:
         pass
 
+    disks = [
+        {
+            "mount": "/",
+            **_bytes_dict(disk_total, disk_used, disk_free, disk_pct),
+        }
+    ]
+    try:
+        st2 = os.statvfs("/opt/astra")
+        t2 = st2.f_frsize * st2.f_blocks
+        if t2 and t2 != disk_total:
+            f2 = st2.f_frsize * st2.f_bavail
+            u2 = t2 - st2.f_frsize * st2.f_bfree
+            disks.append(
+                {
+                    "mount": "/opt/astra",
+                    **_bytes_dict(t2, u2, f2, round((u2 / t2) * 100, 1) if t2 else 0.0),
+                }
+            )
+    except OSError:
+        pass
+
     return {
-        "cpu_percent": 0.0,
+        "cpu_percent": cpu_pct,
         "cpu_count_logical": cpu_count,
         "cpu_count_physical": None,
         "cpu_per_core": [],
@@ -391,23 +503,13 @@ def _collect_fallback() -> dict[str, Any]:
             **_bytes_dict(mem_total, mem_used, mem_free, mem_pct),
             "available": int(mem_avail),
         },
-        "swap": _bytes_dict(0, 0, 0, 0.0),
-        "disks": [
-            {
-                "mount": "/",
-                **_bytes_dict(disk_total, disk_used, disk_free, disk_pct),
-            }
-        ],
+        "swap": _bytes_dict(swap_total, swap_used, swap_free, swap_pct),
+        "disks": disks,
         "uptime_seconds": int(uptime),
         "boot_time": int(time.time() - uptime) if uptime else 0,
-        "process_count": 0,
-        "net": {
-            "bytes_sent": 0,
-            "bytes_recv": 0,
-            "packets_sent": 0,
-            "packets_recv": 0,
-        },
-        "note": "psutil نصب نیست — آمار محدود",
+        "process_count": _process_count_proc(),
+        "net": _net_from_proc(),
+        "note": "",
     }
 
 
@@ -418,6 +520,7 @@ def collect_host_metrics(*, force: bool = False) -> dict[str, Any]:
         return _CACHE
 
     t0 = time.monotonic()
+    engine = "fallback"
     try:
         import psutil  # noqa: F401
 
@@ -425,8 +528,19 @@ def collect_host_metrics(*, force: bool = False) -> dict[str, Any]:
         engine = "psutil"
     except Exception as exc:  # noqa: BLE001
         logger.debug("psutil host metrics failed: %s", exc)
-        core = _collect_fallback()
-        engine = "fallback"
+        if _try_install_psutil():
+            try:
+                import importlib
+                import psutil as _ps
+
+                importlib.reload(_ps)
+                core = _collect_with_psutil()
+                engine = "psutil"
+            except Exception as exc2:  # noqa: BLE001
+                logger.debug("psutil still unavailable after install: %s", exc2)
+                core = _collect_fallback()
+        else:
+            core = _collect_fallback()
 
     hostname = socket.gethostname()
     try:
