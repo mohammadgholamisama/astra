@@ -1550,17 +1550,33 @@ async def _users_list_chip_counts(
     group_id: int | None,
     now_ts: int,
 ) -> UsersListCounts:
-    """One round-trip for chip totals — was 4×COUNT and dominated list latency."""
+    """One round-trip for chip totals — was 4×COUNT and dominated list latency.
+
+    Error chip uses a cheap EXISTS (status=error on active panel) instead of the
+    full actionable-error clause with JSON/ILIKE filters — that path scanned too
+    hard under bot load and stalled the panel board.
+    """
     filters, needs_group_join, group_filter = _user_list_scope(
         search=search, group_id=group_id
     )
     active_c = _active_user_clause(now_ts)
     expired_c = _expired_user_clause(now_ts)
-    error_c = _error_user_clause(now_ts)
+    cheap_error = and_(
+        active_c,
+        exists(
+            select(PanelAccount.id)
+            .join(Panel, Panel.id == PanelAccount.panel_id)
+            .where(
+                PanelAccount.user_id == User.id,
+                PanelAccount.status == PanelAccountStatus.error,
+                Panel.is_active.is_(True),
+            )
+        ),
+    )
     q = select(
         func.count(func.distinct(User.id)),
         func.count(func.distinct(User.id)).filter(active_c),
-        func.count(func.distinct(User.id)).filter(error_c),
+        func.count(func.distinct(User.id)).filter(cheap_error),
         func.count(func.distinct(User.id)).filter(expired_c),
     )
     if needs_group_join:

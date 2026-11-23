@@ -615,7 +615,7 @@ async def lifespan(_app: FastAPI):
         name="astra-outbound-health",
     )
     xray_heal_task = asyncio.create_task(
-        _delayed(_astra_xray_heal_loop, 30, "xray-heal"),
+        _delayed(_astra_xray_heal_loop, 240, "xray-heal"),
         name="astra-xray-heal",
     )
     order_boot_task = asyncio.create_task(
