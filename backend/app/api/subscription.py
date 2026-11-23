@@ -24,6 +24,7 @@ from app.services.orchestrator import (
     hydrate_share_links,
     refresh_usage,
     sync_modify_user,
+    sync_modify_user_background,
 )
 from app.services.site_settings import (
     ensure_loaded,
@@ -69,10 +70,11 @@ def _is_cancel(exc: BaseException) -> bool:
 
 # Debounce background maintain so many clients don't stampede one user
 _bg_last: dict[int, float] = {}
-_BG_MIN_INTERVAL = 18.0
+_BG_MIN_INTERVAL = 45.0
 # Parallel heal/hydrate — keep low so QueuePool keeps headroom for /sub.
 # (Was 6; each task used to hold a DB checkout across remote HTTP.)
-_bg_heavy = asyncio.Semaphore(3)
+_bg_heavy = asyncio.Semaphore(2)
+_BG_MAINTAIN_GATE = asyncio.Semaphore(2)
 
 # Live usage pull on sub refresh — must stay accurate (quota / money).
 _bg_usage_last: dict[int, float] = {}
@@ -458,26 +460,29 @@ async def _bg_sub_maintain(user_id: int, *, force: bool = False) -> None:
                         UserStatus.expired,
                         UserStatus.disabled,
                     )
-                    if changed or blocked or blocked_early:
-                        await asyncio.wait_for(
-                            sync_modify_user(
-                                db,
-                                user,
-                                skip_nginx_sync=True,
-                                # Harder freeze for expired — freeze_fast left
-                                # PasarGuard remotes online when disable was slow.
-                                freeze_fast=False,
-                                remote_timeout=14.0,
-                            ),
-                            timeout=45.0,
-                        )
+                    if blocked or blocked_early:
+                        await db.commit()
+                        from app.services.orchestrator import kick_freeze_user
+
+                        await kick_freeze_user(int(user_id), remote_timeout=10.0)
+                        invalidate_user_feed_cache(int(user_id))
+                    elif changed:
+                        await db.commit()
+                        # Fire-and-forget — never hold this session across remotes.
+                        try:
+                            asyncio.create_task(
+                                sync_modify_user_background(int(user_id)),
+                                name=f"astra-sub-sync-{int(user_id)}",
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
                         invalidate_user_feed_cache(int(user_id))
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("bg quota user_id=%s: %s", user_id, exc)
-                try:
-                    await db.commit()
-                except Exception:  # noqa: BLE001
-                    await db.rollback()
+                    try:
+                        await db.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
     except Exception:  # noqa: BLE001
         logger.exception("bg sub maintain user_id=%s failed", user_id)
 
@@ -648,9 +653,13 @@ async def _bg_sub_maintain_deferred(
 
 
 def _schedule_bg_maintain(user_id: int, *, force: bool = False) -> None:
+    async def _gated() -> None:
+        async with _BG_MAINTAIN_GATE:
+            await _bg_sub_maintain_deferred(user_id, force=force)
+
     try:
         asyncio.create_task(
-            _bg_sub_maintain_deferred(user_id, force=force),
+            _gated(),
             name=f"astra-sub-bg-{user_id}",
         )
     except RuntimeError:
