@@ -1057,12 +1057,31 @@ async def rebuild_xray_config(
 
     net = panel_inbound_network(meta=meta)
     inbound_clients = []
+    # Xray refuses duplicate emails («User X already exists») and exits —
+    # that 203/crash-looped systemd when configs had dupes from legacy rows.
+    seen_emails: set[str] = set()
+    seen_uuids: set[str] = set()
     for c in clients:
         if not c.enable:
             continue
+        email = (c.email or "").strip()
+        uid = (c.uuid or "").strip()
+        if not email or not uid:
+            continue
+        el = email.lower()
+        if el in seen_emails or uid in seen_uuids:
+            logger.warning(
+                "skip duplicate xray client panel=%s email=%s uuid=%s",
+                panel.id,
+                email,
+                uid[:8],
+            )
+            continue
+        seen_emails.add(el)
+        seen_uuids.add(uid)
         entry: dict[str, Any] = {
-            "id": c.uuid,
-            "email": c.email,
+            "id": uid,
+            "email": email,
             "level": 0,
         }
         # Vision is Reality/TCP-only — never set on XHTTP.
