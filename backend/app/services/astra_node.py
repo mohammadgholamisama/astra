@@ -381,7 +381,20 @@ async def sync_nginx_ws_upstreams(db: AsyncSession) -> Path | None:
         logger.warning("nginx ws include write failed: %s", exc)
         return None
     await db.flush()
-    # Best-effort reload (astra user → sudo astra-helper)
+    # Never await sudo/nginx while the caller still holds this DB transaction —
+    # that was flooding «connection is closed» / PendingRollback under load.
+    try:
+        asyncio.get_running_loop().create_task(
+            _reload_nginx_helper_bg(),
+            name="astra-nginx-reload",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("nginx reload schedule: %s", exc)
+    return NGINX_WS_INCLUDE
+
+
+async def _reload_nginx_helper_bg() -> None:
+    """Best-effort nginx reload outside any DB transaction."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "sudo",
@@ -393,7 +406,6 @@ async def sync_nginx_ws_upstreams(db: AsyncSession) -> Path | None:
         await asyncio.wait_for(proc.communicate(), timeout=25)
     except Exception as exc:  # noqa: BLE001
         logger.debug("nginx reload via helper: %s", exc)
-    return NGINX_WS_INCLUDE
 
 
 def _free_tcp_port() -> int:

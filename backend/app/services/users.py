@@ -29,6 +29,12 @@ async def load_user(db: AsyncSession, username: str) -> User | None:
     return result.scalar_one_or_none()
 
 
+async def load_user_by_token_light(db: AsyncSession, token: str) -> User | None:
+    """User row only — for cache-hit /sub Update (no groups/accounts join)."""
+    result = await db.execute(select(User).where(User.sub_token == token))
+    return result.scalar_one_or_none()
+
+
 async def load_user_by_token(db: AsyncSession, token: str) -> User | None:
     from app.models.group import Group, GroupPanel
     from app.models.user import PanelAccount
@@ -64,20 +70,31 @@ def to_user_response(user: User, *, include_links: bool = True) -> UserResponse:
 
     panel_accounts = []
     for a in accounts:
-        if a.status == PanelAccountStatus.deleted:
-            continue
         # Only use panel if already loaded — never trigger async lazy IO
         panel = a.__dict__.get("panel")
-        # Off / missing panel must not keep showing as a user error or live account
-        if panel is None or not bool(getattr(panel, "is_active", True)):
-            continue
+        used = int(getattr(a, "used_traffic", 0) or 0)
+        is_deleted = a.status == PanelAccountStatus.deleted
+        panel_active = panel is not None and bool(getattr(panel, "is_active", True))
+
+        # Deleted remotes keep banked ``used_traffic`` for quota. The Users
+        # «مصرف پنل‌ها» modal must still list them — hiding them made total
+        # traffic look orphaned after remove-panel / remove-group.
+        if is_deleted:
+            if used <= 0:
+                continue
+        elif not panel_active:
+            # Panel off/missing: still show rows that contribute to quota.
+            if used <= 0:
+                continue
+
         panel_type = None
         panel_base = None
         if panel is not None:
             ptype = getattr(panel, "type", None)
             panel_type = ptype.value if hasattr(ptype, "value") else (str(ptype) if ptype else None)
             panel_base = getattr(panel, "base_url", None) or getattr(panel, "url", None)
-        raw_links = [x for x in (a.links or []) if x]
+        # Deleted rows are already cut from sub — never re-ship stale share links
+        raw_links = [] if is_deleted else [x for x in (a.links or []) if x]
         # Never surface stale error_message on healthy accounts (UI false positives)
         err = a.error_message if a.status == PanelAccountStatus.error else None
         panel_accounts.append(

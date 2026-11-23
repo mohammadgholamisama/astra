@@ -44,12 +44,35 @@ class PanelTestOut(BaseModel):
     is_active: bool
     success: bool
     error: str | None = None
+    latency_ms: int | None = None
+    grade: str | None = None  # fast | ok | slow | fail
+    base_url: str | None = None
+
+
+class PanelTestAllStats(BaseModel):
+    total: int = 0
+    ok: int = 0
+    fail: int = 0
+    active_ok: int = 0
+    active_fail: int = 0
+    inactive_ok: int = 0
+    inactive_fail: int = 0
+    fast: int = 0
+    normal: int = 0
+    slow: int = 0
+    avg_latency_ms: int | None = None
+    median_latency_ms: int | None = None
+    best_latency_ms: int | None = None
+    worst_latency_ms: int | None = None
+    duration_ms: int = 0
 
 
 class PanelTestAllOut(BaseModel):
     results: list[PanelTestOut] = Field(default_factory=list)
     ok: int = 0
     fail: int = 0
+    stats: PanelTestAllStats = Field(default_factory=PanelTestAllStats)
+    tested_at: datetime | None = None
 
 
 class PanelOut(ORMModel):
@@ -63,8 +86,16 @@ class PanelOut(ORMModel):
     meta: dict[str, Any]
     is_active: bool
     category_id: int | None = None
+    sort_order: int = 0
     last_ok_at: datetime | None
     created_at: datetime
+
+
+class PanelReorderBody(BaseModel):
+    """Reorder panels inside one UI tab (category or «همه پنل‌ها»)."""
+
+    panel_ids: list[int] = Field(min_length=1)
+    category_id: int | None = None
 
 
 class PanelCategoryCreate(BaseModel):

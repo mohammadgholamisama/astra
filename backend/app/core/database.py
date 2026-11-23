@@ -234,11 +234,14 @@ async def pool_guardian_loop(interval: float = 45.0) -> None:
                 high_streak += 1
                 logger.warning("db pool critical: %s", st)
                 if high_streak >= 3:
-                    # Soft recovery: dispose idle pooled conns; in-flight keep working
+                    # Do NOT dispose_engine() here — that closes live checkouts and
+                    # cascades PendingRollback / «connection is closed» across the
+                    # panel (create/save look like «DB busy»). Log + reset streak.
                     logger.error(
-                        "db pool stuck at capacity — disposing engine to recover"
+                        "db pool stuck at capacity — skip dispose to protect "
+                        "in-flight requests: %s",
+                        st,
                     )
-                    await dispose_engine()
                     high_streak = 0
             elif pressure == "high":
                 high_streak = min(high_streak + 1, 2)

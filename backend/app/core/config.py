@@ -21,10 +21,10 @@ class Settings(BaseSettings):
     )
 
     DATABASE_URL: str = "sqlite+aiosqlite:///./astra.db"
-    # Postgres pool (ignored for SQLite NullPool). Keep headroom for login/API.
-    DB_POOL_SIZE: int = 8
-    DB_MAX_OVERFLOW: int = 12
-    DB_POOL_TIMEOUT: float = 3.0
+    # Postgres pool — sized so analytics/UI never starve behind usage pulls.
+    DB_POOL_SIZE: int = 48
+    DB_MAX_OVERFLOW: int = 36
+    DB_POOL_TIMEOUT: float = 8.0
     DB_POOL_RECYCLE: int = 300
     SECRET_KEY: str = "astra-dev-secret-key-change-in-production-32chars"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
@@ -40,8 +40,12 @@ class Settings(BaseSettings):
     # when a user spans many panels; wall time still ≈ ceil(N/limit)×slowest.
     PANEL_REMOTE_CONCURRENCY: int = 32
     # Background quota watch cadence (seconds). Exhausted users are frozen
-    # on every remote in the same cycle. Keep ≥8 so heavy installs don't peg CPU.
-    USAGE_REFRESH_SECONDS: int = 10
+    # on every remote in the same cycle.
+    USAGE_REFRESH_SECONDS: int = 15
+    # Full-fleet usage pull (all panels + dirty recount), seconds.
+    USAGE_FLEET_SECONDS: int = 60
+    # Hot loop for /sub-active users (seconds).
+    USAGE_HOT_SECONDS: int = 20
     # Official install helper for SSL / nginx (empty = SSL UI disabled)
     ASTRA_HELPER: str = ""
     ASTRA_APP_PORT: int = 8000

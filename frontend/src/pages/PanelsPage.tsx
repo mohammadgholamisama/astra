@@ -4,6 +4,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowRightLeft,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   FolderPlus,
   Gauge,
   GripVertical,
@@ -261,7 +263,19 @@ export default function PanelsPage() {
 
   function beginReorder() {
     if (searchQ) setSearch("");
-    setReorderIds(visiblePanels.map((p) => p.id));
+    // Full tab list — never the search-filtered subset (that broke save)
+    const tabIds = [...data]
+      .filter((p) =>
+        activeTab == null ? p.category_id == null : p.category_id === activeTab
+      )
+      .sort((a, b) => {
+        const sa = a.sort_order ?? 0;
+        const sb = b.sort_order ?? 0;
+        if (sa !== sb) return sa - sb;
+        return a.id - b.id;
+      })
+      .map((p) => p.id);
+    setReorderIds(tabIds);
     setReorderMode(true);
     setDragOverId(null);
     setDraggingId(null);
@@ -285,6 +299,19 @@ export default function PanelsPage() {
       if (from < 0 || to < 0) return prev;
       next.splice(from, 1);
       next.splice(to, 0, fromId);
+      return next;
+    });
+  }
+
+  function shiftReorderId(id: number, dir: -1 | 1) {
+    setReorderIds((prev) => {
+      const from = prev.indexOf(id);
+      if (from < 0) return prev;
+      const to = from + dir;
+      if (to < 0 || to >= prev.length) return prev;
+      const next = [...prev];
+      const [row] = next.splice(from, 1);
+      next.splice(to, 0, row);
       return next;
     });
   }
@@ -685,10 +712,20 @@ export default function PanelsPage() {
       }),
     onSuccess: (rows) => {
       qc.setQueryData<Panel[]>(["panels"], (prev) => {
-        if (!prev) return rows;
         const byId = new Map(rows.map((p) => [p.id, p]));
-        return prev.map((p) => byId.get(p.id) || p);
+        const merged = (prev || []).map((p) => byId.get(p.id) || p);
+        // Include any returned rows missing from cache
+        for (const p of rows) {
+          if (!merged.some((x) => x.id === p.id)) merged.push(p);
+        }
+        return [...merged].sort((a, b) => {
+          const sa = a.sort_order ?? 0;
+          const sb = b.sort_order ?? 0;
+          if (sa !== sb) return sa - sb;
+          return a.id - b.id;
+        });
       });
+      void qc.invalidateQueries({ queryKey: ["panels"] });
       setReorderMode(false);
       setReorderIds([]);
       setMsg("ترتیب پنل‌ها ذخیره شد");
@@ -892,7 +929,8 @@ export default function PanelsPage() {
     mutationFn: () =>
       api<PanelTestAll>("/api/admin/panels/test-all", {
         method: "POST",
-        timeoutMs: 120_000,
+        // Active panels only; each may need ~20s behind CF — keep headroom.
+        timeoutMs: 200_000,
       }),
     onSuccess: (res) => {
       setTestAllFilter("all");
@@ -903,15 +941,16 @@ export default function PanelsPage() {
         st?.avg_latency_ms != null
           ? ` · میانگین ${formatLatency(st.avg_latency_ms)}`
           : "";
+      const total = res.stats?.total ?? res.results?.length ?? res.ok + res.fail;
       if (res.fail === 0) {
         showTestToast(
           true,
-          `همه ${toFaDigits(res.ok)} پنل وصل‌اند${avg}`
+          `همه ${toFaDigits(res.ok)} پنل روشن وصل‌اند${avg}`
         );
       } else {
         showTestToast(
           false,
-          `${toFaDigits(res.ok)} وصل · ${toFaDigits(res.fail)} قطع${avg}`
+          `${toFaDigits(res.ok)} وصل · ${toFaDigits(res.fail)} قطع از ${toFaDigits(total)} پنل روشن${avg}`
         );
       }
     },
@@ -1203,9 +1242,11 @@ export default function PanelsPage() {
       {msg && (
         <p
           className={
-            msg.includes("موفق") || msg.includes("به‌روز") || msg.includes("دسته")
-              ? "admin-toast ok"
-              : "admin-toast err"
+            /ناموفق|خطا|الزامی|وارد کنید/.test(msg)
+              ? "admin-toast err"
+              : /موفق|به‌روز|ذخیره|حذف شد|دسته|ساخته|اضافه|عوض/.test(msg)
+                ? "admin-toast ok"
+                : "admin-toast err"
           }
         >
           {msg}
@@ -1436,12 +1477,23 @@ export default function PanelsPage() {
                   draggingId === p.id ? " is-dragging" : ""
                 }`}
                 draggable={!reorderMut.isPending}
-                onDragStart={() => {
+                onDragStart={(e) => {
                   dragPanelId.current = p.id;
                   setDraggingId(p.id);
+                  try {
+                    e.dataTransfer.setData("text/plain", String(p.id));
+                    e.dataTransfer.effectAllowed = "move";
+                  } catch {
+                    /* ignore */
+                  }
                 }}
                 onDragOver={(e) => {
                   e.preventDefault();
+                  try {
+                    e.dataTransfer.dropEffect = "move";
+                  } catch {
+                    /* ignore */
+                  }
                   setDragOverId(p.id);
                 }}
                 onDragLeave={() => {
@@ -1449,7 +1501,16 @@ export default function PanelsPage() {
                 }}
                 onDrop={(e) => {
                   e.preventDefault();
-                  const from = dragPanelId.current;
+                  let from = dragPanelId.current;
+                  if (from == null) {
+                    try {
+                      const raw = e.dataTransfer.getData("text/plain");
+                      const n = Number(raw);
+                      if (Number.isFinite(n)) from = n;
+                    } catch {
+                      /* ignore */
+                    }
+                  }
                   dragPanelId.current = null;
                   setDraggingId(null);
                   setDragOverId(null);
@@ -1468,6 +1529,34 @@ export default function PanelsPage() {
                 <div className="panels-reorder-main">
                   <b>{p.name}</b>
                   <small dir="ltr">{p.base_url}</small>
+                </div>
+                <div className="panels-reorder-actions">
+                  <button
+                    type="button"
+                    className="btn ghost icon"
+                    title="بالا"
+                    disabled={reorderMut.isPending || index === 0}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      shiftReorderId(p.id, -1);
+                    }}
+                  >
+                    <ChevronUp size={16} />
+                  </button>
+                  <button
+                    type="button"
+                    className="btn ghost icon"
+                    title="پایین"
+                    disabled={
+                      reorderMut.isPending || index >= reorderPanels.length - 1
+                    }
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      shiftReorderId(p.id, 1);
+                    }}
+                  >
+                    <ChevronDown size={16} />
+                  </button>
                 </div>
                 <span className="badge muted">{typeLabel}</span>
                 <span className={`badge ${p.is_active ? "ok" : "err"}`}>

@@ -123,6 +123,7 @@ def needs_remote_cap_sync(
     active_panel_count: int,
     coefficients: list[float],
     shrink_shared_caps: bool = False,
+    used_ratio: float | None = None,
 ) -> bool:
     """Whether remotes must receive an updated data_limit / status push.
 
@@ -132,5 +133,5 @@ def needs_remote_cap_sync(
     """
     if force or status_changed or blocked:
         return True
-    _ = (active_panel_count, coefficients, shrink_shared_caps)
+    _ = (active_panel_count, coefficients, shrink_shared_caps, used_ratio)
     return False

@@ -816,8 +816,17 @@ class MarzbanAdapter(BasePanelAdapter):
         return AdapterResult(success=False, error=last_err)
 
     async def modify_user(self, payload: UserPayload) -> AdapterResult:
-        """PUT /api/user/{username} — official Marzban modify."""
+        """PUT /api/user/{username} — official Marzban modify.
+
+        Never invent a new UUID on edit (that looks like brand-new configs).
+        On stale inbound tags, clear/filter and retry PUT — do not leave the
+        orchestrator to fall through to create.
+        """
         try:
+            if not (payload.uuid or "").strip():
+                existing = await self._fetch_existing_user(payload.username)
+                if existing and (existing.uuid or "").strip():
+                    payload.uuid = existing.uuid
             body = await self._build_user_body(payload, include_username=False)
             client, headers = await self._authed()
             resp = await client.put(
@@ -829,7 +838,23 @@ class MarzbanAdapter(BasePanelAdapter):
             ok, data = ok_json(resp)
             if ok and isinstance(data, dict):
                 return self._from_user_response(data, payload.username)
-            return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
+            err = err_msg(data, f"HTTP {resp.status_code}")
+            if await self._fix_bad_inbound_tags(payload, err):
+                body = await self._build_user_body(payload, include_username=False)
+                resp2 = await client.put(
+                    f"/api/user/{payload.username}",
+                    headers=headers,
+                    json=body,
+                    timeout=httpx.Timeout(30.0, connect=15.0),
+                )
+                ok2, data2 = ok_json(resp2)
+                if ok2 and isinstance(data2, dict):
+                    return self._from_user_response(data2, payload.username)
+                return AdapterResult(
+                    success=False,
+                    error=err_msg(data2, f"HTTP {resp2.status_code}"),
+                )
+            return AdapterResult(success=False, error=err)
         except Exception as e:
             msg = str(e).strip() or e.__class__.__name__
             if isinstance(e, (asyncio.TimeoutError, httpx.TimeoutException)):

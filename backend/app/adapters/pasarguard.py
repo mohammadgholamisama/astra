@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any
+
+import httpx
 
 from app.adapters.base import AdapterResult, UserPayload, apply_remote_state
 from app.adapters.http_utils import err_msg, ok_json
 from app.adapters.marzban import MarzbanAdapter
+
+# Process-wide short cache so Groups UI reopen / multi-panel apply stays snappy.
+# value: (groups, fresh_until, hard_expire) — serve stale until hard_expire while
+# a refresh is in flight so the Groups modal never sits on «در حال دریافت…».
+_PG_GROUPS_CACHE: dict[str, tuple[list[dict[str, Any]], float, float]] = {}
+_PG_GROUPS_TTL = 120.0
+_PG_GROUPS_STALE_TTL = 900.0  # serve stale up to 15 min if remote is slow
+_PG_GROUPS_REFRESHING: set[str] = set()
 
 
 class PasarGuardAdapter(MarzbanAdapter):
@@ -64,7 +76,11 @@ class PasarGuardAdapter(MarzbanAdapter):
         Fall back to current admin profile when list endpoints are denied.
         """
         client = await self._get_client()
-        resp = await client.get("/api/admin", headers=headers)
+        resp = await client.get(
+            "/api/admin",
+            headers=headers,
+            timeout=httpx.Timeout(5.0, connect=2.5),
+        )
         ok, data = ok_json(resp)
         if not ok or not isinstance(data, dict):
             return None
@@ -85,6 +101,25 @@ class PasarGuardAdapter(MarzbanAdapter):
             ]
         return None
 
+    def _groups_cache_key(self) -> str:
+        return (
+            f"{(self.base_url or '').rstrip('/')}"
+            f"|{(self.username or '').strip()}"
+            f"|{(self.api_token or '')[:12]}"
+        )
+
+    def _store_groups_cache(
+        self, cache_key: str, groups: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        _PG_GROUPS_CACHE[cache_key] = (
+            groups,
+            now + _PG_GROUPS_TTL,
+            now + _PG_GROUPS_STALE_TTL,
+        )
+        self._groups_memo = groups
+        return groups
+
     async def list_groups(self) -> list[dict[str, Any]]:
         """
         Fetch remote groups from PasarGuard (works for owner + operator).
@@ -95,44 +130,132 @@ class PasarGuardAdapter(MarzbanAdapter):
         so prefer GET /api/groups/simple.
 
         NOTE: GET /api/group is invalid (POST-only create) → 405.
+
+        Fast path: return fresh/stale cache immediately. Refresh races only the
+        two most useful endpoints with a tight budget so Groups UI is snappy.
         """
         cached = getattr(self, "_groups_memo", None)
         if cached is not None:
             return cached
+        cache_key = self._groups_cache_key()
+        now = time.monotonic()
+        hit = _PG_GROUPS_CACHE.get(cache_key)
+        if hit is not None:
+            groups, fresh_until, hard_expire = hit
+            if now < fresh_until:
+                self._groups_memo = groups
+                return groups
+            # Stale but usable — return now, refresh in background once.
+            if now < hard_expire and cache_key not in _PG_GROUPS_REFRESHING:
+                _PG_GROUPS_REFRESHING.add(cache_key)
+
+                async def _bg_refresh() -> None:
+                    try:
+                        await self._fetch_groups_remote(cache_key, allow_stale=False)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    finally:
+                        _PG_GROUPS_REFRESHING.discard(cache_key)
+
+                try:
+                    asyncio.get_running_loop().create_task(
+                        _bg_refresh(), name=f"pg-groups-refresh-{cache_key[:24]}"
+                    )
+                except Exception:  # noqa: BLE001
+                    _PG_GROUPS_REFRESHING.discard(cache_key)
+                self._groups_memo = groups
+                return groups
+
+        return await self._fetch_groups_remote(cache_key, allow_stale=True)
+
+    async def _fetch_groups_remote(
+        self, cache_key: str, *, allow_stale: bool
+    ) -> list[dict[str, Any]]:
         client, headers = await self._authed()
-        # Operators: read_simple only. Owners: both work.
-        attempts: list[tuple[str, dict[str, Any] | None]] = [
+        # Two best shots first — owners + operators. Extra shapes only as fallback.
+        primary: list[tuple[str, dict[str, Any] | None]] = [
             ("/api/groups/simple", {"all": "true"}),
+            ("/api/groups", {"limit": "1000", "offset": "0"}),
+        ]
+        secondary: list[tuple[str, dict[str, Any] | None]] = [
             ("/api/groups/simple", {"limit": "1000", "offset": "0"}),
             ("/api/groups/simple", None),
-            ("/api/groups", {"limit": "1000", "offset": "0"}),
             ("/api/groups", None),
         ]
+        req_timeout = httpx.Timeout(3.5, connect=1.8)
         errors: list[str] = []
-        for path, params in attempts:
-            resp = await client.get(path, headers=headers, params=params)
+
+        async def _try_one(
+            path: str, params: dict[str, Any] | None
+        ) -> list[dict[str, Any]]:
+            resp = await client.get(
+                path, headers=headers, params=params, timeout=req_timeout
+            )
             ok, data = ok_json(resp)
             if not ok:
-                errors.append(f"{path}: {err_msg(data, f'HTTP {resp.status_code}')}")
-                continue
+                raise RuntimeError(
+                    f"{path}: {err_msg(data, f'HTTP {resp.status_code}')}"
+                )
             parsed = self._parse_groups_payload(data)
             if parsed is None:
-                errors.append(f"{path}: unexpected response shape")
-                continue
-            self._groups_memo = parsed
+                raise RuntimeError(f"{path}: unexpected response shape")
             return parsed
 
+        async def _race(
+            attempts: list[tuple[str, dict[str, Any] | None]], budget: float
+        ) -> list[dict[str, Any]] | None:
+            tasks = [
+                asyncio.create_task(_try_one(path, params), name=f"pg-groups-{path}")
+                for path, params in attempts
+            ]
+            winner: list[dict[str, Any]] | None = None
+            try:
+                for fut in asyncio.as_completed(tasks, timeout=budget):
+                    try:
+                        winner = await fut
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(str(exc).strip() or exc.__class__.__name__)
+            except asyncio.TimeoutError:
+                errors.append("timeout waiting for group list")
+            finally:
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            return winner
+
+        winner = await _race(primary, 4.0)
+        if winner is None:
+            winner = await _race(secondary, 3.0)
+
+        if winner is not None:
+            return self._store_groups_cache(cache_key, winner)
+
         # Last resort for restricted operators
-        fallback = await self._groups_from_admin_profile(headers)
+        try:
+            fallback = await asyncio.wait_for(
+                self._groups_from_admin_profile(headers), timeout=3.0
+            )
+        except Exception:  # noqa: BLE001
+            fallback = None
         if fallback is not None:
-            self._groups_memo = fallback
-            return fallback
+            return self._store_groups_cache(cache_key, fallback)
+
+        if allow_stale:
+            stale = _PG_GROUPS_CACHE.get(cache_key)
+            if stale is not None and time.monotonic() < stale[2]:
+                self._groups_memo = stale[0]
+                return stale[0]
 
         hint = (
             "اگر آدرس پنل را با /dashboard وارد کرده‌اید، فقط ریشه دامنه را بگذارید "
             "(مثلاً https://panel.example.com:8443)."
         )
-        raise RuntimeError((" | ".join(errors) if errors else "Cannot list groups") + f" — {hint}")
+        raise RuntimeError(
+            (" | ".join(errors) if errors else "Cannot list groups") + f" — {hint}"
+        )
 
     async def _resolve_group_ids(self, payload: UserPayload) -> list[int]:
         configured = (
@@ -285,20 +408,69 @@ class PasarGuardAdapter(MarzbanAdapter):
         )
 
     async def test_connection(self) -> AdapterResult:
-        try:
-            client, headers = await self._authed()
-            resp = await client.get("/api/admin", headers=headers)
-            ok, data = ok_json(resp)
-            if ok:
-                return AdapterResult(success=True, raw=data)
-            # some builds expose /api/system
-            resp2 = await client.get("/api/system", headers=headers)
-            ok2, data2 = ok_json(resp2)
-            if ok2:
-                return AdapterResult(success=True, raw=data2)
-            return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
-        except Exception as e:
-            return AdapterResult(success=False, error=str(e).strip() or e.__class__.__name__)
+        """Prove admin token — retry soft network/CF blips like Marzban."""
+        import asyncio
+
+        import httpx
+
+        last_err = "اتصال ناموفق"
+        for attempt in range(3):
+            try:
+                client, headers = await self._authed()
+                resp = await client.get(
+                    "/api/admin",
+                    headers=headers,
+                    timeout=httpx.Timeout(18.0, connect=10.0),
+                )
+                ok, data = ok_json(resp)
+                if ok:
+                    return AdapterResult(
+                        success=True, raw=data if isinstance(data, dict) else {}
+                    )
+                if resp.status_code in (401, 403):
+                    last_err = err_msg(data, f"HTTP {resp.status_code}")
+                    self._token = None
+                    from app.adapters.marzban import _TOKEN_CACHE
+
+                    _TOKEN_CACHE.pop(self._cache_key(), None)
+                    await self.close()
+                    if attempt < 2:
+                        await asyncio.sleep(0.4 + attempt * 0.3)
+                        continue
+                    return AdapterResult(success=False, error=last_err)
+                # some builds expose /api/system
+                resp2 = await client.get(
+                    "/api/system",
+                    headers=headers,
+                    timeout=httpx.Timeout(14.0, connect=8.0),
+                )
+                ok2, data2 = ok_json(resp2)
+                if ok2:
+                    return AdapterResult(
+                        success=True,
+                        raw=data2 if isinstance(data2, dict) else {},
+                    )
+                last_err = err_msg(data2, err_msg(data, f"HTTP {resp.status_code}"))
+                if attempt < 2:
+                    await self.close()
+                    await asyncio.sleep(0.4 + attempt * 0.3)
+                    continue
+                return AdapterResult(success=False, error=last_err)
+            except Exception as e:
+                last_err = str(e).strip() or e.__class__.__name__
+                self._token = None
+                try:
+                    from app.adapters.marzban import _TOKEN_CACHE
+
+                    _TOKEN_CACHE.pop(self._cache_key(), None)
+                except Exception:
+                    pass
+                await self.close()
+                if attempt < 2:
+                    await asyncio.sleep(0.45 + attempt * 0.35)
+                    continue
+                return AdapterResult(success=False, error=last_err)
+        return AdapterResult(success=False, error=last_err)
 
     async def create_user(self, payload: UserPayload) -> AdapterResult:
         """POST /api/user — PasarGuard docs; retry on network blips; idempotent if exists."""
@@ -315,8 +487,8 @@ class PasarGuardAdapter(MarzbanAdapter):
             )
         body = self._build_pg_body(payload, group_ids)
         last_err = "create failed"
-        # Keep under orchestrator create_timeout (~20s): 2 tries, short connect
-        req_timeout = httpx.Timeout(16.0, connect=5.0)
+        # Keep under orchestrator create_timeout (~28s): 2 tries, short connect
+        req_timeout = httpx.Timeout(22.0, connect=6.0)
         for attempt in range(2):
             try:
                 client, headers = await self._authed()
@@ -391,6 +563,22 @@ class PasarGuardAdapter(MarzbanAdapter):
                         ),
                     )
                 last_err = f"{err} (group_ids={group_ids})"
+                # Group user-cap full: panel is fine. If the username already
+                # exists (partial create / other path), adopt instead of failing.
+                cap = "limit reached" in low or "user limit" in low
+                if cap:
+                    existing = await self.get_usage(
+                        payload.username, expand_links=False
+                    )
+                    if existing.success:
+                        return existing
+                    return AdapterResult(
+                        success=False,
+                        error=(
+                            f"User limit reached — ظرفیت گروه پر است "
+                            f"(group_ids={group_ids}): {err}"
+                        ),
+                    )
                 if resp.status_code in (401, 403) and attempt < 1:
                     self._token = None
                     from app.adapters.marzban import _TOKEN_CACHE
@@ -433,37 +621,41 @@ class PasarGuardAdapter(MarzbanAdapter):
         Quota freeze on Astra must call the same disable endpoint as PasarGuard's
         edit UI ({disabled: true}); status/data_limit alone leaves leftover traffic
         usable when coefficients exhaust Astra before the raw remote cap.
+
+        ``config._freeze_only``: skip the heavy PUT (can hit User limit reached)
+        and only call /disabled — that is what actually cuts traffic.
         """
         want_disabled = self._want_disabled(payload)
-        hint = (payload.config or {}).get("_remote_id") or (payload.config or {}).get(
-            "remote_id"
-        )
+        cfg = payload.config or {}
+        hint = cfg.get("_remote_id") or cfg.get("remote_id")
+        freeze_only = bool(cfg.get("_freeze_only")) and want_disabled
         mod = AdapterResult(success=False, error="modify not attempted")
         group_ids: list[int] = []
-        try:
-            group_ids = await self._resolve_group_ids(payload)
-            body = self._build_pg_body(payload, group_ids)
-            body.pop("username", None)
-            client, headers = await self._authed()
-            resp = await client.put(
-                f"/api/user/{payload.username}",
-                headers=headers,
-                json=body,
-                timeout=__import__("httpx").Timeout(22.0, connect=8.0),
-            )
-            ok, data = ok_json(resp)
-            if ok and isinstance(data, dict):
-                mod = self._from_pg_response(data, payload.username)
-            else:
-                err = err_msg(data, f"HTTP {resp.status_code}")
-                mod = AdapterResult(
-                    success=False,
-                    error=f"{err} (group_ids={group_ids})",
+        if not freeze_only:
+            try:
+                group_ids = await self._resolve_group_ids(payload)
+                body = self._build_pg_body(payload, group_ids)
+                body.pop("username", None)
+                client, headers = await self._authed()
+                resp = await client.put(
+                    f"/api/user/{payload.username}",
+                    headers=headers,
+                    json=body,
+                    timeout=__import__("httpx").Timeout(22.0, connect=8.0),
                 )
-        except Exception as e:
-            mod = AdapterResult(
-                success=False, error=str(e).strip() or e.__class__.__name__
-            )
+                ok, data = ok_json(resp)
+                if ok and isinstance(data, dict):
+                    mod = self._from_pg_response(data, payload.username)
+                else:
+                    err = err_msg(data, f"HTTP {resp.status_code}")
+                    mod = AdapterResult(
+                        success=False,
+                        error=f"{err} (group_ids={group_ids})",
+                    )
+            except Exception as e:
+                mod = AdapterResult(
+                    success=False, error=str(e).strip() or e.__class__.__name__
+                )
 
         uid: int | None = None
         if mod.success and mod.remote_id and str(mod.remote_id).strip().isdigit():

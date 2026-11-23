@@ -1,8 +1,11 @@
 import asyncio
 import base64
+import hashlib
+import json
 import logging
 import re
 import time
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
@@ -30,7 +33,11 @@ from app.services.site_settings import (
     get_sub_base_url,
 )
 from app.services.sub_page import render_subscription_page
-from app.services.users import load_user_by_token, subscription_url
+from app.services.users import (
+    load_user_by_token,
+    load_user_by_token_light,
+    subscription_url,
+)
 
 router = APIRouter(tags=["Subscription"])
 logger = logging.getLogger("astra.sub")
@@ -38,26 +45,9 @@ logger = logging.getLogger("astra.sub")
 
 # #region agent log
 def _dbg(hypothesis_id: str, location: str, message: str, data: dict | None = None) -> None:
-    """Debug-mode NDJSON for session 941288 (usage miss + sub 502)."""
-    import json as _json
-
-    payload = {
-        "sessionId": "941288",
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data or {},
-        "timestamp": int(time.time() * 1000),
-    }
+    """Hot-path debug — logger only (sync disk I/O was starving /sub Update)."""
     try:
-        with open(
-            "/opt/astra/data/debug-941288.ndjson", "a", encoding="utf-8"
-        ) as f:
-            f.write(_json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-    try:
-        logger.info("DBG941288 %s %s %s", hypothesis_id, message, data or {})
+        logger.debug("DBG941288 %s %s %s", hypothesis_id, message, data or {})
     except Exception:
         pass
 
@@ -79,25 +69,35 @@ def _is_cancel(exc: BaseException) -> bool:
 
 # Debounce background maintain so many clients don't stampede one user
 _bg_last: dict[int, float] = {}
-_BG_MIN_INTERVAL = 12.0
+_BG_MIN_INTERVAL = 18.0
 # Parallel heal/hydrate — keep low so QueuePool keeps headroom for /sub.
 # (Was 6; each task used to hold a DB checkout across remote HTTP.)
-_bg_heavy = asyncio.Semaphore(2)
+_bg_heavy = asyncio.Semaphore(3)
 
 # Live usage pull on sub refresh — must stay accurate (quota / money).
 _bg_usage_last: dict[int, float] = {}
-_BG_USAGE_INTERVAL = 8.0
-# Shares orchestrator._USAGE_PULL_GATE; keep at 1 under pool pressure.
-_bg_usage_sem = asyncio.Semaphore(1)
+_BG_USAGE_INTERVAL = 25.0
+# Keep low so /sub Update stays ahead of usage scrapes.
+# /sub usage pulls — capped so QueuePool keeps headroom for analytics pages.
+_bg_usage_sem = asyncio.Semaphore(5)
 
 # Tiny in-process feed cache — VPN clients often refresh in bursts.
 # Incomplete coverage also caches (shorter TTL) so Iran-edge clients don't
 # wait on a full rebuild every tap of «Update» while bg heal catches up.
 # Cache key: (user_id, include_hidden, op_bucket) — op_bucket separates ISP orders
 _feed_cache: dict[tuple[int, bool, str], tuple[float, bytes, bool]] = {}
-_FEED_CACHE_TTL = 12.0
-_FEED_CACHE_TTL_PARTIAL = 6.0
-_FEED_CACHE_MAX = 800
+# Longer TTL = more instant Update hits (apps still send no-cache; server is warm).
+_FEED_CACHE_TTL = 90.0
+_FEED_CACHE_TTL_PARTIAL = 35.0
+_FEED_CACHE_MAX = 4000
+
+# Token→body cache: serve Update with ZERO DB checkout (survives pool starve).
+# meta: user_id, username, display_name, used_traffic, data_limit, expire, status
+_token_feed_cache: dict[tuple[str, str], tuple[float, bytes, dict]] = {}
+_TOKEN_FEED_MAX = 6000
+# Shared across uvicorn workers — memory miss still hits disk warm body.
+_TOKEN_DISK_DIR = Path("/tmp/astra_sub_tok")
+_TOKEN_DISK_TTL = 90.0
 
 
 def _op_bucket(rank_operator: str | None) -> str:
@@ -142,6 +142,126 @@ def _feed_cache_put(
     )
 
 
+def _token_disk_key(token: str, rank_operator: str | None = None) -> str:
+    raw = f"{(token or '').strip()}|{_op_bucket(rank_operator)}"
+    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:40]
+
+
+def _token_disk_path(token: str, rank_operator: str | None = None) -> Path:
+    return _TOKEN_DISK_DIR / f"{_token_disk_key(token, rank_operator)}.bin"
+
+
+def _token_disk_get(
+    token: str, rank_operator: str | None = None
+) -> tuple[bytes, dict] | None:
+    try:
+        path = _token_disk_path(token, rank_operator)
+        meta_path = path.with_suffix(".meta")
+        if not path.is_file() or not meta_path.is_file():
+            return None
+        age = time.time() - path.stat().st_mtime
+        if age > _TOKEN_DISK_TTL:
+            try:
+                path.unlink(missing_ok=True)
+                meta_path.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if not isinstance(meta, dict):
+            return None
+        complete = bool(meta.get("complete", True))
+        ttl = _FEED_CACHE_TTL if complete else _FEED_CACHE_TTL_PARTIAL
+        if age > ttl:
+            return None
+        body = path.read_bytes()
+        if not body:
+            return None
+        return body, meta
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _token_disk_put(
+    token: str,
+    body: bytes,
+    meta: dict,
+    *,
+    rank_operator: str | None = None,
+) -> None:
+    if not body:
+        return
+    try:
+        _TOKEN_DISK_DIR.mkdir(parents=True, exist_ok=True)
+        path = _token_disk_path(token, rank_operator)
+        meta_path = path.with_suffix(".meta")
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(body)
+        tmp.replace(path)
+        meta_path.write_text(
+            json.dumps(meta, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _token_disk_clear() -> None:
+    try:
+        if not _TOKEN_DISK_DIR.is_dir():
+            return
+        for p in _TOKEN_DISK_DIR.iterdir():
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _token_feed_get(
+    token: str, rank_operator: str | None = None
+) -> tuple[bytes, dict] | None:
+    key = ((token or "").strip(), _op_bucket(rank_operator))
+    hit = _token_feed_cache.get(key)
+    if hit:
+        ts, body, meta = hit
+        complete = bool(meta.get("complete", True))
+        ttl = _FEED_CACHE_TTL if complete else _FEED_CACHE_TTL_PARTIAL
+        if time.monotonic() - ts > ttl:
+            _token_feed_cache.pop(key, None)
+        else:
+            return body, meta
+    disk = _token_disk_get(token, rank_operator)
+    if disk:
+        body, meta = disk
+        # Warm this worker's memory so the next Update is pure RAM.
+        _token_feed_cache[key] = (time.monotonic(), body, dict(meta))
+        return body, meta
+    return None
+
+
+def _token_feed_put(
+    token: str,
+    body: bytes,
+    meta: dict,
+    *,
+    rank_operator: str | None = None,
+) -> None:
+    if len(_token_feed_cache) >= _TOKEN_FEED_MAX:
+        for k, _ in sorted(_token_feed_cache.items(), key=lambda kv: kv[1][0])[
+            : max(1, _TOKEN_FEED_MAX // 10)
+        ]:
+            _token_feed_cache.pop(k, None)
+    payload = dict(meta)
+    _token_feed_cache[((token or "").strip(), _op_bucket(rank_operator))] = (
+        time.monotonic(),
+        body,
+        payload,
+    )
+    _token_disk_put(token, body, payload, rank_operator=rank_operator)
+
+
 def invalidate_user_feed_cache(*user_ids: int) -> None:
     """Drop cached sub bodies after membership / remote changes."""
     if not user_ids:
@@ -150,11 +270,21 @@ def invalidate_user_feed_cache(*user_ids: int) -> None:
     for key in list(_feed_cache.keys()):
         if key[0] in want:
             _feed_cache.pop(key, None)
+    for key, (_ts, _body, meta) in list(_token_feed_cache.items()):
+        try:
+            if int(meta.get("user_id") or 0) in want:
+                _token_feed_cache.pop(key, None)
+        except Exception:
+            _token_feed_cache.pop(key, None)
+    # Shared disk may hold stale active bodies after expire/limit — wipe.
+    _token_disk_clear()
 
 
 def clear_feed_cache() -> None:
     """Drop all feed bodies (e.g. after ISP order maps refresh)."""
     _feed_cache.clear()
+    _token_feed_cache.clear()
+    _token_disk_clear()
 
 
 def _account_has_ready_shares(account) -> bool:
@@ -244,6 +374,7 @@ async def _bg_sub_maintain(user_id: int, *, force: bool = False) -> None:
             )
 
             complete = True
+            blocked_early = False
             async with AsyncSessionLocal() as db:
                 result = await db.execute(
                     select(User)
@@ -258,11 +389,24 @@ async def _bg_sub_maintain(user_id: int, *, force: bool = False) -> None:
                 user = result.scalar_one_or_none()
                 if not user:
                     return
-                complete = await _user_sub_links_complete(db, user)
+                # Flip expire before any heal — never provision dead subs.
+                try:
+                    await activate_on_hold_if_used(db, user)
+                    await enforce_user_quota(db, user)
+                except Exception:  # noqa: BLE001
+                    pass
+                blocked_early = user.status in (
+                    UserStatus.limited,
+                    UserStatus.expired,
+                    UserStatus.disabled,
+                )
+                if not blocked_early:
+                    complete = await _user_sub_links_complete(db, user)
                 await db.commit()
             # Session closed before remote heal/hydrate.
 
-            if not complete:
+            # Expired/limited: freeze only — heal must not create fresh remotes.
+            if not blocked_early and not complete:
                 try:
                     await asyncio.wait_for(
                         heal_user_coverage_pool_safe(
@@ -304,15 +448,18 @@ async def _bg_sub_maintain(user_id: int, *, force: bool = False) -> None:
                         UserStatus.expired,
                         UserStatus.disabled,
                     )
-                    if changed or blocked:
+                    if changed or blocked or blocked_early:
                         await asyncio.wait_for(
                             sync_modify_user(
                                 db,
                                 user,
                                 skip_nginx_sync=True,
-                                freeze_fast=True,
+                                # Harder freeze for expired — freeze_fast left
+                                # PasarGuard remotes online when disable was slow.
+                                freeze_fast=False,
+                                remote_timeout=14.0,
                             ),
-                            timeout=12.0,
+                            timeout=45.0,
                         )
                         invalidate_user_feed_cache(int(user_id))
                 except Exception as exc:  # noqa: BLE001
@@ -391,7 +538,9 @@ async def _bg_usage_pull(user_id: int) -> None:
                     refresh_usage_pool_safe(
                         int(user_id), force=True, quick=True
                     ),
-                    timeout=28.0,
+                    # Must finish all remotes — 28s cancelled mid-pull and
+                    # left Astra usage far below the main panel total.
+                    timeout=75.0,
                 )
                 if after < 0:
                     return
@@ -463,7 +612,7 @@ async def _bg_sub_maintain_deferred(
 ) -> None:
     # Let the HTTP request finish + release its DB session first so concurrent
     # writers don't leave the request session in PendingRollback (500).
-    await asyncio.sleep(0.25)
+    await asyncio.sleep(0.05 if force else 0.12)
     await _bg_sub_maintain(user_id, force=force)
 
 
@@ -633,24 +782,22 @@ def _wants_probe(request: Request) -> bool:
 def _wants_curated_feed(request: Request) -> bool:
     """True → ranked SUB_MAX client feed (no hidden).
 
-    React Native / OkHttp often strips custom User-Agent and may drop
-    ``?probe=1`` behind some edges — those requests must still get the full
-    inventory so AstraPing can clean/test every endpoint. Only well-known
-    VPN client UAs stay on the curated 99-cap path.
+    Default is curated for ALL clients (including OkHttp / empty UA). The old
+    «unknown UA → full probe inventory» path stampeded origin CPU and made
+    every app's «Update» time out. Full inventory only for AstraPing /
+    ``?probe=1`` / ``?full=1``.
     """
     if _wants_probe(request):
         return False
-    # Force full feed
+    # Force full feed (admin / AstraPing cleaning)
     for key in ("full", "uncapped"):
         q = (request.query_params.get(key) or "").lower()
         if q in ("1", "true", "yes", "all"):
             return False
     ua = (request.headers.get("user-agent") or "").lower().strip()
-    if not ua:
+    if "astraping" in ua:
         return False
-    if "astraping" in ua or "okhttp" in ua:
-        return False
-    return any(m in ua for m in _VPN_CLIENT_UA_MARKERS)
+    return True
 
 
 def _wants_html_page(request: Request) -> bool:
@@ -1068,7 +1215,7 @@ async def _render_info_page_body(
         "surrogate-control": "no-store",
         "content-disposition": "inline",
         "x-astra-rank-op": (rank_operator or "global")[:32],
-        "x-astra-html-rev": "312-cfg-snippet",
+        "x-astra-html-rev": "342-no-inline-links",
     }
     try:
         from app.services.client_ua import ACCEPT_CH_HEADERS
@@ -1077,7 +1224,15 @@ async def _render_info_page_body(
         html_headers.update(ACCEPT_CH_HEADERS)
     except Exception:  # noqa: BLE001
         pass
-    return HTMLResponse(html, headers=html_headers)
+    # Explicit length avoids truncated HTML through CF tunnel / edge nginx.
+    body = html.encode("utf-8")
+    html_headers["content-length"] = str(len(body))
+    return Response(
+        content=body,
+        status_code=200,
+        media_type="text/html; charset=utf-8",
+        headers=html_headers,
+    )
 
 
 async def _render_info_page(
@@ -1122,11 +1277,7 @@ async def _render_info_page(
 
 
 @router.get("/sub/{token}")
-async def get_subscription(
-    token: str,
-    request: Request,
-    db: AsyncSession = Depends(get_db),
-):
+async def get_subscription(token: str, request: Request):
     """
     One URL, two responses (like PasarGuard):
     - Browser (Mozilla + Accept:text/html) → HTML page
@@ -1137,9 +1288,107 @@ async def get_subscription(
 
     Must never return 500 through the Iran reverse tunnel — clients show
     "Internal Server Error" and abandon the update.
+
+    Critical: do NOT Depends(get_db) here — token/disk cache hits must serve
+    with zero QueuePool checkout (that alone was 2–3s under load).
     """
+    is_probe = _wants_probe(request)
+    is_html = _wants_html_page(request)
+    curated_early = (not is_html) and (not is_probe) and _wants_curated_feed(request)
+    rank_operator_early = (
+        _rank_operator_from_request(request) if curated_early else None
+    )
+
+    # Zero-DB Update path: token body cache (survives QueuePool / CPU storms).
+    if curated_early:
+        tok_hit = _token_feed_get(token, rank_operator_early)
+        if tok_hit:
+            body_hit, meta = tok_hit
+            st = str(meta.get("status") or "")
+            exp_raw = meta.get("expire")
+            try:
+                exp_i = int(exp_raw or 0)
+            except (TypeError, ValueError):
+                exp_i = 0
+            # Wall-clock expire must invalidate even if cached status is still active
+            timed_out = exp_i > 0 and int(time.time()) >= exp_i
+            if timed_out or st in (
+                UserStatus.limited.value,
+                UserStatus.expired.value,
+                UserStatus.disabled.value,
+                "limited",
+                "expired",
+                "disabled",
+            ):
+                try:
+                    uid_meta = int(meta.get("user_id") or 0)
+                    if uid_meta:
+                        invalidate_user_feed_cache(uid_meta)
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                from types import SimpleNamespace
+
+                proxy = SimpleNamespace(
+                    id=int(meta.get("user_id") or 0),
+                    username=str(meta.get("username") or "user"),
+                    display_name=meta.get("display_name"),
+                    used_traffic=int(meta.get("used_traffic") or 0),
+                    data_limit=int(meta.get("data_limit") or 0),
+                    expire=meta.get("expire"),
+                    sub_token=token,
+                    status=st,
+                )
+                try:
+                    from app.services.orchestrator import mark_live_usage_priority
+
+                    if proxy.id:
+                        mark_live_usage_priority(int(proxy.id))
+                        _schedule_bg_usage(int(proxy.id))
+                except Exception:  # noqa: BLE001
+                    pass
+
+                def _headers_tok(body: bytes) -> dict[str, str]:
+                    digest = hashlib.sha256(body or b"").hexdigest()[:12]
+                    hdrs = _sub_headers(
+                        proxy, body_rev=f"{digest}-{int(time.time())}"
+                    )
+                    hdrs["x-astra-rank-op"] = (rank_operator_early or "global")[:32]
+                    hdrs["x-astra-cache"] = "token"
+                    return hdrs
+
+                return _feed_response(
+                    body_hit,
+                    _headers_tok(body_hit),
+                    share_count=max(1, body_hit.count(b"\n")),
+                )
+
+    async with AsyncSessionLocal() as db:
+        return await _serve_subscription_db(
+            token,
+            request,
+            db,
+            is_probe=is_probe,
+            is_html=is_html,
+            curated_early=curated_early,
+            rank_operator_early=rank_operator_early,
+        )
+
+
+async def _serve_subscription_db(
+    token: str,
+    request: Request,
+    db: AsyncSession,
+    *,
+    is_probe: bool,
+    is_html: bool,
+    curated_early: bool,
+    rank_operator_early: str | None,
+):
+    # Light load first — VPN Update cache-hit must not join all accounts/groups
+    # (that query alone was 3–10s under load → apps «آپدیت نشد»).
     try:
-        user = await load_user_by_token(db, token)
+        user = await load_user_by_token_light(db, token)
     except BaseException as exc:  # noqa: BLE001
         if _is_cancel(exc):
             raise
@@ -1150,12 +1399,25 @@ async def get_subscription(
     if not user:
         return PlainTextResponse("Not found", status_code=404)
 
+    # Flip expire → expired on the request path (do not wait for quota-watch).
+    # Then schedule a hard remote freeze so main panels cut traffic immediately.
+    try:
+        flipped = await enforce_user_quota(db, user)
+        if flipped:
+            await db.commit()
+            invalidate_user_feed_cache(int(user.id))
+            _schedule_bg_maintain(int(user.id), force=True)
+    except Exception:  # noqa: BLE001
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+
     # Snapshot scalars before any rollback/expire — exception paths must not
     # lazy-load ORM attrs (MissingGreenlet → HTTP 500 → VPN «آپدیت نشد»).
     uname_safe = str(getattr(user, "username", None) or "?")
     uid_safe = int(user.id)
 
-    # #region agent log
     _t0 = time.monotonic()
     _dbg(
         "H7",
@@ -1165,18 +1427,75 @@ async def get_subscription(
             "user_id": uid_safe,
             "username": uname_safe,
             "status": str(user.status),
-            "used": int(user.used_traffic or 0),
-            "limit": int(user.data_limit or 0),
             "token8": (token or "")[:8],
             "ua": (request.headers.get("user-agent") or "")[:60],
-            "host": (request.headers.get("host") or "")[:40],
         },
     )
-    # #endregion
+
+    # Instant Update: light user + feed cache — no heavy ORM, no ensure_loaded.
+    blocked_early = user.status in (UserStatus.limited, UserStatus.expired)
+    if (
+        curated_early
+        and user.status != UserStatus.disabled
+        and not blocked_early
+    ):
+        cached_early = _feed_cache_get(uid_safe, False, rank_operator_early)
+        if cached_early:
+            try:
+                from app.services.orchestrator import mark_live_usage_priority
+
+                mark_live_usage_priority(uid_safe)
+            except Exception:  # noqa: BLE001
+                pass
+            _schedule_bg_usage(uid_safe)
+            # Maintain only on debounce — not every Update tap.
+            _schedule_bg_maintain(uid_safe)
+            _token_feed_put(
+                token,
+                cached_early,
+                {
+                    "user_id": uid_safe,
+                    "username": uname_safe,
+                    "display_name": getattr(user, "display_name", None),
+                    "used_traffic": int(user.used_traffic or 0),
+                    "data_limit": int(user.data_limit or 0),
+                    "expire": user.expire,
+                    "status": getattr(user.status, "value", user.status),
+                    "complete": True,
+                },
+                rank_operator=rank_operator_early,
+            )
+
+            def _headers_hit(body: bytes) -> dict[str, str]:
+                import hashlib
+
+                digest = hashlib.sha256(body or b"").hexdigest()[:12]
+                hdrs = _sub_headers(
+                    user, body_rev=f"{digest}-{int(time.time())}"
+                )
+                hdrs["x-astra-rank-op"] = (rank_operator_early or "global")[:32]
+                hdrs["x-astra-cache"] = "hit"
+                return hdrs
+
+            return _feed_response(
+                cached_early,
+                _headers_hit(cached_early),
+                share_count=max(1, cached_early.count(b"\n")),
+            )
+
+    # Cache miss / HTML / probe: full graph load for collect + membership checks.
+    try:
+        user_full = await load_user_by_token(db, token)
+        if user_full is not None:
+            user = user_full
+    except BaseException as exc:  # noqa: BLE001
+        if _is_cancel(exc):
+            raise
+        logger.exception("sub full-load token=%s…", (token or "")[:8])
+        await _safe_rollback(db)
+        return PlainTextResponse("Temporarily unavailable", status_code=503)
 
     # Analytics: log sub opens (HTML + feed) so quota-watch prioritizes them
-    is_probe = _wants_probe(request)
-    is_html = _wants_html_page(request)
     try:
         if not is_probe:
             from app.services.user_analytics import record_sub_fetch
@@ -1195,14 +1514,17 @@ async def get_subscription(
     except Exception:  # noqa: BLE001
         pass
 
-    # Live usage: every real client refresh pulls remotes in the background so
-    # quota / «مصرف» / analytics stay accurate without blocking the feed.
+    # Live usage MUST NOT block the VPN feed. Waiting on remotes here made
+    # Cloudflare/edge return 503 and apps showed «آپدیت نشد» while browser HTML
+    # still worked. Hot/bg loops keep «مصرف» fresh; feed returns instantly.
     if not is_probe:
         try:
-            _schedule_bg_usage(int(user.id))
+            from app.services.orchestrator import mark_live_usage_priority
+
+            mark_live_usage_priority(uid_safe)
+            _schedule_bg_usage(uid_safe)
         except Exception:  # noqa: BLE001
             pass
-
     try:
         if is_html:
             # Browser page must use the same ISP order as Update in the app.
@@ -1212,10 +1534,6 @@ async def get_subscription(
                 user,
                 rank_operator=_rank_operator_from_request(request),
             )
-
-        from app.services.site_settings import ensure_loaded
-
-        await ensure_loaded(db)
 
         # Curated 99-cap only for known VPN apps. AstraPing / OkHttp / probe
         # get the full inventory (incl. globally-hidden) for cleaning/tests.
@@ -1227,6 +1545,7 @@ async def get_subscription(
         rank_operator = (
             _rank_operator_from_request(request) if curated else None
         )
+
         def _headers_for(body: bytes) -> dict[str, str]:
             import hashlib
 
@@ -1238,6 +1557,7 @@ async def get_subscription(
             )
             # Lets us verify which ISP order the client received.
             hdrs["x-astra-rank-op"] = (rank_operator or "global")[:32]
+            hdrs["x-astra-cache"] = "miss"
             return hdrs
 
         # limited/expired: still return updateable feed with «تموم/منقضی» remarks.
@@ -1264,20 +1584,15 @@ async def get_subscription(
             )
             return _feed_response(body, _headers_for(body))
 
-        # Recover missing group×panel remotes after panel outages (non-blocking)
-        try:
-            complete = await _user_sub_links_complete(db, user)
-        except Exception:  # noqa: BLE001
-            complete = True
-        if not complete:
-            _schedule_bg_maintain(int(user.id))
-
-        # Incomplete coverage: bg pool-safe heal fills gaps. Avoid long sync
-        # hydrate on the request session (held checkout → QueuePool starve).
-        # Only do a short pool-safe hydrate when we have nothing to serve yet.
-        if not complete:
-            _schedule_bg_maintain(int(user.id), force=True)
-            if not _user_has_share_links(user):
+        # Completeness: VPN curated skips expensive claims scan on the request
+        # path (that query competed with Update under load). BG maintain heals.
+        has_links = _user_has_share_links(user)
+        if curated:
+            complete = has_links
+            _schedule_bg_maintain(int(user.id), force=not has_links)
+            # First open with no share links: brief hydrate so app isn't blank,
+            # still under CF/edge budgets; BG fills the rest.
+            if not has_links:
                 try:
                     await db.commit()
                 except Exception:  # noqa: BLE001
@@ -1290,17 +1605,49 @@ async def get_subscription(
 
                     n = await asyncio.wait_for(
                         hydrate_share_links_pool_safe(int(user.id)),
-                        timeout=6.0 if curated else 7.0,
+                        timeout=1.4,
                     )
                     if n:
                         invalidate_user_feed_cache(int(user.id))
                         user = await load_user_by_token(db, token) or user
-                        logger.info(
-                            "sub quick-hydrate pool-safe user=%s accounts=%s curated=%s",
-                            getattr(user, "username", "?"),
-                            n,
-                            int(bool(curated)),
-                        )
+                        has_links = _user_has_share_links(user)
+                        complete = has_links
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "sub curated-hydrate user=%s: %s",
+                        uname_safe,
+                        exc,
+                    )
+                    try:
+                        user = await load_user_by_token(db, token) or user
+                    except Exception:  # noqa: BLE001
+                        pass
+        else:
+            try:
+                complete = await _user_sub_links_complete(db, user)
+            except Exception:  # noqa: BLE001
+                complete = True
+            if not complete:
+                _schedule_bg_maintain(int(user.id), force=True)
+            # Probe/full may do a short hydrate when completely empty.
+            if not has_links:
+                try:
+                    await db.commit()
+                except Exception:  # noqa: BLE001
+                    try:
+                        await db.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+                try:
+                    from app.services.orchestrator import hydrate_share_links_pool_safe
+
+                    n = await asyncio.wait_for(
+                        hydrate_share_links_pool_safe(int(user.id)),
+                        timeout=3.0,
+                    )
+                    if n:
+                        invalidate_user_feed_cache(int(user.id))
+                        user = await load_user_by_token(db, token) or user
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "sub quick-hydrate user=%s: %s",
@@ -1316,10 +1663,16 @@ async def get_subscription(
         blocked = user.status in (UserStatus.limited, UserStatus.expired)
         if blocked:
             invalidate_user_feed_cache(int(user.id))
-        # Curated VPN feeds: never serve in-process cache on Update — phones
-        # already fight edge/CDN caches; a 12s sticky short body made «آپدیت»
-        # look broken. Probe still rebuilds every time (include_hidden).
-        cached = None
+        # Short curated cache keeps Update bursts under CF limits (no 503).
+        # Probe/full always rebuilds.
+        if curated and not blocked:
+            cached = _feed_cache_get(int(user.id), False, rank_operator)
+            if cached:
+                return _feed_response(
+                    cached,
+                    _headers_for(cached),
+                    share_count=max(1, cached.count(b"\n")),
+                )
 
         # Tunnel nginx 502s if this handler is slow or cancelled. DB links only.
         # Full/probe inventory is heavier — allow more time so AstraPing gets all.
@@ -1340,8 +1693,8 @@ async def get_subscription(
                         len(links),
                     )
             if not links:
-                # 5s was too tight under group-resync DB load → many VPN
-                # clients got a soft-empty body even when links existed.
+                # Curated VPN path must stay fast for Cloudflare quick tunnel
+                # (slow origin → CF 502). Probe inventory keeps a longer budget.
                 links = await asyncio.wait_for(
                     _collect_feed_links(
                         user,
@@ -1349,7 +1702,7 @@ async def get_subscription(
                         db=db,
                         rank_operator=rank_operator,
                     ),
-                    timeout=30.0 if include_hidden else 18.0,
+                    timeout=25.0 if include_hidden else 2.5,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("sub collect user=%s: %s", user.username, exc)
@@ -1371,66 +1724,55 @@ async def get_subscription(
             if _isl(x) and "127.0.0.1" not in (x or "")
         )
 
-        # Empty / sparse feed → heal missing remotes + hydrate, then re-collect.
-        # Covers: panel removed then re-added without full apply, timeout mid-
-        # collect, and claim/link gaps after group resync.
+        # Empty / sparse feed: keep CF/Iran tunnel budgets tight.
+        # Sparse-but-nonempty returns immediately; empty gets one short recollect.
         if not include_hidden and real_n < 55:
             _schedule_bg_maintain(int(user.id), force=True)
-            try:
-                from app.services.orchestrator import (
-                    heal_user_coverage_pool_safe,
-                    hydrate_share_links_pool_safe,
-                )
-
+            if real_n <= 0 and curated:
                 try:
-                    await db.commit()
-                except Exception:  # noqa: BLE001
-                    pass
-                if real_n <= 0:
-                    try:
-                        await asyncio.wait_for(
-                            heal_user_coverage_pool_safe(int(user.id)),
-                            timeout=12.0,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "sub empty-heal user=%s: %s", uname_safe, exc
-                        )
-                n2 = await asyncio.wait_for(
-                    hydrate_share_links_pool_safe(int(user.id)),
-                    timeout=8.0 if real_n <= 0 else 5.0,
-                )
-                if n2 or real_n <= 0:
-                    invalidate_user_feed_cache(int(user.id))
-                    user = await load_user_by_token(db, token) or user
-                    links = await asyncio.wait_for(
-                        _collect_feed_links(
-                            user,
-                            include_hidden=False,
-                            db=db,
-                            rank_operator=rank_operator,
-                        ),
-                        timeout=18.0,
+                    from app.services.orchestrator import hydrate_share_links_pool_safe
+
+                    n = await asyncio.wait_for(
+                        hydrate_share_links_pool_safe(int(user.id)),
+                        timeout=1.2,
                     )
-                    if curated:
+                    if n:
+                        user = await load_user_by_token(db, token) or user
+                        links = await asyncio.wait_for(
+                            _collect_feed_links(
+                                user,
+                                include_hidden=False,
+                                db=db,
+                                rank_operator=rank_operator,
+                            ),
+                            timeout=1.2,
+                        )
                         links = [
                             x
                             for x in links
                             if x and "@[" not in x and not _looks_like_ipv6_host(x)
                         ]
-                    real_n = sum(
-                        1
-                        for x in links
-                        if _isl(x) and "127.0.0.1" not in (x or "")
+                        real_n = sum(
+                            1
+                            for x in links
+                            if _isl(x) and "127.0.0.1" not in (x or "")
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "sub empty-recollect user=%s: %s", uname_safe, exc
                     )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "sub sparse-hydrate user=%s: %s", uname_safe, exc
+            elif real_n <= 0:
+                logger.info(
+                    "sub empty-bg-only user=%s curated=%s",
+                    uname_safe,
+                    int(bool(curated)),
                 )
-                try:
-                    await db.rollback()
-                except Exception:  # noqa: BLE001
-                    pass
+            else:
+                logger.info(
+                    "sub sparse-bg-only user=%s real_n=%s (no request hydrate)",
+                    uname_safe,
+                    real_n,
+                )
 
         body = _encode_feed(links)
         if not body or real_n <= 0:
@@ -1439,6 +1781,30 @@ async def get_subscription(
                 user.username,
                 token[:8],
                 real_n,
+            )
+        elif curated and real_n > 0 and not blocked:
+            _complete = bool(complete and real_n >= 40)
+            _feed_cache_put(
+                int(user.id),
+                False,
+                body,
+                complete=_complete,
+                rank_operator=rank_operator,
+            )
+            _token_feed_put(
+                token,
+                body,
+                {
+                    "user_id": int(user.id),
+                    "username": str(user.username or "user"),
+                    "display_name": getattr(user, "display_name", None),
+                    "used_traffic": int(user.used_traffic or 0),
+                    "data_limit": int(user.data_limit or 0),
+                    "expire": user.expire,
+                    "status": getattr(user.status, "value", user.status),
+                    "complete": _complete,
+                },
+                rank_operator=rank_operator,
             )
 
         # #region agent log

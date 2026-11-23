@@ -56,6 +56,8 @@ class Panel(Base):
         index=True,
         default=None,
     )
+    # Admin UI order on Panels page (drag-reorder within a tab)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, index=True)
     last_ok_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

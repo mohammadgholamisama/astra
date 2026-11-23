@@ -131,33 +131,41 @@ async def _bg_apply_group_panels_to_subs(
     group_name: str = "",
     removed_panel_ids: list[int] | None = None,
 ) -> None:
-    """Apply group panels to EVERY relevant user — category first, then group.
+    """Apply group panels to EVERY relevant user.
 
-    Previously category + group resyncs ran in parallel. Group work-list is
-    UserGroup members only, so category-bound users were still missing
-    membership when the group wave started → empty/partial apply + dashboard
-    «کاربری در گروه نبود» / thin remotes on the main panel.
+    Removals hit remotes immediately — never wait on a full category membership
+    wave (that left ghosts on the main panel for hours).
+
+    Adds / «اعمال پنل‌ها» go straight to the group wave. Missing category
+    members are bound inside ``resync_users_for_group`` — a full category
+    resync first was burning minutes re-provisioning every category user
+    across every group before the new panel was even touched.
     """
     from app.services.ops_progress import start_job
 
     gid = int(group_id)
     cat_id = int(category_id) if category_id is not None else None
     gname = (group_name or "").strip()
+    removed = [int(x) for x in (removed_panel_ids or []) if x is not None]
 
-    if cat_id is not None:
-        title = (
-            f"۱/۲ عضویت دسته — گروه «{gname}»"
-            if gname
-            else f"۱/۲ عضویت دسته برای گروه #{gid}"
-        )
-        jid = start_job(
-            "category_resync",
-            title,
-            message="اول همه کاربران دسته عضو گروه می‌شوند…",
-        )
-        # Full desired groups (no added-only hint) so every bound user gets
-        # complete membership before panel delete/add/retry.
-        await _bg_resync_category_users(cat_id, job_id=jid)
+    if removed:
+        # Cut / repair current members NOW (delete + add gaps).
+        await _bg_resync_group_users(gid, removed)
+        if cat_id is not None:
+            title = (
+                f"عضویت دسته بعد از حذف پنل — «{gname}»"
+                if gname
+                else f"عضویت دسته بعد از حذف پنل #{gid}"
+            )
+            jid = start_job(
+                "category_resync",
+                title,
+                message="کاربران جدید دسته عضو می‌شوند؛ حذف پنل از قبل روی پنل اصلی زده شد…",
+            )
+            await _bg_resync_category_users(cat_id, job_id=jid)
+            # Newly joined category users may need the remaining panels.
+            await _bg_resync_group_users(gid, [])
+        return
 
     await _bg_resync_group_users(gid, removed_panel_ids)
 
@@ -793,11 +801,9 @@ async def reorder_groups(
     _admin=Depends(get_current_admin),
 ):
     """Persist drag order for one Groups-page tab (UI only)."""
-    ids = [int(x) for x in body.group_ids if x is not None]
-    if not ids:
+    raw_ids = [int(x) for x in body.group_ids if x is not None]
+    if not raw_ids:
         raise HTTPException(status_code=400, detail="لیست گروه خالی است")
-    if len(ids) != len(set(ids)):
-        raise HTTPException(status_code=400, detail="شناسه تکراری در ترتیب")
 
     cat_id = await _ensure_category(db, body.category_id)
     if cat_id is None:
@@ -807,17 +813,31 @@ async def reorder_groups(
             select(Group).where(Group.category_id == int(cat_id))
         )
     scoped = {int(g.id): g for g in scope.scalars().all()}
-    if set(ids) != set(scoped.keys()):
-        raise HTTPException(
-            status_code=400,
-            detail="ترتیب باید دقیقاً همه گروه‌های همین تب را شامل شود",
-        )
-    for i, gid in enumerate(ids):
+    if not scoped:
+        raise HTTPException(status_code=400, detail="در این تب گروهی نیست")
+
+    seen: set[int] = set()
+    ordered: list[int] = []
+    for gid in raw_ids:
+        if gid in seen or gid not in scoped:
+            continue
+        seen.add(gid)
+        ordered.append(gid)
+    # Append any tab groups missing from the payload (e.g. search-filtered UI)
+    missing = sorted(
+        (gid for gid in scoped.keys() if gid not in seen),
+        key=lambda gid: (
+            int(getattr(scoped[gid], "sort_order", 0) or 0),
+            gid,
+        ),
+    )
+    final = ordered + missing
+    for i, gid in enumerate(final):
         scoped[gid].sort_order = (i + 1) * 10
     await db.commit()
     rows = await db.execute(
         select(Group)
-        .where(Group.id.in_(ids))
+        .where(Group.id.in_(final))
         .options(selectinload(Group.panel_links).selectinload(GroupPanel.panel))
         .order_by(Group.sort_order.asc(), Group.id.asc())
     )
@@ -856,6 +876,8 @@ async def resync_group_users(
         mark_group_resync_dirty,
     )
 
+    from app.models.user import PanelAccount, PanelAccountStatus
+
     group = await db.get(Group, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="گروه پیدا نشد")
@@ -874,8 +896,33 @@ async def resync_group_users(
         )
         cat_users = int(crow.scalar() or 0)
 
+    # Panels still on live accounts for this group but no longer in GroupPanel
+    # → must be cut from every member sub (usage stays banked on deleted rows).
+    desired_pids = {
+        int(pid)
+        for (pid,) in (
+            await db.execute(
+                select(GroupPanel.panel_id).where(GroupPanel.group_id == int(group_id))
+            )
+        ).all()
+        if pid is not None
+    }
+    orphan_q = select(PanelAccount.panel_id).where(
+        PanelAccount.group_id == int(group_id),
+        PanelAccount.status != PanelAccountStatus.deleted,
+    )
+    if desired_pids:
+        orphan_q = orphan_q.where(PanelAccount.panel_id.notin_(sorted(desired_pids)))
+    removed_panel_ids = sorted(
+        {
+            int(p)
+            for (p,) in (await db.execute(orphan_q.distinct())).all()
+            if p is not None
+        }
+    )
+
     if group_resync_in_progress(group_id):
-        mark_group_resync_dirty(int(group_id), [])
+        mark_group_resync_dirty(int(group_id), removed_panel_ids)
 
         async def _bg_refresh_membership_then_dirty() -> None:
             """Finish category bind, then force the running group wave to redo."""
@@ -890,7 +937,7 @@ async def resync_group_users(
                 message="کاربران دسته عضو می‌شوند تا موج بعدی گروه همه را ببیند…",
             )
             await _bg_resync_category_users(int(cat_id), job_id=jid)
-            _dirty(int(group_id), [])
+            _dirty(int(group_id), removed_panel_ids)
 
         if cat_id is not None:
             asyncio.create_task(
@@ -909,32 +956,45 @@ async def resync_group_users(
                     if cat_id is not None
                     else ""
                 )
+                + (
+                    f" — حذف از ساب: {len(removed_panel_ids)} پنل"
+                    if removed_panel_ids
+                    else ""
+                )
                 + " — داشبورد را ببینید"
             ),
             "group_id": int(group_id),
             "users": user_count,
             "category_users": cat_users,
+            "removed_panels": removed_panel_ids,
         }
 
-    # Sequential: category membership → group panel delete/add/retry.
-    # Never fire both in parallel (that left category users unprovisioned).
+    # Group wave binds missing category members + concurrent remote create/expand.
+    # Do NOT queue a full category resync first (that made «اعمال پنل» take minutes).
     asyncio.create_task(
         _bg_apply_group_panels_to_subs(
             int(group_id),
             category_id=int(cat_id) if cat_id is not None else None,
             group_name=str(getattr(group, "name", "") or ""),
-            removed_panel_ids=[],
+            removed_panel_ids=removed_panel_ids,
         ),
         name=f"astra-group-manual-resync-{group_id}",
     )
     detail = (
         f"اعمال پنل‌ها روی ساب شروع شد"
         f" ({user_count} عضو گروه"
-        + (f" + {cat_users} کاربر دسته" if cat_id is not None else "")
+        + (f" · {cat_users} کاربر دسته در صورت نیاز عضو می‌شوند" if cat_id is not None else "")
         + ")"
     )
-    if cat_id is not None:
-        detail += " — مرحله ۱ عضویت دسته، مرحله ۲ حذف/اضافه/تلاش خطا"
+    if removed_panel_ids:
+        detail += (
+            f" — {len(removed_panel_ids)} پنل از ساب حذف می‌شود"
+            " (مصرف بانکی می‌ماند)"
+        )
+    if removed_panel_ids:
+        detail += " — حذف از پنل اصلی فوری و موازی شروع شد"
+    else:
+        detail += " — ساخت همزمان روی پنل اصلی + باز کردن لینک ساب"
     detail += " — پیشرفت زنده در داشبورد"
     return {
         "ok": True,
@@ -943,6 +1003,7 @@ async def resync_group_users(
         "group_id": int(group_id),
         "users": user_count,
         "category_users": cat_users,
+        "removed_panels": removed_panel_ids,
     }
 
 
@@ -1042,6 +1103,22 @@ async def update_group(
         await _set_panels(db, group, body.panels)
         need_local_recount = old_fp != new_fp
         need_full_resync = old_remote_fp != new_remote_fp or bool(removed_panel_ids)
+        # Wipe share links in THIS transaction so the next /sub hit (after
+        # commit + invalidate) has empty links — claim_keys also drop, but
+        # clearing links beats any stale in-memory graph / hydrate race.
+        if removed_panel_ids:
+            try:
+                from app.services.orchestrator import clear_group_panel_share_links
+
+                await clear_group_panel_share_links(
+                    db, int(group_id), removed_panel_ids
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "clear links on group %s remove panels %s",
+                    group_id,
+                    removed_panel_ids,
+                )
     # Disable/enable also affects category-bound membership (enabled-only)
     if body.is_disabled is not None and old_cat is not None:
         cat_changed = True
@@ -1188,58 +1265,116 @@ async def delete_group(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
-    """Remove group from Astra AFTER deleting its remotes on every panel.
+    """Remove group from Astra AFTER cutting its remotes on every panel.
 
     Order matters: PanelAccount.group_id is SET NULL when Group is deleted, so
     remotes must be scrubbed while group_id is still set.
+
+    Local sub cut commits first (own transaction + retry). Remote panel
+    delete/disable runs in background with real timeouts — never 500 the UI
+    because a panel is slow.
     """
-    from app.services.orchestrator import deprovision_group_from_all_users
+    from app.core.database import AsyncSessionLocal
+    from app.services.orchestrator import (
+        _is_transient_db_err,
+        deprovision_group_from_all_users,
+    )
 
     group = await db.get(Group, group_id)
     if not group:
-        raise HTTPException(status_code=404, detail="Group not found")
+        raise HTTPException(status_code=404, detail="گروه پیدا نشد")
+    # Capture before delete — ORM object is unusable after commit.
     old_cat = getattr(group, "category_id", None)
+    gname = str(getattr(group, "name", "") or "")
 
-    # 1) Fast local cut (bulk) + bg remote delete. Never block on panel HTTP.
+    # 1) Fast durable local cut + bg remote delete/disable.
     try:
         remote_stats = await deprovision_group_from_all_users(db, group_id)
-    except Exception:  # noqa: BLE001
-        logger.exception("delete group=%s remote deprovision failed", group_id)
-        remote_stats = {"users": 0, "ok": 0, "fail": 0}
-
-    # 2) Explicit child cleanup (avoids async lazy-load / FK 500s)
-    await db.execute(delete(GroupConfigItem).where(GroupConfigItem.group_id == group_id))
-    await db.execute(delete(GroupPanel).where(GroupPanel.group_id == group_id))
-    # UserGroup already wiped in deprovision; belt-and-suspenders
-    await db.execute(delete(UserGroup).where(UserGroup.group_id == group_id))
-
-    # Drop local sample probe user if present
-    from app.models.user import PanelAccount, User
-
-    sample_name = sample_username_for_group(group_id)
-    sample = (
-        await db.execute(select(User).where(User.username == sample_name))
-    ).scalar_one_or_none()
-    if sample is not None:
-        await db.execute(delete(PanelAccount).where(PanelAccount.user_id == sample.id))
-        await db.execute(delete(UserGroup).where(UserGroup.user_id == sample.id))
-        await db.delete(sample)
-
-    await db.delete(group)
-    try:
-        await db.commit()
     except Exception as exc:  # noqa: BLE001
-        await db.rollback()
-        raise HTTPException(status_code=400, detail=f"حذف گروه ناموفق: {exc}") from exc
+        logger.exception("delete group=%s remote deprovision failed", group_id)
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "قطع کانفیگ‌های این گروه از ساب ناموفق بود "
+                f"(خطای داخلی دیتابیس/اعمال محلی — ربطی به اتصال پنل ریموت ندارد): {exc}"
+            ),
+        ) from exc
+
+    # 2) Drop the Group row (children) — retry once on transient DB errors.
+    # Local cut is already committed; a failure here must not re-activate configs.
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            async with AsyncSessionLocal() as sdb:
+                g2 = await sdb.get(Group, int(group_id))
+                if g2 is None:
+                    last_exc = None
+                    break
+                await sdb.execute(
+                    delete(GroupConfigItem).where(
+                        GroupConfigItem.group_id == int(group_id)
+                    )
+                )
+                await sdb.execute(
+                    delete(GroupPanel).where(GroupPanel.group_id == int(group_id))
+                )
+                await sdb.execute(
+                    delete(UserGroup).where(UserGroup.group_id == int(group_id))
+                )
+
+                from app.models.user import PanelAccount, User
+
+                sample_name = sample_username_for_group(group_id)
+                sample = (
+                    await sdb.execute(select(User).where(User.username == sample_name))
+                ).scalar_one_or_none()
+                if sample is not None:
+                    await sdb.execute(
+                        delete(PanelAccount).where(PanelAccount.user_id == sample.id)
+                    )
+                    await sdb.execute(
+                        delete(UserGroup).where(UserGroup.user_id == sample.id)
+                    )
+                    await sdb.delete(sample)
+
+                await sdb.delete(g2)
+                await sdb.commit()
+            last_exc = None
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt == 0 and _is_transient_db_err(exc):
+                logger.warning(
+                    "delete group=%s local commit transient — retry: %s",
+                    group_id,
+                    exc,
+                )
+                await asyncio.sleep(0.35)
+                continue
+            logger.exception("delete group=%s local commit failed", group_id)
+            break
+
+    if last_exc is not None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "حذف ردیف گروه از دیتابیس Astra ناموفق بود — "
+                "کانفیگ‌ها از ساب قطع شده‌اند و حذف/خاموش از پنل اصلی در پس‌زمینه ادامه دارد. "
+                f"یک‌بار دیگر بزنید: {last_exc}"
+            ),
+        ) from last_exc
+
     if old_cat is not None:
-        # Heal remaining category-bound users to current desired set (bg only)
         _schedule_category_resync(
             int(old_cat),
             removed_group_ids=[int(group_id)],
-            group_name=str(getattr(group, "name", "") or ""),
+            group_name=gname,
         )
     return {
-        "detail": "Group deleted",
+        "detail": (
+            f"گروه «{gname}» حذف شد — کانفیگ از ساب قطع شد؛ "
+            "حذف/خاموش‌سازی از پنل‌های ریموت در پس‌زمینه ادامه دارد (مصرف بانکی می‌ماند)"
+        ),
         "remote_users": remote_stats.get("users", 0),
         "remote_ok": remote_stats.get("ok", 0),
         "remote_failed": remote_stats.get("fail", 0),

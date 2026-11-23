@@ -111,10 +111,15 @@ def _port_listening(port: int) -> bool:
 
 
 def _systemctl_usable() -> bool:
-    """Probe once every 30s — if dbus is wedged, skip systemctl entirely."""
+    """Probe once every 60s — if dbus is wedged, skip systemctl entirely.
+
+    Dashboard service rows for astra/nginx/xray already use /proc heuristics, so
+    a slow dbus must not flip the whole host card into a scary «systemd down»
+    warning. Only treat hard dbus transport failures as unusable.
+    """
     global _SYSTEMCTL_OK, _SYSTEMCTL_PROBE_AT
     now = time.monotonic()
-    if _SYSTEMCTL_OK is not None and (now - _SYSTEMCTL_PROBE_AT) < 30:
+    if _SYSTEMCTL_OK is not None and (now - _SYSTEMCTL_PROBE_AT) < 60:
         return _SYSTEMCTL_OK
     _SYSTEMCTL_PROBE_AT = now
     try:
@@ -122,15 +127,21 @@ def _systemctl_usable() -> bool:
             ["systemctl", "is-system-running"],
             capture_output=True,
             text=True,
-            timeout=0.35,
+            timeout=1.0,
         )
         out = ((r.stdout or "") + (r.stderr or "")).lower()
-        if "transport endpoint is not connected" in out or r.returncode == 124:
+        # Hard dbus failure only — "degraded"/"starting" are fine (nonzero rc).
+        if "transport endpoint is not connected" in out:
             _SYSTEMCTL_OK = False
         else:
             _SYSTEMCTL_OK = True
+    except subprocess.TimeoutExpired:
+        # Slow dbus ≠ broken; keep last known or assume usable for heuristics UI.
+        if _SYSTEMCTL_OK is None:
+            _SYSTEMCTL_OK = True
     except Exception:  # noqa: BLE001
-        _SYSTEMCTL_OK = False
+        if _SYSTEMCTL_OK is None:
+            _SYSTEMCTL_OK = True
     return bool(_SYSTEMCTL_OK)
 
 
@@ -149,11 +160,21 @@ def _service_active(name: str, cmds: list[str] | None = None) -> str:
             return "active"
         return "inactive"
     if name == "astra-sub-rtunnel" or name.startswith("astra-sub-rtunnel"):
-        return (
-            "active"
-            if _cmd_has(cmds, "18081:127.0.0.1:2086", "astra_sub_rtunnel")
-            else "inactive"
-        )
+        # Sub path: Edge(Iran) often holds `ssh -L :18081→foreign:2086` because
+        # Foreign→Iran:22 reverse SSH times out. Count reverse ssh if present,
+        # else CF quick-tunnel / tunnel watchdog as the live sub path.
+        if _cmd_has(
+            cmds,
+            "18081:127.0.0.1:2086",
+            "astra_sub_rtunnel",
+            "astra-sub-rtunnel-run",
+        ):
+            return "active"
+        if _cmd_has(cmds, "cloudflared tunnel", "astra-cf-sub-run"):
+            return "active"
+        if _cmd_has(cmds, "astra-sub-rtunnel-watchdog", "astra-sub-tunnel-watch"):
+            return "active"
+        return "inactive"
     if name.startswith("astra-xray@"):
         panel_id = name.replace("astra-xray@", "").replace(".service", "")
         return (
@@ -386,9 +407,8 @@ def collect_host_metrics(*, force: bool = False) -> dict[str, Any]:
         )
 
     note = core.pop("note", None)
-    if not _systemctl_usable():
-        extra = "systemd موقتاً پاسخگو نیست — وضعیت از روی پروسه‌ها"
-        note = f"{note} · {extra}" if note else extra
+    # Service states above are process/port based for astra/nginx/xray — do not
+    # surface a dbus probe timeout as a user-facing outage banner.
 
     payload = {
         "ok": True,

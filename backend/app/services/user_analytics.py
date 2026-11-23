@@ -1965,6 +1965,59 @@ async def build_sub_insights(
     }
 
 
+def empty_user_overview(*, tz_offset_min: int = 0, note: str | None = None) -> dict[str, Any]:
+    """Minimal valid payload so the Users analytics page never hard-fails."""
+    now = _utc_now()
+    periods = _period_starts(now, tz_offset_min)
+    tz_off = int(periods["tz_offset_min"])
+    grid_hour = int(periods["grid_hour"])
+    g_start = grid_hour - 23 * 3600
+    global_hourly = [
+        {
+            "hour_ts": g_start + i * 3600,
+            "raw_bytes": 0,
+            "weighted_bytes": 0,
+            "is_current": i == 23,
+        }
+        for i in range(24)
+    ]
+    empty_hod = {"bytes": [0] * 24, "peak_hour": None, "peak_bytes": 0}
+    return {
+        "generated_at": now.isoformat(),
+        "tz_offset_min": tz_off,
+        "online_users": 0,
+        "online_source": "empty",
+        "online_updated_at": None,
+        "online_panels": [],
+        "raw_hour": {
+            "current": 0,
+            "previous": 0,
+            "change_pct": None,
+        },
+        "raw_today": 0,
+        "raw_week": 0,
+        "raw_month": 0,
+        "raw_current": 0,
+        "raw_pending": 0,
+        "eligible_users": 0,
+        "active_users": {"day": 0, "week": 0, "month": 0, "all": 0},
+        "range_stats": {},
+        "hour_of_day": empty_hod,
+        "global_hourly": global_hourly,
+        "global_24h": {
+            "raw_bytes": 0,
+            "weighted_bytes": 0,
+            "source": "empty",
+            "note": note or "آمار موقتاً در دسترس نیست — دوباره تلاش کنید",
+        },
+        "top_hour": [],
+        "health_counts": {},
+        "health_users": [],
+        "note": note
+        or "آمار موقتاً سبک بارگذاری شد — چند ثانیه بعد بروزرسانی کنید",
+    }
+
+
 async def build_overview(
     db: AsyncSession,
     *,
@@ -1981,16 +2034,22 @@ async def build_overview(
     tz_off = int(periods["tz_offset_min"])
 
     async def _sum_all(start_ts: int, end_ts: int) -> int:
+        """Sum usage with SQL GROUP BY hour — never pull per-user rows."""
         if end_ts <= start_ts:
             return 0
         lo = _align_down_hour(start_ts)
         hi = _align_up_hour(end_ts)
         rows = (
             await db.execute(
-                select(UsageHourBucket.hour_ts, UsageHourBucket.raw_bytes).where(
+                select(
+                    UsageHourBucket.hour_ts,
+                    func.coalesce(func.sum(UsageHourBucket.raw_bytes), 0),
+                )
+                .where(
                     UsageHourBucket.hour_ts >= lo,
                     UsageHourBucket.hour_ts < hi,
                 )
+                .group_by(UsageHourBucket.hour_ts)
             )
         ).all()
         return sum(
@@ -2094,35 +2153,36 @@ async def build_overview(
         """Active users with real local-period traffic (not «صفر / استفاده نشده»).
 
         Partition: آنلاین‌شده (≥1KiB) + صفرمصرف(<1KiB) = کاربران فعال.
+        Uses SQL SUM per user (fast) — edge-hour proration is negligible here.
         """
         if end_ts <= start_ts or not eligible_uids:
             return 0
         lo = _align_down_hour(start_ts)
         hi = _align_up_hour(end_ts)
-        bytes_by: dict[int, int] = {uid: 0 for uid in eligible_uids}
-        for uid, ts, raw in (
-            await db.execute(
-                select(
-                    UsageHourBucket.user_id,
-                    UsageHourBucket.hour_ts,
-                    UsageHourBucket.raw_bytes,
-                ).where(
-                    UsageHourBucket.user_id.in_(eligible_uids),
-                    UsageHourBucket.hour_ts >= lo,
-                    UsageHourBucket.hour_ts < hi,
+        bytes_by: dict[int, int] = {
+            int(uid): int(raw or 0)
+            for uid, raw in (
+                await db.execute(
+                    select(
+                        UsageHourBucket.user_id,
+                        func.coalesce(func.sum(UsageHourBucket.raw_bytes), 0),
+                    )
+                    .where(
+                        UsageHourBucket.user_id.in_(eligible_uids),
+                        UsageHourBucket.hour_ts >= lo,
+                        UsageHourBucket.hour_ts < hi,
+                    )
+                    .group_by(UsageHourBucket.user_id)
                 )
-            )
-        ).all():
-            uid_i = int(uid)
-            if uid_i not in bytes_by:
-                continue
-            bytes_by[uid_i] += _overlap_bytes(
-                int(ts), int(raw or 0), start_ts, end_ts
-            )
+            ).all()
+        }
         if end_ts > int(now.timestamp()) - 1:
             for uid, pend in pending_by_uid.items():
-                if uid in bytes_by:
-                    bytes_by[uid] += pend
+                bytes_by[uid] = int(bytes_by.get(uid, 0)) + int(pend)
+        # Users with only pending (no bucket yet) still count
+        for uid, pend in pending_by_uid.items():
+            if uid not in bytes_by and int(pend) >= _LOW_USAGE_NONE_MAX:
+                bytes_by[uid] = int(pend)
         return sum(
             1 for b in bytes_by.values() if int(b) >= _LOW_USAGE_NONE_MAX
         )
@@ -2166,17 +2226,21 @@ async def build_overview(
         )
         online_source = "local_sample"
 
-    # Hour-of-day heat for day/week/month/all (and legacy 7d peak)
-    oldest_bucket = (
-        await db.execute(select(func.min(UsageHourBucket.hour_ts)))
-    ).scalar()
-    oldest_ts = int(oldest_bucket) if oldest_bucket is not None else grid_hour
-    heat_lo = min(day, week, month, grid_hour - 7 * 86400, oldest_ts)
+    # Hour-of-day heat — aggregated by hour (not per-user). Cap history at 90d
+    # so a cold full-table MIN+scan never freezes the page.
+    heat_lo = min(day, week, month, grid_hour - 7 * 86400)
+    heat_floor = grid_hour - 90 * 86400
+    if heat_lo < heat_floor:
+        heat_lo = heat_floor
+    oldest_ts = heat_lo
     heat_rows = (
         await db.execute(
-            select(UsageHourBucket.hour_ts, UsageHourBucket.raw_bytes).where(
-                UsageHourBucket.hour_ts >= _align_down_hour(heat_lo)
+            select(
+                UsageHourBucket.hour_ts,
+                func.coalesce(func.sum(UsageHourBucket.raw_bytes), 0),
             )
+            .where(UsageHourBucket.hour_ts >= _align_down_hour(heat_lo))
+            .group_by(UsageHourBucket.hour_ts)
         )
     ).all()
 
@@ -2212,57 +2276,57 @@ async def build_overview(
         peak_day_bytes if peak_day is not None else peak_7d_bytes
     )
 
-    # Top consumers this local hour (overlap-aware via grid + pending later in UI)
+    # Top consumers this local hour — SQL SUM per user (2–3 hour buckets max)
     top_lo = _align_down_hour(hour)
     top_hi = _align_up_hour(hour_end)
     top_rows = (
         await db.execute(
             select(
                 UsageHourBucket.user_id,
-                UsageHourBucket.hour_ts,
-                UsageHourBucket.raw_bytes,
                 User.username,
+                func.coalesce(func.sum(UsageHourBucket.raw_bytes), 0),
             )
             .join(User, User.id == UsageHourBucket.user_id)
             .where(
                 UsageHourBucket.hour_ts >= top_lo,
                 UsageHourBucket.hour_ts < top_hi,
             )
+            .group_by(UsageHourBucket.user_id, User.username)
+            .order_by(func.coalesce(func.sum(UsageHourBucket.raw_bytes), 0).desc())
+            .limit(max(limit_users * 3, 60))
         )
     ).all()
     top_acc: dict[int, dict[str, Any]] = {}
-    for uid, ts, raw, uname in top_rows:
-        part = _overlap_bytes(int(ts), int(raw or 0), hour, hour_end)
+    for uid, uname, raw in top_rows:
+        part = int(raw or 0)
         if part <= 0:
             continue
-        slot = top_acc.setdefault(
-            int(uid), {"username": uname, "user_id": int(uid), "raw_bytes": 0}
-        )
-        slot["raw_bytes"] += part
-    # Add per-user pending for seeded users (weighted User.used_traffic)
-    if pending_all > 0:
-        live_by_user = {
-            int(uid): int(live or 0)
-            for uid, live in (
-                await db.execute(
-                    select(User.id, func.coalesce(User.used_traffic, 0))
-                )
-            ).all()
+        top_acc[int(uid)] = {
+            "username": uname,
+            "user_id": int(uid),
+            "raw_bytes": part,
         }
+    # Add modest pending only for users already in the top set (no full-table scan)
+    if pending_all > 0 and top_acc:
+        top_uids = list(top_acc.keys())
         state_rows = (
             await db.execute(
                 select(
                     UserUsageState.user_id,
                     UserUsageState.last_raw_total,
                     User.username,
+                    func.coalesce(User.used_traffic, 0),
                 )
                 .join(User, User.id == UserUsageState.user_id)
-                .where(UserUsageState.last_sample_at.is_not(None))
+                .where(
+                    UserUsageState.user_id.in_(top_uids),
+                    UserUsageState.last_sample_at.is_not(None),
+                )
             )
         ).all()
-        for uid, curs, uname in state_rows:
+        for uid, curs, uname, live in state_rows:
             pend = _pending_bytes(
-                live=int(live_by_user.get(int(uid), 0)),
+                live=int(live or 0),
                 cursor=int(curs or 0),
                 seeded=True,
             )
@@ -2391,26 +2455,13 @@ async def build_overview(
     }
     health_users.sort(key=lambda x: (order.get(x["health"]["code"], 9), -x["raw_1h"]))
 
-    # Canonical 24h series — SAME source as panel analytics (PanelUsageHourBucket)
-    # so «ترافیک کل پنل» matches «مصرف کل پنل‌ها — ۲۴ ساعت».
+    # Canonical 24h series — SAME source as panel analytics (PanelUsageHourBucket).
+    # Skip live remote flush on overview GET (that starved the pool / timed out).
     global_hourly: list[dict[str, Any]] = []
     global_24h_raw = 0
     global_24h_weighted = 0
     try:
         from app.services import panel_analytics as panel_analytics_svc
-
-        # Same pre-flush as panel overview so current-hour bars land together
-        try:
-            usage_map = await panel_analytics_svc.live_panel_raw_and_weighted(db)
-            live_for_flush = {
-                int(pid): int(v.get("raw") or 0) for pid, v in usage_map.items()
-            }
-            await panel_analytics_svc.flush_live_deltas_to_hours(
-                db, live_for_flush, now=now
-            )
-            await panel_analytics_svc.credit_system_bw_hour_deltas(db, now=now)
-        except Exception:  # noqa: BLE001
-            logger.debug("pre-flush before global 24h failed", exc_info=True)
 
         g24 = await panel_analytics_svc.build_global_hourly_24h(
             db, tz_offset_min=tz_offset_min

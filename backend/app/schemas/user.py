@@ -147,8 +147,27 @@ class UserRetryErrorsResponse(BaseModel):
     remaining: int = 0
     dropped: int = 0
     skipped_unreachable: int = 0
+    skipped_capacity: int = 0
     panels_ok: list[str] = Field(default_factory=list)
     panels_down: list[str] = Field(default_factory=list)
     users_recovered: int = 0
     users_remaining: int = 0
     healed_coverage: int = 0
+    swept_active: int = 0
+    swept_pending: int = 0
+    swept_inactive: int = 0
+
+
+class UserFixSubResponse(BaseModel):
+    """One-user heal: retry errors, fill missing panels, hydrate share links."""
+
+    username: str
+    before_share: int = 0
+    after_share: int = 0
+    before_gaps: int = 0
+    after_gaps: int = 0
+    retried: int = 0
+    healed: int = 0
+    hydrated: int = 0
+    message: str = ""
+    user: UserResponse | None = None

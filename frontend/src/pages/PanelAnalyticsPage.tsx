@@ -502,11 +502,11 @@ export default function PanelAnalyticsPage() {
     queryKey: ["analytics-panels", tz],
     queryFn: () =>
       api<Overview>(`/api/analytics/panels?tz_offset=${tz}`, {
-        timeoutMs: 12_000,
+        timeoutMs: 25_000,
       }),
     refetchInterval: 3 * 60_000,
     refetchOnWindowFocus: true,
-    retry: 1,
+    retry: 2,
     staleTime: 10_000,
   });
 

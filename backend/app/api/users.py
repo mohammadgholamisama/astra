@@ -19,6 +19,7 @@ from app.schemas.user import (
     UserBulkCreateResponse,
     UserBulkFail,
     UserCreate,
+    UserFixSubResponse,
     UserFromTemplate,
     UserModify,
     UserResponse,
@@ -74,6 +75,59 @@ def _username_exists_error(username: str) -> HTTPException:
             "username": username,
         },
     )
+
+
+def _user_created_recently(user: User, *, window_sec: int = 600) -> bool:
+    """True when row was inserted in the last ``window_sec`` (idempotent retry)."""
+    created = getattr(user, "created_at", None)
+    if created is None:
+        return False
+    if getattr(created, "tzinfo", None) is None:
+        created = created.replace(tzinfo=timezone.utc)
+    try:
+        age = (datetime.now(timezone.utc) - created).total_seconds()
+    except Exception:  # noqa: BLE001
+        return False
+    return 0 <= age <= float(window_sec)
+
+
+async def _bg_finish_create_provision(username: str, group_ids: list[int]) -> None:
+    """Finish remotes after create returned — must not block the HTTP response."""
+    from app.core.database import AsyncSessionLocal
+
+    log = __import__("logging").getLogger("astra.users")
+    try:
+        async with AsyncSessionLocal() as db:
+            user = await load_user(db, username)
+            if user is None:
+                return
+            panels = await orchestrator.resolve_panels_for_groups(db, group_ids)
+            if panels:
+                try:
+                    await orchestrator.provision_users_now(
+                        db, [user], panels, wait=55.0
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception("bg create provision failed user=%s", username)
+                    try:
+                        await db.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+            try:
+                await db.commit()
+            except Exception:  # noqa: BLE001
+                try:
+                    await db.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            await orchestrator.heal_user_coverage_pool_safe(
+                int(user.id), wait=20.0, include_empty_links=True
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("bg create heal user=%s failed", username, exc_info=True)
+    except Exception:  # noqa: BLE001
+        log.exception("bg finish create failed user=%s", username)
 
 
 async def _resolve_source_category(
@@ -172,8 +226,32 @@ async def create_user(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
+    """Create Astra user + kick remotes.
+
+    Critical: local row is committed BEFORE remote HTTP. The response MUST return
+    200 once that commit succeeds — waiting on every panel (up to ~90s) made the
+    edge/nginx return 500/502 while the user already existed, so retry showed
+    «قبلاً ثبت شده». Short sync provision + background finish + idempotent retry.
+    """
+    log = __import__("logging").getLogger("astra.users")
+
     existing = await db.execute(select(User).where(User.username == body.username))
-    if existing.scalar_one_or_none():
+    prior = existing.scalar_one_or_none()
+    if prior is not None:
+        # Idempotent: first request timed out after commit → retry returns the user
+        if _user_created_recently(prior):
+            user = await load_user(db, body.username)
+            if user is not None:
+                try:
+                    asyncio.create_task(
+                        _bg_finish_create_provision(
+                            body.username, list(body.group_ids or [])
+                        ),
+                        name=f"astra-create-idempotent-{body.username}",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                return to_user_response(user)
         raise _username_exists_error(body.username)
 
     if not body.group_ids:
@@ -225,6 +303,10 @@ async def create_user(
                 await asyncio.sleep(0.2 * (attempt + 1))
     except IntegrityError as exc:
         await db.rollback()
+        # Race: concurrent create committed first — treat recent row as success
+        raced = await load_user(db, body.username)
+        if raced is not None and _user_created_recently(raced):
+            return to_user_response(raced)
         raise _username_exists_error(body.username) from exc
     except OperationalError as exc:
         await db.rollback()
@@ -249,8 +331,8 @@ async def create_user(
             },
         )
 
-    # Commit user+groups BEFORE panel HTTP so SQLite write lock is not held
-    # for the whole create (that was causing "database is locked" / 500).
+    # Commit user+groups BEFORE panel HTTP so the write lock is not held
+    # across remote I/O (that caused locked DB / opaque 500s).
     try:
         for attempt in range(6):
             try:
@@ -265,6 +347,9 @@ async def create_user(
                 await asyncio.sleep(0.25 * (attempt + 1))
     except IntegrityError as exc:
         await db.rollback()
+        raced = await load_user(db, body.username)
+        if raced is not None and _user_created_recently(raced):
+            return to_user_response(raced)
         raise _username_exists_error(body.username) from exc
     except OperationalError as exc:
         await db.rollback()
@@ -276,50 +361,83 @@ async def create_user(
             },
         ) from exc
 
+    # From here the user EXISTS — never return 5xx for provision/serialize issues.
     db.expire_all()
     user = await load_user(db, body.username)
     if not user:
-        raise HTTPException(status_code=500, detail="کاربر ساخته شد ولی قابل خواندن نیست")
+        # Extremely rare — commit succeeded but read failed; still not a hard 500
+        # for the admin retry path (next try is idempotent).
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "CREATE_READBACK",
+                "message": "کاربر ثبت شد ولی خواندن پاسخ طول کشید — لیست را رفرش کنید",
+            },
+        )
 
+    # Brief first wave so some configs land; rest finishes in background.
     try:
-        await orchestrator.provision_users_now(db, [user], panels)
+        await asyncio.wait_for(
+            orchestrator.provision_users_now(db, [user], panels, wait=5.0),
+            timeout=7.0,
+        )
     except Exception:  # noqa: BLE001
-        log = __import__("logging").getLogger("astra.users")
-        log.exception("create provision failed user=%s", body.username)
+        log.warning(
+            "create brief provision user=%s — continuing in background",
+            body.username,
+            exc_info=True,
+        )
         try:
             await db.rollback()
         except Exception:  # noqa: BLE001
             pass
-        try:
-            await orchestrator.provision_users_now(db, [user], panels, wait=8.0)
-        except Exception:  # noqa: BLE001
-            log.exception("create provision retry failed user=%s", body.username)
+
     try:
         asyncio.create_task(
-            orchestrator.heal_users_missing_panel_accounts(limit_users=8),
-            name=f"astra-heal-missing-after-create-{body.username}",
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        asyncio.create_task(
-            orchestrator.heal_failed_panel_accounts_batch(limit_users=5),
-            name=f"astra-heal-after-create-{body.username}",
+            _bg_finish_create_provision(body.username, list(body.group_ids)),
+            name=f"astra-create-finish-{body.username}",
         )
     except Exception:  # noqa: BLE001
         pass
 
-    db.expire_all()
-    user = await load_user(db, body.username)
-    if not user:
-        raise HTTPException(status_code=500, detail="کاربر ساخته شد ولی قابل خواندن نیست")
+    try:
+        user = await load_user(db, body.username) or user
+    except Exception:  # noqa: BLE001
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
     try:
         return to_user_response(user)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=500,
-            detail=f"کاربر ساخته شد ولی پاسخ API خطا داد: {exc}",
-        ) from exc
+        log.exception("create serialize failed user=%s", body.username)
+        # Hand-built success body — user is already in Astra
+        from app.services.users import subscription_url
+
+        return UserResponse(
+            username=str(user.username),
+            display_name=(getattr(user, "display_name", None) or None),
+            status=user.status,
+            used_traffic=int(getattr(user, "used_traffic", 0) or 0),
+            lifetime_used_traffic=int(getattr(user, "lifetime_used_traffic", 0) or 0),
+            data_limit=int(getattr(user, "data_limit", 0) or 0),
+            expire=int(getattr(user, "expire", 0) or 0) or 0,
+            on_hold_expire_duration=int(
+                getattr(user, "on_hold_expire_duration", 0) or 0
+            ),
+            include_promo_first=bool(getattr(user, "include_promo_first", True)),
+            data_limit_reset_strategy=str(
+                getattr(user, "data_limit_reset_strategy", None) or "no_reset"
+            ),
+            note=getattr(user, "note", None),
+            created_at=getattr(user, "created_at", None),
+            links=[],
+            subscription_url=subscription_url(user),
+            proxies={},
+            group_ids=list(body.group_ids),
+            source_category_id=getattr(user, "source_category_id", None),
+            panel_accounts=[],
+        )
 
 
 @router.post("/api/users/bulk", response_model=UserBulkCreateResponse)
@@ -587,15 +705,34 @@ async def get_user(
     user = await load_user(db, username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    await orchestrator.refresh_usage(db, user, force=True)
-    changed = await orchestrator.enforce_user_quota(db, user)
-    # Force push so remotes keep the FULL purchased data_limit (coeff does not shrink),
-    # and freeze/disable all panels when Astra weighted usage is exhausted.
-    if await orchestrator.should_push_remotes(
-        db, user, status_changed=changed, force=True
-    ):
-        await orchestrator.sync_modify_user(db, user)
-    await db.commit()
+    # Never block the edit dialog on a full remote scrape — und2-style users
+    # with dozens of panels used to 500/timeout here and the UI looked "broken".
+    try:
+        await asyncio.wait_for(
+            orchestrator.refresh_usage(db, user, force=True, quick=True),
+            timeout=12.0,
+        )
+        changed = await orchestrator.enforce_user_quota(db, user)
+        if await orchestrator.should_push_remotes(
+            db, user, status_changed=changed, force=False
+        ):
+            await asyncio.wait_for(
+                orchestrator.sync_modify_user(
+                    db, user, skip_nginx_sync=True, remote_timeout=8.0
+                ),
+                timeout=15.0,
+            )
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        import logging
+
+        logging.getLogger("astra.users").exception(
+            "get_user refresh soft-fail user=%s", username
+        )
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
     user = await load_user(db, username)
     return to_user_response(user)  # type: ignore[arg-type]
 
@@ -710,28 +847,7 @@ async def modify_user(
             if body.category_id is None and not body.clear_category:
                 user.source_category_id = None
 
-            # 1) Remove remotes for dropped groups BEFORE rewriting membership
-            if removed:
-                results = await orchestrator.sync_delete_user_group_accounts(
-                    db, user, removed
-                )
-                failed = [r for r in results if not r.get("ok")]
-                if failed:
-                    await db.commit()  # persist per-panel error_message
-                    parts = [
-                        f"{r.get('panel_name') or r.get('panel_id')}: {r.get('error') or 'خطا'}"
-                        for r in failed
-                    ]
-                    raise HTTPException(
-                        status_code=502,
-                        detail="حذف کانفیگ گروه از پنل اصلی ناموفق بود — عضویت گروه عوض نشد: "
-                        + "؛ ".join(parts),
-                    )
-
-            # 2) Replace membership (add + remove + order) — sub_token unchanged
-            await _attach_groups(db, user, wanted)
-
-            # 3) Provision current (panel×group) set — creates missing for added groups
+            # Validate panels exist before rewriting membership
             panels = await orchestrator.resolve_panels_for_groups(db, wanted)
             if not panels:
                 raise HTTPException(
@@ -741,15 +857,54 @@ async def modify_user(
                         "message": "گروه‌های انتخاب‌شده هیچ پنل فعالی ندارند",
                     },
                 )
-            await orchestrator.provision_user_on_panels(db, user, panels)
+
+            # Membership + local retire ONLY in this request session — never hold
+            # the pool connection across remote create/delete (that closed the
+            # connection → commit 500 / PendingRollbackError).
+            await _attach_groups(db, user, wanted)
+            if removed:
+                removed_set = set(removed)
+                for acc in list(user.panel_accounts or []):
+                    gid = getattr(acc, "group_id", None)
+                    if gid is None:
+                        continue
+                    if int(gid) not in removed_set:
+                        continue
+                    if acc.status == PanelAccountStatus.deleted:
+                        continue
+                    acc.status = PanelAccountStatus.deleted
+                    # keep used_traffic / links banked for quota
+
+            if (
+                body.data_limit is not None
+                or body.expire is not None
+                or body.status is not None
+            ):
+                try:
+                    await orchestrator.enforce_user_quota(db, user)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            await db.commit()
+            uid = int(user.id)
+            asyncio.create_task(
+                orchestrator.apply_user_group_changes_background(
+                    uid,
+                    removed_group_ids=removed,
+                    added_group_ids=added,
+                ),
+                name=f"astra-group-edit-{username}",
+            )
             try:
-                fresh = await load_user(db, username)
-                if fresh:
-                    await orchestrator.hydrate_share_links(db, fresh)
-                    user = fresh
+                from app.api.subscription import invalidate_user_feed_cache
+
+                invalidate_user_feed_cache(uid)
             except Exception:  # noqa: BLE001
                 pass
-            _ = added  # reserved for future audit hooks
+            user = await load_user(db, username)
+            if not user:
+                raise HTTPException(status_code=404, detail="User not found")
+            return to_user_response(user)  # type: ignore[arg-type]
 
     # Re-evaluate quota whenever volume / expire / status change.
     # Raising data_limit while status was "limited" must flip back to active
@@ -760,31 +915,48 @@ async def modify_user(
         or body.expire is not None
         or body.status is not None
     ):
-        await orchestrator.enforce_user_quota(db, user)
+        try:
+            await orchestrator.enforce_user_quota(db, user)
+        except Exception:  # noqa: BLE001
+            pass
 
     # Fast path for volume/expire edits: push Astra node immediately (local DB),
     # then sync foreign remotes in the background so the admin UI isn't blocked.
     from app.models.panel import PanelType
 
-    if groups_changed:
-        await orchestrator.sync_modify_user(db, user)
-        await db.commit()
-    else:
+    uid = int(user.id)
+    try:
         await orchestrator.sync_modify_user(
             db,
             user,
             only_types={PanelType.astra},
-            remote_timeout=20,
+            remote_timeout=12,
             skip_nginx_sync=True,
         )
         await db.commit()
-        uid = int(user.id)
         asyncio.create_task(
             orchestrator.sync_modify_user_background(
                 uid, exclude_types={PanelType.astra}
             ),
             name=f"astra-sync-remotes-{username}",
         )
+    except Exception:  # noqa: BLE001
+        import logging
+
+        logging.getLogger("astra.users").exception(
+            "modify_user sync soft-fail user=%s", username
+        )
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
     if body.include_promo_first is not None:
         try:
             from app.api.subscription import invalidate_user_feed_cache
@@ -792,7 +964,16 @@ async def modify_user(
             invalidate_user_feed_cache(int(user.id))
         except Exception:  # noqa: BLE001
             pass
-    user = await load_user(db, username)
+    try:
+        user = await load_user(db, username)
+    except Exception:  # noqa: BLE001
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        user = await load_user(db, username)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
     return to_user_response(user)  # type: ignore[arg-type]
 
 
@@ -802,28 +983,46 @@ async def delete_user(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
+    """Delete Astra user immediately; purge remotes in background.
+
+    Holding the request DB session across 30+ panel HTTPs caused
+    ``underlying connection is closed`` → HTTP 500 while the user stayed.
+    """
     user = await load_user(db, username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Best-effort remotes: inactive / removed / unreachable panels are skipped
-    # so they never block deleting the Astra user.
-    results = await orchestrator.sync_delete_user(db, user)
+    uid = int(user.id)
+    uname = str(user.username or username)
+    jobs = await orchestrator.snapshot_user_delete_jobs(db, user)
+    panels_count = len(jobs)
+
+    try:
+        from app.api.subscription import invalidate_user_feed_cache
+
+        invalidate_user_feed_cache(uid)
+    except Exception:  # noqa: BLE001
+        pass
+
     await db.delete(user)
     await db.commit()
-    skipped = [r for r in results if r.get("skipped")]
+
+    if jobs:
+        try:
+            asyncio.create_task(
+                orchestrator.purge_user_remotes_background(jobs),
+                name=f"astra-del-user-{uname[:24]}",
+            )
+        except RuntimeError:
+            # No running loop edge-case — still deleted from Astra
+            pass
+
     return {
         "detail": "User deleted",
-        "panels": results,
-        "skipped_count": len(skipped),
-        "skipped": [
-            {
-                "panel_id": r.get("panel_id"),
-                "panel_name": r.get("panel_name"),
-                "reason": r.get("error"),
-            }
-            for r in skipped
-        ],
+        "panels_count": panels_count,
+        "remote_bg": True,
+        "skipped_count": 0,
+        "skipped": [],
     }
 
 
@@ -893,6 +1092,145 @@ async def retry_provision(
     return to_user_response(user)  # type: ignore[arg-type]
 
 
+def _share_gap_stats(user: User) -> tuple[int, int]:
+    """Return (unique_share_count, empty_live_accounts)."""
+    from app.adapters.http_utils import is_share_link
+
+    uniq: set[str] = set()
+    gaps = 0
+    for a in user.panel_accounts or []:
+        st = getattr(a.status, "value", a.status)
+        links = [
+            str(x)
+            for x in (a.links or [])
+            if x and is_share_link(str(x))
+        ]
+        for x in links:
+            uniq.add(x.split("#", 1)[0])
+        if st in ("active", "pending", "error") and not links:
+            gaps += 1
+    return len(uniq), gaps
+
+
+@router.post("/api/user/{username}/fix-sub", response_model=UserFixSubResponse)
+async def fix_user_subscription(
+    username: str,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """Heal one user's incomplete subscription feed.
+
+    Retries error/empty accounts, recreates missing group×panel slots, hydrates
+    share links, and clears the /sub feed cache — so the next app Update is full.
+    """
+    from app.adapters.http_utils import is_share_link
+    from app.api.subscription import invalidate_user_feed_cache
+
+    user = await load_user(db, username)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    before_share, before_gaps = _share_gap_stats(user)
+    uid = int(user.id)
+
+    # Empty active rows must be retried like errors (retry only sees error/pending).
+    marked = 0
+    for a in user.panel_accounts or []:
+        st = getattr(a.status, "value", a.status)
+        links = [
+            str(x)
+            for x in (a.links or [])
+            if x and is_share_link(str(x))
+        ]
+        if st in ("active", "pending") and not links:
+            a.status = PanelAccountStatus.error
+            if not (a.error_message or "").strip():
+                a.error_message = "fix-sub: empty links"
+            marked += 1
+    if marked:
+        await db.commit()
+        user = await load_user(db, username) or user
+
+    try:
+        orchestrator.mark_live_usage_priority(uid)
+    except Exception:  # noqa: BLE001
+        pass
+
+    retried_n = 0
+    try:
+        got = await orchestrator.retry_failed_accounts(
+            db, user, overall_timeout=45.0
+        )
+        retried_n = len(got or [])
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+
+    healed_n = 0
+    try:
+        healed_n = int(
+            await orchestrator.heal_user_coverage_pool_safe(
+                uid, wait=28.0, include_empty_links=True
+            )
+            or 0
+        )
+    except Exception:  # noqa: BLE001
+        healed_n = 0
+
+    hydrated_n = 0
+    try:
+        hydrated_n = int(
+            await orchestrator.hydrate_share_links_pool_safe(uid) or 0
+        )
+    except Exception:  # noqa: BLE001
+        hydrated_n = 0
+
+    try:
+        invalidate_user_feed_cache(uid)
+    except Exception:  # noqa: BLE001
+        pass
+
+    user = await load_user(db, username)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    after_share, after_gaps = _share_gap_stats(user)
+
+    if after_gaps <= 0 and after_share >= before_share:
+        if after_share > before_share:
+            msg = (
+                f"لیست تکمیل شد: {before_share} → {after_share} کانفیگ یکتا"
+            )
+        else:
+            msg = f"لیست کامل است ({after_share} کانفیگ یکتا)"
+    elif after_share > before_share:
+        msg = (
+            f"بهبود یافت: {before_share} → {after_share} کانفیگ "
+            f"— هنوز {after_gaps} پنل بدون لینک"
+        )
+    elif after_gaps < before_gaps:
+        msg = f"بخشی درست شد — {after_gaps} پنل هنوز لینک ندارد"
+    else:
+        msg = (
+            "تغییر محسوسی نبود؛ پنل‌های قطع/پر ممکن است جلوی ساخت را گرفته باشند"
+        )
+
+    return UserFixSubResponse(
+        username=user.username,
+        before_share=before_share,
+        after_share=after_share,
+        before_gaps=before_gaps,
+        after_gaps=after_gaps,
+        retried=retried_n,
+        healed=healed_n,
+        hydrated=hydrated_n,
+        message=msg,
+        user=to_user_response(user),
+    )
+
+
 @router.post("/api/users/retry-errors", response_model=UserRetryErrorsResponse)
 async def retry_all_errors(
     db: AsyncSession = Depends(get_db),
@@ -960,16 +1298,65 @@ def _active_user_clause(now_ts: int):
     )
 
 
-def _error_user_clause():
-    """User has ≥1 error account on a still-active panel (same as UI cards)."""
-    return exists(
-        select(PanelAccount.id)
-        .join(Panel, Panel.id == PanelAccount.panel_id)
-        .where(
-            PanelAccount.user_id == User.id,
-            PanelAccount.status == PanelAccountStatus.error,
-            Panel.is_active.is_(True),
-        )
+def _capacity_error_sql():
+    """PasarGuard group cap full — panel online, not a retryable panel fault."""
+    msg = PanelAccount.error_message
+    return or_(
+        msg.ilike("%user limit reached%"),
+        msg.ilike("%limit reached%"),
+        msg.ilike("%ظرفیت گروه%"),
+        msg.ilike("%ظرفیت پر%"),
+        msg.ilike("%maximum users%"),
+        msg.ilike("%too many users%"),
+    )
+
+
+def _soft_timeout_error_sql():
+    """Slow panel create — healable pending noise, not a real fault chip."""
+    msg = PanelAccount.error_message
+    return or_(
+        msg.ilike("%timeout%"),
+        msg.ilike("%timed out%"),
+        msg.ilike("%waiting for panel response%"),
+        msg.ilike("%طول کشید%"),
+        msg.ilike("%تایم%"),
+    )
+
+
+def _error_user_clause(now_ts: int | None = None):
+    """Active (not expired) user with a real error on a live panel.
+
+    Excludes expired users, sticky rows that already have share links, and
+    capacity-full remote groups (panel is up — not an actionable panel fault).
+    """
+    from sqlalchemy import not_
+
+    ts = int(now_ts if now_ts is not None else time.time())
+    return and_(
+        _active_user_clause(ts),
+        exists(
+            select(PanelAccount.id)
+            .join(Panel, Panel.id == PanelAccount.panel_id)
+            .where(
+                PanelAccount.user_id == User.id,
+                PanelAccount.status == PanelAccountStatus.error,
+                Panel.is_active.is_(True),
+                # Sticky «error but already has links» cleared by sweep;
+                # still ignore empty-looking payloads when comparable.
+                or_(
+                    PanelAccount.links.is_(None),
+                    PanelAccount.links == [],
+                ),
+                or_(
+                    PanelAccount.error_message.is_(None),
+                    PanelAccount.error_message == "",
+                    and_(
+                        not_(_capacity_error_sql()),
+                        not_(_soft_timeout_error_sql()),
+                    ),
+                ),
+            )
+        ),
     )
 
 
@@ -1026,7 +1413,7 @@ async def list_users(
 
     expired_c = _expired_user_clause(now_ts)
     active_c = _active_user_clause(now_ts)
-    error_c = _error_user_clause()
+    error_c = _error_user_clause(now_ts)
 
     # Chip totals for current search/group — independent of the selected chip
     counts = UsersListCounts(
@@ -1087,9 +1474,9 @@ async def list_users(
             pass
 
     if refresh and users:
-        # Fail-fast parallel pull for this page only (UI paints DB first, then patches)
+        # Parallel live pull for this page — keep UI meters level with remotes
         await orchestrator.refresh_users_usage_batch(
-            db, users, force=True, concurrency=16, push_remotes=False, quick=True
+            db, users, force=True, concurrency=8, push_remotes=False, quick=True
         )
         await db.commit()
         ids = [u.id for u in users]

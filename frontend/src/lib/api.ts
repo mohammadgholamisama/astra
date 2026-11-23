@@ -86,8 +86,11 @@ export async function api<T>(
     } catch {
       if (res.status === 502 || res.status === 504) {
         message = "پاسخ از سرور نرسید (تایم‌اوت) — دوباره تلاش کنید";
+      } else if (res.status === 503) {
+        message = "سرور موقتاً شلوغ است — چند ثانیه بعد دوباره تلاش کنید";
       } else if (res.status >= 500) {
-        message = `خطای سرور (${res.status})`;
+        message =
+          "عملیات روی سرور کامل نشد — دوباره تلاش کنید (اگر تکرار شد، لاگ astra را ببینید)";
       } else if (!message || message === "Error") {
         message = "خطای درخواست";
       }

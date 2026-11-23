@@ -3,6 +3,8 @@ import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowRightLeft,
+  ChevronDown,
+  ChevronUp,
   FolderPlus,
   GripVertical,
   Layers,
@@ -235,6 +237,7 @@ export default function GroupsPage() {
   const [draggingId, setDraggingId] = useState<number | null>(null);
   const dragGroupId = useRef<number | null>(null);
   const [highlightId, setHighlightId] = useState<number | null>(null);
+  const [msg, setMsg] = useState("");
   const deepLinkDone = useRef<string | null>(null);
   const [moveGroup, setMoveGroup] = useState<Group | null>(null);
   const [catModal, setCatModal] = useState<"create" | { edit: GroupCategory } | null>(null);
@@ -344,7 +347,19 @@ export default function GroupsPage() {
 
   function beginReorder() {
     if (searchQ) setSearch("");
-    setReorderIds(visibleGroups.map((g) => g.id));
+    // Full tab list — never the search-filtered subset (that broke save)
+    const tabIds = [...groups]
+      .filter((g) =>
+        activeTab == null ? g.category_id == null : g.category_id === activeTab
+      )
+      .sort((a, b) => {
+        const sa = a.sort_order ?? 0;
+        const sb = b.sort_order ?? 0;
+        if (sa !== sb) return sa - sb;
+        return a.id - b.id;
+      })
+      .map((g) => g.id);
+    setReorderIds(tabIds);
     setReorderMode(true);
     setDragOverId(null);
     setDraggingId(null);
@@ -372,6 +387,19 @@ export default function GroupsPage() {
     });
   }
 
+  function shiftReorderId(id: number, dir: -1 | 1) {
+    setReorderIds((prev) => {
+      const from = prev.indexOf(id);
+      if (from < 0) return prev;
+      const to = from + dir;
+      if (to < 0 || to >= prev.length) return prev;
+      const next = [...prev];
+      const [row] = next.splice(from, 1);
+      next.splice(to, 0, row);
+      return next;
+    });
+  }
+
   const reorderGroups = useMemo(() => {
     const byId = new Map(groups.map((g) => [g.id, g]));
     return reorderIds.map((id) => byId.get(id)).filter(Boolean) as Group[];
@@ -385,12 +413,19 @@ export default function GroupsPage() {
     const firstTime = !seededRef.current.has(panel.id);
     setCatalogs((prev) => ({
       ...prev,
-      [panel.id]: { ...(prev[panel.id] || emptyCatalog()), loading: true, error: "" },
+      [panel.id]: {
+        ...(prev[panel.id] || emptyCatalog()),
+        // Keep prior groups visible while refreshing (avoids empty «در حال دریافت»).
+        loading: true,
+        error: "",
+      },
     }));
 
     try {
       if (panel.type === "sanaei") {
-        const list = await api<InboundInfo[]>(`/api/admin/panels/${panel.id}/inbounds`);
+        const list = await api<InboundInfo[]>(`/api/admin/panels/${panel.id}/inbounds`, {
+          timeoutMs: 12_000,
+        });
         const ids = list.map((x) => x.id);
         seededRef.current.add(panel.id);
         setCatalogs((prev) => ({
@@ -405,7 +440,10 @@ export default function GroupsPage() {
           )
         );
       } else if (panel.type === "pasarguard") {
-        const list = await api<RemoteGroupInfo[]>(`/api/admin/panels/${panel.id}/groups`);
+        const list = await api<RemoteGroupInfo[]>(
+          `/api/admin/panels/${panel.id}/groups`,
+          { timeoutMs: 8_000 }
+        );
         const ids = list.map((x) => x.id);
         seededRef.current.add(panel.id);
         setCatalogs((prev) => ({
@@ -421,7 +459,8 @@ export default function GroupsPage() {
         );
       } else if (panel.type === "marzban") {
         const list = await api<MarzProtocolInfo[]>(
-          `/api/admin/panels/${panel.id}/marz-protocols`
+          `/api/admin/panels/${panel.id}/marz-protocols`,
+          { timeoutMs: 12_000 }
         );
         const names = list.map((x) => x.protocol);
         seededRef.current.add(panel.id);
@@ -450,7 +489,8 @@ export default function GroupsPage() {
         );
       } else if (panel.type === "rebecca" || panel.type === "guard") {
         const list = await api<MarzProtocolInfo[]>(
-          `/api/admin/panels/${panel.id}/marz-protocols`
+          `/api/admin/panels/${panel.id}/marz-protocols`,
+          { timeoutMs: 12_000 }
         );
         seededRef.current.add(panel.id);
         setCatalogs((prev) => ({
@@ -511,6 +551,16 @@ export default function GroupsPage() {
     }
   }, [open, picks, panelMap, loadCatalog]);
 
+  // Prefetch PasarGuard group catalogs as soon as panels load — modal reopen is instant.
+  useEffect(() => {
+    const pg = panels.filter((p) => p.type === "pasarguard" && p.is_active !== false);
+    for (const panel of pg.slice(0, 12)) {
+      if (!attemptedRef.current.has(panel.id) && !loadingRef.current.has(panel.id)) {
+        void loadCatalog(panel);
+      }
+    }
+  }, [panels, loadCatalog]);
+
   const save = useMutation({
     mutationFn: () => {
       // Finalize any mid-edit coefficient drafts (e.g. "1,33") before payload
@@ -527,6 +577,23 @@ export default function GroupsPage() {
           priority: finalized.length - i,
         };
       });
+      // PasarGuard without remote groups → create may succeed but sub stays empty.
+      for (const pick of finalized) {
+        const panel = panelMap[pick.panel_id];
+        if (!panel || panel.type !== "pasarguard") continue;
+        const cat = catalogs[pick.panel_id];
+        // Already-selected ids (from prior save) are enough — don't block on reload.
+        if (cat?.loading && !pick.group_ids.length) {
+          throw new Error(
+            `گروه‌های ریموت پنل «${panel.name}» هنوز لود نشده — چند لحظه صبر کنید و دوباره ذخیره کنید`
+          );
+        }
+        if (!pick.group_ids.length) {
+          throw new Error(
+            `برای پنل پاسارگاد «${panel.name}» حداقل یک گروه ریموت انتخاب کنید`
+          );
+        }
+      }
       const costRaw = usageCost.trim();
       const costNum =
         costRaw === ""
@@ -690,16 +757,25 @@ export default function GroupsPage() {
       }),
     onSuccess: (rows) => {
       qc.setQueryData<Group[]>(["groups"], (prev) => {
-        if (!prev) return rows;
         const byId = new Map(rows.map((g) => [g.id, g]));
-        return prev.map((g) => byId.get(g.id) || g);
+        const merged = (prev || []).map((g) => byId.get(g.id) || g);
+        for (const g of rows) {
+          if (!merged.some((x) => x.id === g.id)) merged.push(g);
+        }
+        return [...merged].sort((a, b) => {
+          const sa = a.sort_order ?? 0;
+          const sb = b.sort_order ?? 0;
+          if (sa !== sb) return sa - sb;
+          return a.id - b.id;
+        });
       });
+      void qc.invalidateQueries({ queryKey: ["groups"] });
       setReorderMode(false);
       setReorderIds([]);
-      window.alert("ترتیب گروه‌ها ذخیره شد");
+      setMsg("ترتیب گروه‌ها ذخیره شد");
     },
     onError: (e: unknown) => {
-      window.alert(e instanceof Error ? e.message : "ذخیره ترتیب ناموفق بود");
+      setMsg(e instanceof Error ? e.message : "ذخیره ترتیب ناموفق بود");
     },
   });
 
@@ -875,8 +951,18 @@ export default function GroupsPage() {
         ? ok
         : "other",
     );
-    setCatalogs({});
-    attemptedRef.current = new Set();
+    // Keep warm catalogs (especially PasarGuard) — only drop in-flight errors.
+    setCatalogs((prev) => {
+      const next: Record<number, PanelCatalog> = {};
+      for (const [key, cat] of Object.entries(prev)) {
+        if (!cat || cat.loading) continue;
+        if (cat.groups.length || cat.inbounds.length || cat.protocols.length) {
+          next[Number(key)] = cat;
+          attemptedRef.current.add(Number(key));
+        }
+      }
+      return next;
+    });
     loadingRef.current = new Set();
     const nextPicks: PanelPick[] = [];
     const seeded = new Set<number>();
@@ -922,6 +1008,9 @@ export default function GroupsPage() {
   }, [highlightId]);
 
   function selectionSummary(panel: Panel, pick: PanelPick, cat?: PanelCatalog) {
+    if ((!cat || cat.loading) && panel.type === "pasarguard" && pick.group_ids.length) {
+      return `${pick.group_ids.length} گروه (در حال تازه‌سازی…)`;
+    }
     if (!cat || cat.loading) return "در حال دریافت…";
     if (cat.error) return "خطا در دریافت";
     if (panel.type === "sanaei") return `${pick.inbound_ids.length} از ${cat.inbounds.length} اینباند`;
@@ -949,6 +1038,20 @@ export default function GroupsPage() {
         گروه‌ها را در دسته‌ها (مثل مستقیم، تانل، گیمینگ) مرتب کنید. گروه جدید پیش‌فرض در «همه گروه‌ها»
         می‌آید مگر روی تب دسته دیگری باشید. مصرف Astra = جمع (مصرف خام × ضریب هر گروه).
       </p>
+
+      {msg && (
+        <p
+          className={
+            /ناموفق|خطا|الزامی|وارد کنید/.test(msg)
+              ? "admin-toast err"
+              : /موفق|به‌روز|ذخیره|حذف شد|دسته|ساخته|اضافه|عوض/.test(msg)
+                ? "admin-toast ok"
+                : "admin-toast err"
+          }
+        >
+          {msg}
+        </p>
+      )}
 
       <div className="toolbar">
         <div className="admin-search">
@@ -1159,12 +1262,23 @@ export default function GroupsPage() {
                   draggingId === g.id ? " is-dragging" : ""
                 }`}
                 draggable={!reorderMut.isPending}
-                onDragStart={() => {
+                onDragStart={(e) => {
                   dragGroupId.current = g.id;
                   setDraggingId(g.id);
+                  try {
+                    e.dataTransfer.setData("text/plain", String(g.id));
+                    e.dataTransfer.effectAllowed = "move";
+                  } catch {
+                    /* ignore */
+                  }
                 }}
                 onDragOver={(e) => {
                   e.preventDefault();
+                  try {
+                    e.dataTransfer.dropEffect = "move";
+                  } catch {
+                    /* ignore */
+                  }
                   setDragOverId(g.id);
                 }}
                 onDragLeave={() => {
@@ -1172,7 +1286,16 @@ export default function GroupsPage() {
                 }}
                 onDrop={(e) => {
                   e.preventDefault();
-                  const from = dragGroupId.current;
+                  let from = dragGroupId.current;
+                  if (from == null) {
+                    try {
+                      const raw = e.dataTransfer.getData("text/plain");
+                      const n = Number(raw);
+                      if (Number.isFinite(n)) from = n;
+                    } catch {
+                      /* ignore */
+                    }
+                  }
                   dragGroupId.current = null;
                   setDraggingId(null);
                   setDragOverId(null);
@@ -1194,6 +1317,34 @@ export default function GroupsPage() {
                     {g.description?.trim() ||
                       `${toFaDigits(panelN)} پنل · ${kindLabel}`}
                   </small>
+                </div>
+                <div className="panels-reorder-actions">
+                  <button
+                    type="button"
+                    className="btn ghost icon"
+                    title="بالا"
+                    disabled={reorderMut.isPending || index === 0}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      shiftReorderId(g.id, -1);
+                    }}
+                  >
+                    <ChevronUp size={16} />
+                  </button>
+                  <button
+                    type="button"
+                    className="btn ghost icon"
+                    title="پایین"
+                    disabled={
+                      reorderMut.isPending || index >= reorderGroups.length - 1
+                    }
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      shiftReorderId(g.id, 1);
+                    }}
+                  >
+                    <ChevronDown size={16} />
+                  </button>
                 </div>
                 <span className="badge muted">{toFaDigits(panelN)} پنل</span>
                 <span className={`badge ${g.is_disabled ? "err" : "ok"}`}>
@@ -1291,12 +1442,13 @@ export default function GroupsPage() {
                     const inCat = g.category_id != null;
                     const ok = window.confirm(
                       `اعمال تغییرات پنل‌های گروه «${g.name}» روی ساب؟\n` +
-                        `• پنل‌های فعلی گروه (${toFaDigits(n)}): کانفیگ ساخته/همگام می‌شود\n` +
-                        `• پنل‌های حذف‌شده: از پنل اصلی و ساب کاربران پاک می‌شود\n` +
+                        `• پنل جدید / ناقص (${toFaDigits(n)} پنل گروه): برای کاربران عضو ساخته و به ساب اضافه می‌شود\n` +
+                        `• پنل‌های سالم قبلی دست نمی‌خورند\n` +
+                        `• پنل حذف‌شده: کانفیگ از ساب همه کاربران پاک می‌شود (حجم مصرف‌شده کم نمی‌شود و برای اتمام حجم حساب می‌ماند)\n` +
                         (inCat
-                          ? `• این گروه در دسته است — همه کاربران همان دسته هم عضویت/پنل می‌گیرند\n`
+                          ? `• این گروه در دسته است — اول عضویت کاربران دسته، بعد حذف/اضافه پنل\n`
                           : "") +
-                        `اگر حجم کاربر تمام باشد، کانفیگ‌های جدید هم خاموش می‌مانند.`
+                        `اگر حجم کاربر تمام باشد، بقیه کانفیگ‌ها مثل قبل خاموش می‌مانند.`
                     );
                     if (ok) resyncGroup.mutate(g.id);
                   }}
@@ -1568,7 +1720,7 @@ export default function GroupsPage() {
                                 type="button"
                                 className="btn ghost sm"
                                 onClick={() => selectAll(p)}
-                                disabled={!!cat?.loading}
+                                disabled={!cat || (!(cat.groups.length || cat.inbounds.length || cat.protocols.length) && !!cat.loading)}
                               >
                                 همه
                               </button>
@@ -1576,7 +1728,7 @@ export default function GroupsPage() {
                                 type="button"
                                 className="btn ghost sm"
                                 onClick={() => clearAll(p)}
-                                disabled={!!cat?.loading}
+                                disabled={!cat}
                               >
                                 هیچ‌کدام
                               </button>
@@ -1603,7 +1755,34 @@ export default function GroupsPage() {
                               </button>
                             </p>
                           )}
-                          {(!cat || cat.loading) && <p className="muted">در حال دریافت از پنل…</p>}
+                          {(!cat || cat.loading) &&
+                            !(p.type === "pasarguard" && (pick.group_ids.length || (cat?.groups.length ?? 0))) && (
+                            <p className="muted">در حال دریافت از پنل…</p>
+                          )}
+                          {p.type === "pasarguard" &&
+                            (!cat || cat.loading) &&
+                            pick.group_ids.length > 0 &&
+                            !(cat?.groups.length) && (
+                            <div className="inbound-list">
+                              <p className="muted" style={{ marginBottom: 8 }}>
+                                در حال تازه‌سازی لیست… ({toFaDigits(pick.group_ids.length)} گروه انتخاب‌شده — ذخیره مجاز است)
+                              </p>
+                              {pick.group_ids.map((gid) => (
+                                <button
+                                  key={gid}
+                                  type="button"
+                                  className="inbound-item selected"
+                                  onClick={() => toggleGroupId(p.id, gid)}
+                                >
+                                  <span className="inbound-check" aria-hidden>✓</span>
+                                  <span className="inbound-body">
+                                    <strong>Group #{gid}</strong>
+                                    <small>ID {gid} · از ذخیره قبلی</small>
+                                  </span>
+                                </button>
+                              ))}
+                            </div>
+                          )}
 
                           {p.type === "sanaei" && cat && !cat.loading && cat.inbounds.length > 0 && (
                             <div className="inbound-list">
@@ -1634,8 +1813,13 @@ export default function GroupsPage() {
                             </div>
                           )}
 
-                          {p.type === "pasarguard" && cat && !cat.loading && cat.groups.length > 0 && (
+                          {p.type === "pasarguard" && cat && cat.groups.length > 0 && (
                             <div className="inbound-list">
+                              {cat.loading && (
+                                <p className="muted" style={{ marginBottom: 8 }}>
+                                  در حال تازه‌سازی لیست گروه‌ها…
+                                </p>
+                              )}
                               {cat.groups.map((g) => {
                                 const selected = pick.group_ids.includes(g.id);
                                 return (
@@ -1946,7 +2130,16 @@ export default function GroupsPage() {
                 ساب پاک می‌شود. خود کاربر در Astra می‌ماند.
               </span>
             </p>
-            {remove.isError && <p className="error">{(remove.error as Error).message}</p>}
+            {remove.isError && (
+              <p className="error" style={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
+                {(remove.error as Error).message}
+                <br />
+                <span className="muted" style={{ fontSize: "0.85rem" }}>
+                  اگر قطع ساب انجام شده، یک‌بار دیگر بزنید تا ردیف گروه هم پاک شود.
+                  حذف/خاموش از پنل اصلی بعد از قطع ساب در پس‌زمینه انجام می‌شود.
+                </span>
+              </p>
+            )}
             <footer className="modal-foot">
               <button
                 type="button"

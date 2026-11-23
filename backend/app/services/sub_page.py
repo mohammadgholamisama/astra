@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import html
 import io
-import json
 import math
 import re
 from typing import Any
@@ -13,6 +12,40 @@ from typing import Any
 import qrcode
 
 from app.services.jalali import format_jalali_from_unix, to_fa_digits
+
+
+def _expire_remaining_label(expire: int | None, *, status: str = "") -> str:
+    """Human remaining / overdue text for the public sub page."""
+    import time
+
+    s = (status or "").lower()
+    if s == "on_hold":
+        return "از اولین اتصال شروع می‌شود"
+    if not expire or int(expire) <= 0:
+        return "بدون محدودیت زمانی"
+    left = int(expire) - int(time.time())
+    if left <= 0 or s == "expired":
+        overdue = abs(left)
+        if overdue < 3600:
+            return "منقضی شده"
+        days = overdue // 86400
+        if days <= 0:
+            hours = max(1, overdue // 3600)
+            return f"منقضی شده · {to_fa_digits(hours)} ساعت پیش"
+        return f"منقضی شده · {to_fa_digits(days)} روز پیش"
+    days = left // 86400
+    hours = (left % 86400) // 3600
+    if days >= 1:
+        if hours > 0:
+            return f"{to_fa_digits(days)} روز و {to_fa_digits(hours)} ساعت مانده"
+        return f"{to_fa_digits(days)} روز مانده"
+    if hours >= 1:
+        mins = (left % 3600) // 60
+        if mins > 0:
+            return f"{to_fa_digits(hours)} ساعت و {to_fa_digits(mins)} دقیقه مانده"
+        return f"{to_fa_digits(hours)} ساعت مانده"
+    mins = max(1, left // 60)
+    return f"{to_fa_digits(mins)} دقیقه مانده"
 
 
 def _format_bytes(n: int) -> str:
@@ -134,8 +167,10 @@ def render_subscription_page(
     panels_usage: list[dict[str, Any]] | None = None,
     device_limit: int = 0,
     public_links: dict[str, str] | None = None,
+    rank_operator: str | None = None,
 ) -> str:
     del panels_usage  # end-users must not see panel/coeff breakdown
+    _ = rank_operator
     used_i = int(used or 0)
     limit_i = int(limit or 0)
     unlimited = limit_i <= 0
@@ -149,9 +184,15 @@ def render_subscription_page(
 
     status_label, status_tone = _status_meta(status)
     if (status or "").lower() == "on_hold":
-        expire_label = "از اولین استفاده"
+        expire_date_label = "از اولین استفاده"
     else:
-        expire_label = format_jalali_from_unix(expire)
+        expire_date_label = format_jalali_from_unix(expire)
+    expire_remain_label = _expire_remaining_label(expire, status=status)
+    expire_label = (
+        expire_date_label
+        if (status or "").lower() == "on_hold" or not expire or int(expire) <= 0
+        else f"{expire_date_label} · {expire_remain_label}"
+    )
     used_label = _format_bytes(used_i)
     limit_label = "نامحدود" if unlimited else _format_bytes(limit_i)
     remain_label = "نامحدود" if remain is None else _format_bytes(remain)
@@ -161,7 +202,9 @@ def render_subscription_page(
     brand = html.escape(panel_name or "Astra")
     user_esc = html.escape(username)
     sub_esc = html.escape(sub_url)
-    links_json = json.dumps([c["link"] for c in configs], ensure_ascii=False)
+    # Do NOT embed share URIs in HTML/JS: Cloudflare Email Obfuscation rewrites
+    # ``uuid@host`` and large inline payloads get truncated on the edge tunnel.
+    # Copy buttons lazy-fetch ``?raw=1`` (Base64 feed) instead.
     qr_url = _qr_data_url(sub_url)
     donut = _donut_svg(pct, bar_tone)
 
@@ -218,11 +261,14 @@ def render_subscription_page(
             proto_label = _proto(link)
         proto = html.escape(proto_label)
         remark = html.escape(str(c.get("remark") or "").strip())
-        preview = html.escape(
-            remark
-            if is_special and remark
-            else (link if len(link) <= 64 else link[:64] + "…")
-        )
+        # Never put raw share URIs in HTML text — CF Email Obfuscation turns
+        # ``uuid@host`` into ``[email protected]`` and breaks the page.
+        if remark:
+            preview = remark
+        elif is_special:
+            preview = html.escape(proto_label)
+        else:
+            preview = html.escape(_proto(link))
         if is_special:
             idx_html = ""
             title_html = ""
@@ -272,6 +318,8 @@ def render_subscription_page(
 <meta name="color-scheme" content="dark light"/>
 <meta name="theme-color" content="#0b1220"/>
 <title>{brand} · {user_esc}</title>
+<meta name="format-detection" content="email=no, telephone=no"/>
+<meta name="robots" content="noindex,nofollow"/>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
 <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@600;700&family=Vazirmatn:wght@400;500;600;700;800&display=swap" rel="stylesheet"/>
@@ -354,7 +402,7 @@ body{{
 .stats-mini{{display:grid;grid-template-columns:1fr 1fr;gap:8px}}
 .stat-mini{{padding:10px;border-radius:10px;border:1px solid var(--line);background:var(--input);min-width:0}}
 .stat-mini span{{display:block;color:var(--muted);font-size:.7rem}}
-.stat-mini b{{display:block;margin-top:3px;font-size:.86rem;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.stat-mini b{{display:block;margin-top:3px;font-size:.86rem;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:normal;line-height:1.35}}
 .card h2{{margin:0 0 4px;font-size:1rem;font-weight:700}}
 .card .hint{{margin:0 0 12px;color:var(--muted);font-size:.8rem;line-height:1.5}}
 .links-card{{padding:12px 14px}}
@@ -448,6 +496,7 @@ input#sub{{
 </style>
 </head>
 <body>
+<!--email_off-->
 <div class="wrap">
   <header class="hero">
     <div class="hero-bar">
@@ -462,7 +511,7 @@ input#sub{{
     </div>
     <div class="chips">
       <span class="badge {status_tone}">{html.escape(status_label)}</span>
-      <span class="badge soft">{html.escape(expire_label)}</span>
+      <span class="badge soft" title="تاریخ انقضای اشتراک">{html.escape(expire_label)}</span>
       <span class="badge soft">{count_label} کانفیگ</span>
       {device_chip}
     </div>
@@ -478,6 +527,8 @@ input#sub{{
       <div class="stats-mini">
         <div class="stat-mini"><span>مصرف‌شده</span><b>{used_label}</b></div>
         <div class="stat-mini"><span>سقف حجم</span><b>{limit_label}</b></div>
+        <div class="stat-mini"><span>انقضای اشتراک</span><b>{html.escape(expire_date_label)}</b></div>
+        <div class="stat-mini"><span>زمان باقی‌مانده</span><b>{html.escape(expire_remain_label)}</b></div>
       </div>
     </div>
   </section>
@@ -514,9 +565,10 @@ input#sub{{
   <p class="footer">{brand}</p>
 </div>
 <div class="toast" id="toast" role="status"></div>
+<!--email_off-->
 <script>
 (function(){{
-  var LINKS={links_json};
+  var LINKS=null;
   var root=document.documentElement,themeBtn=document.getElementById('themeBtn'),toastEl=document.getElementById('toast'),toastTimer;
   function applyTheme(t){{
     root.setAttribute('data-theme',t);
@@ -540,11 +592,43 @@ input#sub{{
       ta.remove();
     }}
   }}
+  function b64ToUtf8(b64){{
+    var bin=atob((b64||'').replace(/\\s+/g,''));
+    if(window.TextDecoder){{
+      var bytes=new Uint8Array(bin.length);
+      for(var i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+      return new TextDecoder('utf-8').decode(bytes);
+    }}
+    try{{return decodeURIComponent(escape(bin));}}catch(e){{return bin;}}
+  }}
+  function loadLinks(){{
+    if(LINKS) return Promise.resolve(LINKS);
+    return fetch(location.pathname+'?raw=1',{{
+      headers:{{'Accept':'text/plain,*/*','X-Astra-Sub':'copy'}},
+      credentials:'same-origin',
+      cache:'no-store'
+    }})
+      .then(function(r){{if(!r.ok) throw new Error('feed'); return r.text();}})
+      .then(function(txt){{
+        var body=b64ToUtf8(txt.trim());
+        LINKS=body.split(/\\r?\\n/).map(function(s){{return s.trim();}}).filter(Boolean);
+        return LINKS;
+      }});
+  }}
   document.getElementById('copySub').addEventListener('click',function(){{copyText(document.getElementById('sub').value);}});
-  document.getElementById('copyAll').addEventListener('click',function(){{if(LINKS.length)copyText(LINKS.join('\\n'));}});
+  document.getElementById('copyAll').addEventListener('click',function(){{
+    loadLinks().then(function(links){{
+      if(links.length) copyText(links.join('\\n'));
+      else toast('کانفیگی نیست');
+    }}).catch(function(){{toast('بارگذاری ناموفق');}});
+  }});
   document.getElementById('cfgList').addEventListener('click',function(e){{
     var btn=e.target.closest('[data-copy-one]');if(!btn)return;
-    var i=Number(btn.getAttribute('data-copy-one'));if(LINKS[i])copyText(LINKS[i]);
+    var i=Number(btn.getAttribute('data-copy-one'));
+    loadLinks().then(function(links){{
+      if(links[i]) copyText(links[i]);
+      else toast('پیدا نشد');
+    }}).catch(function(){{toast('بارگذاری ناموفق');}});
   }});
   var items=document.querySelectorAll('#cfgList .cfg');
   if(items.length>8){{
@@ -560,5 +644,6 @@ input#sub{{
   }}
 }})();
 </script>
+<!--/email_off-->
 </body>
 </html>"""

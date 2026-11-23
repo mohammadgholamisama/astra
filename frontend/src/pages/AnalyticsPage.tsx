@@ -168,8 +168,13 @@ export default function AnalyticsPage() {
   const overview = useQuery({
     queryKey: ["analytics-overview", tz],
     queryFn: () =>
-      api<Overview>(`/api/analytics/overview?tz_offset=${tz}`),
+      api<Overview>(`/api/analytics/overview?tz_offset=${tz}`, {
+        timeoutMs: 45_000,
+      }),
     refetchInterval: 60_000,
+    retry: 1,
+    staleTime: 15_000,
+    placeholderData: (prev) => prev,
   });
 
   const userQ = useQuery({
@@ -793,6 +798,18 @@ export default function AnalyticsPage() {
       ) : (
         <div className="admin-empty">
           <p>خطا در بارگذاری آمار</p>
+          <p className="muted">
+            {(overview.error as Error)?.message ||
+              "پاسخ سرور نرسید — دوباره تلاش کنید"}
+          </p>
+          <button
+            type="button"
+            className="btn sm"
+            onClick={() => void overview.refetch()}
+          >
+            <RefreshCw size={14} />
+            تلاش مجدد
+          </button>
         </div>
       )}
     </div>

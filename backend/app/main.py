@@ -60,10 +60,11 @@ logger = logging.getLogger("astra")
 
 
 async def _auto_retry_errors_loop() -> None:
-    """Every 3 minutes: same as admin «تلاش مجدد همه خطاها».
+    """Cadenced heal of error/pending accounts — never abandons huge backlogs.
 
-    When panels come back, error/pending accounts are retried automatically
-    without waiting for someone to open the Users page.
+    Large sticky piles used to skip entirely (n>800), so the Users banner
+    stayed at thousands forever. Now: sweep false errors instantly, then
+    always chew a small fair batch so /sub stays responsive.
     """
     from sqlalchemy import func, select
 
@@ -73,12 +74,23 @@ async def _auto_retry_errors_loop() -> None:
     from app.services.orchestrator import (
         heal_users_missing_panel_accounts,
         retry_all_failed_accounts,
+        sweep_stale_panel_errors,
     )
 
-    await asyncio.sleep(75)
+    await asyncio.sleep(45)
     while True:
         try:
             async with AsyncSessionLocal() as db:
+                # Instant local cleanup (links→active, timeout→pending)
+                sweep = await sweep_stale_panel_errors(db)
+                if sweep.get("swept_active") or sweep.get("swept_pending"):
+                    logger.info(
+                        "auto retry-errors sweep active=%s pending=%s",
+                        sweep.get("swept_active"),
+                        sweep.get("swept_pending"),
+                    )
+                from sqlalchemy import and_, or_
+
                 n_err = int(
                     (
                         await db.scalar(
@@ -93,15 +105,39 @@ async def _auto_retry_errors_loop() -> None:
                                     )
                                 ),
                                 Panel.is_active.is_(True),
+                                # Capacity-full cannot heal by retry — don't
+                                # burn the auto-retry budget on thousands of them.
+                                or_(
+                                    PanelAccount.status == PanelAccountStatus.pending,
+                                    PanelAccount.error_message.is_(None),
+                                    PanelAccount.error_message == "",
+                                    and_(
+                                        ~PanelAccount.error_message.ilike(
+                                            "%user limit reached%"
+                                        ),
+                                        ~PanelAccount.error_message.ilike(
+                                            "%limit reached%"
+                                        ),
+                                        ~PanelAccount.error_message.ilike("%ظرفیت%"),
+                                    ),
+                                ),
                             )
                         )
                     )
                     or 0
                 )
             if n_err > 0:
+                # Smaller batches when backlog is huge — protect /sub Update
+                if n_err > 5000:
+                    limit, conc, overall = 60, 4, 70.0
+                elif n_err > 800:
+                    limit, conc, overall = 100, 6, 90.0
+                else:
+                    limit, conc, overall = 160, 10, 110.0
                 logger.info(
-                    "auto retry-errors: %s error/pending accounts — starting",
+                    "auto retry-errors: backlog=%s batch=%s",
                     n_err,
+                    limit,
                 )
                 sem = background_db_sem()
                 await sem.acquire()
@@ -109,25 +145,27 @@ async def _auto_retry_errors_loop() -> None:
                     async with AsyncSessionLocal() as db:
                         stats = await retry_all_failed_accounts(
                             db,
-                            overall_timeout=160.0,
-                            per_remote_timeout=20.0,
-                            probe_timeout=10.0,
-                            concurrency=18,
-                            limit_accounts=None,
+                            overall_timeout=overall,
+                            per_remote_timeout=12.0,
+                            probe_timeout=5.0,
+                            concurrency=conc,
+                            limit_accounts=limit,
                         )
                         try:
                             await db.commit()
                         except Exception:  # noqa: BLE001
                             pass
                         logger.info(
-                            "auto retry-errors done attempted=%s recovered=%s remaining=%s down=%s",
+                            "auto retry-errors done attempted=%s recovered=%s "
+                            "remaining=%s swept_active=%s swept_pending=%s",
                             stats.get("attempted"),
                             stats.get("recovered"),
                             stats.get("remaining"),
-                            (stats.get("panels_down") or [])[:5],
+                            stats.get("swept_active"),
+                            stats.get("swept_pending"),
                         )
                     try:
-                        await heal_users_missing_panel_accounts(limit_users=60)
+                        await heal_users_missing_panel_accounts(limit_users=20)
                     except Exception:  # noqa: BLE001
                         logger.debug(
                             "auto retry-errors heal-coverage skipped",
@@ -139,7 +177,27 @@ async def _auto_retry_errors_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("auto retry-errors loop failed")
-        await asyncio.sleep(180)
+        # Faster chew when backlog exists; idle longer when clean
+        try:
+            async with AsyncSessionLocal() as db:
+                left = int(
+                    (
+                        await db.scalar(
+                            select(func.count(PanelAccount.id)).where(
+                                PanelAccount.status.in_(
+                                    (
+                                        PanelAccountStatus.error,
+                                        PanelAccountStatus.pending,
+                                    )
+                                )
+                            )
+                        )
+                    )
+                    or 0
+                )
+        except Exception:  # noqa: BLE001
+            left = 0
+        await asyncio.sleep(90 if left > 0 else 300)
 
 
 
@@ -233,13 +291,126 @@ async def _usage_sync_loop() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("quota watch loop failed")
             elapsed = _time.monotonic() - t0
-        interval = max(8, int(settings.USAGE_REFRESH_SECONDS or 8))
-        # Heavy cycle → proportional cooldown so the event loop / DB can breathe
+        interval = max(6, int(settings.USAGE_REFRESH_SECONDS or 12))
+        # Heavy cycle → short cooldown (was up to 90s and starved meter updates)
         if elapsed > interval:
-            cooldown = min(90.0, max(float(interval), elapsed * 0.75))
+            cooldown = min(25.0, max(float(interval), elapsed * 0.35))
         else:
             cooldown = max(1.0, float(interval) - elapsed)
         await asyncio.sleep(cooldown)
+
+
+async def _fleet_usage_loop() -> None:
+    """Every ~45s: pull ALL remote panels in parallel + recount dirty users."""
+    import time as _time
+
+    from app.core.database import background_db_sem
+    from app.services.panel_usage_bulk import run_fleet_usage_cycle
+
+    # Short boot delay — first fleet should catch remote meters ASAP.
+    await asyncio.sleep(12)
+    while True:
+        t0 = _time.monotonic()
+        try:
+            sem = background_db_sem()
+            await sem.acquire()
+            try:
+                stats = await run_fleet_usage_cycle()
+            finally:
+                sem.release()
+            logger.info(
+                "fleet usage: astra=%s panels=%s listed=%s dirty=%s "
+                "recount=%s flipped=%s dt=%ss",
+                stats.get("astra_panels"),
+                stats.get("panels"),
+                stats.get("listed"),
+                stats.get("dirty"),
+                stats.get("recount_users"),
+                stats.get("flipped"),
+                stats.get("dt"),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("fleet usage loop failed")
+        interval = max(45, int(getattr(settings, "USAGE_FLEET_SECONDS", 60) or 60))
+        elapsed = _time.monotonic() - t0
+        await asyncio.sleep(max(12.0, float(interval) - elapsed))
+
+
+async def _hot_usage_loop() -> None:
+    """Every ~12s: parallel live-pull for recent /sub users (near real-time مصرف)."""
+    import time as _time
+
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import select
+
+    from app.core.database import AsyncSessionLocal
+    from app.services.orchestrator import (
+        refresh_usage_pool_safe,
+        take_live_usage_priority,
+    )
+
+    await asyncio.sleep(8)
+    while True:
+        t0 = _time.monotonic()
+        ids: list[int] = []
+        try:
+            ids = list(take_live_usage_priority(300.0, 60))
+            try:
+                from app.models.user_analytics import UserUsageState
+
+                since = datetime.now(timezone.utc) - timedelta(minutes=20)
+                async with AsyncSessionLocal() as db:
+                    recent = [
+                        int(uid)
+                        for (uid,) in (
+                            await db.execute(
+                                select(UserUsageState.user_id)
+                                .where(UserUsageState.last_sub_fetch_at.is_not(None))
+                                .where(UserUsageState.last_sub_fetch_at >= since)
+                                .order_by(UserUsageState.last_sub_fetch_at.desc())
+                                .limit(40)
+                            )
+                        ).all()
+                    ]
+                ids = list(dict.fromkeys(ids + recent))[:28]
+            except Exception:  # noqa: BLE001
+                pass
+
+            # Parallel but capped — 1.9.379 flooded QueuePool and killed analytics.
+            ids = ids[:20]
+            if ids:
+                sem = asyncio.Semaphore(6)
+
+                async def _one(uid: int) -> None:
+                    async with sem:
+                        try:
+                            await asyncio.wait_for(
+                                refresh_usage_pool_safe(
+                                    int(uid), force=True, quick=True
+                                ),
+                                timeout=12.0,
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                await asyncio.gather(
+                    *[_one(uid) for uid in ids], return_exceptions=True
+                )
+                logger.info(
+                    "hot usage: pulled=%s dt=%.1fs",
+                    len(ids),
+                    _time.monotonic() - t0,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("hot usage loop failed")
+        interval = max(12, int(getattr(settings, "USAGE_HOT_SECONDS", 20) or 20))
+        elapsed = _time.monotonic() - t0
+        await asyncio.sleep(max(6.0, float(interval) - elapsed))
 
 
 async def _analytics_sample_loop() -> None:
@@ -340,6 +511,8 @@ async def lifespan(_app: FastAPI):
             logging.getLogger("astra").exception("order_kind boot task failed")
 
     usage_task = asyncio.create_task(_usage_sync_loop(), name="astra-usage-sync")
+    fleet_task = asyncio.create_task(_fleet_usage_loop(), name="astra-fleet-usage")
+    hot_task = asyncio.create_task(_hot_usage_loop(), name="astra-hot-usage")
     analytics_task = asyncio.create_task(
         _analytics_sample_loop(), name="astra-analytics-sample"
     )
@@ -357,6 +530,8 @@ async def lifespan(_app: FastAPI):
         yield
     finally:
         usage_task.cancel()
+        fleet_task.cancel()
+        hot_task.cancel()
         analytics_task.cancel()
         retry_errors_task.cancel()
         outbound_task.cancel()
@@ -364,6 +539,8 @@ async def lifespan(_app: FastAPI):
         pool_task.cancel()
         for task in (
             usage_task,
+            fleet_task,
+            hot_task,
             analytics_task,
             retry_errors_task,
             outbound_task,

@@ -26,7 +26,9 @@ from app.schemas.panel import (
     PanelCreate,
     PanelMoveBody,
     PanelOut,
+    PanelReorderBody,
     PanelTestAllOut,
+    PanelTestAllStats,
     PanelTestOut,
     PanelUpdate,
     RemoteGroupOut,
@@ -86,13 +88,12 @@ def _is_hard_auth_fail(err: str | None) -> bool:
 async def _live_test_panel(
     panel: Panel,
     *,
-    overall_timeout: float = 9.0,
+    overall_timeout: float = 18.0,
 ) -> dict:
-    """Accurate + fast connectivity probe for the admin Test button.
+    """Accurate connectivity probe for the admin Test button / test-all.
 
-    Clears cached tokens, retries once on soft failures, and hard-caps wall time
-    so a slow remote cannot hang the UI — without false «قطع» when the panel
-    answers after a brief JWT refresh.
+    Clears cached tokens, retries soft failures, and gives Marzban-family
+    enough wall time (login + /api/admin can exceed 10s behind CF).
     """
     import time as _time
 
@@ -100,21 +101,24 @@ async def _live_test_panel(
 
     t0 = _time.monotonic()
     last_err = "اتصال ناموفق"
-    # Marzban-family: one quick retry after cache clear. Others: single attempt.
-    tries = (
-        2
-        if panel.type
-        in (PanelType.marzban, PanelType.rebecca, PanelType.guard, PanelType.pasarguard)
-        else 1
-    )
-    if panel.type == PanelType.sanaei:
-        tries = 2
+    # Always allow at least 2 tries for remote panels (token refresh / CF blip).
+    tries = 3 if panel.type in (
+        PanelType.marzban,
+        PanelType.rebecca,
+        PanelType.guard,
+        PanelType.pasarguard,
+        PanelType.sanaei,
+    ) else 2
 
     for attempt in range(tries):
         remaining = overall_timeout - (_time.monotonic() - t0)
-        if remaining < 0.6:
+        if remaining < 1.0:
             break
-        per_try = min(6.5 if attempt == 0 else remaining, remaining)
+        # First try gets most of the budget; later tries use what's left.
+        if attempt == 0:
+            per_try = min(14.0, remaining)
+        else:
+            per_try = min(10.0, remaining)
         adapter = get_adapter(panel)
         result: AdapterResult | None = None
         try:
@@ -123,7 +127,10 @@ async def _live_test_panel(
                 adapter.test_connection(), timeout=per_try
             )
         except asyncio.TimeoutError:
-            last_err = "پاسخ پنل طول کشید — دوباره تست کنید"
+            last_err = (
+                "پاسخ پنل از سرور Astra طول کشید "
+                "(ممکن است از اینترنت شما باز شود ولی از این سرور دیر برسد)"
+            )
             result = None
         except Exception as exc:  # noqa: BLE001
             last_err = str(exc).strip() or exc.__class__.__name__
@@ -146,9 +153,30 @@ async def _live_test_panel(
         if _is_hard_auth_fail(last_err):
             break
         if attempt + 1 < tries:
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.35 + attempt * 0.25)
 
     ms = int((_time.monotonic() - t0) * 1000)
+    # Clarify path: browser OK ≠ Astra server can reach the panel
+    low = last_err.lower()
+    if any(
+        x in low
+        for x in (
+            "timeout",
+            "timed out",
+            "connect",
+            "unreachable",
+            "name or service",
+            "ssl",
+            "certificate",
+            "طول کشید",
+            "connection reset",
+            "network",
+        )
+    ) and "رمز" not in last_err and "password" not in low and "401" not in low:
+        last_err = (
+            f"{last_err} — از اینترنت شما ممکن است باز شود؛ "
+            "تست از مسیر سرور Astra است."
+        )
     return {
         "success": False,
         "error": last_err,
@@ -277,7 +305,72 @@ async def _ensure_panel_category(
     return int(cat.id)
 
 
+async def _release_db_txn(db: AsyncSession) -> None:
+    """End idle-in-transaction before slow remote/OS work.
+
+    Holding a Postgres checkout across `_probe_panel` / nginx reload lets
+    idle_in_transaction killers close the socket → PendingRollback → false
+    «دیتابیس شلوغ است» on save.
+    """
+    try:
+        await db.rollback()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _is_db_conn_dead(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return (
+        "pendingrollback" in msg
+        or "connection is closed" in msg
+        or "underlying connection is closed" in msg
+        or "connectiondoesnotexist" in msg.replace(" ", "")
+    )
+
+
+async def _commit_panel_db(db: AsyncSession, *, label: str) -> None:
+    """Commit with one reconnect-style retry after a killed checkout."""
+    last: BaseException | None = None
+    for attempt in range(3):
+        try:
+            await db.commit()
+            return
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if not _is_db_conn_dead(exc) or attempt >= 2:
+                raise
+            logger.warning(
+                "panel db commit retry attempt=%s label=%s: %s",
+                attempt + 1,
+                label,
+                exc,
+            )
+            await _release_db_txn(db)
+            await asyncio.sleep(0.15 * (attempt + 1))
+    if last:
+        raise last
+
+
+async def _next_panel_sort_order(
+    db: AsyncSession, category_id: int | None
+) -> int:
+    q = select(func.coalesce(func.max(Panel.sort_order), 0))
+    if category_id is None:
+        q = q.where(Panel.category_id.is_(None))
+    else:
+        q = q.where(Panel.category_id == int(category_id))
+    raw = (await db.execute(q)).scalar()
+    try:
+        return int(raw or 0) + 10
+    except (TypeError, ValueError):
+        return 10
+
+
 def _to_out(p: Panel) -> PanelOut:
+    try:
+        sort_order = int(getattr(p, "sort_order", 0) or 0)
+    except (TypeError, ValueError):
+        sort_order = 0
     return PanelOut(
         id=p.id,
         name=p.name,
@@ -289,6 +382,7 @@ def _to_out(p: Panel) -> PanelOut:
         meta=p.meta or {},
         is_active=p.is_active,
         category_id=getattr(p, "category_id", None),
+        sort_order=sort_order,
         last_ok_at=p.last_ok_at,
         created_at=p.created_at,
     )
@@ -495,7 +589,11 @@ async def move_panel(
     panel = await db.get(Panel, panel_id)
     if not panel:
         raise HTTPException(status_code=404, detail="Panel not found")
-    panel.category_id = await _ensure_panel_category(db, body.category_id)
+    new_cat = await _ensure_panel_category(db, body.category_id)
+    old_cat = getattr(panel, "category_id", None)
+    panel.category_id = new_cat
+    if new_cat != old_cat:
+        panel.sort_order = await _next_panel_sort_order(db, new_cat)
     await db.commit()
     await db.refresh(panel)
     return _to_out(panel)
@@ -508,69 +606,129 @@ async def create_panel(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
-    existing = await db.execute(select(Panel).where(Panel.name == body.name))
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail="Panel name already exists")
-    _validate_credentials(body.type, body.username, body.password, body.api_token)
-    category_id = await _ensure_panel_category(db, body.category_id)
+    try:
+        existing = await db.execute(select(Panel).where(Panel.name == body.name))
+        if existing.scalar_one_or_none():
+            raise HTTPException(status_code=409, detail="Panel name already exists")
+        _validate_credentials(body.type, body.username, body.password, body.api_token)
+        category_id = await _ensure_panel_category(db, body.category_id)
 
-    meta = dict(body.meta or {})
-    if body.type == PanelType.astra:
-        from app.services.astra_node import ensure_panel_token
+        meta = dict(body.meta or {})
+        if body.type == PanelType.astra:
+            from app.services.astra_node import ensure_panel_token
 
-        meta = ensure_panel_token(meta)
-        # Public client host — accept bare host or URL
-        base = str(body.base_url or "").strip() or "127.0.0.1"
-        if "://" not in base:
-            base = f"https://{base}"
-        panel = Panel(
+            meta = ensure_panel_token(meta)
+            # Public client host — accept bare host or URL
+            base = str(body.base_url or "").strip() or "127.0.0.1"
+            if "://" not in base:
+                base = f"https://{base}"
+            sort_order = await _next_panel_sort_order(db, category_id)
+            panel = Panel(
+                name=body.name,
+                type=body.type,
+                base_url=normalize_panel_base_url(base),
+                username=None,
+                password=None,
+                api_token=str(meta.get("node_token") or ""),
+                meta=meta,
+                is_active=body.is_active,
+                category_id=category_id,
+                sort_order=sort_order,
+            )
+            db.add(panel)
+            await db.flush()
+            # Persist id into meta for adapter resolution, write initial xray config
+            meta = ensure_panel_token(meta, panel_id=panel.id)
+            meta["panel_id"] = panel.id
+            if not meta.get("public_host"):
+                meta["public_host"] = panel.base_url.replace("https://", "").replace(
+                    "http://", ""
+                ).split("/")[0].split(":")[0]
+            panel.meta = meta
+            from app.services import astra_node as astra_node_svc
+
+            try:
+                await astra_node_svc.rebuild_xray_config(db, panel)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("astra create rebuild failed name=%s", body.name)
+                await db.rollback()
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"ساخت پنل آسترا ناموفق بود: {exc}",
+                ) from exc
+            panel.last_ok_at = datetime.now(timezone.utc)
+            await _commit_panel_db(db, label="create_astra")
+            await db.refresh(panel)
+            return _to_out(panel)
+
+        sort_order = await _next_panel_sort_order(db, category_id)
+        # Detached probe object — must not hold Postgres txn across remote HTTP
+        probe = Panel(
             name=body.name,
             type=body.type,
-            base_url=normalize_panel_base_url(base),
-            username=None,
-            password=None,
-            api_token=str(meta.get("node_token") or ""),
+            base_url=normalize_panel_base_url(str(body.base_url)),
+            username=(body.username or "").strip() or None,
+            password=(body.password or "").strip() or None,
+            api_token=(body.api_token or "").strip() or None,
             meta=meta,
             is_active=body.is_active,
             category_id=category_id,
+            sort_order=sort_order,
+        )
+        await _release_db_txn(db)
+        # Test BEFORE persisting — wrong credentials must not create a row
+        await _probe_panel(probe)
+
+        # Fresh write txn after probe (name may race; sort_order may advance)
+        existing = await db.execute(select(Panel).where(Panel.name == body.name))
+        if existing.scalar_one_or_none():
+            raise HTTPException(status_code=409, detail="Panel name already exists")
+        category_id = await _ensure_panel_category(db, body.category_id)
+        sort_order = await _next_panel_sort_order(db, category_id)
+        panel = Panel(
+            name=probe.name,
+            type=probe.type,
+            base_url=probe.base_url,
+            username=probe.username,
+            password=probe.password,
+            api_token=probe.api_token,
+            meta=dict(probe.meta or {}),
+            is_active=probe.is_active,
+            category_id=category_id,
+            sort_order=sort_order,
+            last_ok_at=datetime.now(timezone.utc),
         )
         db.add(panel)
-        await db.flush()
-        # Persist id into meta for adapter resolution, write initial xray config
-        meta = ensure_panel_token(meta, panel_id=panel.id)
-        meta["panel_id"] = panel.id
-        if not meta.get("public_host"):
-            meta["public_host"] = panel.base_url.replace("https://", "").replace(
-                "http://", ""
-            ).split("/")[0].split(":")[0]
-        panel.meta = meta
-        from app.services import astra_node as astra_node_svc
-
-        await astra_node_svc.rebuild_xray_config(db, panel)
-        panel.last_ok_at = datetime.now(timezone.utc)
-        await db.commit()
+        await _commit_panel_db(db, label="create_panel")
         await db.refresh(panel)
         return _to_out(panel)
-
-    panel = Panel(
-        name=body.name,
-        type=body.type,
-        base_url=normalize_panel_base_url(str(body.base_url)),
-        username=(body.username or "").strip() or None,
-        password=(body.password or "").strip() or None,
-        api_token=(body.api_token or "").strip() or None,
-        meta=meta,
-        is_active=body.is_active,
-        category_id=category_id,
-    )
-    # Test BEFORE persisting — wrong credentials must not create a row
-    await _probe_panel(panel)
-    panel.last_ok_at = datetime.now(timezone.utc)
-
-    db.add(panel)
-    await db.commit()
-    await db.refresh(panel)
-    return _to_out(panel)
+    except HTTPException:
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("create_panel failed name=%s", getattr(body, "name", "?"))
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        msg = str(exc).strip() or exc.__class__.__name__
+        # Surface real cause instead of opaque CF/edge «Internal Server Error»
+        if "UniqueViolation" in msg or "unique" in msg.lower() or "duplicate" in msg.lower():
+            raise HTTPException(
+                status_code=409, detail="نام پنل تکراری است"
+            ) from exc
+        if _is_db_conn_dead(exc):
+            raise HTTPException(
+                status_code=503,
+                detail="ذخیره پنل قطع شد — دوباره ذخیره کنید (اتصال دیتابیس ریست شد)",
+            ) from exc
+        raise HTTPException(
+            status_code=400,
+            detail=f"ذخیره پنل ناموفق بود: {msg[:220]}",
+        ) from exc
 
 
 @router.get("/api/panel", response_model=list[PanelOut])
@@ -579,8 +737,60 @@ async def list_panels(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
-    result = await db.execute(select(Panel).order_by(Panel.id))
+    result = await db.execute(
+        select(Panel).order_by(Panel.sort_order.asc(), Panel.id.asc())
+    )
     return [_to_out(p) for p in result.scalars().all()]
+
+
+@router.put("/api/panel/reorder", response_model=list[PanelOut])
+@router.put("/api/admin/panels/reorder", response_model=list[PanelOut])
+async def reorder_panels(
+    body: PanelReorderBody,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """Persist drag order for one Panels-page tab (UI only)."""
+    raw_ids = [int(x) for x in body.panel_ids if x is not None]
+    if not raw_ids:
+        raise HTTPException(status_code=400, detail="لیست پنل خالی است")
+
+    cat_id = await _ensure_panel_category(db, body.category_id)
+    if cat_id is None:
+        scope = await db.execute(select(Panel).where(Panel.category_id.is_(None)))
+    else:
+        scope = await db.execute(
+            select(Panel).where(Panel.category_id == int(cat_id))
+        )
+    scoped = {int(p.id): p for p in scope.scalars().all()}
+    if not scoped:
+        raise HTTPException(status_code=400, detail="در این تب پنلی نیست")
+
+    seen: set[int] = set()
+    ordered: list[int] = []
+    for pid in raw_ids:
+        if pid in seen or pid not in scoped:
+            continue
+        seen.add(pid)
+        ordered.append(pid)
+    # Keep any tab panels missing from the payload at the end (stable prior order)
+    missing = sorted(
+        (pid for pid in scoped.keys() if pid not in seen),
+        key=lambda pid: (
+            int(getattr(scoped[pid], "sort_order", 0) or 0),
+            pid,
+        ),
+    )
+    final = ordered + missing
+    for i, pid in enumerate(final):
+        scoped[pid].sort_order = (i + 1) * 10
+    await db.commit()
+    rows = await db.execute(
+        select(Panel)
+        .where(Panel.id.in_(final))
+        .order_by(Panel.sort_order.asc(), Panel.id.asc())
+    )
+    return [_to_out(p) for p in rows.scalars().all()]
 
 
 @router.post("/api/admin/panels/preview-inbounds", response_model=list[InboundOut])
@@ -670,11 +880,43 @@ async def update_panel(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
+    try:
+        return await _update_panel_inner(panel_id, body, db)
+    except HTTPException:
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("update_panel failed id=%s", panel_id)
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        msg = str(exc).strip() or exc.__class__.__name__
+        if _is_db_conn_dead(exc):
+            raise HTTPException(
+                status_code=503,
+                detail="به‌روزرسانی قطع شد — دوباره ذخیره کنید (اتصال دیتابیس ریست شد)",
+            ) from exc
+        raise HTTPException(
+            status_code=400,
+            detail=f"به‌روزرسانی پنل ناموفق بود: {msg[:220]}",
+        ) from exc
+
+
+async def _update_panel_inner(
+    panel_id: int,
+    body: PanelUpdate,
+    db: AsyncSession,
+) -> PanelOut:
     panel = await db.get(Panel, panel_id)
     if not panel:
         raise HTTPException(status_code=404, detail="Panel not found")
     data = body.model_dump(exclude_unset=True)
     clear_category = bool(data.pop("clear_category", False))
+    old_cat = getattr(panel, "category_id", None)
     if clear_category:
         data["category_id"] = None
     elif "category_id" in data:
@@ -692,6 +934,9 @@ async def update_panel(
         elif k in ("username", "password", "api_token") and isinstance(v, str):
             v = v.strip() or None
         setattr(panel, k, v)
+    new_cat = getattr(panel, "category_id", None)
+    if "category_id" in data and new_cat != old_cat:
+        panel.sort_order = await _next_panel_sort_order(db, new_cat)
 
     turning_off = was_active and not bool(panel.is_active)
     turning_on = (not was_active) and bool(panel.is_active)
@@ -700,7 +945,7 @@ async def update_panel(
         # Toggle on/off must not require a live probe (panel may be temporarily down)
         if turning_off:
             await _prepare_panel_turn_off(db, panel.id)
-        await db.commit()
+        await _commit_panel_db(db, label="panel_active_toggle")
         await db.refresh(panel)
         if turning_off:
             _schedule_panel_freeze(panel.id)
@@ -743,14 +988,45 @@ async def update_panel(
         )
         panel.last_ok_at = datetime.now(timezone.utc)
     else:
-        # Re-test with new credentials; reject update if remote rejects us
-        await _probe_panel(panel)
+        # Snapshot credentials, release txn, probe, then re-apply + commit
+        probe = Panel(
+            name=panel.name,
+            type=panel.type,
+            base_url=panel.base_url,
+            username=panel.username,
+            password=panel.password,
+            api_token=panel.api_token,
+            meta=dict(panel.meta or {}),
+            is_active=True,
+        )
+        pending = dict(data)
+        pending_sort = getattr(panel, "sort_order", None)
+        await _release_db_txn(db)
+        await _probe_panel(probe)
+
+        panel = await db.get(Panel, panel_id)
+        if not panel:
+            raise HTTPException(status_code=404, detail="Panel not found")
+        for k, v in pending.items():
+            if k == "base_url" and v:
+                v = normalize_panel_base_url(str(v))
+            elif k in ("username", "password", "api_token") and isinstance(v, str):
+                v = v.strip() or None
+            setattr(panel, k, v)
+        if "category_id" in pending:
+            new_cat = getattr(panel, "category_id", None)
+            if new_cat != old_cat:
+                panel.sort_order = (
+                    pending_sort
+                    if pending_sort is not None
+                    else await _next_panel_sort_order(db, new_cat)
+                )
         panel.last_ok_at = datetime.now(timezone.utc)
 
     if turning_off:
         await _prepare_panel_turn_off(db, panel.id)
 
-    await db.commit()
+    await _commit_panel_db(db, label="update_panel")
     await db.refresh(panel)
     if turning_off:
         _schedule_panel_freeze(panel.id)
@@ -867,13 +1143,29 @@ async def delete_panel(
     was_astra = panel.type == PanelType.astra
     astra_meta = dict(panel.meta or {}) if was_astra else {}
 
-    stats = await deprovision_all_accounts_on_panel(db, panel_id)
-
-    # Explicit child cleanup — avoids SQLite NOT NULL on FK nulling (async ORM)
+    # Drop group claims FIRST so collect_links claim_keys exclude this panel
+    # before the (possibly slow) remote deprovision finishes.
+    await db.execute(sa_delete(GroupPanel).where(GroupPanel.panel_id == panel_id))
     await db.execute(sa_delete(AstraOutbound).where(AstraOutbound.panel_id == panel_id))
     await db.execute(sa_delete(AstraNodeClient).where(AstraNodeClient.panel_id == panel_id))
-    await db.execute(sa_delete(GroupPanel).where(GroupPanel.panel_id == panel_id))
+    try:
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        await db.rollback()
+        logger.exception("delete panel=%s claim cleanup failed", panel_id)
+        raise HTTPException(status_code=500, detail=f"حذف پنل ناموفق: {exc}") from exc
 
+    # Clears links + marks deleted + commits + invalidates, then cuts remotes.
+    stats = await deprovision_all_accounts_on_panel(db, panel_id)
+
+    panel = await db.get(Panel, panel_id)
+    if panel is None:
+        return {
+            "detail": "Panel deleted",
+            "remote_deleted": stats.get("ok", 0),
+            "remote_failed": stats.get("fail", 0),
+            "accounts": stats.get("accounts", 0),
+        }
     await db.delete(panel)
     try:
         await db.commit()
@@ -898,41 +1190,183 @@ async def delete_panel(
     }
 
 
+def _panel_test_grade(success: bool, latency_ms: int | None) -> str:
+    if not success:
+        return "fail"
+    if latency_ms is None:
+        return "ok"
+    if latency_ms <= 1000:
+        return "fast"
+    if latency_ms <= 3000:
+        return "ok"
+    return "slow"
+
+
+def _panel_test_all_stats(
+    results: list[PanelTestOut], *, duration_ms: int
+) -> PanelTestAllStats:
+    ok_n = sum(1 for r in results if r.success)
+    fail_n = len(results) - ok_n
+    latencies = sorted(
+        int(r.latency_ms)
+        for r in results
+        if r.success and r.latency_ms is not None and int(r.latency_ms) >= 0
+    )
+    avg = int(sum(latencies) / len(latencies)) if latencies else None
+    med = None
+    if latencies:
+        mid = len(latencies) // 2
+        if len(latencies) % 2:
+            med = latencies[mid]
+        else:
+            med = int((latencies[mid - 1] + latencies[mid]) / 2)
+    return PanelTestAllStats(
+        total=len(results),
+        ok=ok_n,
+        fail=fail_n,
+        active_ok=sum(1 for r in results if r.is_active and r.success),
+        active_fail=sum(1 for r in results if r.is_active and not r.success),
+        inactive_ok=sum(1 for r in results if (not r.is_active) and r.success),
+        inactive_fail=sum(1 for r in results if (not r.is_active) and not r.success),
+        fast=sum(1 for r in results if r.grade == "fast"),
+        normal=sum(1 for r in results if r.grade == "ok"),
+        slow=sum(1 for r in results if r.grade == "slow"),
+        avg_latency_ms=avg,
+        median_latency_ms=med,
+        best_latency_ms=latencies[0] if latencies else None,
+        worst_latency_ms=latencies[-1] if latencies else None,
+        duration_ms=int(duration_ms),
+    )
+
+
 @router.post("/api/admin/panels/test-all", response_model=PanelTestAllOut)
 @router.post("/api/panel/test-all", response_model=PanelTestAllOut)
 async def test_all_panels(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
-    """Probe every saved panel in parallel — report which connections fail."""
-    rows = await db.execute(select(Panel).order_by(Panel.id.asc()))
+    """Probe every *active* panel in parallel — off panels are skipped."""
+    import time as _time
+
+    rows = await db.execute(
+        select(Panel)
+        .where(Panel.is_active.is_(True))
+        .order_by(Panel.id.asc())
+    )
     panels = list(rows.scalars().all())
+    now = datetime.now(timezone.utc)
     if not panels:
-        return PanelTestAllOut(results=[], ok=0, fail=0)
-
-    # Bound concurrency so a flood of remotes doesn't stall the event loop.
-    sem = asyncio.Semaphore(12)
-
-    async def _one(panel: Panel) -> PanelTestOut:
-        async with sem:
-            probe = await _live_test_panel(panel, overall_timeout=8.0)
-        ok = bool(probe.get("success"))
-        err = None if ok else (probe.get("error") or "اتصال ناموفق")
-        if ok:
-            panel.last_ok_at = datetime.now(timezone.utc)
-        return PanelTestOut(
-            id=int(panel.id),
-            name=panel.name,
-            type=panel.type,
-            is_active=bool(panel.is_active),
-            success=ok,
-            error=err,
+        empty = PanelTestAllStats(duration_ms=0)
+        return PanelTestAllOut(
+            results=[], ok=0, fail=0, stats=empty, tested_at=now
         )
 
-    results = list(await asyncio.gather(*[_one(p) for p in panels]))
-    await db.commit()
-    ok_n = sum(1 for r in results if r.success)
-    return PanelTestAllOut(results=results, ok=ok_n, fail=len(results) - ok_n)
+    # Detach probe inputs from the request AsyncSession. Concurrent workers
+    # must not mutate/read the same session (that broke commit with rvf5).
+    from types import SimpleNamespace
+
+    snapshots: list[dict] = []
+    for p in panels:
+        probe_panel = SimpleNamespace(
+            id=int(p.id),
+            name=p.name,
+            type=p.type,
+            is_active=True,
+            base_url=p.base_url,
+            username=p.username,
+            password=p.password,
+            api_token=p.api_token,
+            meta=dict(p.meta or {}),
+        )
+        snapshots.append(
+            {
+                "id": int(p.id),
+                "name": p.name,
+                "type": p.type,
+                "is_active": True,
+                "base_url": str(getattr(p, "base_url", "") or "").rstrip("/")
+                or None,
+                "panel": probe_panel,
+            }
+        )
+
+    # Fewer concurrent probes + longer per-panel budget so slow CF/hosts
+    # (e.g. real.takrofast.xyz) are not false-failed by a 7s wall clock.
+    sem = asyncio.Semaphore(6)
+    t0 = _time.monotonic()
+
+    async def _one(snap: dict) -> PanelTestOut:
+        async with sem:
+            probe = await _live_test_panel(snap["panel"], overall_timeout=22.0)
+        ok = bool(probe.get("success"))
+        ms = probe.get("latency_ms")
+        latency = int(ms) if isinstance(ms, (int, float)) and ms >= 0 else None
+        return PanelTestOut(
+            id=snap["id"],
+            name=snap["name"],
+            type=snap["type"],
+            is_active=snap["is_active"],
+            success=ok,
+            error=None if ok else (probe.get("error") or "اتصال ناموفق"),
+            latency_ms=latency,
+            grade=_panel_test_grade(ok, latency),
+            base_url=snap["base_url"],
+        )
+
+    gathered = await asyncio.gather(
+        *[_one(s) for s in snapshots], return_exceptions=True
+    )
+    duration_ms = int((_time.monotonic() - t0) * 1000)
+
+    results: list[PanelTestOut] = []
+    ok_ids: list[int] = []
+    for snap, item in zip(snapshots, gathered):
+        if isinstance(item, Exception):
+            logger.warning(
+                "test-all panel=%s failed: %s", snap["id"], item, exc_info=False
+            )
+            results.append(
+                PanelTestOut(
+                    id=snap["id"],
+                    name=snap["name"],
+                    type=snap["type"],
+                    is_active=snap["is_active"],
+                    success=False,
+                    error=(str(item).strip() or item.__class__.__name__)[:300],
+                    latency_ms=None,
+                    grade="fail",
+                    base_url=snap["base_url"],
+                )
+            )
+            continue
+        results.append(item)
+        if item.success:
+            ok_ids.append(int(item.id))
+
+    # Sequential last_ok_at update — one SQL, no concurrent session writes.
+    if ok_ids:
+        try:
+            await db.execute(
+                update(Panel)
+                .where(Panel.id.in_(ok_ids))
+                .values(last_ok_at=now)
+            )
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception("test-all last_ok_at commit failed")
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+
+    stats = _panel_test_all_stats(results, duration_ms=duration_ms)
+    return PanelTestAllOut(
+        results=results,
+        ok=stats.ok,
+        fail=stats.fail,
+        stats=stats,
+        tested_at=now,
+    )
 
 
 @router.post("/api/panel/{panel_id}/test")
@@ -946,7 +1380,7 @@ async def test_panel(
     panel = await db.get(Panel, panel_id)
     if not panel:
         raise HTTPException(status_code=404, detail="Panel not found")
-    probe = await _live_test_panel(panel, overall_timeout=9.0)
+    probe = await _live_test_panel(panel, overall_timeout=22.0)
     if probe.get("success"):
         panel.last_ok_at = datetime.now(timezone.utc)
         await db.commit()

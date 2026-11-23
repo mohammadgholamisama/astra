@@ -1,0 +1,13 @@
+---
+description: Push every live VERSION deploy to GitHub origin/main
+alwaysApply: true
+---
+
+# GitHub upload on every live version
+
+Whenever a new panel `VERSION` is deployed to the live server (`/opt/astra` / `systemctl restart astra`):
+
+1. Commit the app changes that shipped (including `VERSION`) — not one-off `scripts/_deploy_*` / `_diag_*` helpers, secrets, or `*.broken_local` files unless the user asks.
+2. Push to `origin` on the current branch (normally `main`) in the same turn as the successful deploy.
+3. Commit message should name the version and the why (e.g. `Ship 1.9.387: fast user delete with background remote purge.`).
+4. If push fails (auth/network), tell the user and retry once when possible; do not leave a live version unpushed without saying so.

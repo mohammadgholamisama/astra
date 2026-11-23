@@ -28,12 +28,61 @@ async def analytics_overview(
         le=840,
         description="JS Date.getTimezoneOffset() minutes",
     ),
-    db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
-    return await analytics_svc.build_overview(
-        db, limit_users=limit, tz_offset_min=tz_offset
-    )
+    """Users analytics overview — hard-capped, always returns JSON (never blank UI)."""
+    import asyncio
+    import json
+    import time
+    from pathlib import Path
+
+    from app.core.database import AsyncSessionLocal
+
+    cache_path = Path("/tmp/astra_user_analytics_overview.json")
+    ttl = 20.0
+    now = time.time()
+    try:
+        if cache_path.is_file() and 0 <= (now - cache_path.stat().st_mtime) < ttl:
+            disk = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(disk, dict) and "raw_hour" in disk:
+                return disk
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        async with AsyncSessionLocal() as db:
+            payload = await asyncio.wait_for(
+                analytics_svc.build_overview(
+                    db, limit_users=limit, tz_offset_min=tz_offset
+                ),
+                timeout=12.0,
+            )
+        try:
+            cache_path.write_text(
+                json.dumps(payload, ensure_ascii=False, default=str),
+                encoding="utf-8",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return payload
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("analytics overview failed/timed out: %s", exc)
+        try:
+            if cache_path.is_file():
+                disk = json.loads(cache_path.read_text(encoding="utf-8"))
+                if isinstance(disk, dict) and "raw_hour" in disk:
+                    disk = dict(disk)
+                    disk["note"] = (
+                        (disk.get("note") or "")
+                        + " · آخرین نمونهٔ کش‌شده (بروزرسانی طول کشید)"
+                    ).strip(" ·")
+                    return disk
+        except Exception:  # noqa: BLE001
+            pass
+        return analytics_svc.empty_user_overview(
+            tz_offset_min=tz_offset,
+            note="آمار سبک بارگذاری شد — چند ثانیه بعد بروزرسانی کنید",
+        )
 
 
 @router.get("/api/analytics/users/search")

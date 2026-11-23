@@ -25,6 +25,7 @@ import {
   Trash2,
   Users,
   Wifi,
+  Wrench,
   X,
 } from "lucide-react";
 import QRCode from "qrcode";
@@ -53,9 +54,38 @@ type FilterKey = "all" | "active" | "error" | "expired";
 
 const PAGE_SIZE = 10;
 
+function isCapacityAccountError(msg?: string | null) {
+  const m = (msg || "").toLowerCase();
+  if (!m) return false;
+  if (m.includes("user limit reached") || m.includes("limit reached")) return true;
+  if (m.includes("ظرفیت") && (m.includes("پر") || m.includes("گروه"))) return true;
+  return m.includes("maximum users") || m.includes("too many users");
+}
+
+function isSoftTimeoutAccountError(msg?: string | null) {
+  const m = (msg || "").toLowerCase();
+  if (!m) return false;
+  return (
+    m.includes("timeout") ||
+    m.includes("timed out") ||
+    m.includes("waiting for panel response") ||
+    m.includes("طول کشید") ||
+    m.includes("تایم")
+  );
+}
+
+function isNoiseAccountError(msg?: string | null) {
+  return isCapacityAccountError(msg) || isSoftTimeoutAccountError(msg);
+}
+
 function userHasErrors(u: User) {
-  // Only real error status — never treat leftover error_message on active as error
-  return (u.panel_accounts || []).some((a) => a.status === "error");
+  // Real actionable error with no share links — capacity/timeout are not panel faults
+  return (u.panel_accounts || []).some(
+    (a) =>
+      a.status === "error" &&
+      !(a.links && a.links.length > 0) &&
+      !isNoiseAccountError(a.error_message)
+  );
 }
 
 /** Distinct remote panels (not per-group account rows). */
@@ -67,7 +97,13 @@ function uniquePanelStats(u: User): { ok: number; total: number; errorPanels: nu
   for (const a of accounts) {
     all.add(a.panel_id);
     if (a.status === "active") active.add(a.panel_id);
-    if (a.status === "error") errored.add(a.panel_id);
+    if (
+      a.status === "error" &&
+      !(a.links && a.links.length > 0) &&
+      !isNoiseAccountError(a.error_message)
+    ) {
+      errored.add(a.panel_id);
+    }
   }
   return { ok: active.size, total: all.size, errorPanels: errored.size };
 }
@@ -127,6 +163,7 @@ function statusLabel(u: User) {
 }
 
 type PanelUsageRow = {
+  key: string;
   panelId: number;
   name: string;
   raw: number;
@@ -134,6 +171,8 @@ type PanelUsageRow = {
   weighted: number;
   remoteLimit: number;
   configs: number;
+  /** Removed from sub/group but usage still counts toward Astra quota */
+  banked: boolean;
 };
 
 type GroupUsageRow = {
@@ -145,6 +184,8 @@ type GroupUsageRow = {
   configs: number;
   /** Distinct coefficients used by this group's panels */
   coefficients: number[];
+  /** Group no longer on user — usage kept from deleted remotes */
+  banked: boolean;
 };
 
 type UsageMode = "panels" | "groups";
@@ -171,26 +212,43 @@ function claimCoeff(groups: Group[], groupId: number, panelId: number): number {
   return readCoeff((gp?.config as { coefficient?: number } | undefined)?.coefficient);
 }
 
-/** Coefficient for one PanelAccount: its group×panel config (not max across groups). */
+/** Coefficient for one PanelAccount: stored period coeff, else group×panel config. */
 function accountCoeff(a: User["panel_accounts"][number], groups: Group[], groupIds: number[]): number {
-  if (a.group_id != null) {
-    return claimCoeff(groups, a.group_id, a.panel_id);
+  const stored = readCoeff(a.applied_coefficient);
+  if (a.applied_coefficient != null && stored >= 0.01) {
+    // Prefer locked coeff for banked/deleted rows (group link may be gone)
+    if (a.status === "deleted") return stored;
   }
-  // Legacy merged account: max across user's groups on this panel
+  if (a.group_id != null) {
+    const live = claimCoeff(groups, a.group_id, a.panel_id);
+    // claimCoeff falls back to 1 when group/panel link missing — keep stored
+    const g = groups.find((x) => x.id === a.group_id);
+    const hasLink = (g?.panels || []).some((p) => p.panel_id === a.panel_id);
+    if (hasLink) return live;
+    if (a.applied_coefficient != null && stored >= 0.01) return stored;
+    return live;
+  }
+  // Legacy merged account: max across THIS user's current groups on this panel.
+  // Never scan every Astra group when membership is empty — that painted
+  // unrelated group names into the usage modal.
   const want = new Set(groupIds || []);
+  if (!want.size) {
+    if (a.applied_coefficient != null && stored >= 0.01) return stored;
+    return 1;
+  }
   let best = 1;
   for (const g of groups) {
-    if (want.size && !want.has(g.id)) continue;
+    if (!want.has(g.id)) continue;
     const gp = (g.panels || []).find((p) => p.panel_id === a.panel_id);
     if (!gp) continue;
     const c = readCoeff((gp.config as { coefficient?: number } | undefined)?.coefficient);
     if (c > best) best = c;
   }
+  if (best === 1 && a.applied_coefficient != null && stored >= 0.01) return stored;
   return best;
 }
 
-function accountWeighted(a: User["panel_accounts"][number], coefficient: number): number {
-  const raw = Number(a.used_traffic) || 0;
+function accountWeighted(raw: number, coefficient: number): number {
   const coeff = coefficient >= 0.01 ? coefficient : 1;
   return Math.round(raw * coeff);
 }
@@ -199,17 +257,69 @@ function formatCoeff(c: number): string {
   return c === Math.floor(c) ? String(c) : c.toFixed(2).replace(/\.?0+$/, "");
 }
 
+function remoteKey(panelId: number, name: string | null | undefined): string | null {
+  const n = (name || "").trim().toLowerCase();
+  return n ? `${panelId}:${n}` : null;
+}
+
+/** Live remote identities — deleted twins that share them must not double-count. */
+function liveRemoteKeys(accounts: User["panel_accounts"]): Set<string> {
+  const keys = new Set<string>();
+  for (const a of accounts || []) {
+    if (a.status !== "active" && a.status !== "error") continue;
+    for (const raw of [a.remote_username]) {
+      const k = remoteKey(a.panel_id, raw);
+      if (k) keys.add(k);
+    }
+  }
+  return keys;
+}
+
+function liveRawForDeleted(
+  account: User["panel_accounts"][number],
+  accounts: User["panel_accounts"],
+): number {
+  const mine = new Set<string>();
+  const k = remoteKey(account.panel_id, account.remote_username);
+  if (k) mine.add(k);
+  if (!mine.size) return 0;
+  let best = 0;
+  for (const other of accounts || []) {
+    if (other.status !== "active" && other.status !== "error") continue;
+    if (other.panel_id !== account.panel_id) continue;
+    const ok = remoteKey(other.panel_id, other.remote_username);
+    if (ok && mine.has(ok)) {
+      best = Math.max(best, Number(other.used_traffic) || 0);
+    }
+  }
+  return best;
+}
+
 function panelUsageRows(u: User, groups: Group[]): PanelUsageRow[] {
   const astraLimit = Number(u.data_limit) || 0;
   const usedWeighted = Number(u.used_traffic) || 0;
   const rows: PanelUsageRow[] = [];
   const gids = u.group_ids || [];
+  const accounts = u.panel_accounts || [];
+  const liveKeys = liveRemoteKeys(accounts);
 
-  for (const a of u.panel_accounts || []) {
-    if (a.status !== "active" && a.status !== "error") continue;
-    const raw = Number(a.used_traffic) || 0;
+  for (const a of accounts) {
+    const banked = a.status === "deleted";
+    if (!banked && a.status !== "active" && a.status !== "error") continue;
+
+    let raw = Number(a.used_traffic) || 0;
+    if (banked) {
+      if (raw <= 0) continue;
+      const rk = remoteKey(a.panel_id, a.remote_username);
+      if (rk && liveKeys.has(rk)) {
+        const gap = raw - liveRawForDeleted(a, accounts);
+        if (gap <= 0) continue;
+        raw = gap;
+      }
+    }
+
     const coefficient = accountCoeff(a, groups, gids);
-    const weighted = accountWeighted(a, coefficient);
+    const weighted = accountWeighted(raw, coefficient);
     let remoteLimit = 0;
     if (astraLimit > 0) {
       const exhausted = usedWeighted >= astraLimit;
@@ -217,53 +327,92 @@ function panelUsageRows(u: User, groups: Group[]): PanelUsageRow[] {
     }
     const gName =
       a.group_id != null ? groups.find((g) => g.id === a.group_id)?.name : null;
+    const baseName = gName
+      ? `${a.panel_name || `پنل #${a.panel_id}`} · ${gName}`
+      : a.panel_name || `پنل #${a.panel_id}`;
     rows.push({
+      key: `${a.id}-${a.panel_id}-${a.group_id ?? "x"}-${banked ? "b" : "l"}`,
       panelId: a.panel_id,
-      name: gName
-        ? `${a.panel_name || `پنل #${a.panel_id}`} · ${gName}`
-        : a.panel_name || `پنل #${a.panel_id}`,
+      name: banked ? `${baseName} · بانکی` : baseName,
       raw,
       coefficient,
       weighted,
       remoteLimit,
-      configs: (a.links || []).filter(Boolean).length,
+      configs: banked ? 0 : (a.links || []).filter(Boolean).length,
+      banked,
     });
   }
-  rows.sort((a, b) => b.weighted - a.weighted);
+  rows.sort((a, b) => b.weighted - a.weighted || Number(a.banked) - Number(b.banked));
   return rows;
 }
 
-/** Per-group: Σ (raw × coeff) only for accounts that belong to that group. */
+/** Per-group: Σ (raw × coeff) for live + banked accounts of that group.
+
+  Only:
+  - groups the user currently belongs to, and/or
+  - groups that still have banked (deleted) meters for this user.
+
+  Never paint unrelated Astra groups when membership is empty — that was the
+  «اسم گروه‌های دیگه میاد» bug after removing the only group.
+ */
 function groupUsageRows(u: User, groups: Group[]): GroupUsageRow[] {
   const want = new Set(u.group_ids || []);
   const accounts = (u.panel_accounts || []).filter(
-    (a) => a.status === "active" || a.status === "error",
+    (a) => a.status === "active" || a.status === "error" || a.status === "deleted",
   );
+  const liveKeys = liveRemoteKeys(u.panel_accounts || []);
+  const byGroup = new Map<number, User["panel_accounts"]>();
+  for (const a of accounts) {
+    if (a.group_id == null) continue;
+    const list = byGroup.get(a.group_id) || [];
+    list.push(a);
+    byGroup.set(a.group_id, list);
+  }
+
   const rows: GroupUsageRow[] = [];
-  for (const g of groups) {
-    if (want.size && !want.has(g.id)) continue;
+  const seenGroup = new Set<number>();
+
+  const pushGroup = (g: Group, bankedOnly: boolean) => {
+    seenGroup.add(g.id);
     let rawSum = 0;
     let weighted = 0;
     let panels = 0;
     let configs = 0;
     const coeffSet = new Set<number>();
+    // Prefer accounts tagged with this group_id. Legacy null group_id only
+    // when the user is still a member of THIS group (never for strangers).
     const mine = accounts.filter((a) => a.group_id === g.id);
     if (mine.length) {
       for (const a of mine) {
-        const c = claimCoeff(groups, g.id, a.panel_id);
-        const raw = Number(a.used_traffic) || 0;
+        let raw = Number(a.used_traffic) || 0;
+        if (a.status === "deleted") {
+          if (raw <= 0) continue;
+          const rk = remoteKey(a.panel_id, a.remote_username);
+          if (rk && liveKeys.has(rk)) {
+            const gap = raw - liveRawForDeleted(a, u.panel_accounts || []);
+            if (gap <= 0) continue;
+            raw = gap;
+          }
+        }
+        const c =
+          a.status === "deleted"
+            ? accountCoeff(a, groups, u.group_ids || [])
+            : claimCoeff(groups, g.id, a.panel_id);
         rawSum += raw;
         weighted += Math.round(raw * c);
         panels += 1;
-        configs += (a.links || []).filter(Boolean).length;
+        configs += a.status === "deleted" ? 0 : (a.links || []).filter(Boolean).length;
         coeffSet.add(c);
       }
-    } else {
-      // Legacy: no group_id on accounts — attribute each panel once with this group's coeff
+    } else if (!bankedOnly && want.has(g.id)) {
+      // Legacy: null group_id accounts — only for current memberships.
       const seenPanel = new Set<number>();
       for (const gp of g.panels || []) {
         const a = accounts.find(
-          (x) => x.panel_id === gp.panel_id && (x.group_id == null || x.group_id === g.id),
+          (x) =>
+            x.panel_id === gp.panel_id &&
+            x.status !== "deleted" &&
+            x.group_id == null,
         );
         if (!a || seenPanel.has(a.panel_id)) continue;
         seenPanel.add(a.panel_id);
@@ -276,15 +425,72 @@ function groupUsageRows(u: User, groups: Group[]): GroupUsageRow[] {
         coeffSet.add(c);
       }
     }
+    // Hide empty stranger/banked rows; keep empty current memberships only
+    // when the user is still in the group (shows «۰» until first traffic).
+    if (rawSum <= 0 && weighted <= 0 && panels <= 0) {
+      if (bankedOnly || !want.has(g.id)) return;
+    }
     rows.push({
       groupId: g.id,
-      name: g.name,
+      name: bankedOnly ? `${g.name} · بانکی` : g.name,
       raw: rawSum,
       weighted,
       panels,
       configs,
       coefficients: [...coeffSet].sort((a, b) => a - b),
+      banked: bankedOnly,
     });
+  };
+
+  // Current memberships only — never «all groups» when want is empty.
+  for (const g of groups) {
+    if (!want.has(g.id)) continue;
+    pushGroup(g, false);
+  }
+  // Groups removed from the user but still holding banked deleted meters
+  for (const [gid, list] of byGroup) {
+    if (seenGroup.has(gid)) continue;
+    if (!list.some((a) => a.status === "deleted" && (Number(a.used_traffic) || 0) > 0)) {
+      continue;
+    }
+    const g = groups.find((x) => x.id === gid);
+    if (g) {
+      pushGroup(g, true);
+    } else {
+      // Group row deleted from Astra entirely — still show a synthetic label
+      let rawSum = 0;
+      let weighted = 0;
+      let panels = 0;
+      const coeffSet = new Set<number>();
+      for (const a of list) {
+        if (a.status !== "deleted") continue;
+        let raw = Number(a.used_traffic) || 0;
+        if (raw <= 0) continue;
+        const rk = remoteKey(a.panel_id, a.remote_username);
+        if (rk && liveKeys.has(rk)) {
+          const gap = raw - liveRawForDeleted(a, u.panel_accounts || []);
+          if (gap <= 0) continue;
+          raw = gap;
+        }
+        const c = accountCoeff(a, groups, u.group_ids || []);
+        rawSum += raw;
+        weighted += Math.round(raw * c);
+        panels += 1;
+        coeffSet.add(c);
+      }
+      if (rawSum > 0 || weighted > 0) {
+        rows.push({
+          groupId: gid,
+          name: `گروه #${gid} · بانکی`,
+          raw: rawSum,
+          weighted,
+          panels,
+          configs: 0,
+          coefficients: [...coeffSet].sort((a, b) => a - b),
+          banked: true,
+        });
+      }
+    }
   }
   rows.sort((a, b) => b.weighted - a.weighted || a.name.localeCompare(b.name, "fa"));
   return rows;
@@ -443,19 +649,41 @@ export default function UsersPage() {
   const { data, isLoading, isFetching, isSuccess } = useQuery({
     queryKey: usersQueryKey,
     queryFn: () =>
-      api<UsersListPayload>(`/api/users?${buildUsersQs({ refresh: false, pageIndex: page })}`),
-    staleTime: 15_000,
-    refetchInterval: 60_000,
+      api<UsersListPayload>(
+        `/api/users?${buildUsersQs({ refresh: false, pageIndex: page })}`,
+        { timeoutMs: 25_000 }
+      ),
+    staleTime: 12_000,
+    refetchInterval: 40_000,
     refetchOnMount: true,
-    refetchOnWindowFocus: true,
+    refetchOnWindowFocus: false,
     placeholderData: (prev) => prev,
   });
+
+  // Prefetch neighbors so prev/next feel instant
+  useEffect(() => {
+    if (!isSuccess) return;
+    const neighbors = [page - 1, page + 1].filter((p) => p >= 0);
+    for (const p of neighbors) {
+      void qc.prefetchQuery({
+        queryKey: ["users", searchDebounced, filterGroupId, filter, p],
+        queryFn: () =>
+          api<UsersListPayload>(
+            `/api/users?${buildUsersQs({ refresh: false, pageIndex: p })}`,
+            { timeoutMs: 25_000 }
+          ),
+        staleTime: 12_000,
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, isSuccess, searchDebounced, filterGroupId, filter]);
 
   async function syncUsageNow(silent = false) {
     setSyncingUsage(true);
     try {
       const fresh = await api<UsersListPayload>(
-        `/api/users?${buildUsersQs({ refresh: true, pageIndex: page })}`
+        `/api/users?${buildUsersQs({ refresh: true, pageIndex: page })}`,
+        { timeoutMs: 60_000 }
       );
       qc.setQueryData(usersQueryKey, fresh);
       if (!silent) {
@@ -473,20 +701,22 @@ export default function UsersPage() {
     }
   }
 
-  // After fast paint: pull live usage/configs for this page in parallel (non-blocking)
+  // One silent live pull after paint + slow interval (don't stampede pagination)
   useEffect(() => {
-    if (!isSuccess || !data?.users?.length) return;
-    let cancelled = false;
-    const t = window.setTimeout(() => {
-      if (cancelled) return;
+    if (!isSuccess) return;
+    const kick = window.setTimeout(() => {
       void syncUsageNow(true);
-    }, 30);
+    }, 1200);
+    const id = window.setInterval(() => {
+      if (document.visibilityState === "hidden") return;
+      void syncUsageNow(true);
+    }, 60_000);
     return () => {
-      cancelled = true;
-      window.clearTimeout(t);
+      window.clearTimeout(kick);
+      window.clearInterval(id);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isSuccess, searchDebounced, filterGroupId, filter, page]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- page/search scoped
+  }, [usersQueryKey.join("|"), isSuccess]);
   const { data: groups = [] } = useQuery({
     queryKey: ["groups"],
     queryFn: () => api<Group[]>("/api/groups"),
@@ -499,7 +729,7 @@ export default function UsersPage() {
   });
 
   const create = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       const gb = Number(dataGb);
       const dayN = Number(days);
       const hold = startOnFirstUse && dayN > 0;
@@ -509,20 +739,47 @@ export default function UsersPage() {
           ? Math.floor(Date.now() / 1000) + Math.floor(dayN * 86400)
           : 0;
       const dn = displayName.trim();
-      return api<User>("/api/user", {
-        method: "POST",
-        body: JSON.stringify({
-          username,
-          display_name: dn || null,
-          data_limit: gb > 0 ? gbToBytes(gb) : 0,
-          expire,
-          status: hold ? "on_hold" : "active",
-          on_hold_expire_duration: hold ? Math.floor(dayN * 86400) : 0,
-          include_promo_first: includePromoFirst,
-          group_ids: groupIds,
-          category_id: createBoundCategoryId,
-        }),
-      });
+      const uname = username.trim();
+      try {
+        return await api<User>("/api/user", {
+          method: "POST",
+          // Remotes finish in background — don't wait until edge kills the request.
+          timeoutMs: 25_000,
+          body: JSON.stringify({
+            username: uname,
+            display_name: dn || null,
+            data_limit: gb > 0 ? gbToBytes(gb) : 0,
+            expire,
+            status: hold ? "on_hold" : "active",
+            on_hold_expire_duration: hold ? Math.floor(dayN * 86400) : 0,
+            include_promo_first: includePromoFirst,
+            group_ids: groupIds,
+            category_id: createBoundCategoryId,
+          }),
+        });
+      } catch (err) {
+        // First shot timed out / 5xx after commit → user often already exists.
+        if (
+          err instanceof ApiError &&
+          (err.status === 409 ||
+            err.code === "USERNAME_EXISTS" ||
+            err.status === 502 ||
+            err.status === 503 ||
+            err.status === 504 ||
+            err.status >= 500)
+        ) {
+          try {
+            const existing = await api<User>(
+              `/api/user/${encodeURIComponent(uname)}`,
+              { timeoutMs: 8_000 }
+            );
+            if (existing?.username) return existing;
+          } catch {
+            /* fall through */
+          }
+        }
+        throw err;
+      }
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["users"] });
@@ -550,6 +807,9 @@ export default function UsersPage() {
       }
       if (err.code === "HOLD_DURATION_REQUIRED") {
         return "برای شروع از اولین استفاده باید روز اعتبار بیشتر از صفر باشد";
+      }
+      if (err.code === "CREATE_READBACK") {
+        return err.message;
       }
       return err.message;
     }
@@ -682,20 +942,20 @@ export default function UsersPage() {
 
   const remove = useMutation({
     mutationFn: (u: string) =>
-      api<{ detail?: string; skipped_count?: number }>(
+      api<{ detail?: string; skipped_count?: number; panels_count?: number; remote_bg?: boolean }>(
         `/api/user/${encodeURIComponent(u)}`,
-        { method: "DELETE" }
+        { method: "DELETE", timeoutMs: 30000 }
       ),
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["users"] });
       setConfirmUser(null);
-      const skipped = Number(res?.skipped_count || 0);
+      const n = Number(res?.panels_count || 0);
       setActionMsg({
         type: "ok",
         text:
-          skipped > 0
-            ? `کاربر حذف شد — ${toFaDigits(skipped)} پنل خاموش/قطع رد شد`
-            : "کاربر از Astra و پنل‌ها حذف شد",
+          res?.remote_bg && n > 0
+            ? `کاربر از Astra حذف شد — حذف از ${toFaDigits(n)} پنل در پس‌زمینه`
+            : "کاربر حذف شد",
       });
     },
     onError: (e: Error) => {
@@ -719,6 +979,36 @@ export default function UsersPage() {
       });
     },
     onError: (e: Error) => setActionMsg({ type: "err", text: e.message }),
+  });
+
+  type FixSubResult = {
+    username: string;
+    before_share: number;
+    after_share: number;
+    before_gaps: number;
+    after_gaps: number;
+    retried: number;
+    healed: number;
+    hydrated: number;
+    message: string;
+  };
+
+  const fixSub = useMutation({
+    mutationFn: (u: string) =>
+      api<FixSubResult>(`/api/user/${encodeURIComponent(u)}/fix-sub`, {
+        method: "POST",
+        timeoutMs: 120_000,
+      }),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: ["users"] });
+      setErrorsUser(null);
+      setActionMsg({
+        type: r.after_gaps > 0 && r.after_share <= r.before_share ? "err" : "ok",
+        text: r.message || "تکمیل کانفیگ‌ها انجام شد",
+      });
+    },
+    onError: (e: Error) =>
+      setActionMsg({ type: "err", text: e.message || "تکمیل کانفیگ‌ها ناموفق بود" }),
   });
 
   type RetryAllResult = {
@@ -765,21 +1055,6 @@ export default function UsersPage() {
     },
     onError: (e: Error) => setActionMsg({ type: "err", text: e.message }),
   });
-
-  const retryAllPendingRef = useRef(false);
-  retryAllPendingRef.current = retryAll.isPending;
-  const errorCountRef = useRef(0);
-
-  // Auto «تلاش مجدد همه» every 3 minutes while errors remain (server also does this).
-  useEffect(() => {
-    const id = window.setInterval(() => {
-      if (errorCountRef.current <= 0) return;
-      if (retryAllPendingRef.current) return;
-      retryAll.mutate();
-    }, 180_000);
-    return () => window.clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- stable mutate; gated by refs
-  }, []);
 
   const togglePower = useMutation({
     mutationFn: ({ username, enable }: { username: string; enable: boolean }) =>
@@ -1262,7 +1537,6 @@ export default function UsersPage() {
       loaded: users.length,
     };
   }, [users, totalUsers, counts]);
-  errorCountRef.current = stats.withError;
 
   // Server already filters by chip — list is the current page of that filter
   const filtered = users;
@@ -1273,7 +1547,10 @@ export default function UsersPage() {
 
   const errorAccounts: PanelAccount[] = useMemo(() => {
     if (!errorsUser) return [];
-    return (errorsUser.panel_accounts || []).filter((a) => a.status === "error");
+    // Show capacity notes too (softer badge) — banner/chip still exclude them
+    return (errorsUser.panel_accounts || []).filter(
+      (a) => a.status === "error" && !(a.links && a.links.length > 0)
+    );
   }, [errorsUser]);
 
   const filterGroupName =
@@ -1480,9 +1757,8 @@ export default function UsersPage() {
         <div className="users-retry-banner">
           <AlertTriangle size={16} />
           <p>
-            {toFaDigits(stats.withError)} کاربر با خطای پنل — پنل هر ۳ دقیقه خودش تلاش مجدد
-            می‌کند؛ می‌توانید همین حالا هم بزنید. خطاهایی که هنوز پنل‌شان پاسخ ندهد باقی
-            می‌مانند.
+            {toFaDigits(stats.withError)} کاربر فعال با خطای واقعی پنل — سیستم در پس‌زمینه
+            درست می‌کند؛ برای تسریع همین حالا هم می‌توانید بزنید.
           </p>
           <button
             type="button"
@@ -1527,7 +1803,12 @@ export default function UsersPage() {
         <>
         <div className="users-list" role="list" ref={listRef}>
           {filtered.map((u) => {
-            const errors = (u.panel_accounts || []).filter((a) => a.status === "error");
+            const errors = (u.panel_accounts || []).filter(
+              (a) =>
+                a.status === "error" &&
+                !(a.links && a.links.length > 0) &&
+                !isNoiseAccountError(a.error_message)
+            );
             const { ok, total: panels, errorPanels } = uniquePanelStats(u);
             const pct = usagePercent(u.used_traffic, u.data_limit);
             const remain = remainingBytes(u.used_traffic, u.data_limit);
@@ -1615,10 +1896,24 @@ export default function UsersPage() {
                     </span>
                     <strong>{pct == null ? "∞" : `${toFaDigits(pct)}٪`}</strong>
                   </div>
-                  <div className="user-bar" aria-hidden>
+                  <div
+                    className="user-bar"
+                    aria-hidden
+                    title={pct == null ? undefined : `${pct}%`}
+                  >
                     <div
                       className={`user-bar-fill ${barTone}`}
-                      style={{ width: pct == null ? "0%" : `${Math.min(100, pct)}%` }}
+                      style={{
+                        width:
+                          pct == null
+                            ? "0%"
+                            : `${Math.min(
+                                100,
+                                // Floor at 12% when any usage exists so the chip
+                                // stays readable on light cards (label still shows true %).
+                                Math.max(pct > 0 ? 12 : 0, pct),
+                              )}%`,
+                      }}
                     />
                   </div>
                   <div className="user-card-usage-remain">
@@ -1657,7 +1952,7 @@ export default function UsersPage() {
             <button
               type="button"
               className="users-page-btn"
-              disabled={page <= 0 || isFetching}
+              disabled={page <= 0}
               onClick={() => setPage((p) => Math.max(0, p - 1))}
               aria-label="صفحه قبلی"
             >
@@ -1674,12 +1969,13 @@ export default function UsersPage() {
                 {toFaDigits(page * PAGE_SIZE + 1)}–
                 {toFaDigits(Math.min((page + 1) * PAGE_SIZE, totalUsers))} از{" "}
                 {toFaDigits(totalUsers)} کاربر
+                {isFetching ? " · …" : ""}
               </span>
             </div>
             <button
               type="button"
               className="users-page-btn"
-              disabled={page + 1 >= totalPages || isFetching}
+              disabled={page + 1 >= totalPages}
               onClick={() => setPage((p) => p + 1)}
               aria-label="صفحه بعدی"
             >
@@ -1695,7 +1991,12 @@ export default function UsersPage() {
         const u = menuUser;
         const st = statusLabel(u);
         const isOff = u.status === "disabled";
-        const errors = (u.panel_accounts || []).filter((a) => a.status === "error");
+        const errors = (u.panel_accounts || []).filter(
+          (a) =>
+            a.status === "error" &&
+            !(a.links && a.links.length > 0) &&
+            !isNoiseAccountError(a.error_message)
+        );
         const { ok, total: panels } = uniquePanelStats(u);
         const remain = remainingBytes(u.used_traffic, u.data_limit);
         const exp = expireChip(u);
@@ -1888,11 +2189,34 @@ export default function UsersPage() {
                     <small>صفر کردن حجم مصرف‌شده</small>
                   </span>
                 </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={fixSub.isPending || retry.isPending}
+                  onClick={() => {
+                    setMenuUser(null);
+                    setActionMsg({
+                      type: "ok",
+                      text: `در حال تکمیل کانفیگ‌های ${u.username}…`,
+                    });
+                    fixSub.mutate(u.username);
+                  }}
+                >
+                  <span className="user-actions-ico">
+                    <Wrench size={18} className={fixSub.isPending ? "spin" : undefined} />
+                  </span>
+                  <span className="user-actions-label">
+                    <strong>
+                      {fixSub.isPending ? "در حال تکمیل…" : "تکمیل کانفیگ‌ها"}
+                    </strong>
+                    <small>رفع اختلال ساب و پر کردن لیست ناقص</small>
+                  </span>
+                </button>
                 {errors.length > 0 && (
                   <button
                     type="button"
                     role="menuitem"
-                    disabled={retry.isPending || retryAll.isPending}
+                    disabled={retry.isPending || retryAll.isPending || fixSub.isPending}
                     onClick={() => {
                       setMenuUser(null);
                       retry.mutate(u.username);
@@ -3132,8 +3456,9 @@ export default function UsersPage() {
             {usageMode === "panels" ? (
               <>
                 <p className="usage-modal-hint">
-                  مصرف کل = جمع (خام هر پنل × ضریب نهایی). با رسیدن به سقف خرید، وضعیت «اتمام حجم»
-                  می‌شود و کانفیگ روی پنل اصلی هم خاموش می‌شود — حتی اگر آنجا حجم مانده باشد.
+                  مصرف کل = جمع (خام هر پنل × ضریب نهایی). حذف پنل/گروه از ساب آمار مصرف را پاک
+                  نمی‌کند — ردیف‌های «بانکی» همان حجم قبلی‌اند. با رسیدن به سقف خرید، وضعیت «اتمام
+                  حجم» می‌شود و کانفیگ روی پنل اصلی هم خاموش می‌شود.
                 </p>
 
                 <div className="usage-modal-total">
@@ -3148,7 +3473,7 @@ export default function UsersPage() {
 
                 {usageRows.length === 0 ? (
                   <p className="muted" style={{ textAlign: "center", padding: "20px 0" }}>
-                    پنل فعالی برای این کاربر نیست
+                    پنل یا مصرف بانکی برای این کاربر نیست
                   </p>
                 ) : (
                   <div className="usage-panel-list">
@@ -3159,7 +3484,10 @@ export default function UsersPage() {
                           ? Math.round((row.weighted / usageTotalWeighted) * 100)
                           : 0;
                       return (
-                        <div key={row.panelId} className="usage-panel-row">
+                        <div
+                          key={row.key}
+                          className={`usage-panel-row${row.banked ? " usage-panel-row--banked" : ""}`}
+                        >
                           <div className="usage-panel-head">
                             <strong>{row.name}</strong>
                             <span>{formatTraffic(row.weighted, { empty: "۰" })}</span>
@@ -3170,13 +3498,19 @@ export default function UsersPage() {
                           <div className="usage-panel-meta">
                             <span>خام: {formatTraffic(row.raw, { empty: "۰" })}</span>
                             <span>ضریب ×{toFaDigits(formatCoeff(row.coefficient))}</span>
+                            {row.banked ? (
+                              <span>از ساب حذف شده · در سقف حجم می‌ماند</span>
+                            ) : (
+                              <span>
+                                روی پنل:{" "}
+                                {row.remoteLimit > 0
+                                  ? formatTraffic(row.remoteLimit, { empty: "۰" })
+                                  : "نامحدود"}
+                              </span>
+                            )}
                             <span>
-                              روی پنل:{" "}
-                              {row.remoteLimit > 0
-                                ? formatTraffic(row.remoteLimit, { empty: "۰" })
-                                : "نامحدود"}
+                              {row.banked ? "بدون کانفیگ" : `${toFaDigits(row.configs)} کانفیگ`}
                             </span>
-                            <span>{toFaDigits(row.configs)} کانفیگ</span>
                             <span>{toFaDigits(share)}٪ از کل</span>
                           </div>
                         </div>
@@ -3188,9 +3522,8 @@ export default function UsersPage() {
             ) : (
               <>
                 <p className="usage-modal-hint">
-                  مصرف هر گروه = جمع (خام پنل‌های همان گروه × ضریب همان گروه). مصرف کل Astra هر پنل را
-                  یک‌بار با ضریب نهایی حساب می‌کند؛ اگر پنلی در چند گروه باشد، در هر گروه جدا دیده
-                  می‌شود.
+                  فقط گروه‌های همین کاربر (یا مصرف بانکی همان گروه‌ها بعد از حذف). مصرف = جمع (خام ×
+                  ضریب). گروه حذف‌شده با برچسب «بانکی» می‌ماند تا سقف حجم کم نشود.
                 </p>
 
                 <div className="usage-modal-total">
@@ -3233,7 +3566,10 @@ export default function UsersPage() {
                             ? formatCoeff(row.coefficients[0])
                             : row.coefficients.map(formatCoeff).join(" / ");
                       return (
-                        <div key={row.groupId} className="usage-panel-row">
+                        <div
+                          key={`${row.groupId}-${row.banked ? "b" : "l"}`}
+                          className={`usage-panel-row${row.banked ? " usage-panel-row--banked" : ""}`}
+                        >
                           <div className="usage-panel-head">
                             <strong>{row.name}</strong>
                             <span>{formatTraffic(row.weighted, { empty: "۰" })}</span>
@@ -3245,7 +3581,11 @@ export default function UsersPage() {
                             <span>خام: {formatTraffic(row.raw, { empty: "۰" })}</span>
                             <span>ضریب ×{toFaDigits(coeffLabel)}</span>
                             <span>{toFaDigits(row.panels)} پنل</span>
-                            <span>{toFaDigits(row.configs)} کانفیگ</span>
+                            <span>
+                              {row.banked
+                                ? "از ساب حذف شده"
+                                : `${toFaDigits(row.configs)} کانفیگ`}
+                            </span>
                             <span>{toFaDigits(shareOfGroups)}٪ از گروه‌ها</span>
                             <span>{toFaDigits(shareOfAstra)}٪ نسبت به کل</span>
                           </div>
@@ -3342,7 +3682,7 @@ export default function UsersPage() {
               <div>
                 <h3>تأیید حذف</h3>
                 <p className="modal-sub">
-                  کاربر از Astra حذف می‌شود؛ پنل‌های خاموش یا قطع خودکار رد می‌شوند
+                  کاربر فوراً از Astra حذف می‌شود؛ کانفیگ‌ها از همه پنل‌ها موازی پاک می‌شوند
                 </p>
               </div>
               <button
@@ -3379,7 +3719,7 @@ export default function UsersPage() {
                 disabled={remove.isPending}
                 onClick={() => remove.mutate(confirmUser.username)}
               >
-                {remove.isPending ? "در حال حذف از پنل‌ها…" : "بله، حذف شود"}
+                {remove.isPending ? "در حال حذف…" : "بله، حذف شود"}
               </button>
             </footer>
           </div>
@@ -3410,18 +3750,25 @@ export default function UsersPage() {
               <p className="muted">خطای واقعی روی هیچ پنلی ثبت نشده</p>
             ) : (
               <div className="user-err-list">
-                {errorAccounts.map((a) => (
+                {errorAccounts.map((a) => {
+                  const capacity = isCapacityAccountError(a.error_message);
+                  const softTimeout = isSoftTimeoutAccountError(a.error_message);
+                  const soft = capacity || softTimeout;
+                  return (
                   <div key={a.id || a.panel_id} className="user-err-item">
                     <div className="user-err-head">
                       <strong>{a.panel_name || `پنل #${a.panel_id}`}</strong>
-                      <span className="badge err">خطا</span>
+                      <span className={`badge ${soft ? "warn" : "err"}`}>
+                        {capacity ? "ظرفیت پر" : softTimeout ? "کند / تایم‌اوت" : "خطا"}
+                      </span>
                       {a.panel_type && <span className="badge muted">{a.panel_type}</span>}
                     </div>
                     <pre className="user-err-body" dir="auto">
                       {formatPanelErrorDetail(a, errorsUser.username)}
                     </pre>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             )}
 
@@ -3429,7 +3776,9 @@ export default function UsersPage() {
               <button type="button" className="btn ghost" onClick={() => setErrorsUser(null)}>
                 بستن
               </button>
-              {errorAccounts.some((a) => a.status === "error") && (
+              {errorAccounts.some(
+                (a) => a.status === "error" && !isNoiseAccountError(a.error_message)
+              ) && (
                 <button
                   type="button"
                   className="btn"

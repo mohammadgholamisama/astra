@@ -191,6 +191,14 @@ def link_current_remark(link: str) -> str:
     return ""
 
 
+# Keep admin group tags readable. Only strip [] / controls that break weak
+# clients; do NOT erase تومان/ضریب text the admin typed in Groups.
+_TAG_MAX = 80
+_REMARK_MAX = 110
+# ASCII / Arabic decimal separators used in coefficients (1.5 / ۱.۵ / ۱٫۵)
+_DECIMAL_SEPS = frozenset(".,٫")
+
+
 def build_config_remark(
     *,
     name: str,
@@ -204,15 +212,16 @@ def build_config_remark(
 
     - no tag:  ``#2. 2.5G | name``
     - with tag: ``#2. text 2.5G | name``
-    - with flag: ``#2. 2.5G | name 🇩🇪`` (after username)
+    - with flag: ``#2. 2.5G | name 🇩🇪``
 
     brand_tag comes from group/settings; location_flag from host:port map.
-    Not used for notice / promo / status rows.
     """
     base = " ".join(to_en_digits(name or "").split()).strip() or "config"
     # Keep ASCII-ish username; flag is appended separately after the name
     base = re.sub(r"[^\w\s.\-]+", "", base, flags=re.UNICODE).strip() or "config"
-    # config_tag verbatim — never to_en_digits / never cut inside ۱.۵ or 1.5
+    if len(base) > 28:
+        base = base[:28].rstrip()
+    # Preserve admin tag text (minus brackets that break some clients)
     tag = _clip_config_tag(brand_tag)
     # Country flag from host:port map (regional-indicator pair, e.g. 🇩🇪)
     flag = re.sub(r"[\x00-\x1f\x7f]", "", str(location_flag or "")).strip()
@@ -222,13 +231,14 @@ def build_config_remark(
     cid = int(config_id)
     name_part = f"{base} {flag}".strip() if flag else base
     if tag:
-        return f"#{cid}. {tag} {remain} | {name_part}"
-    return f"#{cid}. {remain} | {name_part}"
-
-
-_TAG_MAX = 200
-# ASCII / Arabic decimal separators used in coefficients (1.5 / ۱.۵ / ۱٫۵)
-_DECIMAL_SEPS = frozenset(".,٫")
+        remark = f"#{cid}. {tag} {remain} | {name_part}"
+    else:
+        remark = f"#{cid}. {remain} | {name_part}"
+    remark = " ".join(remark.split()).strip()
+    if len(remark) <= _REMARK_MAX:
+        return remark
+    # Soft trim — keep tag start + username end
+    return remark[:_REMARK_MAX].rstrip()
 
 
 def _is_digit_char(ch: str) -> bool:
@@ -240,13 +250,16 @@ def _is_digit_char(ch: str) -> bool:
 
 
 def _clip_config_tag(raw: object) -> str:
-    """Keep admin tag exact; only strip controls. Never chop mid-decimal."""
+    """Keep admin tag; strip only controls/brackets that break client parsers."""
     tag = " ".join(str(raw or "").split()).strip()
-    tag = re.sub(r"[\x00-\x1f\x7f<>\"'`]", "", tag)
+    if not tag:
+        return ""
+    # [] {} () and quotes break remark/URI parsing on some v2ray builds
+    tag = re.sub(r"[\x00-\x1f\x7f<>\"'`\[\]{}()]", "", tag)
+    tag = re.sub(r"\s+", " ", tag).strip()
     if len(tag) <= _TAG_MAX:
         return tag
     cut = tag[:_TAG_MAX]
-    # «…1.» + «5»  or  «…1» + «.5»  → keep the full coefficient token
     i = _TAG_MAX
     if cut and cut[-1] in _DECIMAL_SEPS and i < len(tag) and _is_digit_char(tag[i]):
         i += 1
@@ -267,7 +280,7 @@ def _clip_config_tag(raw: object) -> str:
         cut = tag[:i]
     if cut and cut[-1] in _DECIMAL_SEPS:
         cut = cut[:-1]
-    return cut
+    return cut.rstrip()
 
 
 def apply_display_name(
@@ -279,6 +292,7 @@ def apply_display_name(
     username: str | None = None,
     brand_tag: str | None = None,
     brand_tags_by_panel: dict[int, str] | None = None,
+    user_status: str | None = None,
 ) -> list[dict]:
     """Rename + sanitize REAL configs only — notices / status / promo stay untouched.
 
@@ -287,6 +301,7 @@ def apply_display_name(
       2) ``brand_tags_by_panel[panel_id]`` (legacy fallback)
       3) global ``brand_tag``
     """
+    _ = user_status
     if not links:
         return links
 
@@ -442,6 +457,7 @@ def build_status_row(
     expire: int | None,
     template: str | None = None,
     panel_label: str | None = None,
+    user_status: str | None = None,
 ) -> dict:
     remark = build_status_remark(
         username=username,
@@ -453,6 +469,7 @@ def build_status_row(
     link = build_notice_link(remark)
     label = " ".join((panel_label or DEFAULT_STATUS_PANEL_LABEL).split()).strip()
     label = re.sub(r"[\x00-\x1f\x7f]", "", label)[:48] or DEFAULT_STATUS_PANEL_LABEL
+    _ = user_status  # callers pass status; notices live in quota_block_notices
     return {
         "link": link,
         "panel": label,
@@ -460,6 +477,31 @@ def build_status_row(
         "remark": remark,
         "kind": "status",
     }
+
+
+def quota_block_notices(user_status: str | None) -> list[dict]:
+    """Extra notice rows when Astra quota/time already cut the subscription."""
+    st = (user_status or "").strip().lower()
+    if st == "limited":
+        text = "⛔ حجم اشتراک تمام شده"
+    elif st == "expired":
+        text = "⛔ اشتراک منقضی شده"
+    elif st == "disabled":
+        text = "⛔ اشتراک غیرفعال شده"
+    else:
+        return []
+    link = build_notice_link(text)
+    if not link:
+        return []
+    return [
+        {
+            "link": link,
+            "panel": "اطلاع‌رسانی",
+            "panel_id": 0,
+            "remark": text,
+            "kind": "notice",
+        }
+    ]
 
 
 def build_promo_row(text: str) -> dict | None:

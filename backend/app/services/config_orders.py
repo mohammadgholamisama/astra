@@ -137,7 +137,25 @@ def order_index_map() -> dict[tuple[str, int, str], int]:
         return dict(_order_idx)
 
 
-def link_order_index(link: str) -> int:
+def to_ping_operator(raw: str | None) -> str | None:
+    """Normalize ISP/operator label for ping-based sub ordering."""
+    text = " ".join(str(raw or "").split()).strip().lower()
+    if not text:
+        return None
+    return text[:64]
+
+
+def has_operator_order_map(operator: str | None) -> bool:
+    """True when a per-ISP ping rank map is loaded.
+
+    Global config-order cache is ISP-agnostic; until per-operator maps are
+    wired, always fall back to category-slot arrangement.
+    """
+    _ = operator
+    return False
+
+
+def link_order_index(link: str, *, operator: str | None = None) -> int:
     """Sort rank for a share link; large number if not in the global list.
 
     Match priority:
@@ -145,6 +163,7 @@ def link_order_index(link: str) -> int:
       2) exact host:port:match_host
       3) host:port with empty match_host
     """
+    _ = operator
     ep = extract_link_endpoint(link)
     if not ep:
         return 10**6
