@@ -1,10 +1,14 @@
 #!/bin/bash
+# Reverse-tunnel local Astra (:2086) to Iran edge :18081
 set -euo pipefail
 export AUTOSSH_GATETIME=0
 export AUTOSSH_PORT=0
 export AUTOSSH_POLL=5
 KEY=/root/.ssh/astra_sub_rtunnel
 EDGE=5.202.8.221
+# Always this host's panel — never point at another VPS
+TARGET=127.0.0.1
+PORT=2086
 timeout 12 ssh -o ConnectTimeout=6 -o BatchMode=yes -o StrictHostKeyChecking=yes \
   -i "$KEY" "root@$EDGE" "fuser -k 18081/tcp >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
 sleep 1
@@ -20,5 +24,5 @@ exec /usr/bin/autossh -M 0 -N \
   -o BatchMode=yes \
   -o IPQoS=throughput \
   -o Compression=no \
-  -R 127.0.0.1:18081:127.0.0.1:2086 \
+  -R "127.0.0.1:18081:${TARGET}:${PORT}" \
   "root@$EDGE"
