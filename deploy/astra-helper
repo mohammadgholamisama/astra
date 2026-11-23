@@ -734,6 +734,9 @@ cmd_xray_restart() {
   fi
   mkdir -p "${ASTRA_ROOT}/xray/panel_${pid}"
   [[ -f "$cfg" ]] || die "missing xray config for panel ${pid}"
+  if [[ ! -x "$xray_bin" ]]; then
+    die "xray binary missing at ${xray_bin} — run: bash ${ASTRA_ROOT}/deploy/astra-xray/install_xray.sh"
+  fi
 
   # Prefer start/restart (fast). enable is optional and timed — hung enable
   # was freezing PID1/logind and breaking SSH under panel heal storms.

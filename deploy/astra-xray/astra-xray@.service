@@ -2,6 +2,9 @@
 Description=Astra Xray node for panel %i
 After=network.target
 Wants=network-online.target
+# Stop 203/EXEC crash-loops from hammering PID1 when xray binary is missing.
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -9,7 +12,7 @@ User=root
 ExecStartPre=/bin/mkdir -p /opt/astra/xray/panel_%i
 ExecStart=/usr/local/bin/xray run -config /opt/astra/xray/panel_%i/config.json
 Restart=on-failure
-RestartSec=3
+RestartSec=15
 LimitNOFILE=1048576
 
 [Install]

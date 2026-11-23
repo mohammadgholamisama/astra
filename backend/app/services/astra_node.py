@@ -1300,6 +1300,22 @@ async def ensure_all_astra_xray_running(*, limit: int = 64) -> dict[str, int]:
     from app.core.database import AsyncSessionLocal
 
     started = skipped = failed = missing = 0
+    xray_bin = Path(os.environ.get("ASTRA_XRAY_BIN", "/usr/local/bin/xray"))
+    if not xray_bin.is_file():
+        logger.warning(
+            "ensure astra-xray skipped — binary missing at %s "
+            "(run deploy/astra-xray/install_xray.sh)",
+            xray_bin,
+        )
+        return {
+            "started": 0,
+            "skipped": 0,
+            "missing": 0,
+            "failed": 0,
+            "panels": 0,
+            "no_binary": 1,
+        }
+
     async with AsyncSessionLocal() as db:
         rows = (
             await db.execute(
