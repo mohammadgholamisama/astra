@@ -3097,36 +3097,9 @@ async def reset_remotes_background(
     user_id: int, *, exclude_types: set[PanelType] | None = None
 ) -> None:
     """Reset + re-push quota on foreign remotes after a fast Astra reset."""
+    from app.adapters.http_utils import is_emfile_err
     from app.core.database import AsyncSessionLocal
     from app.services.users import load_user
-
-    # #region agent log
-    def _dbg_reset(hid: str, msg: str, data: dict | None = None) -> None:
-        import json as _json
-
-        try:
-            with open(
-                "/opt/astra/data/debug-941288.ndjson", "a", encoding="utf-8"
-            ) as f:
-                f.write(
-                    _json.dumps(
-                        {
-                            "sessionId": "941288",
-                            "runId": "reset-fix",
-                            "hypothesisId": hid,
-                            "location": "orchestrator.reset_remotes_background",
-                            "message": msg,
-                            "data": data or {},
-                            "timestamp": int(time.time() * 1000),
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-
-    # #endregion
 
     try:
         async with AsyncSessionLocal() as db:
@@ -3152,20 +3125,7 @@ async def reset_remotes_background(
                 and a.status != PanelAccountStatus.deleted
                 and (not exclude_types or a.panel.type not in exclude_types)
             ]
-            _dbg_reset(
-                "H-F",
-                "reset_remotes_start",
-                {
-                    "user_id": user_id,
-                    "username": user.username,
-                    "target_n": len(targets),
-                    "pg_n": sum(
-                        1
-                        for a in targets
-                        if a.panel and a.panel.type == PanelType.pasarguard
-                    ),
-                },
-            )
+            sem = asyncio.Semaphore(12)
 
             async def _one(account: PanelAccount) -> dict:
                 panel = account.panel
@@ -3175,38 +3135,56 @@ async def reset_remotes_background(
                         "ok": False,
                         "error": "no panel",
                     }
-                adapter = get_adapter(panel)
                 uname = (account.remote_username or user.username or "").strip()
                 rid = account.remote_id or account.remote_username or uname
                 ok = False
                 err: str | None = None
-                try:
-                    res = await asyncio.wait_for(
-                        adapter.reset_usage(uname, rid), timeout=18
-                    )
-                    ok = bool(res.success)
-                    err = None if ok else (res.error or "reset failed")
-                    if not ok:
-                        # One retry after token refresh / short pause
+                async with sem:
+                    adapter = get_adapter(panel)
+                    try:
+                        for attempt in range(3):
+                            try:
+                                res = await asyncio.wait_for(
+                                    adapter.reset_usage(uname, rid), timeout=18
+                                )
+                                ok = bool(res.success)
+                                err = None if ok else (res.error or "reset failed")
+                                if ok:
+                                    break
+                                if attempt < 2 and is_emfile_err(err):
+                                    reset = getattr(adapter, "_reset_client", None)
+                                    if callable(reset):
+                                        try:
+                                            await reset()
+                                        except Exception:
+                                            pass
+                                    await asyncio.sleep(0.35 + attempt * 0.2)
+                                    continue
+                                if attempt < 2:
+                                    try:
+                                        await adapter.close()  # type: ignore[attr-defined]
+                                    except Exception:
+                                        pass
+                                    await asyncio.sleep(0.3)
+                                    adapter = get_adapter(panel)
+                            except Exception as exc:  # noqa: BLE001
+                                ok = False
+                                err = _exc_msg(exc)
+                                if attempt < 2 and is_emfile_err(exc):
+                                    reset = getattr(adapter, "_reset_client", None)
+                                    if callable(reset):
+                                        try:
+                                            await reset()
+                                        except Exception:
+                                            pass
+                                    await asyncio.sleep(0.35 + attempt * 0.2)
+                                    continue
+                                break
+                    finally:
                         try:
                             await adapter.close()  # type: ignore[attr-defined]
                         except Exception:
                             pass
-                        await asyncio.sleep(0.35)
-                        adapter = get_adapter(panel)
-                        res2 = await asyncio.wait_for(
-                            adapter.reset_usage(uname, rid), timeout=18
-                        )
-                        ok = bool(res2.success)
-                        err = None if ok else (res2.error or err or "reset failed")
-                except Exception as exc:  # noqa: BLE001
-                    ok = False
-                    err = _exc_msg(exc)
-                finally:
-                    try:
-                        await adapter.close()  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
                 account.used_traffic = 0
                 account.coeff_anchor_raw = 0
                 account.coeff_anchor_weighted = 0
@@ -3239,23 +3217,23 @@ async def reset_remotes_background(
             if targets:
                 outcomes = list(await asyncio.gather(*[_one(a) for a in targets]))
             fail_n = sum(1 for o in outcomes if not o.get("ok"))
-            _dbg_reset(
-                "H-F",
-                "reset_remotes_done",
-                {
-                    "user_id": user_id,
-                    "ok_n": len(outcomes) - fail_n,
-                    "fail_n": fail_n,
-                    "fails": [o for o in outcomes if not o.get("ok")][:12],
-                },
-            )
-            await sync_modify_user(
-                db,
-                user,
-                exclude_types=exclude_types,
-                remote_timeout=20,
-                skip_nginx_sync=True,
-            )
+            if fail_n:
+                logger.warning(
+                    "reset_remotes user_id=%s ok=%s fail=%s",
+                    user_id,
+                    len(outcomes) - fail_n,
+                    fail_n,
+                )
+            ok_ids = {int(o["panel_id"]) for o in outcomes if o.get("ok")}
+            if ok_ids:
+                await sync_modify_user(
+                    db,
+                    user,
+                    exclude_types=exclude_types,
+                    only_panel_ids=ok_ids,
+                    remote_timeout=20,
+                    skip_nginx_sync=True,
+                )
             # Zero again after re-enable push (some remotes report stale used)
             for account in accounts:
                 if account.status == PanelAccountStatus.deleted:
@@ -3269,7 +3247,6 @@ async def reset_remotes_background(
             await db.commit()
     except Exception:  # noqa: BLE001
         logger.exception("background reset remotes failed user_id=%s", user_id)
-        _dbg_reset("H-F", "reset_remotes_exc", {"user_id": user_id})
 
 
 async def _remount_freeze_marks(
@@ -3786,10 +3763,13 @@ async def _modify_user_all_names(
     uuid: str | None,
     timeout: float,
 ) -> AdapterResult:
-    """PUT every known remote name in parallel — update existing, never create.
+    """PUT known remote names — update existing, never create.
 
     Covers base / ``_g{group}`` / ``_p{panel}`` so volume edits hit the live
     account instead of minting a twin under a new alias.
+
+    Freeze (``_freeze_only``) tries names sequentially to avoid multiplying
+    PasarGuard by-id disable calls and exhausting FDs (Errno 24).
     """
     from dataclasses import replace
 
@@ -3804,17 +3784,34 @@ async def _modify_user_all_names(
     if not names:
         names = [sanitize_remote_username(payload.username or astra_username)]
 
+    freeze_only = bool((payload.config or {}).get("_freeze_only"))
+
     async def _one(name: str) -> AdapterResult:
         p = replace(payload, username=name, config=dict(payload.config or {}))
         return await asyncio.wait_for(adapter.modify_user(p), timeout=timeout)
 
+    last = _fail_result("modify failed")
+    if freeze_only:
+        for name in names:
+            try:
+                res = await _one(name)
+            except Exception as exc:  # noqa: BLE001
+                last = _fail_result(_exc_msg(exc))
+                continue
+            if res.success:
+                if not res.remote_username:
+                    res.remote_username = name
+                return res
+            last = res
+        return last
+
+    # Cap parallel aliases — unbounded gather × many panels caused EMFILE
+    batch = names[:3]
     results = await asyncio.gather(
-        *[_one(n) for n in names],
+        *[_one(n) for n in batch],
         return_exceptions=True,
     )
-    last = _fail_result("modify failed")
-    # Prefer success on stored remote_username / group name order (names list order)
-    for name, res in zip(names, results):
+    for name, res in zip(batch, results):
         if isinstance(res, BaseException):
             if isinstance(res, asyncio.CancelledError):
                 raise res
@@ -8239,7 +8236,9 @@ async def refresh_usage(
             # stale so Astra showed ~⅓ of real panel usage (e.g. 58MB vs 155MB).
             per_try = 8.0
             tries = 1
-            panel_conc = 28
+            # Keep concurrent clients low — shared pool still needs FD headroom
+            # for freeze/reset (Errno 24 Too many open files).
+            panel_conc = 12
             waves = max(1, (n_pull + panel_conc - 1) // panel_conc) if n_pull else 1
             overall_budget = min(55.0, max(12.0, waves * (per_try + 0.5) + 3.0))
             # Always retry misses on sub/quota pulls so every live account counts.
@@ -8248,7 +8247,7 @@ async def refresh_usage(
             # Complete coverage — users page must not miss panels/groups.
             per_try = 10.0
             tries = 2
-            panel_conc = 12
+            panel_conc = 10
             waves = max(1, (n_pull + panel_conc - 1) // panel_conc) if n_pull else 1
             wave_budget = per_try * tries + 2.0
             # Soft ceiling only; unfinished remotes get a dedicated retry wave.
@@ -8257,7 +8256,7 @@ async def refresh_usage(
         else:
             per_try = 5.0
             tries = 1
-            panel_conc = 10
+            panel_conc = 8
             waves = max(1, (n_pull + panel_conc - 1) // panel_conc) if n_pull else 1
             overall_budget = min(40.0, max(12.0, waves * (per_try + 1.0) + 5.0))
             do_miss_retry = False

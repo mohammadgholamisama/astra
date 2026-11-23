@@ -21,7 +21,13 @@ from app.adapters.base import (
     UserPayload,
     apply_remote_state,
 )
-from app.adapters.http_utils import err_msg, make_client, ok_json
+from app.adapters.http_utils import (
+    acquire_shared_client,
+    err_msg,
+    invalidate_shared_client,
+    is_emfile_err,
+    ok_json,
+)
 
 # Protocols Marzban/Rebecca accept in proxies/inbounds
 KNOWN_PROTOCOLS = ("vless", "vmess", "trojan", "shadowsocks")
@@ -45,20 +51,29 @@ class MarzbanAdapter(BasePanelAdapter):
     def _cache_key(self) -> str:
         return f"{self.base_url}|{(self.username or '').strip()}"
 
+    def _verify_ssl(self) -> bool:
+        return bool(self.meta.get("verify_ssl", False))
+
     async def _get_client(self):
-        if self._client is None:
-            # No X-Requested-With — Marzban/PasarGuard token endpoint is OAuth2 form, not 3x-ui
-            self._client = make_client(
+        if self._client is None or getattr(self._client, "is_closed", False):
+            # Shared pool — No X-Requested-With (OAuth2 token is picky)
+            self._client = await acquire_shared_client(
                 self.base_url,
-                self.meta.get("verify_ssl", False),
+                self._verify_ssl(),
                 xhr=False,
             )
         return self._client
 
     async def close(self) -> None:
-        if self._client:
-            await self._client.aclose()
-            self._client = None
+        # Drop local handle only — pooled client stays for other adapters.
+        self._client = None
+
+    async def _reset_client(self) -> None:
+        """Force a fresh pooled client after network/EMFILE failures."""
+        self._client = None
+        await invalidate_shared_client(
+            self.base_url, self._verify_ssl(), xhr=False
+        )
 
     async def _post_token(self, client, form: dict[str, str]):
         headers = {
@@ -101,10 +116,13 @@ class MarzbanAdapter(BasePanelAdapter):
                 try:
                     resp = await self._post_token(client, form)
                     break
-                except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as exc:
+                except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError, OSError) as exc:
                     last_detail = f"شبکه پنل: {exc.__class__.__name__}"
                     if net_try < 3:
-                        await self.close()
+                        if is_emfile_err(exc):
+                            await self._reset_client()
+                        else:
+                            await self.close()
                         await asyncio.sleep(0.25 + net_try * 0.2)
                         client = await self._get_client()
                         continue
@@ -136,7 +154,7 @@ class MarzbanAdapter(BasePanelAdapter):
                 )
                 retried = True
             if retried:
-                await self.close()
+                await self._reset_client()
                 client = await self._get_client()
                 for form in attempts:
                     resp = await self._post_token(client, form)
@@ -940,23 +958,37 @@ class MarzbanAdapter(BasePanelAdapter):
 
     async def reset_usage(self, username: str, remote_id: str | None = None) -> AdapterResult:
         """POST /api/user/{username}/reset — Marzban / PasarGuard / Rebecca family."""
-        try:
-            client, headers = await self._authed()
-            resp = await client.post(
-                f"/api/user/{username}/reset",
-                headers=headers,
-                timeout=httpx.Timeout(25.0, connect=15.0),
-            )
-            ok, data = ok_json(resp)
-            if ok:
-                if isinstance(data, dict):
-                    return self._from_user_response(data, username)
-                return AdapterResult(success=True, remote_username=username, used_traffic=0)
-            if resp.status_code in (404, 405):
-                return AdapterResult(success=False, error=err_msg(data, "reset endpoint missing"))
-            return AdapterResult(success=False, error=err_msg(data, f"HTTP {resp.status_code}"))
-        except Exception as e:
-            return AdapterResult(success=False, error=str(e).strip() or e.__class__.__name__)
+        last_err = "reset failed"
+        for attempt in range(3):
+            try:
+                client, headers = await self._authed()
+                resp = await client.post(
+                    f"/api/user/{username}/reset",
+                    headers=headers,
+                    timeout=httpx.Timeout(25.0, connect=15.0),
+                )
+                ok, data = ok_json(resp)
+                if ok:
+                    if isinstance(data, dict):
+                        return self._from_user_response(data, username)
+                    return AdapterResult(
+                        success=True, remote_username=username, used_traffic=0
+                    )
+                if resp.status_code in (404, 405):
+                    return AdapterResult(
+                        success=False, error=err_msg(data, "reset endpoint missing")
+                    )
+                return AdapterResult(
+                    success=False, error=err_msg(data, f"HTTP {resp.status_code}")
+                )
+            except Exception as e:
+                last_err = str(e).strip() or e.__class__.__name__
+                if attempt < 2 and is_emfile_err(e):
+                    await self._reset_client()
+                    await asyncio.sleep(0.35 + attempt * 0.2)
+                    continue
+                return AdapterResult(success=False, error=last_err)
+        return AdapterResult(success=False, error=last_err)
 
     async def get_usage(
         self,

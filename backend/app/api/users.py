@@ -1125,29 +1125,60 @@ async def reset_user_traffic(
     user = await load_user(db, username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    from app.models.panel import PanelType
 
-    # Astra first (local, fast) so UI/volume update immediately; remotes follow.
+    # All panels in one wave (Astra sequential in-session, remotes concurrent).
     results = await orchestrator.reset_user_traffic_on_panels(
         db,
         user,
-        prefer_types={PanelType.astra},
-        remote_timeout=8,
+        remote_timeout=15,
         sync_after=True,
-        sync_only_types={PanelType.astra},
+        sync_remote_timeout=18,
+        concurrency=16,
     )
     await db.commit()
-    uid = int(user.id)
-    asyncio.create_task(
-        orchestrator.reset_remotes_background(uid, exclude_types={PanelType.astra}),
-        name=f"astra-reset-remotes-{username}",
-    )
     user = await load_user(db, username)
     failed = [r for r in results if not r.get("ok")]
     if failed and user:
         parts = [f"{r.get('panel_name')}: {r.get('error')}" for r in failed]
         logger = __import__("logging").getLogger("astra.users")
         logger.warning("reset partial user=%s: %s", username, " | ".join(parts))
+        # Retry only failed remotes in background (do not leave usage stuck)
+        fail_ids = {
+            int(r["panel_id"])
+            for r in failed
+            if r.get("panel_id") is not None
+        }
+        if fail_ids:
+
+            async def _retry_failed() -> None:
+                from app.core.database import AsyncSessionLocal
+                from app.services.users import load_user as _load
+
+                try:
+                    async with AsyncSessionLocal() as sdb:
+                        u = await _load(sdb, username)
+                        if not u:
+                            return
+                        await orchestrator.reset_user_traffic_on_panels(
+                            sdb,
+                            u,
+                            panel_ids=fail_ids,
+                            prefer_types=None,
+                            remote_timeout=18,
+                            sync_after=True,
+                            concurrency=8,
+                        )
+                        u.used_traffic = 0
+                        if u.status == UserStatus.limited:
+                            u.status = UserStatus.active
+                        await sdb.commit()
+                except Exception:  # noqa: BLE001
+                    logger.exception("reset retry failed user=%s", username)
+
+            asyncio.create_task(
+                _retry_failed(),
+                name=f"astra-reset-retry-{username}",
+            )
     return to_user_response(user)  # type: ignore[arg-type]
 
 

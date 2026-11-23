@@ -20,7 +20,12 @@ from typing import Any
 import httpx
 
 from app.adapters.base import AdapterResult, BasePanelAdapter, UserPayload, coerce_unix_ts
-from app.adapters.http_utils import err_msg, make_client, ok_json
+from app.adapters.http_utils import (
+    acquire_shared_client,
+    err_msg,
+    invalidate_shared_client,
+    ok_json,
+)
 
 logger = logging.getLogger("astra.sanaei")
 
@@ -52,12 +57,13 @@ class SanaeiAdapter(BasePanelAdapter):
         return token
 
     async def _get_client(self):
-        if self._client is None:
-            # Heavy inbound payloads behind Cloudflare often need a long read window
-            self._client = make_client(
+        if self._client is None or getattr(self._client, "is_closed", False):
+            # Shared pool; heavy inbound payloads need a long read window
+            self._client = await acquire_shared_client(
                 self.base_url,
                 self.meta.get("verify_ssl", False),
                 timeout=180.0,
+                xhr=True,
             )
         return self._client
 
@@ -124,9 +130,16 @@ class SanaeiAdapter(BasePanelAdapter):
         return True, data, status or 200
 
     async def close(self) -> None:
-        if self._client:
-            await self._client.aclose()
-            self._client = None
+        # Drop local handle only — pooled client stays for other adapters.
+        self._client = None
+
+    async def _reset_client(self) -> None:
+        self._client = None
+        await invalidate_shared_client(
+            self.base_url,
+            self.meta.get("verify_ssl", False),
+            xhr=True,
+        )
 
     def _auth_headers(self, *, with_bearer: bool = True) -> dict[str, str]:
         headers: dict[str, str] = {

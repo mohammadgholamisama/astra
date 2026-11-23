@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     ADAPTER_TIMEOUT: float = 35.0
     # Max concurrent HTTP ops to remotes (create/delete/modify). Caps FD/TLS storm
     # when a user spans many panels; wall time still ≈ ceil(N/limit)×slowest.
-    PANEL_REMOTE_CONCURRENCY: int = 32
+    PANEL_REMOTE_CONCURRENCY: int = 20
     # Background quota watch cadence (seconds). Exhausted users are frozen
     # on every remote in the same cycle.
     USAGE_REFRESH_SECONDS: int = 8

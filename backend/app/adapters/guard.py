@@ -12,7 +12,13 @@ from typing import Any
 import httpx
 
 from app.adapters.base import AdapterResult, BasePanelAdapter, UserPayload, coerce_unix_ts
-from app.adapters.http_utils import err_msg, expand_subscription_links, make_client, ok_json
+from app.adapters.http_utils import (
+    acquire_shared_client,
+    err_msg,
+    expand_subscription_links,
+    invalidate_shared_client,
+    ok_json,
+)
 
 _TOKEN_CACHE: dict[str, tuple[str, float]] = {}
 _TOKEN_TTL = 240.0
@@ -30,8 +36,8 @@ class GuardAdapter(BasePanelAdapter):
         return f"guard|{self.base_url}|{(self.username or '').strip()}|{(self.api_token or '')[:12]}"
 
     async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = make_client(
+        if self._client is None or getattr(self._client, "is_closed", False):
+            self._client = await acquire_shared_client(
                 self.base_url,
                 self.meta.get("verify_ssl", False),
                 xhr=False,
@@ -39,9 +45,16 @@ class GuardAdapter(BasePanelAdapter):
         return self._client
 
     async def close(self) -> None:
-        if self._client:
-            await self._client.aclose()
-            self._client = None
+        # Drop local handle only — pooled client stays for other adapters.
+        self._client = None
+
+    async def _reset_client(self) -> None:
+        self._client = None
+        await invalidate_shared_client(
+            self.base_url,
+            self.meta.get("verify_ssl", False),
+            xhr=False,
+        )
 
     async def _ensure_token(self) -> str:
         if self._token:

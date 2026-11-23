@@ -49,6 +49,19 @@ def normalize_panel_base_url(url: str) -> str:
             break
     return urlunsplit((parts.scheme, parts.netloc, path, "", "")).rstrip("/")
 
+# One shared AsyncClient per panel base URL — stops Errno 24 (Too many open files)
+# when usage refresh / freeze / reset stampede get_adapter() × unbounded clients.
+_SHARED_CLIENTS: dict[str, httpx.AsyncClient] = {}
+_SHARED_LOCK = asyncio.Lock()
+# Cap sockets per panel; default httpx limits are huge and exhaust process FDs.
+_HTTP_LIMITS = httpx.Limits(max_connections=16, max_keepalive_connections=8)
+
+
+def _shared_client_key(base_url: str, verify_ssl: bool, xhr: bool) -> str:
+    root = normalize_panel_base_url(base_url).rstrip("/")
+    return f"{root}|v{int(bool(verify_ssl))}|x{int(bool(xhr))}"
+
+
 def make_client(
     base_url: str,
     verify_ssl: bool = False,
@@ -61,6 +74,8 @@ def make_client(
 
     X-Requested-With helps 3x-ui return real 401 for bad tokens (otherwise often 404).
     Marzban/PasarGuard/Rebecca should pass xhr=False — some builds are picky about extra headers on /api/admin/token.
+
+    Prefer ``acquire_shared_client`` for adapters so concurrent ops reuse one pool.
     """
     root = normalize_panel_base_url(base_url).rstrip("/") + "/"
     t = float(timeout if timeout is not None else settings.ADAPTER_TIMEOUT)
@@ -80,7 +95,51 @@ def make_client(
         verify=verify_ssl,
         follow_redirects=True,
         headers=headers,
+        limits=_HTTP_LIMITS,
     )
+
+
+async def acquire_shared_client(
+    base_url: str,
+    verify_ssl: bool = False,
+    *,
+    timeout: float | None = None,
+    xhr: bool = True,
+) -> httpx.AsyncClient:
+    """Process-wide client for a panel URL (safe across adapter instances)."""
+    key = _shared_client_key(base_url, verify_ssl, xhr)
+    async with _SHARED_LOCK:
+        client = _SHARED_CLIENTS.get(key)
+        if client is None or client.is_closed:
+            client = make_client(
+                base_url, verify_ssl, timeout=timeout, xhr=xhr
+            )
+            _SHARED_CLIENTS[key] = client
+        return client
+
+
+async def invalidate_shared_client(
+    base_url: str,
+    verify_ssl: bool = False,
+    *,
+    xhr: bool = True,
+) -> None:
+    """Drop pooled client (e.g. after EMFILE / broken TLS) so next acquire is fresh."""
+    key = _shared_client_key(base_url, verify_ssl, xhr)
+    async with _SHARED_LOCK:
+        client = _SHARED_CLIENTS.pop(key, None)
+    if client is None:
+        return
+    try:
+        if not client.is_closed:
+            await client.aclose()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def is_emfile_err(exc: BaseException | str | None) -> bool:
+    text = str(exc or "")
+    return "Too many open files" in text or "Errno 24" in text
 
 
 def ok_json(resp: httpx.Response) -> tuple[bool, Any]:

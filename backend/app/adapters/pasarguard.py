@@ -287,6 +287,8 @@ class PasarGuardAdapter(MarzbanAdapter):
         hint: str | int | None = None,
     ) -> int | None:
         """PasarGuard disable API needs numeric id: /api/user/by-id/{id}/disabled."""
+        from app.adapters.http_utils import is_emfile_err
+
         if hint is not None:
             s = str(hint).strip()
             if s.isdigit():
@@ -294,20 +296,31 @@ class PasarGuardAdapter(MarzbanAdapter):
         uname = (username or "").strip()
         if not uname:
             return None
-        try:
-            import httpx
+        for attempt in range(3):
+            try:
+                import httpx
 
-            client, headers = await self._authed()
-            resp = await client.get(
-                f"/api/user/{uname}",
-                headers=headers,
-                timeout=httpx.Timeout(12.0, connect=6.0),
-            )
-            ok, data = ok_json(resp)
-            if ok and isinstance(data, dict) and data.get("id") is not None:
-                return int(data["id"])
-        except Exception:
-            return None
+                client, headers = await self._authed()
+                resp = await client.get(
+                    f"/api/user/{uname}",
+                    headers=headers,
+                    timeout=httpx.Timeout(12.0, connect=6.0),
+                )
+                ok, data = ok_json(resp)
+                if ok and isinstance(data, dict) and data.get("id") is not None:
+                    return int(data["id"])
+                return None
+            except Exception as e:
+                if attempt < 2 and is_emfile_err(e):
+                    reset = getattr(self, "_reset_client", None)
+                    if callable(reset):
+                        try:
+                            await reset()
+                        except Exception:
+                            pass
+                    await asyncio.sleep(0.35 + attempt * 0.25)
+                    continue
+                return None
         return None
 
     async def _set_disabled_by_id(self, user_id: int, disabled: bool) -> AdapterResult:
@@ -316,35 +329,54 @@ class PasarGuardAdapter(MarzbanAdapter):
         This is what PasarGuard UI uses to turn a user off in edit — status-only
         modify does not reliably stop traffic when Astra quota (with coeff) ends.
         """
-        try:
-            import httpx
+        from app.adapters.http_utils import is_emfile_err
 
-            uid = int(user_id)
-            client, headers = await self._authed()
-            resp = await client.put(
-                f"/api/user/by-id/{uid}/disabled",
-                headers=headers,
-                json={"disabled": bool(disabled)},
-                timeout=httpx.Timeout(15.0, connect=6.0),
-            )
-            ok, data = ok_json(resp)
-            if ok or resp.status_code in (200, 204):
-                return AdapterResult(
-                    success=True,
-                    remote_id=str(uid),
-                    raw=data if isinstance(data, dict) else {"disabled": bool(disabled)},
+        uid = int(user_id)
+        last_err = "disable failed"
+        for attempt in range(3):
+            try:
+                import httpx
+
+                client, headers = await self._authed()
+                resp = await client.put(
+                    f"/api/user/by-id/{uid}/disabled",
+                    headers=headers,
+                    json={"disabled": bool(disabled)},
+                    timeout=httpx.Timeout(15.0, connect=6.0),
                 )
-            return AdapterResult(
-                success=False,
-                remote_id=str(uid),
-                error=err_msg(data, f"HTTP {resp.status_code}"),
-            )
-        except Exception as e:
-            return AdapterResult(
-                success=False,
-                remote_id=str(user_id),
-                error=str(e).strip() or e.__class__.__name__,
-            )
+                ok, data = ok_json(resp)
+                if ok or resp.status_code in (200, 204):
+                    return AdapterResult(
+                        success=True,
+                        remote_id=str(uid),
+                        raw=data
+                        if isinstance(data, dict)
+                        else {"disabled": bool(disabled)},
+                    )
+                return AdapterResult(
+                    success=False,
+                    remote_id=str(uid),
+                    error=err_msg(data, f"HTTP {resp.status_code}"),
+                )
+            except Exception as e:
+                last_err = str(e).strip() or e.__class__.__name__
+                if attempt < 2 and is_emfile_err(e):
+                    reset = getattr(self, "_reset_client", None)
+                    if callable(reset):
+                        try:
+                            await reset()
+                        except Exception:
+                            pass
+                    await asyncio.sleep(0.35 + attempt * 0.25)
+                    continue
+                return AdapterResult(
+                    success=False,
+                    remote_id=str(user_id),
+                    error=last_err,
+                )
+        return AdapterResult(
+            success=False, remote_id=str(user_id), error=last_err
+        )
 
     def _build_pg_body(self, payload: UserPayload, group_ids: list[int]) -> dict[str, Any]:
         # Cloud PasarGuard create/modify schema only accepts status ∈ {active, on_hold}.
