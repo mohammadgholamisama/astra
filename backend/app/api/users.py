@@ -18,6 +18,8 @@ from app.schemas.user import (
     UserBulkCreate,
     UserBulkCreateResponse,
     UserBulkFail,
+    UserCheckUsagePanel,
+    UserCheckUsageResponse,
     UserCreate,
     UserFixSubResponse,
     UserFromTemplate,
@@ -997,6 +999,120 @@ async def delete_user(
         "skipped_count": 0,
         "skipped": [],
     }
+
+
+@router.post("/api/user/{username}/check-usage", response_model=UserCheckUsageResponse)
+async def check_user_usage(
+    username: str,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(get_current_admin),
+):
+    """Force live usage pull from every remote panel for one user.
+
+    Admin «چک مصرف دقیق» — waits for remotes (not background-only) so the
+    returned total matches پنل اصلی right now.
+    """
+    user = await load_user(db, username)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    uid = int(user.id)
+    used_before = int(user.used_traffic or 0)
+    t0 = time.monotonic()
+    try:
+        orchestrator.mark_live_usage_priority(uid)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Complete pull (not quick) so PasarGuard / slow remotes are not skipped.
+    after = -1
+    try:
+        after, _activated, _changed, _st = await asyncio.wait_for(
+            orchestrator.refresh_usage_pool_safe(
+                uid, force=True, quick=False
+            ),
+            timeout=90.0,
+        )
+    except asyncio.TimeoutError:
+        try:
+            after = await orchestrator.recount_user_usage_pool_safe(uid)
+        except Exception:  # noqa: BLE001
+            after = -1
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "USAGE_PULL_FAILED",
+                "message": f"استعلام مصرف ناموفق: {exc}",
+            },
+        ) from exc
+
+    user = await load_user(db, username)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    used_after = int(user.used_traffic or 0)
+    if after >= 0:
+        used_after = max(used_after, int(after))
+
+    panels_out: list[UserCheckUsagePanel] = []
+    synced = 0
+    for a in user.panel_accounts or []:
+        st = getattr(a.status, "value", a.status)
+        if st == "deleted":
+            continue
+        pan = a.__dict__.get("panel")
+        ptype = getattr(pan, "type", None) if pan is not None else None
+        ptype_s = (
+            ptype.value if hasattr(ptype, "value") else (str(ptype) if ptype else None)
+        )
+        last = a.last_sync_at
+        last_s = last.isoformat() if last is not None else None
+        if last is not None:
+            synced += 1
+        panels_out.append(
+            UserCheckUsagePanel(
+                panel_id=int(a.panel_id),
+                panel_name=getattr(pan, "name", None) if pan is not None else None,
+                panel_type=ptype_s,
+                remote_username=(a.remote_username or "").strip() or None,
+                status=str(st or ""),
+                used_raw=int(a.used_traffic or 0),
+                last_sync_at=last_s,
+            )
+        )
+    panels_out.sort(key=lambda r: (-int(r.used_raw or 0), r.panel_id))
+
+    dt_ms = int((time.monotonic() - t0) * 1000)
+    delta = used_after - used_before
+    if delta > 0:
+        msg = (
+            f"مصرف به‌روز شد: {used_before} → {used_after} بایت "
+            f"(+{delta}) از {len(panels_out)} اکانت"
+        )
+    elif used_after > 0:
+        msg = (
+            f"مصرف تایید شد: {used_after} بایت "
+            f"({synced}/{len(panels_out)} پنل همگام)"
+        )
+    else:
+        msg = (
+            f"استعلام انجام شد — مصرف هنوز ۰ "
+            f"({synced}/{len(panels_out)} پنل همگام در {dt_ms}ms)"
+        )
+
+    return UserCheckUsageResponse(
+        username=str(user.username),
+        used_before=used_before,
+        used_after=used_after,
+        data_limit=int(user.data_limit or 0),
+        status=str(getattr(user.status, "value", user.status)),
+        accounts=len(panels_out),
+        synced=synced,
+        dt_ms=dt_ms,
+        message=msg,
+        panels=panels_out,
+        user=to_user_response(user),
+    )
 
 
 @router.post("/api/user/{username}/reset", response_model=UserResponse)

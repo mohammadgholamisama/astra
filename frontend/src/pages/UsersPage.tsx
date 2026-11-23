@@ -12,6 +12,7 @@ import {
   Clock,
   Copy,
   ExternalLink,
+  Gauge,
   Layers,
   Menu,
   Pencil,
@@ -1027,6 +1028,60 @@ export default function UsersPage() {
     },
     onError: (e: Error) =>
       setActionMsg({ type: "err", text: e.message || "تکمیل کانفیگ‌ها ناموفق بود" }),
+  });
+
+  type CheckUsageResult = {
+    username: string;
+    used_before: number;
+    used_after: number;
+    data_limit: number;
+    status: string;
+    accounts: number;
+    synced: number;
+    dt_ms: number;
+    message: string;
+    panels: Array<{
+      panel_id: number;
+      panel_name?: string | null;
+      panel_type?: string | null;
+      remote_username?: string | null;
+      status: string;
+      used_raw: number;
+      last_sync_at?: string | null;
+    }>;
+    user?: User | null;
+  };
+
+  const checkUsage = useMutation({
+    mutationFn: (u: string) =>
+      api<CheckUsageResult>(
+        `/api/user/${encodeURIComponent(u)}/check-usage`,
+        { method: "POST", timeoutMs: 100_000 }
+      ),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: ["users"] });
+      const before = formatTraffic(r.used_before, { empty: "۰" });
+      const after = formatTraffic(r.used_after, { empty: "۰" });
+      const delta = r.used_after - r.used_before;
+      const deltaLabel =
+        delta > 0
+          ? ` (+${formatTraffic(delta, { empty: "۰" })})`
+          : delta < 0
+            ? ` (${formatTraffic(delta, { empty: "۰" })})`
+            : "";
+      setActionMsg({
+        type: "ok",
+        text:
+          `چک مصرف ${r.username}: ${before} → ${after}${deltaLabel} · ` +
+          `${toFaDigits(r.synced)}/${toFaDigits(r.accounts)} پنل · ` +
+          `${toFaDigits(Math.max(1, Math.round(r.dt_ms / 1000)))}ث`,
+      });
+    },
+    onError: (e: Error) =>
+      setActionMsg({
+        type: "err",
+        text: e.message || "چک مصرف از پنل‌های اصلی ناموفق بود",
+      }),
   });
 
   type RetryAllResult = {
@@ -2172,6 +2227,34 @@ export default function UsersPage() {
                   <span className="user-actions-label">
                     <strong>ویرایش</strong>
                     <small>حجم، روز و نام کانفیگ</small>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={checkUsage.isPending}
+                  onClick={() => {
+                    setMenuUser(null);
+                    setActionMsg({
+                      type: "ok",
+                      text: `در حال چک مصرف دقیق ${u.username} از پنل‌های اصلی…`,
+                    });
+                    checkUsage.mutate(u.username);
+                  }}
+                >
+                  <span className="user-actions-ico">
+                    <Gauge
+                      size={18}
+                      className={checkUsage.isPending ? "spin" : undefined}
+                    />
+                  </span>
+                  <span className="user-actions-label">
+                    <strong>
+                      {checkUsage.isPending
+                        ? "در حال چک مصرف…"
+                        : "چک مصرف دقیق"}
+                    </strong>
+                    <small>استعلام زنده از همه پنل‌های اصلی</small>
                   </span>
                 </button>
                 <button

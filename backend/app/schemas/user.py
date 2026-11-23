@@ -171,3 +171,29 @@ class UserFixSubResponse(BaseModel):
     hydrated: int = 0
     message: str = ""
     user: UserResponse | None = None
+
+
+class UserCheckUsagePanel(BaseModel):
+    panel_id: int
+    panel_name: str | None = None
+    panel_type: str | None = None
+    remote_username: str | None = None
+    status: str = ""
+    used_raw: int = 0
+    last_sync_at: str | None = None
+
+
+class UserCheckUsageResponse(BaseModel):
+    """Live pull of one user's usage from every remote panel."""
+
+    username: str
+    used_before: int = 0
+    used_after: int = 0
+    data_limit: int = 0
+    status: str = ""
+    accounts: int = 0
+    synced: int = 0
+    dt_ms: int = 0
+    message: str = ""
+    panels: list[UserCheckUsagePanel] = Field(default_factory=list)
+    user: UserResponse | None = None
