@@ -4480,6 +4480,37 @@ th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
   align-items: center;
   gap: 6px;
 }
+.user-bulk-result-all-wrap {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.user-bulk-result-all-label {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--muted);
+}
+.user-bulk-result-all-links {
+  width: 100%;
+  resize: vertical;
+  min-height: 120px;
+  max-height: 280px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  direction: ltr;
+  text-align: left;
+  box-sizing: border-box;
+}
+.user-bulk-result-all-links:focus {
+  outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  outline-offset: 1px;
+}
 .user-bulk-result-list {
   display: flex;
   flex-direction: column;

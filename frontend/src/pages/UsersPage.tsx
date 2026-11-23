@@ -658,8 +658,8 @@ export default function UsersPage() {
         `/api/users?${buildUsersQs({ refresh: false, pageIndex: page })}`,
         { timeoutMs: 25_000 }
       ),
-    staleTime: 8_000,
-    refetchInterval: 15_000,
+    staleTime: 25_000,
+    refetchInterval: 45_000,
     refetchOnMount: true,
     refetchOnWindowFocus: false,
     placeholderData: (prev) => prev,
@@ -942,6 +942,13 @@ export default function UsersPage() {
     bulkCreate.mutate();
   }
 
+  function bulkAllLinksText() {
+    return (bulkResult?.created || [])
+      .map((u) => u.subscription_url)
+      .filter(Boolean)
+      .join("\n");
+  }
+
   function copyAllBulkSubs() {
     const lines = (bulkResult?.created || [])
       .map((u) => `${u.username}\t${u.subscription_url}`)
@@ -951,11 +958,15 @@ export default function UsersPage() {
   }
 
   function copyAllBulkLinksOnly() {
-    const lines = (bulkResult?.created || [])
-      .map((u) => u.subscription_url)
-      .filter(Boolean)
-      .join("\n");
+    const lines = bulkAllLinksText();
     if (!lines) return;
+    const el = document.getElementById(
+      "bulk-all-links-box"
+    ) as HTMLTextAreaElement | null;
+    if (el) {
+      el.focus();
+      el.select();
+    }
     copy(lines, "bulk-links");
   }
 
@@ -3189,6 +3200,24 @@ export default function UsersPage() {
                   )}
                 </button>
               </div>
+
+              {bulkResult.created.length > 0 && (
+                <label className="user-bulk-result-all-wrap">
+                  <span className="user-bulk-result-all-label">
+                    همه لینک‌ها — یک‌جا انتخاب / کپی
+                  </span>
+                  <textarea
+                    id="bulk-all-links-box"
+                    className="user-bulk-result-all-links"
+                    readOnly
+                    dir="ltr"
+                    rows={Math.min(14, Math.max(5, bulkResult.created.length))}
+                    value={bulkAllLinksText()}
+                    onFocus={(e) => e.currentTarget.select()}
+                    onClick={(e) => e.currentTarget.select()}
+                  />
+                </label>
+              )}
 
               <div className="user-bulk-result-list">
                 {bulkResult.created.map((u, i) => (

@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import and_, delete, exists, func, or_, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import defer, load_only, selectinload
 
 from app.api.deps import get_current_admin
 from app.core.database import get_db
@@ -1539,6 +1539,41 @@ async def _count_users(
     return int((await db.execute(q)).scalar() or 0)
 
 
+async def _users_list_chip_counts(
+    db: AsyncSession,
+    *,
+    search: str | None,
+    group_id: int | None,
+    now_ts: int,
+) -> UsersListCounts:
+    """One round-trip for chip totals — was 4×COUNT and dominated list latency."""
+    filters, needs_group_join, group_filter = _user_list_scope(
+        search=search, group_id=group_id
+    )
+    active_c = _active_user_clause(now_ts)
+    expired_c = _expired_user_clause(now_ts)
+    error_c = _error_user_clause(now_ts)
+    q = select(
+        func.count(func.distinct(User.id)),
+        func.count(func.distinct(User.id)).filter(active_c),
+        func.count(func.distinct(User.id)).filter(error_c),
+        func.count(func.distinct(User.id)).filter(expired_c),
+    )
+    if needs_group_join:
+        q = q.join(UserGroup, UserGroup.user_id == User.id)
+        if group_filter is not None:
+            filters.append(group_filter)
+    if filters:
+        q = q.where(*filters)
+    row = (await db.execute(q)).one()
+    return UsersListCounts(
+        all=int(row[0] or 0),
+        active=int(row[1] or 0),
+        error=int(row[2] or 0),
+        expired=int(row[3] or 0),
+    )
+
+
 @router.get("/api/users", response_model=UsersListResponse)
 async def list_users(
     offset: int = Query(0, ge=0),
@@ -1572,18 +1607,9 @@ async def list_users(
     active_c = _active_user_clause(now_ts)
     error_c = _error_user_clause(now_ts)
 
-    # Chip totals for current search/group — independent of the selected chip
-    counts = UsersListCounts(
-        all=await _count_users(db, search=search, group_id=group_id),
-        active=await _count_users(
-            db, search=search, group_id=group_id, extra=active_c
-        ),
-        error=await _count_users(
-            db, search=search, group_id=group_id, extra=error_c
-        ),
-        expired=await _count_users(
-            db, search=search, group_id=group_id, extra=expired_c
-        ),
+    # Chip totals — single SQL (keeps filters accurate without 4 round-trips).
+    counts = await _users_list_chip_counts(
+        db, search=search, group_id=group_id, now_ts=now_ts
     )
 
     status_extra = None
@@ -1594,13 +1620,33 @@ async def list_users(
     elif status_filter == "expired":
         status_extra = expired_c
 
-    total = await _count_users(
-        db, search=search, group_id=group_id, extra=status_extra
-    )
+    if status_filter == "all":
+        total = counts.all
+    elif status_filter == "active":
+        total = counts.active
+    elif status_filter == "error":
+        total = counts.error
+    elif status_filter == "expired":
+        total = counts.expired
+    else:
+        total = await _count_users(
+            db, search=search, group_id=group_id, extra=status_extra
+        )
 
+    # Light list load: skip huge share-link JSON + unused panel columns.
     q = select(User).options(
         selectinload(User.groups),
-        selectinload(User.panel_accounts).selectinload(PanelAccount.panel),
+        selectinload(User.panel_accounts).options(
+            defer(PanelAccount.links),
+            defer(PanelAccount.links_by_group),
+            selectinload(PanelAccount.panel).load_only(
+                Panel.id,
+                Panel.name,
+                Panel.type,
+                Panel.is_active,
+                Panel.base_url,
+            ),
+        ),
     )
     if needs_group_join:
         q = q.join(UserGroup, UserGroup.user_id == User.id)
@@ -1646,7 +1692,17 @@ async def list_users(
             .where(User.id.in_(ids))
             .options(
                 selectinload(User.groups),
-                selectinload(User.panel_accounts).selectinload(PanelAccount.panel),
+                selectinload(User.panel_accounts).options(
+                    defer(PanelAccount.links),
+                    defer(PanelAccount.links_by_group),
+                    selectinload(PanelAccount.panel).load_only(
+                        Panel.id,
+                        Panel.name,
+                        Panel.type,
+                        Panel.is_active,
+                        Panel.base_url,
+                    ),
+                ),
             )
             .order_by(User.id.desc())
         )

@@ -56,8 +56,11 @@ def to_user_response(user: User, *, include_links: bool = True) -> UserResponse:
     """Serialize user for API.
 
     include_links=False for list endpoints — cuts payload size a lot when
-    many users each have large share-link arrays.
+    many users each have large share-link arrays. List queries may ``defer``
+    ``links``; never touch deferred attrs (async lazy-load is unsafe).
     """
+    from sqlalchemy import inspect as sa_inspect
+
     links: list[str] = []
     seen: set[str] = set()
     accounts = list(user.__dict__.get("panel_accounts") or [])
@@ -93,8 +96,16 @@ def to_user_response(user: User, *, include_links: bool = True) -> UserResponse:
             ptype = getattr(panel, "type", None)
             panel_type = ptype.value if hasattr(ptype, "value") else (str(ptype) if ptype else None)
             panel_base = getattr(panel, "base_url", None) or getattr(panel, "url", None)
-        # Deleted rows are already cut from sub — never re-ship stale share links
-        raw_links = [] if is_deleted else [x for x in (a.links or []) if x]
+        # Deferred links on list path — do not access (would lazy-load under async).
+        unloaded = set()
+        try:
+            unloaded = set(sa_inspect(a).unloaded or ())
+        except Exception:  # noqa: BLE001
+            unloaded = set()
+        if is_deleted or "links" in unloaded:
+            raw_links: list = []
+        else:
+            raw_links = [x for x in (a.links or []) if x]
         # Never surface stale error_message on healthy accounts (UI false positives)
         err = a.error_message if a.status == PanelAccountStatus.error else None
         panel_accounts.append(
