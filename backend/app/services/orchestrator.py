@@ -8232,33 +8232,29 @@ async def refresh_usage(
         # quick MUST win over force for budgets — otherwise bg/quota
         # force+quick still burned 56s+ and starved the DB pool (pulled=0).
         if quick:
-            # PasarGuard often needs >3s; the old 3s/14s budget left most meters
-            # stale so Astra showed ~⅓ of real panel usage (e.g. 58MB vs 155MB).
+            # Small waves — keep event loop free for /health + API under sub stampede.
+            # Misses keep previous meters; hot/fleet/sub later fills gaps.
+            per_try = 4.5
+            tries = 1
+            panel_conc = 3
+            waves = max(1, (n_pull + panel_conc - 1) // panel_conc) if n_pull else 1
+            overall_budget = min(28.0, max(10.0, waves * (per_try + 0.4) + 2.0))
+            do_miss_retry = False
+        elif force:
+            # Admin list: still cover all panels, but calm concurrency.
             per_try = 8.0
             tries = 1
-            # Keep concurrent clients low — shared pool still needs FD headroom
-            # for freeze/reset (Errno 24 Too many open files).
-            panel_conc = 12
+            panel_conc = 4
             waves = max(1, (n_pull + panel_conc - 1) // panel_conc) if n_pull else 1
-            overall_budget = min(55.0, max(12.0, waves * (per_try + 0.5) + 3.0))
-            # Always retry misses on sub/quota pulls so every live account counts.
-            do_miss_retry = True
-        elif force:
-            # Complete coverage — users page must not miss panels/groups.
-            per_try = 10.0
-            tries = 2
-            panel_conc = 10
-            waves = max(1, (n_pull + panel_conc - 1) // panel_conc) if n_pull else 1
-            wave_budget = per_try * tries + 2.0
-            # Soft ceiling only; unfinished remotes get a dedicated retry wave.
-            overall_budget = min(95.0, max(20.0, waves * wave_budget + wave_budget))
+            wave_budget = per_try * tries + 1.5
+            overall_budget = min(60.0, max(16.0, waves * wave_budget + 4.0))
             do_miss_retry = True
         else:
             per_try = 5.0
             tries = 1
-            panel_conc = 8
+            panel_conc = 4
             waves = max(1, (n_pull + panel_conc - 1) // panel_conc) if n_pull else 1
-            overall_budget = min(40.0, max(12.0, waves * (per_try + 1.0) + 5.0))
+            overall_budget = min(32.0, max(10.0, waves * (per_try + 0.8) + 3.0))
             do_miss_retry = False
 
         panel_sem = asyncio.Semaphore(max(1, panel_conc))
@@ -8284,7 +8280,8 @@ async def refresh_usage(
                         if res and res.success:
                             return account, res
                     except Exception as exc:  # noqa: BLE001
-                        logger.warning(
+                        # Debug only — WARNING×panels×users flooded journald/CPU.
+                        logger.debug(
                             "get_usage exception user=%s panel=%s try=%s: %s",
                             user.username,
                             account.panel_id,
@@ -8585,12 +8582,17 @@ async def refresh_usage_pool_safe(
         except Exception:  # noqa: BLE001
             pass
 
-    # Cover EVERY live remote. Old quick=3s/sem=8 dropped slow PasarGuard
-    # meters → Astra under-reported vs «پنل اصلی» (e.g. 58MB vs 155MB).
-    per_try = 7.0 if quick else 12.0
+    # Cover every live remote in small waves — never stampede 15+ panels at once
+    # (that pegged the single uvicorn loop + flooded journald with timeouts).
+    # Accuracy: still visit all pullable; slow panels keep previous meters.
+    per_try = 4.5 if quick else 10.0
+    panel_conc = 3 if quick else 5
     results: dict[int, AdapterResult] = {}
-    # Bound per-user remote fan-out so hot×users doesn't peg CPU/TLS.
-    sem = asyncio.Semaphore(10 if quick else 14)
+    # Rate-limit timeout spam (one line per panel per 60s).
+    _usage_warn_ts: dict[int, float] = getattr(
+        refresh_usage_pool_safe, "_warn_ts", {}
+    )
+    setattr(refresh_usage_pool_safe, "_warn_ts", _usage_warn_ts)
 
     async def _one(
         aid: int,
@@ -8607,43 +8609,44 @@ async def refresh_usage_pool_safe(
             panel_id=int(panel.id),
             group_id=group_id,
         ) or [uname]
-        async with sem:
-            adapter = get_adapter(panel)
-            try:
-                for name in names:
-                    if not name:
-                        continue
-                    for attempt in range(2 if quick else 1):
-                        try:
-                            try:
-                                coro = adapter.get_usage(  # type: ignore[call-arg]
-                                    name, rid or name, expand_links=False
-                                )
-                            except TypeError:
-                                coro = adapter.get_usage(name, rid or name)
-                            res = await asyncio.wait_for(coro, timeout=per_try)
-                            if res is not None and res.success:
-                                results[aid] = res
-                                return
-                        except Exception as exc:  # noqa: BLE001
-                            if attempt == 0 and name == names[0]:
-                                logger.warning(
-                                    "pool-safe get_usage user=%s panel=%s name=%s: %s",
-                                    username,
-                                    panel.id,
-                                    name[:40],
-                                    _exc_msg(exc),
-                                )
-            finally:
-                close = getattr(adapter, "close", None)
-                if callable(close):
+        adapter = get_adapter(panel)
+        try:
+            for name in names:
+                if not name:
+                    continue
+                try:
                     try:
-                        await close()
-                    except Exception:  # noqa: BLE001
-                        pass
+                        coro = adapter.get_usage(  # type: ignore[call-arg]
+                            name, rid or name, expand_links=False
+                        )
+                    except TypeError:
+                        coro = adapter.get_usage(name, rid or name)
+                    res = await asyncio.wait_for(coro, timeout=per_try)
+                    if res is not None and res.success:
+                        results[aid] = res
+                        return
+                except Exception as exc:  # noqa: BLE001
+                    now_m = time.monotonic()
+                    pid = int(panel.id)
+                    last = float(_usage_warn_ts.get(pid) or 0.0)
+                    if now_m - last >= 60.0:
+                        _usage_warn_ts[pid] = now_m
+                        logger.info(
+                            "pool-safe get_usage soft-fail user=%s panel=%s: %s",
+                            username,
+                            pid,
+                            _exc_msg(exc),
+                        )
+                    return
+        finally:
+            close = getattr(adapter, "close", None)
+            if callable(close):
+                try:
+                    await close()
+                except Exception:  # noqa: BLE001
+                    pass
 
     # Reload group_id for candidates (stored in pullable as prev used only).
-    # Re-query light map: aid -> group_id
     aid_gid: dict[int, int | None] = {}
     try:
         async with AsyncSessionLocal() as sdb:
@@ -8656,32 +8659,47 @@ async def refresh_usage_pool_safe(
             ).all()
             for aid, gid in rows:
                 aid_gid[int(aid)] = int(gid) if gid is not None else None
+            await sdb.rollback()
     except Exception:  # noqa: BLE001
         pass
 
     if pullable:
-        await asyncio.gather(
-            *[
-                _one(
-                    aid,
-                    panel,
-                    uname,
-                    rid,
-                    aid_gid.get(int(aid)),
-                )
-                for aid, panel, uname, rid, _prev in pullable
-            ]
-        )
+        # Hard wall so one sub refresh cannot own the event loop for a minute.
+        wall = 28.0 if quick else 55.0
+        t_deadline = time.monotonic() + wall
+        sem = asyncio.Semaphore(max(1, panel_conc))
+
+        async def _gated(item: tuple) -> None:
+            aid, panel, uname, rid, _prev = item
+            if time.monotonic() >= t_deadline:
+                return
+            async with sem:
+                if time.monotonic() >= t_deadline:
+                    return
+                await _one(aid, panel, uname, rid, aid_gid.get(int(aid)))
+
+        # Process in waves so the loop can serve /health + SSH CPU between them.
+        wave = max(1, panel_conc)
+        for i in range(0, len(pullable), wave):
+            if time.monotonic() >= t_deadline:
+                break
+            batch = pullable[i : i + wave]
+            await asyncio.gather(
+                *[_gated(item) for item in batch], return_exceptions=True
+            )
+            await asyncio.sleep(0)
         miss = max(0, len(pullable) - len(results))
-        log = logger.warning if miss else logger.debug
-        log(
-            "pool-safe usage user=%s pullable=%s ok=%s miss=%s quick=%s per_try=%.1f",
+        logger.info(
+            "pool-safe usage user=%s pullable=%s ok=%s miss=%s quick=%s "
+            "conc=%s per_try=%.1f wall=%.0fs",
             username,
             len(pullable),
             len(results),
             miss,
             quick,
+            panel_conc,
             per_try,
+            wall,
         )
 
     for attempt in range(2):

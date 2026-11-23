@@ -554,13 +554,25 @@ async def _bg_usage_pull(user_id: int) -> None:
                         before = max(before, int(instant))
                 except Exception:  # noqa: BLE001
                     pass
-                after, activated, changed, status_now = await asyncio.wait_for(
-                    refresh_usage_pool_safe(
-                        int(user_id), force=True, quick=True
-                    ),
-                    # Must finish all remotes — short cancels left usage at 0.
-                    timeout=75.0,
-                )
+                try:
+                    after, activated, changed, status_now = await asyncio.wait_for(
+                        refresh_usage_pool_safe(
+                            int(user_id), force=True, quick=True
+                        ),
+                        # Waves cover remotes calmly; hard wall protects the event loop.
+                        timeout=32.0,
+                    )
+                except asyncio.TimeoutError:
+                    # Keep accurate weighted total from meters already on disk.
+                    from app.services.orchestrator import recount_user_usage_pool_safe
+
+                    after = await recount_user_usage_pool_safe(int(user_id))
+                    activated, changed, status_now = False, False, ""
+                    logger.info(
+                        "bg usage pull timeout user_id=%s — kept recount=%s",
+                        user_id,
+                        after,
+                    )
                 if after < 0:
                     return
                 async with AsyncSessionLocal() as db:

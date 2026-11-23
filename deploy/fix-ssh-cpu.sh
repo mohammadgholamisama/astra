@@ -9,7 +9,12 @@ ROOT=/opt/astra
 echo "== sshd harden =="
 install -m 644 "$ROOT/deploy/sshd-astra-harden.conf" /etc/ssh/sshd_config.d/60-astra-harden.conf
 sshd -t
-systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+# Avoid systemctl when D-Bus is wedged («Transport endpoint is not connected»)
+if systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null; then
+  :
+else
+  kill -HUP "$(cat /run/sshd.pid 2>/dev/null || pgrep -n sshd)" 2>/dev/null || true
+fi
 
 echo "== astra CPU guard =="
 install -m 644 "$ROOT/deploy/astra.service" /etc/systemd/system/astra.service
@@ -20,8 +25,16 @@ CPUQuota=250%
 TasksMax=4096
 OOMPolicy=continue
 EOF
-systemctl daemon-reload
-systemctl restart astra
+systemctl daemon-reload 2>/dev/null || true
+if ! systemctl restart astra 2>/dev/null; then
+  # D-Bus/systemd socket broken in some web consoles — restart by PID.
+  pkill -f 'uvicorn app.main:app' 2>/dev/null || true
+  sleep 1
+  # Unit may still respawn if systemd is healthy; else start manually:
+  if ! systemctl is-active astra >/dev/null 2>&1; then
+    sudo -u astra bash -lc 'cd /opt/astra/backend && nohup .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 2086 --limit-concurrency 120 --timeout-keep-alive 5 >/tmp/astra-uvicorn.log 2>&1 &' || true
+  fi
+fi
 
 echo "== nginx stub (avoid reload failures) =="
 mkdir -p /opt/astra/nginx
