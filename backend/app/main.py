@@ -373,14 +373,14 @@ async def _fleet_usage_loop() -> None:
 
 
 async def _hot_usage_loop() -> None:
-    """Every ~12s: parallel live-pull for recent /sub users (near real-time مصرف)."""
+    """Cadenced live-pull for recent /sub users — shares background_db_sem."""
     import time as _time
 
     from datetime import datetime, timedelta, timezone
 
     from sqlalchemy import select
 
-    from app.core.database import AsyncSessionLocal
+    from app.core.database import AsyncSessionLocal, background_db_sem
     from app.services.orchestrator import (
         refresh_usage_pool_safe,
         take_live_usage_priority,
@@ -391,6 +391,12 @@ async def _hot_usage_loop() -> None:
         t0 = _time.monotonic()
         ids: list[int] = []
         try:
+            from app.core.database import pool_pressure_blocks_background
+
+            if pool_pressure_blocks_background():
+                logger.warning("hot usage deferred — db pool under pressure")
+                await asyncio.sleep(45)
+                continue
             ids = list(take_live_usage_priority(300.0, 16))
             try:
                 from app.models.user_analytics import UserUsageState
@@ -440,42 +446,47 @@ async def _hot_usage_loop() -> None:
                 pass
 
             # Parallel live pulls for currently-active /sub users (bounded).
-            ids = ids[:12]
+            ids = ids[:8]
             if ids:
-                sem = asyncio.Semaphore(3)
+                bg = background_db_sem()
+                await bg.acquire()
+                try:
+                    sem = asyncio.Semaphore(2)
 
-                async def _one(uid: int) -> None:
-                    async with sem:
-                        try:
-                            await asyncio.wait_for(
-                                refresh_usage_pool_safe(
-                                    int(uid), force=True, quick=True
-                                ),
-                                timeout=32.0,
-                            )
-                        except asyncio.TimeoutError:
+                    async def _one(uid: int) -> None:
+                        async with sem:
                             try:
-                                from app.services.orchestrator import (
-                                    recount_user_usage_pool_safe,
+                                await asyncio.wait_for(
+                                    refresh_usage_pool_safe(
+                                        int(uid), force=True, quick=True
+                                    ),
+                                    timeout=24.0,
                                 )
+                            except asyncio.TimeoutError:
+                                try:
+                                    from app.services.orchestrator import (
+                                        recount_user_usage_pool_safe,
+                                    )
 
-                                await recount_user_usage_pool_safe(int(uid))
+                                    await recount_user_usage_pool_safe(int(uid))
+                                except Exception:  # noqa: BLE001
+                                    logger.warning(
+                                        "hot usage timeout recount user_id=%s",
+                                        uid,
+                                        exc_info=True,
+                                    )
                             except Exception:  # noqa: BLE001
                                 logger.warning(
-                                    "hot usage timeout recount user_id=%s",
+                                    "hot usage pull user_id=%s failed",
                                     uid,
                                     exc_info=True,
                                 )
-                        except Exception:  # noqa: BLE001
-                            logger.warning(
-                                "hot usage pull user_id=%s failed",
-                                uid,
-                                exc_info=True,
-                            )
 
-                await asyncio.gather(
-                    *[_one(uid) for uid in ids], return_exceptions=True
-                )
+                    await asyncio.gather(
+                        *[_one(uid) for uid in ids], return_exceptions=True
+                    )
+                finally:
+                    bg.release()
                 logger.info(
                     "hot usage: pulled=%s dt=%.1fs",
                     len(ids),

@@ -178,11 +178,20 @@ async def system_db_pool(_admin=Depends(get_current_admin)):
 
 
 @router.get("/api/system/host")
-async def system_host(_admin=Depends(get_current_admin)):
-    """CPU / RAM / disk / uptime / services for the dashboard (cached, non-blocking)."""
+async def system_host(
+    request: Request,
+    token: str | None = Depends(oauth2_scheme),
+):
+    """CPU / RAM / disk — no DB session held during host collection."""
     import asyncio
 
+    from app.core.database import AsyncSessionLocal
     from app.services import host_metrics as hm
+
+    # Auth in a short session, then release before /proc + systemctl I/O.
+    async with AsyncSessionLocal() as db:
+        await get_current_admin(request, token, db)
+        await db.rollback()
 
     try:
         data = await asyncio.wait_for(

@@ -706,22 +706,8 @@ export default function UsersPage() {
     }
   }
 
-  // One silent live pull after paint + slow interval (don't stampede pagination)
-  useEffect(() => {
-    if (!isSuccess) return;
-    const kick = window.setTimeout(() => {
-      void syncUsageNow(true);
-    }, 1200);
-    const id = window.setInterval(() => {
-      if (document.visibilityState === "hidden") return;
-      void syncUsageNow(true);
-    }, 15_000);
-    return () => {
-      window.clearTimeout(kick);
-      window.clearInterval(id);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- page/search scoped
-  }, [usersQueryKey.join("|"), isSuccess]);
+  // Live usage stays accurate via fleet/hot/quota loops.
+  // Do NOT auto-call refresh=true — that stampeded remotes + DB pool and froze the panel.
   const { data: groups = [] } = useQuery({
     queryKey: ["groups"],
     queryFn: () => api<Group[]>("/api/groups"),

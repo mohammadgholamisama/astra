@@ -812,6 +812,44 @@ def _migrate_group_order_kind(connection: Connection) -> list[str]:
     return changed
 
 
+def _ensure_dashboard_perf_indexes(connection: Connection) -> list[str]:
+    """Indexes that keep /api/system + users chips from full-scanning 10k+ rows."""
+    created: list[str] = []
+    dialect = connection.dialect.name
+    statements: list[tuple[str, str]] = [
+        (
+            "ix_users_used_traffic",
+            'CREATE INDEX IF NOT EXISTS "ix_users_used_traffic" '
+            'ON "users" (used_traffic DESC)'
+            if dialect == "postgresql"
+            else 'CREATE INDEX IF NOT EXISTS "ix_users_used_traffic" '
+            'ON "users" (used_traffic)',
+        ),
+        (
+            "ix_panel_accounts_status",
+            'CREATE INDEX IF NOT EXISTS "ix_panel_accounts_status" '
+            'ON "panel_accounts" (status)',
+        ),
+        (
+            "ix_panel_accounts_status_panel",
+            'CREATE INDEX IF NOT EXISTS "ix_panel_accounts_status_panel" '
+            'ON "panel_accounts" (status, panel_id)',
+        ),
+    ]
+    for name, sql in statements:
+        try:
+            connection.execute(text(sql))
+            created.append(name)
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            if "already exists" in msg or "duplicate" in msg:
+                continue
+            logger.warning("Skip perf index %s: %s", name, exc)
+    if created:
+        logger.info("Ensured dashboard perf indexes: %s", ", ".join(created))
+    return created
+
+
 def sync_schema_sync(connection: Connection) -> dict[str, Any]:
     import app.models  # noqa: F401
 
@@ -826,9 +864,10 @@ def sync_schema_sync(connection: Connection) -> dict[str, Any]:
     mig4 = _migrate_group_config_hide_nullable_group_id(connection)
     mig5 = _migrate_group_config_tag_widen(connection)
     added_idx = _add_missing_indexes(connection)
+    perf_idx = _ensure_dashboard_perf_indexes(connection)
     return {
         "added_columns": added_cols,
-        "added_indexes": added_idx,
+        "added_indexes": added_idx + perf_idx,
         "migrations": mig6 + mig + mig2 + mig3 + mig4 + mig5,
     }
 
