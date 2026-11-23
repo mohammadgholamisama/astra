@@ -212,7 +212,10 @@ handle_existing() {
       info "Updating existing install…"
       ensure_user
       if [[ -d "$ASTRA_ROOT/.git" ]]; then
-        git -C "$ASTRA_ROOT" pull --ff-only || die "git pull failed"
+        git -C "$ASTRA_ROOT" fetch origin main || die "git fetch failed"
+        # Untracked files (e.g. manually copied modules) must not block checkout
+        git -C "$ASTRA_ROOT" clean -fd
+        git -C "$ASTRA_ROOT" reset --hard origin/main || die "git reset failed"
       else
         warn "No .git — syncing from installer source if available"
         local src

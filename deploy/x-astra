@@ -303,53 +303,16 @@ cmd_update() {
   header
   echo -e "${BOLD}8) Update panel from git${NC}"
   echo
-  confirm "git pull + rebuild frontend + pip + restart?" || { info "Cancelled"; pause; return; }
+  confirm "fetch latest from GitHub + rebuild + restart? (.env و data حفظ می‌شود)" || { info "Cancelled"; pause; return; }
 
-  if [[ ! -d "${ASTRA_ROOT}/.git" ]]; then
-    err "No .git in ${ASTRA_ROOT} — cannot pull"
-    pause
-    return
+  # Use astra-helper apply-update (fetch + clean untracked + hard reset).
+  # Plain "git pull" fails when a local untracked file collides with upstream
+  # (seen with backend/app/services/client_ua.py).
+  if [[ "$(id -u)" -eq 0 ]]; then
+    astra-helper apply-update || { err "apply-update failed"; pause; return; }
+  else
+    sudo astra-helper apply-update || { err "apply-update failed"; pause; return; }
   fi
-
-  (
-    cd "$ASTRA_ROOT"
-    if [[ "$(id -u)" -eq 0 ]]; then
-      git pull --ff-only
-    else
-      sudo git -C "$ASTRA_ROOT" pull --ff-only
-    fi
-  ) || { err "git pull failed"; pause; return; }
-
-  info "pip install..."
-  sudo -u astra bash -c "cd ${ASTRA_ROOT}/backend && . .venv/bin/activate && pip install -r requirements.txt" \
-    || { err "pip failed"; pause; return; }
-
-  info "npm build..."
-  sudo bash -c "
-    set -e
-    cd '${ASTRA_ROOT}/frontend'
-    export VITE_API_BASE=
-    if [[ -f package-lock.json ]]; then npm ci || npm install; else npm install; fi
-    npm run build
-    chown -R astra:astra '${ASTRA_ROOT}/frontend/dist' 2>/dev/null || true
-    chmod -R a+rX '${ASTRA_ROOT}/frontend/dist'
-  " || { err "frontend build failed"; pause; return; }
-
-  info "Refresh CLI + nginx + systemd..."
-  sudo install -m 755 "${ASTRA_ROOT}/deploy/astra-helper" "$HELPER"
-  sudo install -m 755 "${ASTRA_ROOT}/deploy/x-astra" /usr/local/bin/x-astra
-  if [[ -f "${ASTRA_ROOT}/deploy/sudoers.astra" ]]; then
-    sudo install -m 440 "${ASTRA_ROOT}/deploy/sudoers.astra" /etc/sudoers.d/astra
-  fi
-  if [[ -f "${ASTRA_ROOT}/deploy/astra.service" ]]; then
-    sudo install -m 644 "${ASTRA_ROOT}/deploy/astra.service" /etc/systemd/system/astra.service
-  fi
-  if [[ -f "${ASTRA_ROOT}/deploy/astra-update.service" ]]; then
-    sudo install -m 644 "${ASTRA_ROOT}/deploy/astra-update.service" /etc/systemd/system/astra-update.service
-  fi
-  sudo systemctl daemon-reload
-  run_helper write-nginx
-  run_helper restart-astra
   ok "Updated successfully"
   pause
 }

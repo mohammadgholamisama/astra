@@ -890,6 +890,9 @@ cmd_apply_update() {
   echo "astra-helper: fetching latest code (preserving .env + data)…"
   if [[ -d "${ASTRA_ROOT}/.git" ]]; then
     git -C "$ASTRA_ROOT" fetch origin main
+    # Drop untracked files that block checkout (e.g. manually copied modules).
+    # Does NOT use -x → ignored paths stay (.venv, node_modules, data/, .env).
+    git -C "$ASTRA_ROOT" clean -fd
     git -C "$ASTRA_ROOT" reset --hard origin/main
   else
     # Fallback: sparse sync via tarball without wiping data/.env

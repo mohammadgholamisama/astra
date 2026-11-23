@@ -29,7 +29,8 @@ _SHA_WAVE_SEC = 2.5
 _NNP_HINT = (
     "سرویس astra با NoNewPrivileges اجرا می‌شود و sudo کار نمی‌کند. "
     "یک‌بار با root این را بزنید:\n"
-    "cd /opt/astra && sudo git pull && "
+    "cd /opt/astra && sudo git fetch origin main && sudo git clean -fd && "
+    "sudo git reset --hard origin/main && "
     "sudo install -m 644 deploy/astra.service /etc/systemd/system/astra.service && "
     "sudo install -m 644 deploy/astra-update.service /etc/systemd/system/astra-update.service && "
     "sudo install -m 440 deploy/sudoers.astra /etc/sudoers.d/astra && "
