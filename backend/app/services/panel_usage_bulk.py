@@ -25,7 +25,12 @@ from app.models.user import PanelAccount, PanelAccountStatus, User, UserStatus
 
 logger = logging.getLogger("astra.usage")
 
-_BULK_TYPES = {PanelType.pasarguard, PanelType.marzban, PanelType.rebecca}
+_BULK_TYPES = {
+    PanelType.pasarguard,
+    PanelType.marzban,
+    PanelType.rebecca,
+    PanelType.sanaei,
+}
 _ROTATE_CURSOR = 0
 
 # Set on panel_accounts after a successful remote quota freeze.
@@ -67,12 +72,78 @@ def parse_user_used_traffic(data: dict[str, Any]) -> int:
     return 0
 
 
+async def fetch_sanaei_usage_map(panel: Panel) -> dict[str, int]:
+    """email → used bytes from one Sanaei ``inbounds/list`` (all clients)."""
+    from app.adapters.sanaei import SanaeiAdapter
+
+    adapter = get_adapter(panel)
+    if not isinstance(adapter, SanaeiAdapter):
+        close = getattr(adapter, "close", None)
+        if callable(close):
+            try:
+                await close()
+            except Exception:  # noqa: BLE001
+                pass
+        return {}
+    out: dict[str, int] = {}
+    try:
+        inbounds = await adapter._raw_inbounds_for_usage()
+        for inbound in inbounds or []:
+            if not isinstance(inbound, dict):
+                continue
+            stats = inbound.get("clientStats") or []
+            hit = False
+            if isinstance(stats, list):
+                for stat in stats:
+                    if not isinstance(stat, dict):
+                        continue
+                    email = str(stat.get("email") or "").strip()
+                    if not email:
+                        continue
+                    hit = True
+                    got = int(stat.get("up") or 0) + int(stat.get("down") or 0)
+                    out[email] = int(out.get(email) or 0) + max(0, got)
+            if hit:
+                continue
+            settings_raw = inbound.get("settings")
+            settings: Any = settings_raw
+            if isinstance(settings_raw, str):
+                try:
+                    import json as _json
+
+                    settings = _json.loads(settings_raw)
+                except Exception:  # noqa: BLE001
+                    settings = {}
+            if not isinstance(settings, dict):
+                continue
+            for client in settings.get("clients") or []:
+                if not isinstance(client, dict):
+                    continue
+                email = str(client.get("email") or "").strip()
+                if not email:
+                    continue
+                got = int(client.get("up") or 0) + int(client.get("down") or 0)
+                out[email] = int(out.get(email) or 0) + max(0, got)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("sanaei bulk usage failed panel=%s: %s", panel.id, exc)
+    finally:
+        close = getattr(adapter, "close", None)
+        if callable(close):
+            try:
+                await close()
+            except Exception:  # noqa: BLE001
+                pass
+    return out
+
+
 async def fetch_panel_usage_map(
     panel: Panel, *, max_pages: int = 80, page_size: int = 200
 ) -> dict[str, int]:
     """username → used_traffic bytes via GET /api/users (paginated)."""
     if panel.type not in _BULK_TYPES:
         return {}
+    if panel.type == PanelType.sanaei:
+        return await fetch_sanaei_usage_map(panel)
     adapter = get_adapter(panel)
     if not isinstance(adapter, MarzbanAdapter):
         close = getattr(adapter, "close", None)
@@ -134,14 +205,34 @@ async def fetch_panel_usage_map(
     return out
 
 
+def _lookup_usage_bytes(
+    usage_exact: dict[str, int], usage_lower: dict[str, int], *names: str
+) -> int | None:
+    """Match remote meters by exact name, then case-insensitive."""
+    for raw in names:
+        name = (raw or "").strip()
+        if not name:
+            continue
+        if name in usage_exact:
+            return int(usage_exact[name])
+        hit = usage_lower.get(name.lower())
+        if hit is not None:
+            return int(hit)
+    return None
+
+
 async def apply_usage_map_to_panel(
     db: AsyncSession, panel_id: int, usage_map: dict[str, int]
 ) -> set[int]:
     """Write raw counters onto panel_accounts. Returns dirty user ids."""
     if not usage_map:
         return set()
+    usage_exact = {str(k).strip(): int(v) for k, v in usage_map.items() if str(k).strip()}
+    usage_lower = {k.lower(): v for k, v in usage_exact.items()}
     result = await db.execute(
-        select(PanelAccount).where(
+        select(PanelAccount, User.username)
+        .join(User, User.id == PanelAccount.user_id)
+        .where(
             PanelAccount.panel_id == int(panel_id),
             PanelAccount.status.in_(
                 (
@@ -151,14 +242,22 @@ async def apply_usage_map_to_panel(
             ),
         )
     )
-    accounts = list(result.scalars().all())
+    rows = list(result.all())
     now = datetime.now(timezone.utc)
     dirty: set[int] = set()
-    for acc in accounts:
-        uname = (acc.remote_username or "").strip()
-        if not uname or uname not in usage_map:
+    for acc, astra_uname in rows:
+        got_i = _lookup_usage_bytes(
+            usage_exact,
+            usage_lower,
+            (acc.remote_username or "").strip(),
+            str(astra_uname or "").strip(),
+            str(acc.remote_id or "").strip()
+            if acc.remote_id and not str(acc.remote_id).startswith("{")
+            else "",
+        )
+        if got_i is None:
             continue
-        got = int(usage_map[uname])
+        got = int(got_i)
         prev = int(acc.used_traffic or 0)
         if got < prev:
             continue
@@ -502,7 +601,7 @@ async def run_fleet_usage_cycle() -> dict[str, int]:
 
     try:
         bulk = await sync_all_panels_bulk(
-            concurrency=10, recount=True, recount_concurrency=16
+            concurrency=14, recount=True, recount_concurrency=24
         )
         stats["panels"] = int(bulk.get("panels") or 0)
         stats["listed"] = int(bulk.get("listed") or 0)

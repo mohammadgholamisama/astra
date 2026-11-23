@@ -76,10 +76,9 @@ _bg_heavy = asyncio.Semaphore(3)
 
 # Live usage pull on sub refresh — must stay accurate (quota / money).
 _bg_usage_last: dict[int, float] = {}
-_BG_USAGE_INTERVAL = 8.0
-# Keep low so /sub Update stays ahead of usage scrapes.
-# /sub usage pulls — capped so QueuePool keeps headroom for analytics pages.
-_bg_usage_sem = asyncio.Semaphore(5)
+_BG_USAGE_INTERVAL = 2.5
+# Parallel /sub usage pulls — keep under DB pool headroom.
+_bg_usage_sem = asyncio.Semaphore(12)
 
 # Tiny in-process feed cache — VPN clients often refresh in bursts.
 # Incomplete coverage also caches (shorter TTL) so Iran-edge clients don't
@@ -1988,8 +1987,9 @@ async def _serve_subscription_db(
 async def subscription_usage(token: str, db: AsyncSession = Depends(get_db)):
     """Lightweight live counters for the HTML page (poll every few seconds).
 
-    Schedules a background panel pull so the next poll reflects remotes × coeffs.
-    Never blocks on remote HTTP — keeps Iran tunnel under the 504 wall.
+    Instant DB recount from panel meters, then schedule a background remote
+    pull so the next poll tracks downloads in near real-time. Never blocks on
+    remote HTTP — keeps Iran tunnel under the 504 wall.
     """
     from fastapi.responses import JSONResponse
 
@@ -2004,6 +2004,21 @@ async def subscription_usage(token: str, db: AsyncSession = Depends(get_db)):
         return JSONResponse({"error": "not_found"}, status_code=404)
 
     try:
+        from app.services.orchestrator import (
+            mark_live_usage_priority,
+            recount_user_used_traffic,
+        )
+
+        mark_live_usage_priority(int(user.id))
+        await recount_user_used_traffic(db, user)
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
         _schedule_bg_usage(int(user.id))
     except Exception:  # noqa: BLE001
         pass
@@ -2011,13 +2026,18 @@ async def subscription_usage(token: str, db: AsyncSession = Depends(get_db)):
     status = user.status.value if hasattr(user.status, "value") else str(user.status)
     used = int(user.used_traffic or 0)
     limit = int(user.data_limit or 0)
+    remain = None if limit <= 0 else max(0, limit - used)
+    pct = None
+    if limit > 0:
+        pct = min(100.0, round(used / limit * 1000) / 10)
     return JSONResponse(
         {
             "username": user.username,
             "status": status,
             "used": used,
             "limit": limit,
-            "remain": None if limit <= 0 else max(0, limit - used),
+            "remain": remain,
+            "pct": pct,
             "expire": int(user.expire or 0) or None,
         },
         headers={"cache-control": "no-store"},

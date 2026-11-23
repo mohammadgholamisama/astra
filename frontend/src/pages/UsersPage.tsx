@@ -657,8 +657,8 @@ export default function UsersPage() {
         `/api/users?${buildUsersQs({ refresh: false, pageIndex: page })}`,
         { timeoutMs: 25_000 }
       ),
-    staleTime: 12_000,
-    refetchInterval: 40_000,
+    staleTime: 8_000,
+    refetchInterval: 15_000,
     refetchOnMount: true,
     refetchOnWindowFocus: false,
     placeholderData: (prev) => prev,
@@ -714,7 +714,7 @@ export default function UsersPage() {
     const id = window.setInterval(() => {
       if (document.visibilityState === "hidden") return;
       void syncUsageNow(true);
-    }, 60_000);
+    }, 15_000);
     return () => {
       window.clearTimeout(kick);
       window.clearInterval(id);

@@ -7654,7 +7654,7 @@ _LIVE_USAGE_PRIORITY: dict[int, float] = {}
 # starved the panel with QueuePool TimeoutError → «Temporarily unavailable».
 # Cap concurrent usage pulls so interactive /sub + admin keep DB headroom.
 # Live usage pulls — keep below pool headroom so analytics/UI can checkout.
-_USAGE_PULL_GATE = asyncio.Semaphore(8)
+_USAGE_PULL_GATE = asyncio.Semaphore(14)
 
 
 def mark_live_usage_priority(user_id: int) -> None:
@@ -9340,8 +9340,8 @@ async def run_quota_watch_cycle() -> dict[str, int]:
         logger.debug("quota-watch recent sub list failed", exc_info=True)
 
     priority_ids = list(
-        dict.fromkeys(take_live_usage_priority(180.0, 30) + recent_sub_ids)
-    )[:10]
+        dict.fromkeys(take_live_usage_priority(300.0, 48) + recent_sub_ids)
+    )[:24]
     extra_flip = await _quota_pull_users(
         priority_ids,
         deadline=t0 + 24.0,
@@ -9393,7 +9393,7 @@ async def run_quota_watch_cycle() -> dict[str, int]:
 
     # --- Phase 2: bulk Marzban/PasarGuard/Rebecca /api/users (scales) ---
     try:
-        bulk = await bulk_usage.sync_panels_bulk_rotate(max_panels=3)
+        bulk = await bulk_usage.sync_panels_bulk_rotate(max_panels=8)
         stats["bulk_listed"] = int(bulk.get("listed") or 0)
         stats["bulk_dirty"] = int(bulk.get("dirty") or 0)
         stats["checked"] += int(bulk.get("dirty") or 0)

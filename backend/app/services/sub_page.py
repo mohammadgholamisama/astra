@@ -519,14 +519,14 @@ input#sub{{
 
   {banner}
 
-  <section class="usage-card" aria-label="مصرف">
-    {donut}
+  <section class="usage-card" aria-label="مصرف" id="usageCard">
+    <div id="donutWrap">{donut}</div>
     <div class="usage-side">
       <p class="remain-label">حجم باقی‌مانده</p>
-      <p class="remain-value">{remain_label}</p>
+      <p class="remain-value" id="remainVal">{remain_label}</p>
       <div class="stats-mini">
-        <div class="stat-mini"><span>مصرف‌شده</span><b>{used_label}</b></div>
-        <div class="stat-mini"><span>سقف حجم</span><b>{limit_label}</b></div>
+        <div class="stat-mini"><span>مصرف‌شده</span><b id="usedVal">{used_label}</b></div>
+        <div class="stat-mini"><span>سقف حجم</span><b id="limitVal">{limit_label}</b></div>
         <div class="stat-mini"><span>انقضای اشتراک</span><b>{html.escape(expire_date_label)}</b></div>
         <div class="stat-mini"><span>زمان باقی‌مانده</span><b>{html.escape(expire_remain_label)}</b></div>
       </div>
@@ -644,6 +644,58 @@ input#sub{{
       more.remove();
     }});
   }}
+  function faDigits(s){{return String(s).replace(/[0-9]/g,function(d){{return '۰۱۲۳۴۵۶۷۸۹'[d];}});}}
+  function fmtBytes(n){{
+    n=Number(n)||0;if(n<=0) return '۰';
+    var u=['بایت','کیلوبایت','مگابایت','گیگابایت','ترابایت'],x=n,i=0;
+    while(x>=1024&&i<u.length-1){{x/=1024;i++;}}
+    var num=x>=100?x.toFixed(0):x>=10?x.toFixed(1):x.toFixed(2);
+    return faDigits(num)+' '+u[i];
+  }}
+  function paintUsage(d){{
+    if(!d||d.error) return;
+    var used=Number(d.used)||0,limit=Number(d.limit)||0;
+    var remain=limit<=0?null:Math.max(0,limit-used);
+    var usedEl=document.getElementById('usedVal');
+    var remainEl=document.getElementById('remainVal');
+    var limitEl=document.getElementById('limitVal');
+    if(usedEl) usedEl.textContent=fmtBytes(used);
+    if(remainEl) remainEl.textContent=remain==null?'نامحدود':fmtBytes(remain);
+    if(limitEl) limitEl.textContent=limit<=0?'نامحدود':fmtBytes(limit);
+    var wrap=document.getElementById('donutWrap');
+    if(!wrap) return;
+    var pct=limit<=0?null:Math.min(100,Math.round(used/limit*1000)/10);
+    var tone=pct==null?'muted':pct<70?'ok':pct<90?'warn':'danger';
+    var colors={{ok:'#0d9488',warn:'#d97706',danger:'#e11d48',muted:'#64748b'}};
+    var size=132,stroke=10,r=(size-stroke)/2,c=2*Math.PI*r;
+    var dash,show,sub;
+    if(pct==null){{dash='0 '+c;show='∞';sub='نامحدود';}}
+    else{{
+      var filled=c*(pct/100);
+      dash=filled.toFixed(2)+' '+c.toFixed(2);
+      show=faDigits(pct>=10?pct.toFixed(0):pct.toFixed(1));
+      sub='مصرف‌شده';
+    }}
+    wrap.innerHTML='<svg class="donut" viewBox="0 0 '+size+' '+size+'" width="'+size+'" height="'+size+'" aria-hidden="true">'
+      +'<circle cx="'+(size/2)+'" cy="'+(size/2)+'" r="'+r+'" fill="none" stroke="currentColor" stroke-width="'+stroke+'" class="donut-track"/>'
+      +'<circle cx="'+(size/2)+'" cy="'+(size/2)+'" r="'+r+'" fill="none" stroke="'+(colors[tone]||colors.muted)+'" stroke-width="'+stroke+'"'
+      +' stroke-linecap="round" stroke-dasharray="'+dash+'" transform="rotate(-90 '+(size/2)+' '+(size/2)+')"/>'
+      +'<text x="50%" y="47%" text-anchor="middle" class="donut-num">'+show+(pct!=null?'٪':'')+'</text>'
+      +'<text x="50%" y="60%" text-anchor="middle" class="donut-sub">'+sub+'</text></svg>';
+  }}
+  function usageUrl(){{
+    var p=location.pathname.replace(/\\/info\\/?$/,'');
+    return p.replace(/\\/?$/,'')+'/usage';
+  }}
+  function pollUsage(){{
+    if(document.visibilityState==='hidden') return;
+    fetch(usageUrl(),{{headers:{{'Accept':'application/json'}},credentials:'same-origin',cache:'no-store'}})
+      .then(function(r){{return r.ok?r.json():null;}})
+      .then(paintUsage)
+      .catch(function(){{}});
+  }}
+  pollUsage();
+  setInterval(pollUsage,5000);
 }})();
 </script>
 <!--/email_off-->

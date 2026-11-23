@@ -333,9 +333,9 @@ async def _fleet_usage_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("fleet usage loop failed")
-        interval = max(45, int(getattr(settings, "USAGE_FLEET_SECONDS", 60) or 60))
+        interval = max(20, int(getattr(settings, "USAGE_FLEET_SECONDS", 30) or 30))
         elapsed = _time.monotonic() - t0
-        await asyncio.sleep(max(12.0, float(interval) - elapsed))
+        await asyncio.sleep(max(8.0, float(interval) - elapsed))
 
 
 async def _hot_usage_loop() -> None:
@@ -379,10 +379,10 @@ async def _hot_usage_loop() -> None:
             except Exception:  # noqa: BLE001
                 pass
 
-            # Parallel but capped — 1.9.379 flooded QueuePool and killed analytics.
-            ids = ids[:20]
+            # Parallel live pulls for everyone currently on /sub (downloading).
+            ids = ids[:40]
             if ids:
-                sem = asyncio.Semaphore(6)
+                sem = asyncio.Semaphore(12)
 
                 async def _one(uid: int) -> None:
                     async with sem:
@@ -391,8 +391,8 @@ async def _hot_usage_loop() -> None:
                                 refresh_usage_pool_safe(
                                     int(uid), force=True, quick=True
                                 ),
-                                # Multi-panel users need real time; 12s cancelled
-                                # mid-apply and left users.used_traffic=0 forever.
+                                # Multi-panel users need real time; short cancels
+                                # mid-apply left users.used_traffic stuck.
                                 timeout=75.0,
                             )
                         except asyncio.TimeoutError:
@@ -427,9 +427,9 @@ async def _hot_usage_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("hot usage loop failed")
-        interval = max(12, int(getattr(settings, "USAGE_HOT_SECONDS", 20) or 20))
+        interval = max(6, int(getattr(settings, "USAGE_HOT_SECONDS", 8) or 8))
         elapsed = _time.monotonic() - t0
-        await asyncio.sleep(max(6.0, float(interval) - elapsed))
+        await asyncio.sleep(max(3.0, float(interval) - elapsed))
 
 
 async def _analytics_sample_loop() -> None:
