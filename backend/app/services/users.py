@@ -59,25 +59,26 @@ def to_user_response(user: User, *, include_links: bool = True) -> UserResponse:
     many users each have large share-link arrays. List queries may ``defer``
     ``links``; never touch deferred attrs (async lazy-load is unsafe).
     """
-    from sqlalchemy import inspect as sa_inspect
-
     links: list[str] = []
     seen: set[str] = set()
     accounts = list(user.__dict__.get("panel_accounts") or [])
     if include_links:
         for account in accounts:
-            for link in account.links or []:
+            for link in (account.__dict__.get("links") or []):
                 if link and link not in seen:
                     seen.add(link)
                     links.append(link)
 
     panel_accounts = []
     for a in accounts:
-        # Only use panel if already loaded — never trigger async lazy IO
-        panel = a.__dict__.get("panel")
-        used = int(getattr(a, "used_traffic", 0) or 0)
-        is_deleted = a.status == PanelAccountStatus.deleted
-        panel_active = panel is not None and bool(getattr(panel, "is_active", True))
+        # Only __dict__ / already-loaded attrs — never ORM getattr (MissingGreenlet).
+        adict = a.__dict__
+        panel = adict.get("panel")
+        pdict = panel.__dict__ if panel is not None else {}
+        used = int(adict.get("used_traffic") or 0)
+        status_val = adict.get("status")
+        is_deleted = status_val == PanelAccountStatus.deleted
+        panel_active = bool(pdict.get("is_active", True)) if panel is not None else False
 
         # Deleted remotes keep banked ``used_traffic`` for quota. The Users
         # «مصرف پنل‌ها» modal must still list them — hiding them made total
@@ -92,37 +93,30 @@ def to_user_response(user: User, *, include_links: bool = True) -> UserResponse:
 
         panel_type = None
         panel_base = None
+        panel_name = None
         if panel is not None:
-            ptype = getattr(panel, "type", None)
+            ptype = pdict.get("type")
             panel_type = ptype.value if hasattr(ptype, "value") else (str(ptype) if ptype else None)
-            panel_base = getattr(panel, "base_url", None) or getattr(panel, "url", None)
+            panel_base = pdict.get("base_url") or pdict.get("url")
+            panel_name = pdict.get("name")
         # Never touch deferred/unloaded attrs (async lazy-load → MissingGreenlet).
-        adict = a.__dict__
-        unloaded = set()
-        try:
-            unloaded = set(sa_inspect(a).unloaded or ())
-        except Exception:  # noqa: BLE001
-            unloaded = set()
-        if is_deleted or "links" in unloaded or not include_links:
-            # List view: skip share-link payloads entirely (count stays 0).
+        if not include_links or "links" not in adict or is_deleted:
             raw_links: list = []
         else:
             raw_links = [x for x in (adict.get("links") or []) if x]
         # Never surface stale error_message on healthy accounts (UI false positives)
-        status_val = adict.get("status", a.status)
         err = (
             adict.get("error_message")
             if status_val == PanelAccountStatus.error
             else None
         )
+        gid = adict.get("group_id")
         panel_accounts.append(
             PanelAccountOut(
-                id=a.id,
-                panel_id=a.panel_id,
-                group_id=(
-                    int(a.group_id) if getattr(a, "group_id", None) is not None else None
-                ),
-                panel_name=getattr(panel, "name", None) if panel is not None else None,
+                id=adict.get("id"),
+                panel_id=adict.get("panel_id"),
+                group_id=int(gid) if gid is not None else None,
+                panel_name=panel_name,
                 panel_type=panel_type,
                 panel_base_url=str(panel_base).rstrip("/") if panel_base else None,
                 remote_username=adict.get("remote_username"),
@@ -130,7 +124,7 @@ def to_user_response(user: User, *, include_links: bool = True) -> UserResponse:
                 # List view: keep count only (placeholder) — avoid shipping huge URLs
                 links=list(raw_links) if include_links else (["x"] * len(raw_links)),
                 error_message=err,
-                used_traffic=int(adict.get("used_traffic") or 0),
+                used_traffic=used,
                 coeff_anchor_raw=int(adict.get("coeff_anchor_raw") or 0),
                 coeff_anchor_weighted=int(adict.get("coeff_anchor_weighted") or 0),
                 applied_coefficient=adict.get("applied_coefficient"),

@@ -34,9 +34,10 @@ from app.services.users import load_user, to_user_response
 
 router = APIRouter(tags=["User"])
 
-# Bot/API clients often stampede /api/users?search=&limit=100 — cap concurrency
-# so interactive panel pages keep DB pool headroom.
-_USERS_LIST_SEM = asyncio.Semaphore(6)
+# Bot/API clients stampede /api/users?search=&limit=100. Keep board (no search)
+# on its own semaphore so the Users page is never starved behind bot lookups.
+_USERS_BOARD_SEM = asyncio.Semaphore(4)
+_USERS_SEARCH_SEM = asyncio.Semaphore(2)
 
 
 def _hold_required_error() -> HTTPException:
@@ -1419,6 +1420,26 @@ async def retry_all_errors(
     return UserRetryErrorsResponse(**stats)
 
 
+def _exact_username_term(search: str | None) -> str | None:
+    """Bot lookups pass a full username (telegram id / phone). Use btree index."""
+    term = (search or "").strip()
+    if not term or len(term) < 2:
+        return None
+    if any(ch in term for ch in ("%", "_", " ", "*", "?")):
+        return None
+    if not all(c.isalnum() or c in "._-@" for c in term):
+        return None
+    return term
+
+
+def _username_search_filter(search: str):
+    exact = _exact_username_term(search)
+    if exact is not None:
+        # Case-insensitive exact — still sargable via username index + lower.
+        return or_(User.username == exact, User.username.ilike(exact))
+    return User.username.ilike(f"%{(search or '').strip()}%")
+
+
 def _user_list_scope(
     *,
     search: str | None,
@@ -1426,8 +1447,8 @@ def _user_list_scope(
 ):
     """Shared WHERE pieces for /api/users list + chip counts."""
     filters: list = []
-    if search:
-        filters.append(User.username.ilike(f"%{search.strip()}%"))
+    if search and search.strip():
+        filters.append(_username_search_filter(search))
     needs_group_join = group_id is not None
     group_filter = (
         UserGroup.group_id == int(group_id) if group_id is not None else None
@@ -1573,11 +1594,16 @@ async def _users_list_chip_counts(
             )
         ),
     )
+    # No group join → plain count(*) (users.id is PK). Distinct only when join
+    # can duplicate rows — cheaper plan for the default Users board.
+    id_count = (
+        func.count(func.distinct(User.id)) if needs_group_join else func.count()
+    )
     q = select(
-        func.count(func.distinct(User.id)),
-        func.count(func.distinct(User.id)).filter(active_c),
-        func.count(func.distinct(User.id)).filter(cheap_error),
-        func.count(func.distinct(User.id)).filter(expired_c),
+        id_count,
+        id_count.filter(active_c),
+        id_count.filter(cheap_error),
+        id_count.filter(expired_c),
     )
     if needs_group_join:
         q = q.join(UserGroup, UserGroup.user_id == User.id)
@@ -1614,7 +1640,9 @@ async def list_users(
 ):
     # Acquire the list gate BEFORE opening a DB session — otherwise bot stampedes
     # hold dozens of idle-in-transaction checkouts while queued on the semaphore.
-    async with _USERS_LIST_SEM:
+    is_search = bool((search or "").strip())
+    gate = _USERS_SEARCH_SEM if is_search else _USERS_BOARD_SEM
+    async with gate:
         from app.core.database import AsyncSessionLocal
 
         async with AsyncSessionLocal() as db:
@@ -1645,9 +1673,13 @@ async def _list_users_impl(
     if status_filter not in ("all", "active", "error", "expired"):
         status_filter = "all"
     is_search = bool((search or "").strip())
+    exact_term = _exact_username_term(search) if is_search else None
     # Bot stampede often uses limit=100 search — keep payload tiny.
-    if is_search and limit > 40:
-        limit = 40
+    if is_search:
+        if exact_term is not None:
+            limit = min(limit, 5)
+        elif limit > 20:
+            limit = 20
 
     base_filters, needs_group_join, group_filter = _user_list_scope(
         search=search, group_id=group_id
@@ -1674,7 +1706,26 @@ async def _list_users_impl(
         )
         # Chips are for the full board; search replies only need matching total.
         counts = UsersListCounts(all=total, active=0, error=0, expired=0)
-        q = select(User).options(selectinload(User.groups))
+        q = select(User).options(
+            load_only(
+                User.id,
+                User.username,
+                User.display_name,
+                User.status,
+                User.data_limit,
+                User.used_traffic,
+                User.lifetime_used_traffic,
+                User.expire,
+                User.on_hold_expire_duration,
+                User.include_promo_first,
+                User.data_limit_reset_strategy,
+                User.note,
+                User.created_at,
+                User.sub_token,
+                User.source_category_id,
+            ),
+            selectinload(User.groups).load_only(Group.id),
+        )
     else:
         # Chip totals — single SQL (keeps filters accurate without 4 round-trips).
         counts = await _users_list_chip_counts(
@@ -1694,8 +1745,22 @@ async def _list_users_impl(
             )
         # Light list load: skip huge share-link JSON + unused panel columns.
         q = select(User).options(
-            selectinload(User.groups),
+            selectinload(User.groups).load_only(Group.id),
             selectinload(User.panel_accounts).options(
+                load_only(
+                    PanelAccount.id,
+                    PanelAccount.user_id,
+                    PanelAccount.panel_id,
+                    PanelAccount.group_id,
+                    PanelAccount.remote_username,
+                    PanelAccount.status,
+                    PanelAccount.error_message,
+                    PanelAccount.used_traffic,
+                    PanelAccount.coeff_anchor_raw,
+                    PanelAccount.coeff_anchor_weighted,
+                    PanelAccount.applied_coefficient,
+                    PanelAccount.last_sync_at,
+                ),
                 defer(PanelAccount.links),
                 defer(PanelAccount.links_by_group),
                 selectinload(PanelAccount.panel).load_only(

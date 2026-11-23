@@ -7715,8 +7715,8 @@ _LIVE_USAGE_PRIORITY: dict[int, float] = {}
 # stampede each pull kept a pool connection open during remote HTTP and
 # starved the panel with QueuePool TimeoutError → «Temporarily unavailable».
 # Cap concurrent usage pulls so interactive /sub + admin keep DB headroom.
-# Keep well under DB_POOL_SIZE (16) so SSH/CPU stay responsive.
-_USAGE_PULL_GATE = asyncio.Semaphore(4)
+# Keep well under DB_POOL_SIZE — /api/users board must stay responsive.
+_USAGE_PULL_GATE = asyncio.Semaphore(3)
 
 
 def mark_live_usage_priority(user_id: int) -> None:
@@ -8521,6 +8521,29 @@ async def refresh_usage_pool_safe(
     recount. Returns ``(used, activated, quota_changed, status)``; used=-1 if
     the user is missing / not pullable.
     """
+    from app.core.database import pool_pressure_blocks_background
+
+    # Under pool pressure: recount from local meters only — never stampede remotes
+    # (that froze /api/users for 10s+ and returned 500s).
+    if pool_pressure_blocks_background():
+        try:
+            total = await recount_user_usage_pool_safe(int(user_id))
+            return (int(total), False, False, "pool_busy")
+        except Exception:  # noqa: BLE001
+            return (-1, False, False, "pool_busy")
+
+    async with _USAGE_PULL_GATE:
+        return await _refresh_usage_pool_safe_inner(
+            int(user_id), force=force, quick=quick
+        )
+
+
+async def _refresh_usage_pool_safe_inner(
+    user_id: int,
+    *,
+    force: bool = False,
+    quick: bool = True,
+) -> tuple[int, bool, bool, str]:
     from app.core.database import AsyncSessionLocal
 
     pullable: list[tuple[int, Panel, str, str | None, int]] = []
