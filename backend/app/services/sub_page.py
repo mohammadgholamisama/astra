@@ -603,7 +603,9 @@ input#sub{{
   }}
   function loadLinks(){{
     if(LINKS) return Promise.resolve(LINKS);
-    return fetch(location.pathname+'?raw=1',{{
+    // /sub/{{token}} is always the Base64 feed (browser UI lives on /info).
+    var feedUrl=location.pathname.replace(/\\/info\\/?$/,'')+'?raw=1';
+    return fetch(feedUrl,{{
       headers:{{'Accept':'text/plain,*/*','X-Astra-Sub':'copy'}},
       credentials:'same-origin',
       cache:'no-store'

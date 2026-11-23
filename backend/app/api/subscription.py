@@ -8,13 +8,13 @@ import time
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.database import AsyncSessionLocal, get_db
-from app.models.user import PanelAccount, User, UserStatus
+from app.models.user import PanelAccount, PanelAccountStatus, User, UserStatus
 from app.services.orchestrator import (
     activate_on_hold_if_used,
     collect_links,
@@ -118,6 +118,10 @@ def _feed_cache_get(
     if time.monotonic() - ts > ttl:
         _feed_cache.pop(key, None)
         return None
+    # Never serve a blank Base64 body from cache (apps show 0 nodes).
+    if not body:
+        _feed_cache.pop(key, None)
+        return None
     return body
 
 
@@ -129,6 +133,8 @@ def _feed_cache_put(
     complete: bool = True,
     rank_operator: str | None = None,
 ) -> None:
+    if not body:
+        return
     if len(_feed_cache) >= _FEED_CACHE_MAX:
         # Drop oldest ~10%
         for k, _ in sorted(_feed_cache.items(), key=lambda kv: kv[1][0])[
@@ -228,13 +234,15 @@ def _token_feed_get(
         ts, body, meta = hit
         complete = bool(meta.get("complete", True))
         ttl = _FEED_CACHE_TTL if complete else _FEED_CACHE_TTL_PARTIAL
-        if time.monotonic() - ts > ttl:
+        if time.monotonic() - ts > ttl or not body:
             _token_feed_cache.pop(key, None)
         else:
             return body, meta
     disk = _token_disk_get(token, rank_operator)
     if disk:
         body, meta = disk
+        if not body:
+            return None
         # Warm this worker's memory so the next Update is pure RAM.
         _token_feed_cache[key] = (time.monotonic(), body, dict(meta))
         return body, meta
@@ -248,6 +256,8 @@ def _token_feed_put(
     *,
     rank_operator: str | None = None,
 ) -> None:
+    if not body:
+        return
     if len(_token_feed_cache) >= _TOKEN_FEED_MAX:
         for k, _ in sorted(_token_feed_cache.items(), key=lambda kv: kv[1][0])[
             : max(1, _TOKEN_FEED_MAX // 10)
@@ -811,12 +821,12 @@ def _wants_curated_feed(request: Request) -> bool:
 
 def _wants_html_page(request: Request) -> bool:
     """
-    HTML only for real browser *navigation* (Sec-Fetch). Default = Base64 feed.
+    Browser *navigation* → redirect to ``/sub/{token}/info``.
 
-    V2Ray apps often use WebView/OkHttp with Mozilla UA + Accept:text/html and
-    NO Sec-Fetch — those must get the feed, not the info page.
-    Desktop/mobile browsers always send Sec-Fetch-Mode: navigate on URL open.
-    Force HTML with ?html=1; force feed with ?raw=1.
+    ``/sub/{token}`` itself is ALWAYS the Base64 feed for VPN apps. Serving HTML
+    on the same URL made edge/CDN caches and some WebView fetches return a page
+    apps cannot parse → «۰ کانفیگ» while the browser still showed the list.
+    Force feed with ?raw=1; force info with ?html=1 (redirect).
     """
     raw = (request.query_params.get("raw") or "").lower()
     if raw in ("1", "true", "yes"):
@@ -827,7 +837,7 @@ def _wants_html_page(request: Request) -> bool:
 
     sec_dest = (request.headers.get("sec-fetch-dest") or "").lower()
     sec_mode = (request.headers.get("sec-fetch-mode") or "").lower()
-    # Only address-bar / link navigation → HTML. Everything else → feed.
+    # Only address-bar / link navigation → info page. Everything else → feed.
     if sec_dest in ("document", "iframe") or sec_mode == "navigate":
         return True
     return False
@@ -839,6 +849,50 @@ def _encode_feed(links: list[str]) -> bytes:
     if not body:
         return b""
     return base64.b64encode(body.encode("utf-8"))
+
+
+def _emergency_links_from_accounts(user, *, max_n: int | None = None) -> list[str]:
+    """Fast path when ranked collect fails/times out — raw cached share URIs.
+
+    Skips claims/ping arrange so Update still gets every ready account link
+    (capped) instead of an empty Base64 body.
+    """
+    from app.adapters.http_utils import is_share_link
+    from app.services.orchestrator import _config_hidden
+    from app.services.ping_category_order import SUB_MAX_CONFIGS
+
+    cap = int(max_n if max_n is not None else SUB_MAX_CONFIGS)
+    if cap <= 0:
+        cap = int(SUB_MAX_CONFIGS)
+    out: list[str] = []
+    seen: set[str] = set()
+    for account in user.panel_accounts or []:
+        st = getattr(account, "status", None)
+        if st not in (
+            PanelAccountStatus.active,
+            PanelAccountStatus.error,
+            PanelAccountStatus.pending,
+        ):
+            continue
+        panel = account.__dict__.get("panel") or getattr(account, "panel", None)
+        if panel is not None and not bool(getattr(panel, "is_active", True)):
+            continue
+        for link in account.links or []:
+            text = (link or "").strip()
+            if not text or text in seen or not is_share_link(text):
+                continue
+            if _config_hidden(text):
+                continue
+            if "@[" in text or _looks_like_ipv6_host(text):
+                continue
+            low = text.lower()
+            if "127.0.0.1" in low or "localhost" in low or "@[::1]" in low:
+                continue
+            seen.add(text)
+            out.append(text)
+            if len(out) >= cap:
+                return out
+    return out
 
 
 def _looks_like_ipv6_host(link: str) -> bool:
@@ -1288,11 +1342,12 @@ async def _render_info_page(
 @router.get("/sub/{token}")
 async def get_subscription(token: str, request: Request):
     """
-    One URL, two responses (like PasarGuard):
-    - Browser (Mozilla + Accept:text/html) → HTML page
-    - Everything else → Base64 feed with Content-Length
+    ``/sub/{token}`` is ALWAYS the Base64 VPN feed (Content-Length, no gzip).
 
-    Feed path is cache-first when EVERY membership account has ready share links.
+    Browser address-bar opens redirect to ``/sub/{token}/info`` so the same
+    URL is never HTML for apps (edge cache / Sec-Fetch mis-detect → 0 nodes).
+
+    Feed path is cache-first when membership accounts have ready share links.
     Incomplete accounts get a short hydrate, then we serve; BG maintain fills gaps.
 
     Must never return 500 through the Iran reverse tunnel — clients show
@@ -1303,7 +1358,17 @@ async def get_subscription(token: str, request: Request):
     """
     is_probe = _wants_probe(request)
     is_html = _wants_html_page(request)
-    curated_early = (not is_html) and (not is_probe) and _wants_curated_feed(request)
+    if is_html and not is_probe:
+        # Keep query string (rev / operator hints) off the redirect target.
+        return RedirectResponse(
+            url=f"/sub/{token}/info",
+            status_code=302,
+            headers={
+                "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
+                "cdn-cache-control": "no-store",
+            },
+        )
+    curated_early = (not is_probe) and _wants_curated_feed(request)
     rank_operator_early = (
         _rank_operator_from_request(request) if curated_early else None
     )
@@ -1554,17 +1619,10 @@ async def _serve_subscription_db(
         except Exception:  # noqa: BLE001
             pass
     try:
-        if is_html:
-            # Browser page must use the same ISP order as Update in the app.
-            return await _render_info_page(
-                db,
-                token,
-                user,
-                rank_operator=_rank_operator_from_request(request),
-            )
+        # HTML is served only from /sub/{token}/info (browser redirects above).
+        # This handler is Base64 feed only — never return a page apps cannot parse.
 
-        # Curated 99-cap only for known VPN apps. AstraPing / OkHttp / probe
-        # get the full inventory (incl. globally-hidden) for cleaning/tests.
+        # Curated 99-cap for normal VPN Update. AstraPing / probe get full inventory.
         curated = _wants_curated_feed(request)
         include_hidden = not curated
 
@@ -1765,7 +1823,8 @@ async def _serve_subscription_db(
                     )
             if not links:
                 # Curated VPN path must stay fast for Cloudflare quick tunnel
-                # (slow origin → CF 502). Probe inventory keeps a longer budget.
+                # (slow origin → CF 502). Prefer a slightly longer collect over
+                # returning an empty body apps show as «۰ کانفیگ».
                 links = await asyncio.wait_for(
                     _collect_feed_links(
                         user,
@@ -1773,7 +1832,7 @@ async def _serve_subscription_db(
                         db=db,
                         rank_operator=rank_operator,
                     ),
-                    timeout=25.0 if include_hidden else 2.5,
+                    timeout=25.0 if include_hidden else 4.0,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("sub collect user=%s: %s", user.username, exc)
@@ -1789,14 +1848,17 @@ async def _serve_subscription_db(
 
         from app.adapters.http_utils import is_share_link as _isl
 
-        real_n = sum(
-            1
-            for x in links
-            if _isl(x) and "127.0.0.1" not in (x or "")
-        )
+        def _count_real(items: list[str]) -> int:
+            return sum(
+                1
+                for x in items
+                if _isl(x) and "127.0.0.1" not in (x or "") and "localhost" not in (x or "").lower()
+            )
+
+        real_n = _count_real(links)
 
         # Empty / sparse feed: keep CF/Iran tunnel budgets tight.
-        # Sparse-but-nonempty returns immediately; empty gets one short recollect.
+        # Sparse-but-nonempty returns immediately; empty gets hydrate + emergency.
         if not include_hidden and real_n < 55:
             _schedule_bg_maintain(int(user.id), force=True)
             if real_n <= 0 and curated:
@@ -1805,7 +1867,7 @@ async def _serve_subscription_db(
 
                     n = await asyncio.wait_for(
                         hydrate_share_links_pool_safe(int(user.id)),
-                        timeout=1.2,
+                        timeout=1.6,
                     )
                     if n:
                         user = await load_user_by_token(db, token) or user
@@ -1816,18 +1878,14 @@ async def _serve_subscription_db(
                                 db=db,
                                 rank_operator=rank_operator,
                             ),
-                            timeout=1.2,
+                            timeout=2.0,
                         )
                         links = [
                             x
                             for x in links
                             if x and "@[" not in x and not _looks_like_ipv6_host(x)
                         ]
-                        real_n = sum(
-                            1
-                            for x in links
-                            if _isl(x) and "127.0.0.1" not in (x or "")
-                        )
+                        real_n = _count_real(links)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "sub empty-recollect user=%s: %s", uname_safe, exc
@@ -1844,6 +1902,19 @@ async def _serve_subscription_db(
                     uname_safe,
                     real_n,
                 )
+
+        # Last resort: ranked collect empty but DB already has share links
+        # (timeout / claims blip). Serve raw account links so apps never get 0.
+        if curated and real_n <= 0 and _user_has_share_links(user):
+            emergency = _emergency_links_from_accounts(user)
+            if emergency:
+                logger.warning(
+                    "sub emergency-feed user=%s n=%s (collect empty)",
+                    uname_safe,
+                    len(emergency),
+                )
+                links = emergency
+                real_n = _count_real(links)
 
         body = _encode_feed(links)
         if not body or real_n <= 0:
