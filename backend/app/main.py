@@ -200,13 +200,13 @@ async def _auto_retry_errors_loop() -> None:
 
 
 async def _astra_xray_heal_loop() -> None:
-    """Keep astra-xray@N up for every active Astra panel (dashboard «خاموش» fix)."""
+    """Keep astra-xray@N up — calm cadence; never stampede systemctl/D-Bus."""
     from app.services import astra_node as node
 
-    await asyncio.sleep(12)
+    await asyncio.sleep(90)
     while True:
         try:
-            stats = await node.ensure_all_astra_xray_running(limit=80)
+            stats = await node.ensure_all_astra_xray_running(limit=40)
             if stats.get("started") or stats.get("failed"):
                 logging.getLogger("astra").info(
                     "xray heal: started=%s skipped=%s missing=%s failed=%s",
@@ -219,7 +219,7 @@ async def _astra_xray_heal_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logging.getLogger("astra").exception("xray heal loop failed")
-        await asyncio.sleep(300)
+        await asyncio.sleep(600)
 
 
 async def _outbound_health_loop() -> None:

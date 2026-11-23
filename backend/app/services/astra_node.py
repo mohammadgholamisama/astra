@@ -1292,10 +1292,10 @@ def _xray_process_up(panel_id: int) -> bool:
 
 
 async def ensure_all_astra_xray_running(*, limit: int = 64) -> dict[str, int]:
-    """Enable+start ``astra-xray@N`` for every active Astra panel with a config.
+    """Start ``astra-xray@N`` for active Astra panels that are actually down.
 
-    Dashboard «Xray پنل N خاموش» after reboot / failed unit — heal without
-    waiting for an admin to open each panel page.
+    Caps how many systemctl calls happen per cycle so a wedged D-Bus cannot
+    spawn dozens of hung ``systemctl`` children (that froze SSH/logind).
     """
     from app.core.database import AsyncSessionLocal
 
@@ -1313,7 +1313,10 @@ async def ensure_all_astra_xray_running(*, limit: int = 64) -> dict[str, int]:
             )
         ).scalars().all()
         panels = list(rows)
+        await db.rollback()
 
+    # At most a few restarts per heal tick — never stampede systemd.
+    max_starts = 3
     for panel in panels:
         xdir = panel_xray_dir(panel)
         cfg = xdir / "config.json"
@@ -1323,16 +1326,16 @@ async def ensure_all_astra_xray_running(*, limit: int = 64) -> dict[str, int]:
         if _xray_process_up(int(panel.id)):
             skipped += 1
             continue
+        if started + failed >= max_starts:
+            failed += 1
+            continue
         try:
             await _reload_xray(panel, xdir, cfg)
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.2)
             if _xray_process_up(int(panel.id)) or node_health(panel).get("listen_open"):
                 started += 1
             else:
                 failed += 1
-                logger.warning(
-                    "ensure xray still down panel=%s", panel.id
-                )
         except Exception:  # noqa: BLE001
             failed += 1
             logger.warning(
@@ -1355,39 +1358,82 @@ async def ensure_all_astra_xray_running(*, limit: int = 64) -> dict[str, int]:
     }
 
 
-async def _reload_xray(panel: Panel, xdir: Path, cfg_path: Path) -> None:
-    """Restart unit astra-xray@{panel_id} via astra-helper (sudo) or systemctl."""
-    helper = "/usr/local/bin/astra-helper"
-    cmds = [
-        ["sudo", helper, "xray-restart", str(panel.id)],
-        [helper, "xray-restart", str(panel.id)],
-        ["sudo", "systemctl", "enable", "--now", f"astra-xray@{panel.id}"],
-        ["systemctl", "restart", f"astra-xray@{panel.id}"],
-    ]
+_XRAY_CTL_LOCK = asyncio.Lock()
+
+
+async def _run_ctl(cmd: list[str], *, timeout: float = 8.0) -> tuple[int, bytes, bytes]:
+    """Run systemctl/helper with hard kill on timeout — never leave hung children."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
     try:
-        for cmd in cmds:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return int(proc.returncode or 0), out or b"", err or b""
+    except asyncio.TimeoutError:
+        try:
+            import os
+            import signal
+
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:  # noqa: BLE001
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                out, err = await asyncio.wait_for(proc.communicate(), timeout=20)
-                if proc.returncode == 0:
-                    logger.info("xray reload ok via %s", " ".join(cmd))
-                    # brief wait so listen_open health checks pass
-                    await asyncio.sleep(0.25)
-                    return
-                logger.warning(
-                    "xray reload %s → rc=%s %s",
-                    cmd,
-                    proc.returncode,
-                    ((err or out or b"")[-300:]).decode("utf-8", "replace"),
-                )
-            except FileNotFoundError:
-                continue
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("xray reload failed: %s", exc)
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            await proc.wait()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+
+
+async def _reload_xray(panel: Panel, xdir: Path, cfg_path: Path) -> None:
+    """Restart unit astra-xray@{panel_id} via astra-helper (sudo) or systemctl.
+
+    Never use ``enable --now`` in a heal loop — when D-Bus/systemd is slow it
+    piles up hung ``systemctl`` children, pegs PID1/logind, and freezes SSH.
+    """
+    helper = "/usr/local/bin/astra-helper"
+    unit = f"astra-xray@{panel.id}"
+    # Prefer helper / restart|start — enable is one-shot install, not heal.
+    cmds = [
+        ["sudo", "-n", helper, "xray-restart", str(panel.id)],
+        [helper, "xray-restart", str(panel.id)],
+        ["sudo", "-n", "systemctl", "restart", unit],
+        ["systemctl", "restart", unit],
+        ["sudo", "-n", "systemctl", "start", unit],
+        ["systemctl", "start", unit],
+    ]
+    async with _XRAY_CTL_LOCK:
+        try:
+            for cmd in cmds:
+                try:
+                    rc, out, err = await _run_ctl(cmd, timeout=8.0)
+                    if rc == 0:
+                        logger.info("xray reload ok via %s", " ".join(cmd))
+                        await asyncio.sleep(0.2)
+                        return
+                    logger.debug(
+                        "xray reload %s → rc=%s %s",
+                        cmd,
+                        rc,
+                        ((err or out)[-200:]).decode("utf-8", "replace"),
+                    )
+                except FileNotFoundError:
+                    continue
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "xray reload timed out (killed) panel=%s cmd=%s",
+                        panel.id,
+                        " ".join(cmd),
+                    )
+                    # D-Bus likely wedged — stop trying more systemctl this round.
+                    break
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("xray reload failed: %s", exc)
 
     marker = xdir / "NEED_RELOAD"
     try:
