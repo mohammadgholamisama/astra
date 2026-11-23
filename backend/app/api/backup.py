@@ -83,7 +83,7 @@ async def backup_status(_admin: Admin = Depends(get_session_admin_only)):
 
 @router.get("/api/admin/backup")
 async def download_backup(_admin: Admin = Depends(get_session_admin_only)):
-    """Download a full consistent SQLite backup as zip."""
+    """Download a full consistent DB backup as zip (SQLite or PostgreSQL)."""
     if _lock.locked():
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -183,12 +183,13 @@ async def restore_backup(
                     detail={"code": "BACKUP_INVALID", "message": f"اعتبارسنجی ناموفق: {exc}"},
                 ) from exc
 
-            # Drop all pooled connections before replacing the file
+            # Drop pooled connections before swapping SQLite file / pg_restore
             await engine.dispose()
             try:
-                safety = await asyncio.to_thread(bak.replace_live_database, db_file)
+                safety = await asyncio.to_thread(
+                    bak.restore_payload, db_file, manifest
+                )
             except bak.BackupError as exc:
-                # Try to keep serving old DB if replace failed mid-way
                 await engine.dispose()
                 raise _http_backup_error(exc) from exc
             except Exception as exc:  # noqa: BLE001
@@ -196,7 +197,10 @@ async def restore_backup(
                 await engine.dispose()
                 raise HTTPException(
                     status_code=500,
-                    detail={"code": "RESTORE_FAILED", "message": f"جایگزینی دیتابیس ناموفق: {exc}"},
+                    detail={
+                        "code": "RESTORE_FAILED",
+                        "message": f"جایگزینی دیتابیس ناموفق: {exc}",
+                    },
                 ) from exc
 
             # Re-init schema + caches on the restored DB
@@ -220,12 +224,18 @@ async def restore_backup(
 
             return {
                 "ok": True,
-                "message": "بازیابی انجام شد. برای اطمینان یک‌بار از حساب خارج و دوباره وارد شوید.",
+                "message": (
+                    "بازیابی کامل انجام شد (کاربران، مصرف، گروه‌ها، پنل‌ها، تنظیمات). "
+                    "برای اطمینان یک‌بار از حساب خارج و دوباره وارد شوید."
+                ),
                 "manifest": {
                     "format": manifest.get("format"),
                     "created_at": manifest.get("created_at"),
                     "panel": manifest.get("panel"),
+                    "dialect": manifest.get("dialect"),
                     "db_size": manifest.get("db_size"),
+                    "app_version": manifest.get("app_version"),
+                    "table_counts_highlight": manifest.get("table_counts_highlight"),
                 },
                 "safety_copy": getattr(safety, "name", str(safety)),
             }

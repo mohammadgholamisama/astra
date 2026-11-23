@@ -21,11 +21,16 @@ type BackupStatus = {
   supported: boolean;
   dialect: string;
   path_name?: string;
-  size_bytes?: number;
+  size_bytes?: number | null;
   exists?: boolean;
   format?: string;
   max_upload_bytes?: number;
-  message?: string;
+  message?: string | null;
+  app_version?: string;
+  includes?: string[];
+  tools_ok?: boolean;
+  pg_dump?: boolean;
+  pg_restore?: boolean;
 };
 
 type RestoreResult = {
@@ -35,7 +40,9 @@ type RestoreResult = {
     format?: string;
     created_at?: string;
     panel?: string;
+    dialect?: string;
     db_size?: number;
+    app_version?: string;
   };
   safety_copy?: string;
 };
@@ -189,8 +196,8 @@ export default function BackupPage() {
           <p className="backup-kicker">انتقال امن پنل</p>
           <h1 className="page-title">بک‌آپ و بازیابی</h1>
           <p className="page-sub">
-            کل دیتابیس را دانلود کنید، روی سیستم دیگر آپلود کنید — کاربران، گروه‌ها، پنل‌ها و
-            تنظیمات یکجا منتقل می‌شوند.
+            اسنپ‌شات کامل دیتابیس (SQLite یا PostgreSQL) برای جابه‌جایی سرور: کاربران، مصرف،
+            گروه‌ها، پنل‌ها، ادمین، تنظیمات و بقیه جداول — یک ZIP برای بازیابی روی سرور جدید.
           </p>
         </div>
         <ol className="backup-steps" aria-label="مراحل">
@@ -245,7 +252,9 @@ export default function BackupPage() {
             <div className="backup-status-item">
               <Database size={18} />
               <div>
-                <span>فایل</span>
+                <span>
+                  {status.dialect === "postgresql" ? "PostgreSQL" : "SQLite"}
+                </span>
                 <strong dir="ltr">{status.path_name || "—"}</strong>
               </div>
             </div>
@@ -253,14 +262,19 @@ export default function BackupPage() {
               <Archive size={18} />
               <div>
                 <span>حجم فعلی</span>
-                <strong>{formatBytes(status.size_bytes)}</strong>
+                <strong>
+                  {status.size_bytes != null ? formatBytes(status.size_bytes) : "—"}
+                </strong>
               </div>
             </div>
             <div className="backup-status-item">
               <ShieldCheck size={18} />
               <div>
-                <span>فرمت</span>
-                <strong dir="ltr">{status.format || "—"}</strong>
+                <span>فرمت / نسخه</span>
+                <strong dir="ltr">
+                  {(status.format || "—") +
+                    (status.app_version ? ` · ${status.app_version}` : "")}
+                </strong>
               </div>
             </div>
           </section>
@@ -270,14 +284,16 @@ export default function BackupPage() {
               <div className="backup-panel-icon" aria-hidden>
                 <Download size={22} />
               </div>
-              <h2>دانلود بک‌آپ</h2>
+              <h2>دانلود بک‌آپ کامل</h2>
               <p>
-                اسنپ‌شات کامل و سازگار از دیتابیس زنده. فایل ZIP را در جای امن نگه دارید.
+                کل دیتابیس زنده در یک ZIP — برای انتقال به سرور دیگر همان نوع دیتابیس را
+                بازیابی کنید.
               </p>
               <ul className="backup-checklist">
-                <li>همه کاربران و کانفیگ‌ها</li>
-                <li>گروه‌ها، پنل‌ها و تنظیمات</li>
-                <li>کلیدهای API و checksum اعتبارسنجی</li>
+                <li>کاربران، مصرف و وضعیت محدود/منقضی</li>
+                <li>گروه‌ها، پنل‌ها، اکانت‌های ریموت</li>
+                <li>ادمین، تنظیمات، قالب‌ها، API Key</li>
+                <li>نود آسترا / آنالیتیکس در صورت وجود</li>
               </ul>
               <button
                 type="button"
