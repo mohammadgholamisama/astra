@@ -104,16 +104,16 @@ def test_quota_exhausted_marks_limited():
     assert is_quota_exhausted(100, 0) is False  # unlimited
 
 
-def test_remote_limit_full_purchase_ignores_coeff():
+def test_remote_limit_is_remaining_plus_raw():
     gb = 1024**3
-    # 4GB purchase + coeff 2 → still 4GB on remote (not 2GB)
+    # Fresh user, coeff 2 → room = purchase/coeff on empty panel
     assert (
         remote_data_limit(
             4 * gb, used_weighted_total=0, used_raw_on_panel=0, coefficient=2
         )
-        == 4 * gb
+        == 2 * gb
     )
-    # Mid-usage still full purchase on remote
+    # Mid-usage: used_raw 4GB + remaining_weighted 2GB / coeff2 (=1GB) → 5GB
     assert (
         remote_data_limit(
             10 * gb,
@@ -121,7 +121,17 @@ def test_remote_limit_full_purchase_ignores_coeff():
             used_raw_on_panel=4 * gb,
             coefficient=2,
         )
-        == 10 * gb
+        == 5 * gb
+    )
+    # Exhausted → freeze at current raw
+    assert (
+        remote_data_limit(
+            10 * gb,
+            used_weighted_total=10 * gb,
+            used_raw_on_panel=3 * gb,
+            coefficient=1,
+        )
+        == 3 * gb
     )
 
 
@@ -129,7 +139,7 @@ def test_remote_limit_unlimited():
     assert remote_data_limit(0, used_weighted_total=0, used_raw_on_panel=0, coefficient=5) == 0
 
 
-def test_push_only_when_blocked_or_forced():
+def test_push_when_blocked_forced_or_mid_usage():
     assert needs_remote_cap_sync(
         status_changed=False,
         blocked=True,
@@ -144,7 +154,7 @@ def test_push_only_when_blocked_or_forced():
         active_panel_count=1,
         coefficients=[1],
     )
-    # No mid-flight shrink for multi-panel coefficients
+    # Idle / no ratio → no mid-flight push
     assert not needs_remote_cap_sync(
         status_changed=False,
         blocked=False,
@@ -152,6 +162,24 @@ def test_push_only_when_blocked_or_forced():
         active_panel_count=2,
         coefficients=[1, 2],
         shrink_shared_caps=True,
+    )
+    # Mid usage → tighten remote remaining caps
+    assert needs_remote_cap_sync(
+        status_changed=False,
+        blocked=False,
+        force=False,
+        active_panel_count=2,
+        coefficients=[1, 2],
+        used_ratio=0.4,
+    )
+    assert needs_remote_cap_sync(
+        status_changed=False,
+        blocked=False,
+        force=False,
+        active_panel_count=2,
+        coefficients=[1, 1],
+        shrink_shared_caps=True,
+        used_ratio=0.2,
     )
     assert needs_remote_cap_sync(
         status_changed=False,

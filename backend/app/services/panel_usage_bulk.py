@@ -1052,7 +1052,7 @@ async def find_near_limit_user_ids(*, limit: int = 80) -> list[int]:
             text(
                 "SELECT id FROM users "
                 "WHERE status IN ('active','on_hold') AND data_limit > 0 "
-                "AND used_traffic >= (data_limit * 55) / 100 "
+                "AND used_traffic >= (data_limit * 35) / 100 "
                 "ORDER BY (used_traffic::float / NULLIF(data_limit,0)) DESC "
                 "LIMIT :lim"
             ),
