@@ -620,15 +620,17 @@ export default function UsersPage() {
     setPage(0);
   }, [searchDebounced, filterGroupId, filter]);
 
+  type UsersListCounts = {
+    all: number;
+    active: number;
+    error: number;
+    expired: number;
+  };
+
   type UsersListPayload = {
     users: User[];
     total: number;
-    counts?: {
-      all: number;
-      active: number;
-      error: number;
-      expired: number;
-    };
+    counts?: UsersListCounts;
   };
 
   const usersQueryKey = [
@@ -639,30 +641,105 @@ export default function UsersPage() {
     page,
   ] as const;
 
-  function buildUsersQs(opts: { refresh: boolean; pageIndex: number }) {
+  const countsQueryKey = [
+    "users",
+    "counts",
+    searchDebounced,
+    filterGroupId,
+  ] as const;
+
+  function buildUsersQs(opts: {
+    refresh: boolean;
+    pageIndex: number;
+    details?: boolean;
+  }) {
     const qs = new URLSearchParams({
       limit: String(PAGE_SIZE),
       offset: String(opts.pageIndex * PAGE_SIZE),
       refresh: opts.refresh ? "true" : "false",
       filter,
+      include_counts: "false",
+      details: opts.details === false ? "false" : "true",
     });
     if (searchDebounced.trim()) qs.set("search", searchDebounced.trim());
     if (filterGroupId !== "") qs.set("group_id", String(filterGroupId));
     return qs;
   }
 
+  // Phase 1 — lean rows first so the board paints before chip/error SQL.
   const { data, isLoading, isFetching, isSuccess } = useQuery({
     queryKey: usersQueryKey,
     queryFn: () =>
       api<UsersListPayload>(
-        `/api/users?${buildUsersQs({ refresh: false, pageIndex: page })}`,
-        { timeoutMs: 25_000 }
+        `/api/users?${buildUsersQs({
+          refresh: false,
+          pageIndex: page,
+          details: false,
+        })}`,
+        { timeoutMs: 20_000 }
       ),
     staleTime: 25_000,
     refetchInterval: 45_000,
     refetchOnMount: true,
     refetchOnWindowFocus: false,
     placeholderData: (prev) => prev,
+  });
+
+  // Phase 2 — panel accounts for cards (merge into the same cache).
+  const { isFetching: detailsFetching } = useQuery({
+    queryKey: [...usersQueryKey, "details"],
+    enabled:
+      isSuccess &&
+      !searchDebounced.trim() &&
+      (data?.users?.length ?? 0) > 0,
+    queryFn: async () => {
+      const full = await api<UsersListPayload>(
+        `/api/users?${buildUsersQs({
+          refresh: false,
+          pageIndex: page,
+          details: true,
+        })}`,
+        { timeoutMs: 25_000 }
+      );
+      qc.setQueryData(
+        usersQueryKey,
+        (prev: UsersListPayload | undefined) => {
+          if (!prev) return full;
+          const map = new Map(full.users.map((u) => [u.username, u]));
+          return {
+            ...prev,
+            total: full.total || prev.total,
+            users: prev.users.map((u) => map.get(u.username) || u),
+          };
+        }
+      );
+      return true;
+    },
+    staleTime: 25_000,
+    refetchOnWindowFocus: false,
+  });
+
+  // Phase 3 — chip totals (all/active/error/expired) after list is visible.
+  const {
+    data: chipCounts,
+    isFetching: countsFetching,
+    isPending: countsPending,
+  } = useQuery({
+    queryKey: countsQueryKey,
+    queryFn: () => {
+      const qs = new URLSearchParams();
+      if (searchDebounced.trim()) qs.set("search", searchDebounced.trim());
+      if (filterGroupId !== "") qs.set("group_id", String(filterGroupId));
+      const q = qs.toString();
+      return api<UsersListCounts>(
+        `/api/users/counts${q ? `?${q}` : ""}`,
+        { timeoutMs: 30_000 }
+      );
+    },
+    enabled: !searchDebounced.trim(),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+    refetchOnWindowFocus: false,
   });
 
   // Prefetch neighbors so prev/next feel instant
@@ -674,8 +751,12 @@ export default function UsersPage() {
         queryKey: ["users", searchDebounced, filterGroupId, filter, p],
         queryFn: () =>
           api<UsersListPayload>(
-            `/api/users?${buildUsersQs({ refresh: false, pageIndex: p })}`,
-            { timeoutMs: 25_000 }
+            `/api/users?${buildUsersQs({
+              refresh: false,
+              pageIndex: p,
+              details: false,
+            })}`,
+            { timeoutMs: 20_000 }
           ),
         staleTime: 12_000,
       });
@@ -687,10 +768,15 @@ export default function UsersPage() {
     setSyncingUsage(true);
     try {
       const fresh = await api<UsersListPayload>(
-        `/api/users?${buildUsersQs({ refresh: true, pageIndex: page })}`,
+        `/api/users?${buildUsersQs({
+          refresh: true,
+          pageIndex: page,
+          details: true,
+        })}`,
         { timeoutMs: 60_000 }
       );
       qc.setQueryData(usersQueryKey, fresh);
+      void qc.invalidateQueries({ queryKey: countsQueryKey });
       if (!silent) {
         setActionMsg({ type: "ok", text: "مصرف این صفحه همگام شد" });
       }
@@ -1633,7 +1719,8 @@ export default function UsersPage() {
     guard: "گارد",
   };
 
-  const counts = data?.counts;
+  const counts = chipCounts ?? data?.counts;
+  const countsReady = Boolean(chipCounts) || Boolean(searchDebounced.trim());
   const stats = useMemo(() => {
     const now = Math.floor(Date.now() / 1000);
     let expiringSoon = 0;
@@ -1675,11 +1762,19 @@ export default function UsersPage() {
   const filterGroupName =
     filterGroupId === "" ? null : groupsById.get(Number(filterGroupId))?.name || null;
 
-  const filters: { key: FilterKey; label: string; count: number }[] = [
-    { key: "all", label: "همه", count: stats.total },
-    { key: "active", label: "فعال", count: stats.active },
-    { key: "error", label: "خطا", count: stats.withError },
-    { key: "expired", label: "منقضی", count: stats.expired },
+  const filters: {
+    key: FilterKey;
+    label: string;
+    count: number | null;
+  }[] = [
+    { key: "all", label: "همه", count: countsReady ? stats.total : null },
+    { key: "active", label: "فعال", count: countsReady ? stats.active : null },
+    { key: "error", label: "خطا", count: countsReady ? stats.withError : null },
+    {
+      key: "expired",
+      label: "منقضی",
+      count: countsReady ? stats.expired : null,
+    },
   ];
 
   const hasExtraFilter = !!search.trim() || filter !== "all" || filterGroupId !== "";
@@ -1690,13 +1785,21 @@ export default function UsersPage() {
         <div className="users-head-text">
           <h1 className="page-title">کاربران</h1>
           <p className="page-sub users-head-sub">
-            {toFaDigits(stats.total)} کاربر
+            {countsReady ? toFaDigits(stats.total) : "…"} کاربر
             {filterGroupName ? ` · ${filterGroupName}` : ""}
-            {syncingUsage ? " · همگام‌سازی…" : isFetching ? " · بارگذاری…" : ""}
+            {syncingUsage
+              ? " · همگام‌سازی…"
+              : detailsFetching
+                ? " · جزئیات پنل…"
+                : countsFetching || countsPending
+                  ? " · آمار…"
+                  : isFetching
+                    ? " · بارگذاری…"
+                    : ""}
           </p>
         </div>
         <div className="users-head-actions">
-          {stats.withError > 0 && (
+          {countsReady && stats.withError > 0 && (
             <button
               type="button"
               className="btn ghost sm users-retry-all-btn"
@@ -1757,7 +1860,9 @@ export default function UsersPage() {
               <Users size={15} />
             </span>
             <div className="users-stat-body">
-              <strong>{toFaDigits(stats.total)}</strong>
+              <strong className={!countsReady ? "users-stat-pending" : undefined}>
+                {countsReady ? toFaDigits(stats.total) : "…"}
+              </strong>
               <span>کل</span>
             </div>
           </article>
@@ -1766,7 +1871,9 @@ export default function UsersPage() {
               <Wifi size={15} />
             </span>
             <div className="users-stat-body">
-              <strong>{toFaDigits(stats.active)}</strong>
+              <strong className={!countsReady ? "users-stat-pending" : undefined}>
+                {countsReady ? toFaDigits(stats.active) : "…"}
+              </strong>
               <span>فعال</span>
             </div>
           </article>
@@ -1775,7 +1882,9 @@ export default function UsersPage() {
               <AlertTriangle size={15} />
             </span>
             <div className="users-stat-body">
-              <strong>{toFaDigits(stats.withError)}</strong>
+              <strong className={!countsReady ? "users-stat-pending" : undefined}>
+                {countsReady ? toFaDigits(stats.withError) : "…"}
+              </strong>
               <span>خطا</span>
             </div>
           </article>
@@ -1846,7 +1955,9 @@ export default function UsersPage() {
               onClick={() => setFilter(f.key)}
             >
               <span>{f.label}</span>
-              <em>{toFaDigits(f.count)}</em>
+              <em className={f.count == null ? "users-filter-pending" : undefined}>
+                {f.count == null ? "…" : toFaDigits(f.count)}
+              </em>
             </button>
           ))}
           {hasExtraFilter && (
@@ -1875,7 +1986,7 @@ export default function UsersPage() {
         </div>
       )}
 
-      {stats.withError > 0 && (
+      {countsReady && stats.withError > 0 && (
         <div className="users-retry-banner">
           <AlertTriangle size={16} />
           <p>

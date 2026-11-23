@@ -1620,6 +1620,29 @@ async def _users_list_chip_counts(
     )
 
 
+@router.get("/api/users/counts", response_model=UsersListCounts)
+async def users_list_counts(
+    request: Request,
+    search: str | None = None,
+    group_id: int | None = Query(None, ge=1),
+    token: str | None = Depends(oauth2_scheme),
+):
+    """Chip totals only — loaded after the users list so the board paints fast."""
+    async with _USERS_BOARD_SEM:
+        from app.core.database import AsyncSessionLocal, release_db_txn
+
+        async with AsyncSessionLocal() as db:
+            await get_current_admin(request, token, db)
+            counts = await _users_list_chip_counts(
+                db,
+                search=search,
+                group_id=group_id,
+                now_ts=int(time.time()),
+            )
+            await release_db_txn(db)
+            return counts
+
+
 @router.get("/api/users", response_model=UsersListResponse)
 async def list_users(
     request: Request,
@@ -1635,6 +1658,14 @@ async def list_users(
     refresh: bool = Query(
         False,
         description="Pull live usage from remote panels for this page (read-only; no remote push)",
+    ),
+    include_counts: bool = Query(
+        False,
+        description="Include chip totals in this response (slow). Prefer GET /api/users/counts.",
+    ),
+    details: bool = Query(
+        True,
+        description="Include panel_accounts for cards. False = lean rows for first paint.",
     ),
     token: str | None = Depends(oauth2_scheme),
 ):
@@ -1654,6 +1685,8 @@ async def list_users(
                 group_id=group_id,
                 filter=filter,
                 refresh=refresh,
+                include_counts=include_counts,
+                details=details,
                 db=db,
             )
 
@@ -1666,6 +1699,8 @@ async def _list_users_impl(
     group_id: int | None,
     filter: str | None,
     refresh: bool,
+    include_counts: bool,
+    details: bool,
     db: AsyncSession,
 ):
     now_ts = int(time.time())
@@ -1699,8 +1734,10 @@ async def _list_users_impl(
     elif status_filter == "expired":
         status_extra = expired_c
 
+    want_details = bool(details) and not is_search
     if is_search:
         # Search: one COUNT + lean rows (no panel_accounts / no error EXISTS).
+        # Exact username path stays indexed so bots find users on main panels.
         total = await _count_users(
             db, search=search, group_id=group_id, extra=status_extra
         )
@@ -1727,51 +1764,83 @@ async def _list_users_impl(
             selectinload(User.groups).load_only(Group.id),
         )
     else:
-        # Chip totals — single SQL (keeps filters accurate without 4 round-trips).
-        counts = await _users_list_chip_counts(
-            db, search=search, group_id=group_id, now_ts=now_ts
-        )
-        if status_filter == "all":
-            total = counts.all
-        elif status_filter == "active":
-            total = counts.active
-        elif status_filter == "error":
-            total = counts.error
-        elif status_filter == "expired":
-            total = counts.expired
+        # Fast path: page total only. Chip breakdown arrives via /api/users/counts.
+        if include_counts:
+            counts = await _users_list_chip_counts(
+                db, search=search, group_id=group_id, now_ts=now_ts
+            )
+            if status_filter == "all":
+                total = counts.all
+            elif status_filter == "active":
+                total = counts.active
+            elif status_filter == "error":
+                total = counts.error
+            elif status_filter == "expired":
+                total = counts.expired
+            else:
+                total = await _count_users(
+                    db, search=search, group_id=group_id, extra=status_extra
+                )
         else:
             total = await _count_users(
                 db, search=search, group_id=group_id, extra=status_extra
             )
-        # Light list load: skip huge share-link JSON + unused panel columns.
-        q = select(User).options(
-            selectinload(User.groups).load_only(Group.id),
-            selectinload(User.panel_accounts).options(
-                load_only(
-                    PanelAccount.id,
-                    PanelAccount.user_id,
-                    PanelAccount.panel_id,
-                    PanelAccount.group_id,
-                    PanelAccount.remote_username,
-                    PanelAccount.status,
-                    PanelAccount.error_message,
-                    PanelAccount.used_traffic,
-                    PanelAccount.coeff_anchor_raw,
-                    PanelAccount.coeff_anchor_weighted,
-                    PanelAccount.applied_coefficient,
-                    PanelAccount.last_sync_at,
-                ),
-                defer(PanelAccount.links),
-                defer(PanelAccount.links_by_group),
-                selectinload(PanelAccount.panel).load_only(
-                    Panel.id,
-                    Panel.name,
-                    Panel.type,
-                    Panel.is_active,
-                    Panel.base_url,
-                ),
-            ),
+            counts = UsersListCounts(all=total if status_filter == "all" else 0)
+
+        lean_user = load_only(
+            User.id,
+            User.username,
+            User.display_name,
+            User.status,
+            User.data_limit,
+            User.used_traffic,
+            User.lifetime_used_traffic,
+            User.expire,
+            User.on_hold_expire_duration,
+            User.include_promo_first,
+            User.data_limit_reset_strategy,
+            User.note,
+            User.created_at,
+            User.sub_token,
+            User.source_category_id,
         )
+        if want_details:
+            # Full cards: panel meters (still defer huge share-link JSON).
+            q = select(User).options(
+                lean_user,
+                selectinload(User.groups).load_only(Group.id),
+                selectinload(User.panel_accounts).options(
+                    load_only(
+                        PanelAccount.id,
+                        PanelAccount.user_id,
+                        PanelAccount.panel_id,
+                        PanelAccount.group_id,
+                        PanelAccount.remote_username,
+                        PanelAccount.status,
+                        PanelAccount.error_message,
+                        PanelAccount.used_traffic,
+                        PanelAccount.coeff_anchor_raw,
+                        PanelAccount.coeff_anchor_weighted,
+                        PanelAccount.applied_coefficient,
+                        PanelAccount.last_sync_at,
+                    ),
+                    defer(PanelAccount.links),
+                    defer(PanelAccount.links_by_group),
+                    selectinload(PanelAccount.panel).load_only(
+                        Panel.id,
+                        Panel.name,
+                        Panel.type,
+                        Panel.is_active,
+                        Panel.base_url,
+                    ),
+                ),
+            )
+        else:
+            # First paint: usernames + traffic only — panel rows hydrate next.
+            q = select(User).options(
+                lean_user,
+                selectinload(User.groups).load_only(Group.id),
+            )
     if needs_group_join:
         q = q.join(UserGroup, UserGroup.user_id == User.id)
     if base_filters:
@@ -1782,7 +1851,7 @@ async def _list_users_impl(
         q.order_by(User.id.desc()).offset(offset).limit(limit)
     )
     users = list(result.scalars().unique().all())
-    if not is_search:
+    if want_details:
         missing = [
             u
             for u in users
@@ -1801,7 +1870,7 @@ async def _list_users_impl(
             except Exception:  # noqa: BLE001
                 pass
 
-    if refresh and users and not is_search:
+    if refresh and users and want_details:
         # End list-read txn before parallel remote pulls (idle-in-transaction).
         from app.core.database import release_db_txn
 
