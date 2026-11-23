@@ -19,6 +19,11 @@ Restart=always
 RestartSec=3
 KillSignal=SIGTERM
 TimeoutStopSec=30
+# Leave headroom for sshd/nginx so admin SSH never starves under usage sync.
+# 250% ≈ 2.5 cores; raise only if the host has many cores and stays responsive.
+CPUQuota=250%
+TasksMax=4096
+OOMPolicy=continue
 # Must be false so astra can sudo astra-helper (SSL / update / nginx) via /etc/sudoers.d/astra
 NoNewPrivileges=false
 PrivateTmp=true

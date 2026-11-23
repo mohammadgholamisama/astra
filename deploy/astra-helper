@@ -930,6 +930,21 @@ cmd_apply_update() {
   if [[ -f "${ASTRA_ROOT}/deploy/astra.service" ]]; then
     install -m 644 "${ASTRA_ROOT}/deploy/astra.service" /etc/systemd/system/astra.service
   fi
+  # Keep SSH usable under heavy usage sync (do not let astra eat the whole CPU)
+  mkdir -p /etc/systemd/system/astra.service.d
+  cat > /etc/systemd/system/astra.service.d/cpu-guard.conf <<'EOF'
+[Service]
+CPUQuota=250%
+TasksMax=4096
+OOMPolicy=continue
+EOF
+  if [[ -f "${ASTRA_ROOT}/deploy/sshd-astra-harden.conf" ]]; then
+    install -m 644 "${ASTRA_ROOT}/deploy/sshd-astra-harden.conf" \
+      /etc/ssh/sshd_config.d/60-astra-harden.conf
+    if sshd -t 2>/dev/null; then
+      systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+    fi
+  fi
   if [[ -f "${ASTRA_ROOT}/deploy/astra-update.service" ]]; then
     install -m 644 "${ASTRA_ROOT}/deploy/astra-update.service" /etc/systemd/system/astra-update.service
   fi
