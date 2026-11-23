@@ -108,6 +108,7 @@ async def download_backup(_admin: Admin = Depends(get_session_admin_only)):
             ) from exc
 
         filename = bak.suggested_backup_filename()
+        size = tmp_path.stat().st_size if tmp_path.exists() else 0
 
         def _cleanup() -> None:
             try:
@@ -122,7 +123,10 @@ async def download_backup(_admin: Admin = Depends(get_session_admin_only)):
             background=BackgroundTask(_cleanup),
             headers={
                 "Cache-Control": "no-store",
+                "X-Accel-Buffering": "no",
+                "Content-Length": str(size),
                 "X-Astra-Backup-Format": bak.BACKUP_FORMAT,
+                "X-Astra-Backup-Bytes": str(size),
             },
         )
 
@@ -164,7 +168,7 @@ async def restore_backup(
                         written += len(chunk)
                         if written > bak.MAX_UPLOAD_BYTES:
                             raise bak.BackupError(
-                                "حجم فایل بک‌آپ بیش از حد مجاز است (حداکثر ۵۱۲ مگابایت)"
+                                "حجم فایل بک‌آپ بیش از حد مجاز است (حداکثر ۲ گیگابایت)"
                             )
                         out.write(chunk)
             finally:

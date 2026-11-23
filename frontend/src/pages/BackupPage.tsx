@@ -99,6 +99,8 @@ export default function BackupPage() {
       return api<RestoreResult>("/api/admin/backup/restore", {
         method: "POST",
         body: fd,
+        // Full dump restore can take a long time on large panels
+        timeoutMs: 45 * 60 * 1000,
       });
     },
     onSuccess: (res) => {
@@ -128,10 +130,19 @@ export default function BackupPage() {
   async function downloadBackup() {
     setMsg(null);
     setDownloading(true);
+    const ac = new AbortController();
+    // Large Postgres dumps can take minutes; keep UI waiting with a clear budget.
+    const timer = window.setTimeout(() => ac.abort(), 45 * 60 * 1000);
     try {
+      setMsg({
+        type: "ok",
+        text: "در حال ساخت اسنپ‌شات کامل دیتابیس… لطفاً این تب را باز بگذارید.",
+      });
       const token = localStorage.getItem("astra_token");
       const res = await fetch("/api/admin/backup", {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
+        signal: ac.signal,
+        cache: "no-store",
       });
       if (!res.ok) {
         let message = res.statusText || "دانلود ناموفق";
@@ -141,11 +152,27 @@ export default function BackupPage() {
           if (typeof d === "string") message = d;
           else if (d && typeof d === "object" && d.message) message = String(d.message);
         } catch {
-          /* ignore */
+          if (res.status === 502 || res.status === 504) {
+            message =
+              "تایم‌اوت هنگام ساخت بک‌آپ — پنل را آپدیت کنید یا از پورت مستقیم اپ دوباره تلاش کنید";
+          } else if (res.status >= 500) {
+            message = "ساخت بک‌آپ روی سرور خطا داد — لاگ astra را ببینید";
+          }
         }
         throw new Error(message);
       }
+      const totalHdr = res.headers.get("X-Astra-Backup-Bytes") || res.headers.get("Content-Length");
+      const total = totalHdr ? Number(totalHdr) : 0;
+      if (total > 0) {
+        setMsg({
+          type: "ok",
+          text: `در حال دانلود بک‌آپ (${formatBytes(total)})…`,
+        });
+      }
       const blob = await res.blob();
+      if (!blob || blob.size < 64) {
+        throw new Error("فایل بک‌آپ خالی برگشت — دوباره تلاش کنید");
+      }
       const cd = res.headers.get("Content-Disposition") || "";
       const match = /filename\*?=(?:UTF-8''|")?([^\";]+)/i.exec(cd);
       const rawName = match ? decodeURIComponent(match[1].replace(/"/g, "")) : "";
@@ -159,14 +186,25 @@ export default function BackupPage() {
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
-      setMsg({ type: "ok", text: `دانلود شد: ${filename}` });
+      setMsg({
+        type: "ok",
+        text: `دانلود شد: ${filename} (${formatBytes(blob.size)})`,
+      });
       void refetch();
     } catch (e) {
+      const aborted =
+        (e instanceof DOMException && e.name === "AbortError") ||
+        (e instanceof Error && e.name === "AbortError");
       setMsg({
         type: "err",
-        text: e instanceof Error ? e.message : "دانلود بک‌آپ ناموفق بود",
+        text: aborted
+          ? "زمان ساخت/دانلود بک‌آپ تمام شد — دوباره تلاش کنید"
+          : e instanceof Error
+            ? e.message
+            : "دانلود بک‌آپ ناموفق بود",
       });
     } finally {
+      window.clearTimeout(timer);
       setDownloading(false);
     }
   }

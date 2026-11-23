@@ -192,6 +192,8 @@ async def system_stats(
             (await db.execute(select(func.count(Group.id)))).scalar() or 0
         )
 
+        # Exclude capacity / transient timeouts from "real" sync errors.
+        # Use portable LIKE (SQLite has no Postgres !~* operator).
         err_row = (
             await db.execute(
                 text(
@@ -203,8 +205,14 @@ async def system_stats(
                     JOIN panels p ON p.id = pa.panel_id
                     WHERE pa.status = 'error'
                       AND p.is_active IS TRUE
-                      AND COALESCE(pa.error_message, '') !~*
-                          '(user limit|limit reached|ظرفیت|timeout|timed out|waiting for panel|طول کشید|تایم)'
+                      AND lower(COALESCE(pa.error_message, '')) NOT LIKE '%user limit%'
+                      AND lower(COALESCE(pa.error_message, '')) NOT LIKE '%limit reached%'
+                      AND COALESCE(pa.error_message, '') NOT LIKE '%ظرفیت%'
+                      AND lower(COALESCE(pa.error_message, '')) NOT LIKE '%timeout%'
+                      AND lower(COALESCE(pa.error_message, '')) NOT LIKE '%timed out%'
+                      AND lower(COALESCE(pa.error_message, '')) NOT LIKE '%waiting for panel%'
+                      AND COALESCE(pa.error_message, '') NOT LIKE '%طول کشید%'
+                      AND COALESCE(pa.error_message, '') NOT LIKE '%تایم%'
                     """
                 )
             )

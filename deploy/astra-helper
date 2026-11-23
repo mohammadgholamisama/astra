@@ -106,6 +106,22 @@ EOF
 panel_locations() {
   local port="$1"
   cat <<EOF
+    # Full DB backup/restore — long timeouts + large body (ZIP up to ~2GiB)
+    location ^~ /api/admin/backup {
+        proxy_pass http://127.0.0.1:${port};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        client_max_body_size 2048m;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+    }
+
     location /api/ {
         proxy_pass http://127.0.0.1:${port};
         proxy_http_version 1.1;
@@ -113,7 +129,8 @@ panel_locations() {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 120s;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
     }
 
     # Multi-device ping hub (Go) — only panel host; does not touch /api Astra routes
@@ -259,7 +276,7 @@ server {
     server_name _;
     root /opt/astra/frontend/dist;
     index index.html;
-    client_max_body_size 50m;
+    client_max_body_size 2048m;
 $(panel_locations "$port")
 }
 EOF
@@ -291,7 +308,7 @@ server {
     server_name ${domain};
 ${root_line}
 ${index_line}
-    client_max_body_size 50m;
+    client_max_body_size 2048m;
 
     location /.well-known/acme-challenge/ {
         root /var/www/html;
@@ -375,7 +392,7 @@ ${node_tls_tuning}
 
 ${root_line}
 ${index_line}
-    client_max_body_size 50m;
+    client_max_body_size 2048m;
 $(locations_for_mode "$port" "$mode")
 }
 EOF

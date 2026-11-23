@@ -359,8 +359,19 @@ def build_backup_zip(dest_zip: Path) -> dict[str, Any]:
         if dest_zip.exists():
             dest_zip.unlink()
 
+        # pg_dump -Fc is already compressed → ZIP_STORED (fast).
+        # SQLite: light DEFLATE so large panels finish before reverse-proxy timeouts.
+        db_compress = (
+            zipfile.ZIP_STORED
+            if dialect == "postgresql"
+            else zipfile.ZIP_DEFLATED
+        )
         with zipfile.ZipFile(
-            dest_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+            dest_zip,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=1,
+            allowZip64=True,
         ) as zf:
             zf.writestr(
                 MANIFEST_ENTRY,
@@ -373,7 +384,7 @@ def build_backup_zip(dest_zip: Path) -> dict[str, Any]:
                 json.dumps(counts, ensure_ascii=False, indent=2),
                 compress_type=zipfile.ZIP_DEFLATED,
             )
-            zf.write(db_copy, arcname=db_arc)
+            zf.write(db_copy, arcname=db_arc, compress_type=db_compress)
 
     logger.info(
         "Backup created %s dialect=%s (%s bytes, sha256=%s…)",
