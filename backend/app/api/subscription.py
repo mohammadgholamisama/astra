@@ -1442,7 +1442,26 @@ async def _serve_subscription_db(
     )
 
     # Instant Update: light user + feed cache — no heavy ORM, no ensure_loaded.
+    # Exhausted users must NEVER hit the active feed cache (configs stay live).
     blocked_early = user.status in (UserStatus.limited, UserStatus.expired)
+    if blocked_early:
+        try:
+            invalidate_user_feed_cache(uid_safe)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from app.services.orchestrator import _freeze_quota_users
+
+            asyncio.create_task(
+                _freeze_quota_users(
+                    [uid_safe],
+                    remote_timeout=12.0,
+                    concurrency=14,
+                    wall=90.0,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
     if (
         curated_early
         and user.status != UserStatus.disabled
@@ -1672,6 +1691,49 @@ async def _serve_subscription_db(
         blocked = user.status in (UserStatus.limited, UserStatus.expired)
         if blocked:
             invalidate_user_feed_cache(int(user.id))
+            # Kick remote disable NOW — status remark only, no live share links.
+            try:
+                from app.services.orchestrator import _freeze_quota_users
+
+                asyncio.create_task(
+                    _freeze_quota_users(
+                        [int(user.id)],
+                        remote_timeout=12.0,
+                        concurrency=14,
+                        wall=90.0,
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            if curated:
+                from app.services.link_remark import (
+                    build_notice_link,
+                    build_status_row,
+                )
+                from app.services.site_settings import (
+                    get_status_line_template,
+                    get_status_panel_label,
+                )
+
+                st_val = getattr(user.status, "value", user.status)
+                st_row = build_status_row(
+                    username=(user.username or "user"),
+                    used=int(user.used_traffic or 0),
+                    limit=int(user.data_limit or 0),
+                    expire=user.expire,
+                    template=get_status_line_template(),
+                    panel_label=get_status_panel_label(),
+                    user_status=str(st_val),
+                )
+                notice = build_notice_link(
+                    "⛔️ حجم تمام شد"
+                    if st_val == "limited"
+                    else "⛔️ اشتراک منقضی شد"
+                )
+                body = _encode_feed(
+                    [st_row["link"]] + ([notice] if notice else [])
+                )
+                return _feed_response(body, _headers_for(body), share_count=0)
         # Short curated cache keeps Update bursts under CF limits (no 503).
         # Probe/full always rebuilds.
         if curated and not blocked:

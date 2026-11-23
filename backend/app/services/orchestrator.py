@@ -3272,6 +3272,40 @@ async def reset_remotes_background(
         _dbg_reset("H-F", "reset_remotes_exc", {"user_id": user_id})
 
 
+async def _remount_freeze_marks(
+    user_id: int,
+    account_flags: list[tuple[int, bool]],
+) -> None:
+    """Persist ASTRA_QUOTA_FROZEN on a fresh session after a poisoned freeze TX."""
+    from app.core.database import AsyncSessionLocal
+    from app.services.panel_usage_bulk import QUOTA_FROZEN_MARK
+
+    if not account_flags:
+        return
+    async with AsyncSessionLocal() as sdb:
+        result = await sdb.execute(
+            select(PanelAccount).where(PanelAccount.user_id == int(user_id))
+        )
+        by_id = {int(a.id): a for a in result.scalars().all()}
+        for aid, ok in account_flags:
+            acc = by_id.get(int(aid))
+            if acc is None or acc.status == PanelAccountStatus.deleted:
+                continue
+            if ok:
+                acc.status = PanelAccountStatus.active
+                acc.error_message = QUOTA_FROZEN_MARK
+                try:
+                    acc.links = []
+                except Exception:  # noqa: BLE001
+                    pass
+                if hasattr(acc, "links_by_group"):
+                    try:
+                        acc.links_by_group = None
+                    except Exception:  # noqa: BLE001
+                        pass
+        await sdb.commit()
+
+
 async def sync_modify_user(
     db: AsyncSession,
     user: User,
@@ -3373,6 +3407,10 @@ async def sync_modify_user(
             used_raw_on_panel=int(account.used_traffic or 0),
             remote_username=rem_name,
         )
+        # Hard cut: remotes treat "limited" inconsistently — force disabled so
+        # Marzban / Sanaei / Rebecca / PasarGuard all stop traffic immediately.
+        if blocked:
+            payload.status = "disabled"
         # PasarGuard disable API needs numeric by-id — pass through stored remote_id
         rid = (account.remote_id or "").strip()
         if rid:
@@ -3540,8 +3578,23 @@ async def sync_modify_user(
                     )
             account.error_message = QUOTA_FROZEN_MARK if blocked else None
             account.last_sync_at = now
-            if panel:
+            # Never dirty panels.last_ok_at during freeze: long HTTP leaves the
+            # asyncpg connection idle→closed, then UPDATE panels poisons the TX
+            # and rolls back every ASTRA_QUOTA_FROZEN mark (remotes stay "active").
+            if panel is not None and not blocked:
                 panel.last_ok_at = now
+            if blocked:
+                # Drop share links immediately so /sub cannot keep handing configs
+                # out while a few remotes are still finishing disable.
+                try:
+                    account.links = []
+                except Exception:  # noqa: BLE001
+                    pass
+                if hasattr(account, "links_by_group"):
+                    try:
+                        account.links_by_group = None
+                    except Exception:  # noqa: BLE001
+                        pass
             return
         had_links = bool(account.links)
         was_ok = account.status == PanelAccountStatus.active and had_links
@@ -3552,14 +3605,24 @@ async def sync_modify_user(
             username=payload.username,
         )
         if blocked:
-            account.status = PanelAccountStatus.error
-            account.error_message = msg
-            logger.warning(
-                "failed to freeze remote user=%s panel=%s: %s",
-                user.username,
-                account.panel_id,
-                msg,
-            )
+            # Not-found orphans are already offline — mark frozen so watch
+            # does not keep retrying forever and leave the user half-cut.
+            if _is_not_found_err(res.error):
+                account.status = PanelAccountStatus.active
+                account.error_message = QUOTA_FROZEN_MARK
+                try:
+                    account.links = []
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                account.status = PanelAccountStatus.error
+                account.error_message = msg
+                logger.warning(
+                    "failed to freeze remote user=%s panel=%s: %s",
+                    user.username,
+                    account.panel_id,
+                    msg,
+                )
         elif was_ok and not _is_not_found_err(res.error):
             account.error_message = None
             logger.warning(
@@ -3571,6 +3634,17 @@ async def sync_modify_user(
         else:
             account.status = PanelAccountStatus.error
             account.error_message = msg
+
+    # Release the DB connection BEFORE long HTTP — idle asyncpg dies mid-gather
+    # and the later freeze commit then fails with "connection is closed".
+    if blocked and other_jobs:
+        try:
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
 
     # Foreign remotes first (HTTP) — commit when freezing so an Astra DB
     # failure cannot roll back successful PasarGuard /disabled cuts.
@@ -3584,7 +3658,6 @@ async def sync_modify_user(
         for (account, panel, payload), res in zip(other_jobs, other_res):
             results_by_key[(int(account.panel_id), int(account.id))] = res
             _apply_one(account, panel, payload, res)
-        await db.flush()
         if blocked:
             try:
                 await db.commit()
@@ -3597,6 +3670,28 @@ async def sync_modify_user(
                     await db.rollback()
                 except Exception:  # noqa: BLE001
                     pass
+                # Remount freeze marks on a fresh connection so a dead pooled
+                # socket cannot erase a successful remote cut.
+                try:
+                    await _remount_freeze_marks(
+                        int(user.id),
+                        [
+                            (
+                                int(account.id),
+                                bool(res.success)
+                                or _is_not_found_err(res.error),
+                            )
+                            for (account, _p, _pl), res in zip(
+                                other_jobs, other_res
+                            )
+                        ],
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "remount freeze marks failed user=%s", user.username
+                    )
+        else:
+            await db.flush()
 
     for account, panel, payload in astra_jobs:
         try:
@@ -8624,6 +8719,29 @@ async def refresh_usage_pool_safe(
                 changed = bool(activated) or await enforce_user_quota(db, user)
                 await db.commit()
                 st = getattr(user.status, "value", user.status)
+                blocked_now = user.status in (
+                    UserStatus.limited,
+                    UserStatus.expired,
+                    UserStatus.disabled,
+                )
+                # Flip to limited/expired must cut remotes here — callers often
+                # time out before sync_modify finishes all panels.
+                if changed and blocked_now:
+                    try:
+                        asyncio.create_task(
+                            _freeze_quota_users(
+                                [int(user_id)],
+                                remote_timeout=12.0,
+                                concurrency=14,
+                                wall=90.0,
+                            )
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "schedule freeze after quota flip failed user=%s",
+                            username,
+                            exc_info=True,
+                        )
                 return (
                     int(user.used_traffic or total or 0),
                     bool(activated),
