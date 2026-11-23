@@ -502,7 +502,7 @@ async def _analytics_sample_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("analytics sample loop failed")
-        await asyncio.sleep(90)
+        await asyncio.sleep(180)
 
 
 def _resolve_frontend_dist() -> Path | None:
