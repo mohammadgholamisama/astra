@@ -280,9 +280,9 @@ async def _usage_sync_loop() -> None:
     from app.core.database import background_db_sem
     from app.services.orchestrator import run_quota_watch_cycle
 
-    await asyncio.sleep(8)
     while True:
         t0 = _time.monotonic()
+        elapsed = 0.0
         try:
             sem = background_db_sem()
             await sem.acquire()
@@ -527,6 +527,7 @@ def _resolve_frontend_dist() -> Path | None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # Minimal boot first — /health must answer before any heavy bg work.
     await ensure_schema()
     await seed_admin()
     async with AsyncSessionLocal() as db:
@@ -534,42 +535,58 @@ async def lifespan(_app: FastAPI):
         await refresh_config_locations(db)
         await refresh_config_hides(db)
         await refresh_config_orders(db)
-        # Undo mass hides from older ping-rank bug (once per install)
-        from app.services.config_hides import clear_stale_ping_auto_hides_once
-        from app.services.config_orders import (
-            relayout_order_slots_once,
-            seed_order_kind_from_folders_once,
-        )
+        await db.rollback()
 
-        await clear_stale_ping_auto_hides_once(db)
-    # Never block panel boot on order seed/relayout — site must serve data first
+    from app.services.config_hides import clear_stale_ping_auto_hides_once
+    from app.services.config_orders import (
+        relayout_order_slots_once,
+        seed_order_kind_from_folders_once,
+    )
+
     async def _bg_order_kind_boot() -> None:
         try:
+            await asyncio.sleep(15)
             async with AsyncSessionLocal() as s:
+                await clear_stale_ping_auto_hides_once(s)
                 await seed_order_kind_from_folders_once(s)
                 await relayout_order_slots_once(s)
         except Exception:  # noqa: BLE001
             logging.getLogger("astra").exception("order_kind boot task failed")
 
-    usage_task = asyncio.create_task(_usage_sync_loop(), name="astra-usage-sync")
-    fleet_task = asyncio.create_task(_fleet_usage_loop(), name="astra-fleet-usage")
-    hot_task = asyncio.create_task(_hot_usage_loop(), name="astra-hot-usage")
+    # Stagger bg loops so boot does not stampede CPU/DB in the first minute.
+    async def _delayed(coro, delay: float, name: str):
+        await asyncio.sleep(delay)
+        await coro()
+
+    usage_task = asyncio.create_task(
+        _delayed(_usage_sync_loop, 45, "usage"), name="astra-usage-sync"
+    )
+    fleet_task = asyncio.create_task(
+        _delayed(_fleet_usage_loop, 90, "fleet"), name="astra-fleet-usage"
+    )
+    hot_task = asyncio.create_task(
+        _delayed(_hot_usage_loop, 60, "hot"), name="astra-hot-usage"
+    )
     analytics_task = asyncio.create_task(
-        _analytics_sample_loop(), name="astra-analytics-sample"
+        _delayed(_analytics_sample_loop, 75, "analytics"),
+        name="astra-analytics-sample",
     )
     retry_errors_task = asyncio.create_task(
         _auto_retry_errors_loop(), name="astra-auto-retry-errors"
     )
     outbound_task = asyncio.create_task(
-        _outbound_health_loop(), name="astra-outbound-health"
+        _delayed(_outbound_health_loop, 120, "outbound"),
+        name="astra-outbound-health",
     )
     xray_heal_task = asyncio.create_task(
-        _astra_xray_heal_loop(), name="astra-xray-heal"
+        _delayed(_astra_xray_heal_loop, 30, "xray-heal"),
+        name="astra-xray-heal",
     )
     order_boot_task = asyncio.create_task(
         _bg_order_kind_boot(), name="astra-order-kind-boot"
     )
     pool_task = asyncio.create_task(pool_guardian_loop(), name="astra-db-pool-guard")
+    logger.info("astra lifespan ready — serving; bg loops staggered")
     try:
         yield
     finally:
