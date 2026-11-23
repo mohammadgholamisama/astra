@@ -920,9 +920,21 @@ async def sample_all_users_once() -> dict[str, int]:
         except Exception:  # noqa: BLE001
             logger.exception("analytics weighted rebase failed")
         async with AsyncSessionLocal() as db:
+            # Skip idle/zero users — samples of 0 don't advance buckets and
+            # were pegging CPU on large installs (10k+ nested txns/min).
             rows = (
                 await db.execute(
-                    select(User.id, func.coalesce(User.used_traffic, 0))
+                    select(User.id, func.coalesce(User.used_traffic, 0)).where(
+                        User.status.in_(
+                            (
+                                UserStatus.active,
+                                UserStatus.on_hold,
+                                UserStatus.limited,
+                                UserStatus.expired,
+                            )
+                        ),
+                        User.used_traffic > 0,
+                    )
                 )
             ).all()
             n = 0
@@ -937,7 +949,7 @@ async def sample_all_users_once() -> dict[str, int]:
                         await db.rollback()
                     except Exception:  # noqa: BLE001
                         pass
-                if n % 40 == 0:
+                if n % 80 == 0:
                     try:
                         await db.commit()
                     except Exception:  # noqa: BLE001
@@ -945,6 +957,8 @@ async def sample_all_users_once() -> dict[str, int]:
                             await db.rollback()
                         except Exception:  # noqa: BLE001
                             pass
+                    # Yield so API / hot usage keep the event loop.
+                    await asyncio.sleep(0)
             try:
                 await db.commit()
             except Exception:  # noqa: BLE001

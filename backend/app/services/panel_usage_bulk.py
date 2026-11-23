@@ -853,7 +853,8 @@ async def run_fleet_usage_cycle() -> dict[str, int]:
 
     t0 = time.monotonic()
     _FLEET_CYCLE_N += 1
-    full_pass = _FLEET_CYCLE_N % 5 == 1
+    # Full recount of every user is the heavy path — every 8th cycle only.
+    full_pass = _FLEET_CYCLE_N % 8 == 1
     stats: dict[str, int] = {
         "astra_panels": 0,
         "panels": 0,
@@ -870,7 +871,7 @@ async def run_fleet_usage_cycle() -> dict[str, int]:
 
     try:
         bulk = await sync_all_panels_bulk(
-            concurrency=16, recount=True, recount_concurrency=28
+            concurrency=8, recount=True, recount_concurrency=12
         )
         stats["panels"] = int(bulk.get("panels") or 0)
         stats["listed"] = int(bulk.get("listed") or 0)
@@ -881,7 +882,7 @@ async def run_fleet_usage_cycle() -> dict[str, int]:
 
     if full_pass:
         try:
-            full = await recount_all_live_users(concurrency=32, chunk=1000)
+            full = await recount_all_live_users(concurrency=10, chunk=600)
             stats["recount_users"] = int(full.get("users") or 0)
             stats["flipped"] += int(full.get("flipped") or 0)
         except Exception:  # noqa: BLE001

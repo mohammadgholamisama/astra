@@ -163,8 +163,8 @@ def test_push_when_blocked_forced_or_mid_usage():
         coefficients=[1, 2],
         shrink_shared_caps=True,
     )
-    # Mid usage → tighten remote remaining caps
-    assert needs_remote_cap_sync(
+    # Mid usage alone → no push (CPU); near-end → tighten remaining caps
+    assert not needs_remote_cap_sync(
         status_changed=False,
         blocked=False,
         force=False,
@@ -177,9 +177,17 @@ def test_push_when_blocked_forced_or_mid_usage():
         blocked=False,
         force=False,
         active_panel_count=2,
+        coefficients=[1, 2],
+        used_ratio=0.75,
+    )
+    assert needs_remote_cap_sync(
+        status_changed=False,
+        blocked=False,
+        force=False,
+        active_panel_count=2,
         coefficients=[1, 1],
         shrink_shared_caps=True,
-        used_ratio=0.2,
+        used_ratio=0.55,
     )
     assert needs_remote_cap_sync(
         status_changed=False,

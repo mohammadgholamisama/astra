@@ -314,24 +314,24 @@ async def _usage_sync_loop() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("quota watch loop failed")
             elapsed = _time.monotonic() - t0
-        interval = max(6, int(settings.USAGE_REFRESH_SECONDS or 12))
-        # Heavy cycle → short cooldown (was up to 90s and starved meter updates)
+        interval = max(8, int(settings.USAGE_REFRESH_SECONDS or 12))
+        # Heavy cycle → cool down so we don't re-enter while remotes still drain CPU
         if elapsed > interval:
-            cooldown = min(25.0, max(float(interval), elapsed * 0.35))
+            cooldown = min(35.0, max(float(interval), elapsed * 0.45))
         else:
-            cooldown = max(1.0, float(interval) - elapsed)
+            cooldown = max(2.0, float(interval) - elapsed)
         await asyncio.sleep(cooldown)
 
 
 async def _fleet_usage_loop() -> None:
-    """Every ~45s: pull ALL remote panels in parallel + recount dirty users."""
+    """Periodic full-fleet pull. Live accuracy relies on hot/sub + remaining caps."""
     import time as _time
 
     from app.core.database import background_db_sem
     from app.services.panel_usage_bulk import run_fleet_usage_cycle
 
-    # Short boot delay — first fleet should catch remote meters ASAP.
-    await asyncio.sleep(12)
+    # Boot delay — let quota/hot settle before the heavy fleet pass.
+    await asyncio.sleep(25)
     while True:
         t0 = _time.monotonic()
         try:
@@ -356,9 +356,10 @@ async def _fleet_usage_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("fleet usage loop failed")
-        interval = max(90, int(getattr(settings, "USAGE_FLEET_SECONDS", 120) or 120))
+        interval = max(120, int(getattr(settings, "USAGE_FLEET_SECONDS", 150) or 150))
         elapsed = _time.monotonic() - t0
-        await asyncio.sleep(max(15.0, float(interval) - elapsed))
+        # After a long fleet pass, always rest so API/hot keep CPU headroom.
+        await asyncio.sleep(max(45.0, float(interval) - elapsed))
 
 
 async def _hot_usage_loop() -> None:
@@ -380,11 +381,11 @@ async def _hot_usage_loop() -> None:
         t0 = _time.monotonic()
         ids: list[int] = []
         try:
-            ids = list(take_live_usage_priority(300.0, 60))
+            ids = list(take_live_usage_priority(300.0, 36))
             try:
                 from app.models.user_analytics import UserUsageState
 
-                since = datetime.now(timezone.utc) - timedelta(minutes=20)
+                since = datetime.now(timezone.utc) - timedelta(minutes=12)
                 async with AsyncSessionLocal() as db:
                     recent = [
                         int(uid)
@@ -394,18 +395,18 @@ async def _hot_usage_loop() -> None:
                                 .where(UserUsageState.last_sub_fetch_at.is_not(None))
                                 .where(UserUsageState.last_sub_fetch_at >= since)
                                 .order_by(UserUsageState.last_sub_fetch_at.desc())
-                                .limit(40)
+                                .limit(24)
                             )
                         ).all()
                     ]
-                ids = list(dict.fromkeys(ids + recent))[:28]
+                ids = list(dict.fromkeys(ids + recent))[:20]
             except Exception:  # noqa: BLE001
                 pass
 
-            # Parallel live pulls for everyone currently on /sub (downloading).
-            ids = ids[:40]
+            # Parallel live pulls for currently-active /sub users (bounded).
+            ids = ids[:20]
             if ids:
-                sem = asyncio.Semaphore(12)
+                sem = asyncio.Semaphore(6)
 
                 async def _one(uid: int) -> None:
                     async with sem:
@@ -450,9 +451,9 @@ async def _hot_usage_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("hot usage loop failed")
-        interval = max(6, int(getattr(settings, "USAGE_HOT_SECONDS", 8) or 8))
+        interval = max(8, int(getattr(settings, "USAGE_HOT_SECONDS", 8) or 8))
         elapsed = _time.monotonic() - t0
-        await asyncio.sleep(max(3.0, float(interval) - elapsed))
+        await asyncio.sleep(max(5.0, float(interval) - elapsed))
 
 
 async def _analytics_sample_loop() -> None:
@@ -501,7 +502,7 @@ async def _analytics_sample_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("analytics sample loop failed")
-        await asyncio.sleep(60)
+        await asyncio.sleep(90)
 
 
 def _resolve_frontend_dist() -> Path | None:

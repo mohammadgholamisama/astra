@@ -7651,7 +7651,7 @@ _LIVE_USAGE_PRIORITY: dict[int, float] = {}
 # starved the panel with QueuePool TimeoutError → «Temporarily unavailable».
 # Cap concurrent usage pulls so interactive /sub + admin keep DB headroom.
 # Live usage pulls — keep below pool headroom so analytics/UI can checkout.
-_USAGE_PULL_GATE = asyncio.Semaphore(14)
+_USAGE_PULL_GATE = asyncio.Semaphore(8)
 
 
 def mark_live_usage_priority(user_id: int) -> None:
@@ -8565,9 +8565,10 @@ async def refresh_usage_pool_safe(
 
     # Cover EVERY live remote. Old quick=3s/sem=8 dropped slow PasarGuard
     # meters → Astra under-reported vs «پنل اصلی» (e.g. 58MB vs 155MB).
-    per_try = 9.0 if quick else 12.0
+    per_try = 7.0 if quick else 12.0
     results: dict[int, AdapterResult] = {}
-    sem = asyncio.Semaphore(28 if quick else 20)
+    # Bound per-user remote fan-out so hot×users doesn't peg CPU/TLS.
+    sem = asyncio.Semaphore(10 if quick else 14)
 
     async def _one(
         aid: int,
@@ -8649,12 +8650,14 @@ async def refresh_usage_pool_safe(
                 for aid, panel, uname, rid, _prev in pullable
             ]
         )
-        logger.info(
+        miss = max(0, len(pullable) - len(results))
+        log = logger.warning if miss else logger.debug
+        log(
             "pool-safe usage user=%s pullable=%s ok=%s miss=%s quick=%s per_try=%.1f",
             username,
             len(pullable),
             len(results),
-            max(0, len(pullable) - len(results)),
+            miss,
             quick,
             per_try,
         )

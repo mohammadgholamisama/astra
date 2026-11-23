@@ -38,15 +38,15 @@ class Settings(BaseSettings):
     ADAPTER_TIMEOUT: float = 35.0
     # Max concurrent HTTP ops to remotes (create/delete/modify). Caps FD/TLS storm
     # when a user spans many panels; wall time still ≈ ceil(N/limit)×slowest.
-    PANEL_REMOTE_CONCURRENCY: int = 20
+    PANEL_REMOTE_CONCURRENCY: int = 14
     # Background quota watch cadence (seconds). Exhausted users are frozen
-    # on every remote in the same cycle.
-    USAGE_REFRESH_SECONDS: int = 5
+    # on every remote in the same cycle. Keep ≥8 so heavy cycles cool down.
+    USAGE_REFRESH_SECONDS: int = 10
     # Full-fleet usage pull (all panels + dirty recount), seconds.
-    # Target: every ~2 minutes all remotes are re-queried in parallel.
-    USAGE_FLEET_SECONDS: int = 45
+    # Expensive; live accuracy comes from hot/sub + remaining remote caps.
+    USAGE_FLEET_SECONDS: int = 150
     # Hot loop for /sub-active users (seconds).
-    USAGE_HOT_SECONDS: int = 4
+    USAGE_HOT_SECONDS: int = 8
     # Official install helper for SSL / nginx (empty = SSL UI disabled)
     ASTRA_HELPER: str = ""
     ASTRA_APP_PORT: int = 8000

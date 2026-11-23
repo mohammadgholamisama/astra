@@ -128,9 +128,11 @@ def needs_remote_cap_sync(
     """
     if force or status_changed or blocked:
         return True
-    if used_ratio is not None and float(used_ratio) >= 0.35:
+    # Mid-flight remaining-cap push — keep rare so hot/fleet don't storm remotes.
+    # Remotes already self-cut via remote_data_limit; tighten again near the end.
+    if used_ratio is not None and float(used_ratio) >= 0.70:
         return True
-    if shrink_shared_caps and used_ratio is not None and float(used_ratio) >= 0.15:
+    if shrink_shared_caps and used_ratio is not None and float(used_ratio) >= 0.50:
         return True
     _ = (active_panel_count, coefficients)
     return False
