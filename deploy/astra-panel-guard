@@ -1,0 +1,67 @@
+#!/bin/bash
+# Self-heal panel stalls: reap stuck idle-in-txn; restart only after repeated
+# /health latency failures (never thrash on a single blip).
+set -uo pipefail
+LOGTAG=astra-panel-guard
+FAIL_FILE=/run/astra-panel-guard-failcount
+ASTRA_UNIT=astra.service
+
+health_t=$(curl -fsS -o /dev/null --connect-timeout 1 --max-time 4 \
+  -w "%{time_total}" http://127.0.0.1:2086/health 2>/dev/null || echo 9)
+# shellcheck disable=SC2001
+health_ms=$(python3 - <<PY
+t="${health_t:-9}"
+try:
+  print(int(float(t) * 1000))
+except Exception:
+  print(9000)
+PY
+)
+
+idle_n=0
+if command -v sudo >/dev/null && id -u postgres >/dev/null 2>&1; then
+  idle_n=$(sudo -u postgres psql -d astra -tAc \
+    "SELECT count(*) FROM pg_stat_activity WHERE datname='astra' AND state='idle in transaction'" \
+    2>/dev/null | tr -d ' ' || echo 0)
+fi
+idle_n=${idle_n:-0}
+
+# Always reap stale idle-in-transaction backends (root cause of panel freezes).
+if [[ "$idle_n" -gt 0 ]]; then
+  killed=$(sudo -u postgres psql -d astra -tAc \
+    "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity
+     WHERE datname='astra' AND pid <> pg_backend_pid()
+       AND state='idle in transaction'
+       AND xact_start < now() - interval '8 seconds'" 2>/dev/null | tr -d ' ' || echo 0)
+  if [[ "${killed:-0}" -gt 0 ]]; then
+    logger -t "$LOGTAG" "reaped idle_in_txn=$killed (had $idle_n)"
+  fi
+fi
+
+fails=0
+[[ -f "$FAIL_FILE" ]] && fails=$(cat "$FAIL_FILE" 2>/dev/null || echo 0)
+fails=${fails:-0}
+
+# Fast health = healthy
+if [[ "$health_ms" -lt 1500 ]]; then
+  echo 0 >"$FAIL_FILE"
+  exit 0
+fi
+
+fails=$((fails + 1))
+echo "$fails" >"$FAIL_FILE"
+logger -t "$LOGTAG" "slow health ${health_ms}ms fail=$fails idle_txn=$idle_n"
+
+# Soft recover first: terminate idle-in-txn aggressively
+sudo -u postgres psql -d astra -c \
+  "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+   WHERE datname='astra' AND pid <> pg_backend_pid()
+     AND state='idle in transaction'
+     AND xact_start < now() - interval '3 seconds'" >/dev/null 2>&1 || true
+
+[[ "$fails" -lt 3 ]] && exit 0
+
+# Hard recover — only after 3 consecutive slow health probes
+logger -t "$LOGTAG" "restarting $ASTRA_UNIT after $fails slow health probes"
+systemctl restart "$ASTRA_UNIT" || true
+echo 0 >"$FAIL_FILE"

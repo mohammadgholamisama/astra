@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch Astra sub reverse tunnel every minute
+
+[Timer]
+OnBootSec=45
+OnUnitActiveSec=60
+AccuracySec=5
+Unit=astra-sub-rtunnel-watch.service
+
+[Install]
+WantedBy=timers.target

@@ -1,16 +1,25 @@
 #!/bin/bash
 # Reverse-tunnel local Astra (:2086) to Iran edge :18081
+# Must be the ONLY reverse forward on edge:18081 (old VPS must not steal it).
 set -euo pipefail
 export AUTOSSH_GATETIME=0
 export AUTOSSH_PORT=0
 export AUTOSSH_POLL=5
 KEY=/root/.ssh/astra_sub_rtunnel
 EDGE=5.202.8.221
-# Always this host's panel — never point at another VPS
+OLD_FOREIGN=45.135.194.205
 TARGET=127.0.0.1
 PORT=2086
-timeout 12 ssh -o ConnectTimeout=6 -o BatchMode=yes -o StrictHostKeyChecking=yes \
-  -i "$KEY" "root@$EDGE" "fuser -k 18081/tcp >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+
+# Best-effort: keep old foreign from reclaiming 18081, clear stale listeners.
+timeout 15 ssh -o ConnectTimeout=6 -o BatchMode=yes -o StrictHostKeyChecking=yes \
+  -i "$KEY" "root@$EDGE" bash -s >/dev/null 2>&1 <<REMOTE || true
+iptables -C INPUT -s ${OLD_FOREIGN} -p tcp --dport 22 -j DROP 2>/dev/null \
+  || iptables -I INPUT -s ${OLD_FOREIGN} -p tcp --dport 22 -j DROP
+fuser -k 18081/tcp >/dev/null 2>&1 || true
+sleep 1
+fuser -k 18081/tcp >/dev/null 2>&1 || true
+REMOTE
 sleep 1
 exec /usr/bin/autossh -M 0 -N \
   -i "$KEY" \

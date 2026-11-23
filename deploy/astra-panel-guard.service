@@ -1,0 +1,7 @@
+[Unit]
+Description=Astra panel pool/health self-heal
+After=network-online.target postgresql.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/astra-panel-guard

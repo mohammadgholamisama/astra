@@ -77,9 +77,9 @@ def _build_engine_kwargs() -> dict[str, Any]:
             "server_settings": {
                 "statement_timeout": "45000",
                 # Kill leaked idle-in-transaction checkouts fast. Callers must
-                # release_db_txn() before remote HTTP; 15s is the safety net —
-                # 60s let 14+ stuck backends starve the API pool.
-                "idle_in_transaction_session_timeout": "15000",
+                # release_db_txn() before remote HTTP; 8s is the safety net —
+                # longer windows let stuck backends starve the API pool.
+                "idle_in_transaction_session_timeout": "8000",
             },
         }
     return kwargs
@@ -294,26 +294,25 @@ async def _terminate_stale_idle_in_txn(*, older_than_sec: float = 12.0) -> int:
         return 0
 
 
-async def pool_guardian_loop(interval: float = 15.0) -> None:
-    """Watch pool pressure; recycle idle sockets + kill stuck idle-in-txn."""
-    await asyncio.sleep(20)
+async def pool_guardian_loop(interval: float = 8.0) -> None:
+    """Self-heal pool stalls: always reap stuck idle-in-txn; recycle on pressure."""
+    await asyncio.sleep(15)
     high_streak = 0
     while True:
         try:
+            # Proactive: do not wait for "high" — idle-in-txn is what freezes UI.
+            killed = await _terminate_stale_idle_in_txn(older_than_sec=8.0)
+            if killed:
+                logger.warning(
+                    "pool guardian reaped %s idle-in-transaction backends", killed
+                )
             st = pool_status()
             pressure = st.get("pressure") or "ok"
             if pressure in ("critical", "high"):
                 high_streak += 1
                 logger.warning("db pool %s: %s", pressure, st)
-                killed = await _terminate_stale_idle_in_txn(
-                    older_than_sec=8.0 if pressure == "critical" else 12.0
-                )
-                if killed:
-                    logger.error(
-                        "terminated %s idle-in-transaction backends under pool %s",
-                        killed,
-                        pressure,
-                    )
+                if pressure == "critical":
+                    await _terminate_stale_idle_in_txn(older_than_sec=3.0)
                 if pressure == "critical" or high_streak >= 2:
                     # Invalidate idle pooled connections only (checked-out keep
                     # working). Shrinks postgres backends without killing requests.

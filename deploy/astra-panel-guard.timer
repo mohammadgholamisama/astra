@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Astra panel guard every 30s
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=30
+AccuracySec=3
+Unit=astra-panel-guard.service
+
+[Install]
+WantedBy=timers.target

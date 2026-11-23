@@ -1,0 +1,7 @@
+[Unit]
+Description=Astra sub reverse-tunnel health check
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/astra-sub-rtunnel-watchdog
