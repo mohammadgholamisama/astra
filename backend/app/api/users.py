@@ -1121,64 +1121,121 @@ async def reset_user_traffic(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
-    """Reset used traffic in Astra and on every remote panel for this user."""
+    """Reset used traffic fast: zero Astra locally, remotes in background.
+
+    Waiting for every remote panel in the HTTP request caused browser/CF
+    ``Failed to fetch`` on heavy users. UI must return immediately with zeros;
+    concurrent remote resets continue in the background.
+    """
+    import logging
+
+    from app.core.database import AsyncSessionLocal
+    from app.models.panel import PanelType
+
+    logger = logging.getLogger("astra.users")
     user = await load_user(db, username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    user_id = int(user.id)
 
-    # All panels in one wave (Astra sequential in-session, remotes concurrent).
-    results = await orchestrator.reset_user_traffic_on_panels(
-        db,
-        user,
-        remote_timeout=15,
-        sync_after=True,
-        sync_remote_timeout=18,
-        concurrency=16,
+    # 1) Local zero immediately (what the admin sees)
+    user.lifetime_used_traffic = int(user.lifetime_used_traffic or 0) + int(
+        user.used_traffic or 0
     )
+    user.used_traffic = 0
+    if user.status == UserStatus.limited:
+        user.status = UserStatus.active
+    acc_result = await db.execute(
+        select(PanelAccount).where(PanelAccount.user_id == user_id)
+    )
+    for acc in acc_result.scalars().all():
+        if acc.status == PanelAccountStatus.deleted:
+            continue
+        acc.used_traffic = 0
+        acc.coeff_anchor_raw = 0
+        acc.coeff_anchor_weighted = 0
+    await db.flush()
+
+    # 2) Same-server Astra panels only (no network) — keep request snappy
+    try:
+        await orchestrator.reset_user_traffic_on_panels(
+            db,
+            user,
+            prefer_types={PanelType.astra},
+            remote_timeout=4,
+            sync_after=False,
+            concurrency=4,
+        )
+        # Local zeros again (helper may recount)
+        user.used_traffic = 0
+        if user.status == UserStatus.limited:
+            user.status = UserStatus.active
+    except Exception:  # noqa: BLE001
+        logger.exception("astra-local reset failed user=%s", username)
+
     await db.commit()
+
+    # 3) All foreign remotes + re-enable/push caps — concurrent background
+    async def _bg_remote_reset() -> None:
+        try:
+            async with AsyncSessionLocal() as sdb:
+                u = await load_user(sdb, username)
+                if not u:
+                    return
+                results = await orchestrator.reset_user_traffic_on_panels(
+                    sdb,
+                    u,
+                    prefer_types=None,
+                    remote_timeout=10,
+                    sync_after=True,
+                    sync_remote_timeout=10,
+                    concurrency=24,
+                )
+                u.used_traffic = 0
+                if u.status == UserStatus.limited:
+                    u.status = UserStatus.active
+                await sdb.commit()
+                failed = [r for r in results if not r.get("ok")]
+                if failed:
+                    logger.warning(
+                        "reset remotes partial user=%s fail=%s/%s",
+                        username,
+                        len(failed),
+                        len(results),
+                    )
+                    # One more focused retry on failures
+                    fail_ids = {
+                        int(r["panel_id"])
+                        for r in failed
+                        if r.get("panel_id") is not None
+                    }
+                    if fail_ids:
+                        async with AsyncSessionLocal() as rdb:
+                            uu = await load_user(rdb, username)
+                            if not uu:
+                                return
+                            await orchestrator.reset_user_traffic_on_panels(
+                                rdb,
+                                uu,
+                                panel_ids=fail_ids,
+                                remote_timeout=12,
+                                sync_after=True,
+                                sync_remote_timeout=12,
+                                concurrency=16,
+                            )
+                            uu.used_traffic = 0
+                            if uu.status == UserStatus.limited:
+                                uu.status = UserStatus.active
+                            await rdb.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception("background reset remotes failed user=%s", username)
+
+    asyncio.create_task(
+        _bg_remote_reset(),
+        name=f"astra-reset-remotes-{username}",
+    )
+
     user = await load_user(db, username)
-    failed = [r for r in results if not r.get("ok")]
-    if failed and user:
-        parts = [f"{r.get('panel_name')}: {r.get('error')}" for r in failed]
-        logger = __import__("logging").getLogger("astra.users")
-        logger.warning("reset partial user=%s: %s", username, " | ".join(parts))
-        # Retry only failed remotes in background (do not leave usage stuck)
-        fail_ids = {
-            int(r["panel_id"])
-            for r in failed
-            if r.get("panel_id") is not None
-        }
-        if fail_ids:
-
-            async def _retry_failed() -> None:
-                from app.core.database import AsyncSessionLocal
-                from app.services.users import load_user as _load
-
-                try:
-                    async with AsyncSessionLocal() as sdb:
-                        u = await _load(sdb, username)
-                        if not u:
-                            return
-                        await orchestrator.reset_user_traffic_on_panels(
-                            sdb,
-                            u,
-                            panel_ids=fail_ids,
-                            prefer_types=None,
-                            remote_timeout=18,
-                            sync_after=True,
-                            concurrency=8,
-                        )
-                        u.used_traffic = 0
-                        if u.status == UserStatus.limited:
-                            u.status = UserStatus.active
-                        await sdb.commit()
-                except Exception:  # noqa: BLE001
-                    logger.exception("reset retry failed user=%s", username)
-
-            asyncio.create_task(
-                _retry_failed(),
-                name=f"astra-reset-retry-{username}",
-            )
     return to_user_response(user)  # type: ignore[arg-type]
 
 

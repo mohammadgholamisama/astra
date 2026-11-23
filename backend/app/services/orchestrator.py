@@ -3125,7 +3125,7 @@ async def reset_remotes_background(
                 and a.status != PanelAccountStatus.deleted
                 and (not exclude_types or a.panel.type not in exclude_types)
             ]
-            sem = asyncio.Semaphore(12)
+            sem = asyncio.Semaphore(24)
 
             async def _one(account: PanelAccount) -> dict:
                 panel = account.panel
@@ -3145,7 +3145,7 @@ async def reset_remotes_background(
                         for attempt in range(3):
                             try:
                                 res = await asyncio.wait_for(
-                                    adapter.reset_usage(uname, rid), timeout=18
+                                    adapter.reset_usage(uname, rid), timeout=10
                                 )
                                 ok = bool(res.success)
                                 err = None if ok else (res.error or "reset failed")

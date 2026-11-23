@@ -1178,16 +1178,21 @@ export default function UsersPage() {
     mutationFn: (username: string) =>
       api<User>(`/api/user/${encodeURIComponent(username)}/reset`, {
         method: "POST",
+        // Local zero returns fast; remotes continue in background on the server.
+        timeoutMs: 25_000,
       }),
     onSuccess: (updated) => {
       patchUserInCache(updated);
       setResetUser(null);
       setActionMsg({
         type: "ok",
-        text: "مصرف بازنشانی شد",
+        text: "مصرف صفر شد — ریست پنل‌های اصلی در پس‌زمینه ادامه دارد",
       });
       // Soft background refresh — UI already shows zeros
       void qc.invalidateQueries({ queryKey: ["users"] });
+      window.setTimeout(() => {
+        void qc.invalidateQueries({ queryKey: ["users"] });
+      }, 8_000);
     },
     onError: (e: Error) => {
       setResetUser(null);
