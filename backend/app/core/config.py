@@ -21,11 +21,12 @@ class Settings(BaseSettings):
     )
 
     DATABASE_URL: str = "sqlite+aiosqlite:///./astra.db"
-    # Postgres pool — sized so analytics/UI never starve behind usage pulls.
-    DB_POOL_SIZE: int = 48
-    DB_MAX_OVERFLOW: int = 36
-    DB_POOL_TIMEOUT: float = 8.0
-    DB_POOL_RECYCLE: int = 300
+    # Postgres pool — keep small so uvicorn cannot open 70+ backends and
+    # starve SSH/CPU. Interactive API keeps headroom via background_db_sem.
+    DB_POOL_SIZE: int = 16
+    DB_MAX_OVERFLOW: int = 8
+    DB_POOL_TIMEOUT: float = 5.0
+    DB_POOL_RECYCLE: int = 180
     SECRET_KEY: str = "astra-dev-secret-key-change-in-production-32chars"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     SUB_BASE_URL: str = "http://localhost:8000"
@@ -38,7 +39,7 @@ class Settings(BaseSettings):
     ADAPTER_TIMEOUT: float = 35.0
     # Max concurrent HTTP ops to remotes (create/delete/modify). Caps FD/TLS storm
     # when a user spans many panels; wall time still ≈ ceil(N/limit)×slowest.
-    PANEL_REMOTE_CONCURRENCY: int = 14
+    PANEL_REMOTE_CONCURRENCY: int = 6
     # Background quota watch cadence (seconds). Exhausted users are frozen
     # on every remote in the same cycle. ~3 min keeps CPU calm on busy hosts.
     USAGE_REFRESH_SECONDS: int = 180
@@ -47,6 +48,8 @@ class Settings(BaseSettings):
     USAGE_FLEET_SECONDS: int = 180
     # Hot loop for recent /sub users (seconds). Same ~3 min cadence.
     USAGE_HOT_SECONDS: int = 180
+    # Auto «رفع خطا» on Users page — off by default; use the button manually.
+    AUTO_RETRY_ERRORS: bool = False
     # Official install helper for SSL / nginx (empty = SSL UI disabled)
     ASTRA_HELPER: str = ""
     ASTRA_APP_PORT: int = 8000

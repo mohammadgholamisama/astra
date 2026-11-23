@@ -871,7 +871,7 @@ async def run_fleet_usage_cycle() -> dict[str, int]:
 
     try:
         bulk = await sync_all_panels_bulk(
-            concurrency=8, recount=True, recount_concurrency=12
+            concurrency=4, recount=True, recount_concurrency=6
         )
         stats["panels"] = int(bulk.get("panels") or 0)
         stats["listed"] = int(bulk.get("listed") or 0)
@@ -882,7 +882,7 @@ async def run_fleet_usage_cycle() -> dict[str, int]:
 
     if full_pass:
         try:
-            full = await recount_all_live_users(concurrency=10, chunk=600)
+            full = await recount_all_live_users(concurrency=6, chunk=400)
             stats["recount_users"] = int(full.get("users") or 0)
             stats["flipped"] += int(full.get("flipped") or 0)
         except Exception:  # noqa: BLE001

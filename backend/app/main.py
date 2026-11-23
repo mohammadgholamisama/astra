@@ -60,13 +60,12 @@ logger = logging.getLogger("astra")
 
 
 async def _auto_retry_errors_loop() -> None:
-    """Cadenced heal of error/pending accounts — never abandons huge backlogs.
+    """Optional auto «رفع خطا» — off by default (Users button is enough).
 
-    Large sticky piles used to skip entirely (n>800), so the Users banner
-    stayed at thousands forever. Now: sweep false errors instantly, then
-    always chew a small fair batch so /sub stays responsive.
+    When enabled via AUTO_RETRY_ERRORS=1, chews a small fair batch so /sub
+    stays responsive. Large sticky piles used to burn CPU/DB and freeze SSH.
     """
-    from sqlalchemy import func, select
+    from sqlalchemy import and_, func, or_, select
 
     from app.core.database import AsyncSessionLocal, background_db_sem
     from app.models.panel import Panel
@@ -77,11 +76,16 @@ async def _auto_retry_errors_loop() -> None:
         sweep_stale_panel_errors,
     )
 
+    if not bool(getattr(settings, "AUTO_RETRY_ERRORS", False)):
+        logger.info(
+            "auto retry-errors disabled — use Users «رفع خطا» manually"
+        )
+        return
+
     await asyncio.sleep(45)
     while True:
         try:
             async with AsyncSessionLocal() as db:
-                # Instant local cleanup (links→active, timeout→pending)
                 sweep = await sweep_stale_panel_errors(db)
                 if sweep.get("swept_active") or sweep.get("swept_pending"):
                     logger.info(
@@ -89,8 +93,6 @@ async def _auto_retry_errors_loop() -> None:
                         sweep.get("swept_active"),
                         sweep.get("swept_pending"),
                     )
-                from sqlalchemy import and_, or_
-
                 n_err = int(
                     (
                         await db.scalar(
@@ -105,8 +107,6 @@ async def _auto_retry_errors_loop() -> None:
                                     )
                                 ),
                                 Panel.is_active.is_(True),
-                                # Capacity-full cannot heal by retry — don't
-                                # burn the auto-retry budget on thousands of them.
                                 or_(
                                     PanelAccount.status == PanelAccountStatus.pending,
                                     PanelAccount.error_message.is_(None),
@@ -127,13 +127,12 @@ async def _auto_retry_errors_loop() -> None:
                     or 0
                 )
             if n_err > 0:
-                # Smaller batches when backlog is huge — protect /sub Update
                 if n_err > 5000:
-                    limit, conc, overall = 60, 4, 70.0
+                    limit, conc, overall = 40, 3, 60.0
                 elif n_err > 800:
-                    limit, conc, overall = 100, 6, 90.0
+                    limit, conc, overall = 60, 4, 75.0
                 else:
-                    limit, conc, overall = 160, 10, 110.0
+                    limit, conc, overall = 80, 5, 90.0
                 logger.info(
                     "auto retry-errors: backlog=%s batch=%s",
                     n_err,
@@ -165,7 +164,7 @@ async def _auto_retry_errors_loop() -> None:
                             stats.get("swept_pending"),
                         )
                     try:
-                        await heal_users_missing_panel_accounts(limit_users=20)
+                        await heal_users_missing_panel_accounts(limit_users=10)
                     except Exception:  # noqa: BLE001
                         logger.debug(
                             "auto retry-errors heal-coverage skipped",
@@ -177,7 +176,6 @@ async def _auto_retry_errors_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("auto retry-errors loop failed")
-        # Faster chew when backlog exists; idle longer when clean
         try:
             async with AsyncSessionLocal() as db:
                 left = int(
@@ -197,7 +195,7 @@ async def _auto_retry_errors_loop() -> None:
                 )
         except Exception:  # noqa: BLE001
             left = 0
-        await asyncio.sleep(90 if left > 0 else 300)
+        await asyncio.sleep(180 if left > 0 else 600)
 
 
 
@@ -381,7 +379,7 @@ async def _hot_usage_loop() -> None:
         t0 = _time.monotonic()
         ids: list[int] = []
         try:
-            ids = list(take_live_usage_priority(300.0, 36))
+            ids = list(take_live_usage_priority(300.0, 16))
             try:
                 from app.models.user_analytics import UserUsageState
 
@@ -395,18 +393,18 @@ async def _hot_usage_loop() -> None:
                                 .where(UserUsageState.last_sub_fetch_at.is_not(None))
                                 .where(UserUsageState.last_sub_fetch_at >= since)
                                 .order_by(UserUsageState.last_sub_fetch_at.desc())
-                                .limit(24)
+                                .limit(12)
                             )
                         ).all()
                     ]
-                ids = list(dict.fromkeys(ids + recent))[:20]
+                ids = list(dict.fromkeys(ids + recent))[:12]
             except Exception:  # noqa: BLE001
                 pass
 
             # Parallel live pulls for currently-active /sub users (bounded).
-            ids = ids[:20]
+            ids = ids[:12]
             if ids:
-                sem = asyncio.Semaphore(6)
+                sem = asyncio.Semaphore(3)
 
                 async def _one(uid: int) -> None:
                     async with sem:

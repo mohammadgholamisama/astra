@@ -22,8 +22,8 @@ _URL = (settings.DATABASE_URL or "").strip()
 _IS_SQLITE = _URL.startswith("sqlite")
 
 # Background jobs (quota / heal / outbound ping) share this cap so interactive
-# login/API always keep headroom in the pool. Keep low vs pool_size.
-DB_BACKGROUND_SLOTS = 3
+# login/API always keep headroom in the pool. Keep low vs pool_size (~16+8).
+DB_BACKGROUND_SLOTS = 2
 _bg_sem: asyncio.Semaphore | None = None
 
 
@@ -52,13 +52,12 @@ def _build_engine_kwargs() -> dict[str, Any]:
         )
         return kwargs
 
-    # Postgres / other servers — sized for shared hosts, fail-fast on starve.
-    # Sub HTML + bg usage + quota watch need headroom or /sub falls back to
-    # «در حال آماده‌سازی».
-    pool_size = max(2, int(getattr(settings, "DB_POOL_SIZE", 12) or 12))
-    max_overflow = max(0, int(getattr(settings, "DB_MAX_OVERFLOW", 20) or 20))
+    # Postgres — small pool so one uvicorn cannot open 70+ backends and
+    # starve SSH/CPU. Fail-fast on starve; bg work uses background_db_sem.
+    pool_size = max(2, int(getattr(settings, "DB_POOL_SIZE", 16) or 16))
+    max_overflow = max(0, int(getattr(settings, "DB_MAX_OVERFLOW", 8) or 8))
     pool_timeout = float(getattr(settings, "DB_POOL_TIMEOUT", 5.0) or 5.0)
-    pool_recycle = max(60, int(getattr(settings, "DB_POOL_RECYCLE", 300) or 300))
+    pool_recycle = max(60, int(getattr(settings, "DB_POOL_RECYCLE", 180) or 180))
     kwargs.update(
         {
             "pool_size": pool_size,
@@ -72,15 +71,13 @@ def _build_engine_kwargs() -> dict[str, Any]:
     # asyncpg
     if "+asyncpg" in _URL or _URL.startswith("postgresql+asyncpg"):
         kwargs["connect_args"] = {
-            "timeout": 10,
-            "command_timeout": 60,
+            "timeout": 8,
+            "command_timeout": 45,
             "server_settings": {
-                "statement_timeout": "60000",
+                "statement_timeout": "45000",
                 # Kill leaked idle-in-transaction checkouts (pool starve → /sub 503).
-                # Must cover long admin jobs that hold one session across remote HTTP
-                # (ساخت نمونه ترتیب کانفیگ / استعلام پرچم GeoIP / اعمال گروه).
-                # 4s–60s still killed mid-job → empty sample + «connection is closed».
-                "idle_in_transaction_session_timeout": "300000",
+                # Cap below old 300s so CLOSE-WAIT / stuck sessions free faster.
+                "idle_in_transaction_session_timeout": "120000",
             },
         }
     return kwargs
@@ -222,8 +219,8 @@ async def ping_db() -> bool:
         return False
 
 
-async def pool_guardian_loop(interval: float = 45.0) -> None:
-    """Watch pool pressure; recycle when stuck near capacity."""
+async def pool_guardian_loop(interval: float = 30.0) -> None:
+    """Watch pool pressure; drop idle pooled sockets when stuck near capacity."""
     await asyncio.sleep(20)
     high_streak = 0
     while True:
@@ -233,15 +230,17 @@ async def pool_guardian_loop(interval: float = 45.0) -> None:
             if pressure == "critical":
                 high_streak += 1
                 logger.warning("db pool critical: %s", st)
-                if high_streak >= 3:
-                    # Do NOT dispose_engine() here — that closes live checkouts and
-                    # cascades PendingRollback / «connection is closed» across the
-                    # panel (create/save look like «DB busy»). Log + reset streak.
-                    logger.error(
-                        "db pool stuck at capacity — skip dispose to protect "
-                        "in-flight requests: %s",
-                        st,
-                    )
+                if high_streak >= 2:
+                    # Invalidate idle pooled connections only (checked-out keep
+                    # working). Shrinks postgres backends without killing requests.
+                    try:
+                        await engine.dispose(close=False)
+                        logger.error(
+                            "db pool recycled idle connections under pressure: %s",
+                            st,
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception("db pool idle recycle failed")
                     high_streak = 0
             elif pressure == "high":
                 high_streak = min(high_streak + 1, 2)

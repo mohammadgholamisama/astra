@@ -7650,8 +7650,8 @@ _LIVE_USAGE_PRIORITY: dict[int, float] = {}
 # stampede each pull kept a pool connection open during remote HTTP and
 # starved the panel with QueuePool TimeoutError → «Temporarily unavailable».
 # Cap concurrent usage pulls so interactive /sub + admin keep DB headroom.
-# Live usage pulls — keep below pool headroom so analytics/UI can checkout.
-_USAGE_PULL_GATE = asyncio.Semaphore(8)
+# Keep well under DB_POOL_SIZE (16) so SSH/CPU stay responsive.
+_USAGE_PULL_GATE = asyncio.Semaphore(4)
 
 
 def mark_live_usage_priority(user_id: int) -> None:
