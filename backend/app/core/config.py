@@ -23,9 +23,11 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "sqlite+aiosqlite:///./astra.db"
     # Postgres pool — keep small so uvicorn cannot open 70+ backends and
     # starve SSH/CPU. Interactive API keeps headroom via background_db_sem.
-    DB_POOL_SIZE: int = 16
+    # Slightly larger pool so interactive API keeps slots while a few bg
+    # remotes run — still capped; leaks are fixed by closing sessions on HTTP.
+    DB_POOL_SIZE: int = 24
     DB_MAX_OVERFLOW: int = 8
-    DB_POOL_TIMEOUT: float = 5.0
+    DB_POOL_TIMEOUT: float = 4.0
     DB_POOL_RECYCLE: int = 180
     SECRET_KEY: str = "astra-dev-secret-key-change-in-production-32chars"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440

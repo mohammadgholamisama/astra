@@ -3614,6 +3614,9 @@ async def sync_modify_user(
 
     # Release the DB connection BEFORE long HTTP — idle asyncpg dies mid-gather
     # and the later freeze commit then fails with "connection is closed".
+    # Critical: commit alone is NOT enough — Session keeps the checkout until
+    # close(), which is what exhausted QueuePool and froze the panel UI.
+    freeze_closed = False
     if blocked and other_jobs:
         try:
             await db.commit()
@@ -3622,6 +3625,11 @@ async def sync_modify_user(
                 await db.rollback()
             except Exception:  # noqa: BLE001
                 pass
+        try:
+            await db.close()
+            freeze_closed = True
+        except Exception:  # noqa: BLE001
+            freeze_closed = False
 
     # Foreign remotes first (HTTP) — commit when freezing so an Astra DB
     # failure cannot roll back successful PasarGuard /disabled cuts.
@@ -3632,43 +3640,100 @@ async def sync_modify_user(
                 for account, panel, payload in other_jobs
             ]
         )
-        for (account, panel, payload), res in zip(other_jobs, other_res):
-            results_by_key[(int(account.panel_id), int(account.id))] = res
-            _apply_one(account, panel, payload, res)
-        if blocked:
+        if freeze_closed:
+            # Session was closed to free the pool — remount marks only.
             try:
-                await db.commit()
+                await _remount_freeze_marks(
+                    int(user.id),
+                    [
+                        (
+                            int(account.id),
+                            bool(res.success) or _is_not_found_err(res.error),
+                        )
+                        for (account, _p, _pl), res in zip(other_jobs, other_res)
+                    ],
+                )
             except Exception:  # noqa: BLE001
                 logger.exception(
-                    "freeze commit after foreign remotes failed user=%s",
-                    user.username,
+                    "remount freeze marks failed user=%s", user.username
                 )
+            for (account, panel, payload), res in zip(other_jobs, other_res):
+                results_by_key[(int(account.panel_id), int(account.id))] = res
+        else:
+            for (account, panel, payload), res in zip(other_jobs, other_res):
+                results_by_key[(int(account.panel_id), int(account.id))] = res
+                _apply_one(account, panel, payload, res)
+            if blocked:
                 try:
-                    await db.rollback()
-                except Exception:  # noqa: BLE001
-                    pass
-                # Remount freeze marks on a fresh connection so a dead pooled
-                # socket cannot erase a successful remote cut.
-                try:
-                    await _remount_freeze_marks(
-                        int(user.id),
-                        [
-                            (
-                                int(account.id),
-                                bool(res.success)
-                                or _is_not_found_err(res.error),
-                            )
-                            for (account, _p, _pl), res in zip(
-                                other_jobs, other_res
-                            )
-                        ],
-                    )
+                    await db.commit()
                 except Exception:  # noqa: BLE001
                     logger.exception(
-                        "remount freeze marks failed user=%s", user.username
+                        "freeze commit after foreign remotes failed user=%s",
+                        user.username,
                     )
-        else:
-            await db.flush()
+                    try:
+                        await db.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        await _remount_freeze_marks(
+                            int(user.id),
+                            [
+                                (
+                                    int(account.id),
+                                    bool(res.success)
+                                    or _is_not_found_err(res.error),
+                                )
+                                for (account, _p, _pl), res in zip(
+                                    other_jobs, other_res
+                                )
+                            ],
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "remount freeze marks failed user=%s", user.username
+                        )
+            else:
+                await db.flush()
+
+    if freeze_closed:
+        # Foreign freeze already remounted; finish Astra cuts in short sessions.
+        if astra_jobs:
+            from app.core.database import AsyncSessionLocal as _ASL
+
+            for account, panel, payload in astra_jobs:
+                try:
+                    async with _ASL() as sdb:
+                        p = await sdb.get(Panel, int(panel.id))
+                        if p is None:
+                            continue
+                        # Reuse inline upsert against a fresh session.
+                        from app.services import astra_node as astra_node_svc
+
+                        enable = (payload.status or "active").lower() in (
+                            "active",
+                            "on_hold",
+                        )
+                        await astra_node_svc.upsert_client(
+                            sdb,
+                            p,
+                            email=payload.username,
+                            uuid=payload.uuid,
+                            data_limit=int(payload.data_limit or 0),
+                            expire=int(payload.expire or 0),
+                            enable=enable,
+                            rebuild=True,
+                            sync_nginx=False,
+                        )
+                        await sdb.commit()
+                        results_by_key[(int(account.panel_id), int(account.id))] = (
+                            AdapterResult(success=True)
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    results_by_key[(int(account.panel_id), int(account.id))] = (
+                        _fail_result(_exc_msg(exc))
+                    )
+        return
 
     for account, panel, payload in astra_jobs:
         try:
@@ -9165,35 +9230,30 @@ async def _freeze_quota_users(
     user_ids: list[int],
     *,
     remote_timeout: float = 8.0,
-    concurrency: int = 16,
+    concurrency: int = 2,
     wall: float = 45.0,
 ) -> tuple[int, int]:
     """Disable every remote config for exhausted users (PasarGuard /disabled first).
 
-    Earlier ~1s wall cancelled freezes before PasarGuard disable finished, so
-    Astra showed اتمام حجم while remotes stayed online.
+    Concurrency stays tiny so freeze HTTP cannot pin the whole DB pool
+    (each sync_modify held a checkout for the full remote round-trip).
     """
     from app.core.database import AsyncSessionLocal
+    from app.services.users import load_user
 
     ids = list(dict.fromkeys(int(x) for x in user_ids if x))
     if not ids:
         return 0, 0
-    sem = asyncio.Semaphore(max(1, concurrency))
+    # Hard cap — callers sometimes pass 12–16; that starved /api/system.
+    sem = asyncio.Semaphore(max(1, min(int(concurrency), 3)))
     ok_n = 0
     fail_n = 0
 
     async def _one(uid: int) -> bool:
         async with sem:
+            uname = ""
             async with AsyncSessionLocal() as db:
-                result = await db.execute(
-                    select(User)
-                    .where(User.id == uid)
-                    .options(
-                        selectinload(User.panel_accounts).selectinload(
-                            PanelAccount.panel
-                        )
-                    )
-                )
+                result = await db.execute(select(User).where(User.id == uid))
                 user = result.scalar_one_or_none()
                 if not user:
                     return True
@@ -9203,8 +9263,19 @@ async def _freeze_quota_users(
                     UserStatus.disabled,
                 ):
                     return True
-                # Expired/limited: prefer real retries over freeze_fast — a 1s
-                # PasarGuard disable miss left remotes online until next cycle.
+                uname = str(user.username or "")
+                await db.rollback()
+            # Session closed → pool slot free during the slow remote path.
+            async with AsyncSessionLocal() as db:
+                user = await load_user(db, uname)
+                if user is None:
+                    return True
+                if user.status not in (
+                    UserStatus.limited,
+                    UserStatus.expired,
+                    UserStatus.disabled,
+                ):
+                    return True
                 await sync_modify_user(
                     db,
                     user,

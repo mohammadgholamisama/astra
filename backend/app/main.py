@@ -595,16 +595,16 @@ async def lifespan(_app: FastAPI):
         await coro()
 
     usage_task = asyncio.create_task(
-        _delayed(_usage_sync_loop, 45, "usage"), name="astra-usage-sync"
+        _delayed(_usage_sync_loop, 120, "usage"), name="astra-usage-sync"
     )
     fleet_task = asyncio.create_task(
-        _delayed(_fleet_usage_loop, 90, "fleet"), name="astra-fleet-usage"
+        _delayed(_fleet_usage_loop, 180, "fleet"), name="astra-fleet-usage"
     )
     hot_task = asyncio.create_task(
-        _delayed(_hot_usage_loop, 60, "hot"), name="astra-hot-usage"
+        _delayed(_hot_usage_loop, 90, "hot"), name="astra-hot-usage"
     )
     analytics_task = asyncio.create_task(
-        _delayed(_analytics_sample_loop, 75, "analytics"),
+        _delayed(_analytics_sample_loop, 150, "analytics"),
         name="astra-analytics-sample",
     )
     retry_errors_task = asyncio.create_task(
