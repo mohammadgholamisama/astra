@@ -40,7 +40,36 @@ if ! curl -sm3 http://127.0.0.1:2086/health >/dev/null 2>&1; then
   sleep 5
 fi
 
+# Bring every Astra Xray node unit up (panel_N/config.json present).
+# Without this, after reboot dashboard shows «Xray پنل N خاموش» forever.
+xray_n=0
+xray_ok=0
+if [[ -d /opt/astra/xray ]]; then
+  if [[ -f /opt/astra/deploy/astra-xray/astra-xray@.service ]]; then
+    install -m 644 /opt/astra/deploy/astra-xray/astra-xray@.service \
+      /etc/systemd/system/astra-xray@.service 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+  fi
+  for d in /opt/astra/xray/panel_*; do
+    [[ -d "$d" ]] || continue
+    [[ -f "$d/config.json" ]] || continue
+    pid="${d##*_}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    xray_n=$((xray_n + 1))
+    unit="astra-xray@${pid}"
+    if [[ -x /usr/local/bin/astra-helper ]]; then
+      /usr/local/bin/astra-helper xray-restart "$pid" >/dev/null 2>&1 \
+        || systemctl enable --now "$unit" >/dev/null 2>&1 \
+        || systemctl restart "$unit" >/dev/null 2>&1 || true
+    else
+      systemctl enable --now "$unit" >/dev/null 2>&1 \
+        || systemctl restart "$unit" >/dev/null 2>&1 || true
+    fi
+    systemctl is-active --quiet "$unit" && xray_ok=$((xray_ok + 1)) || true
+  done
+fi
+
 ok=0
 curl -sm3 http://127.0.0.1:2086/health >/dev/null 2>&1 && ok=1
-logger -t astra-boot-heal "done health=$ok astra=$(systemctl is-active astra) rt=$(systemctl is-active astra-sub-rtunnel) cf=$(systemctl is-active astra-cf-sub)"
+logger -t astra-boot-heal "done health=$ok astra=$(systemctl is-active astra) rt=$(systemctl is-active astra-sub-rtunnel) cf=$(systemctl is-active astra-cf-sub) xray=${xray_ok}/${xray_n}"
 exit 0

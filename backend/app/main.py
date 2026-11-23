@@ -201,6 +201,29 @@ async def _auto_retry_errors_loop() -> None:
 
 
 
+async def _astra_xray_heal_loop() -> None:
+    """Keep astra-xray@N up for every active Astra panel (dashboard «خاموش» fix)."""
+    from app.services import astra_node as node
+
+    await asyncio.sleep(12)
+    while True:
+        try:
+            stats = await node.ensure_all_astra_xray_running(limit=80)
+            if stats.get("started") or stats.get("failed"):
+                logging.getLogger("astra").info(
+                    "xray heal: started=%s skipped=%s missing=%s failed=%s",
+                    stats.get("started"),
+                    stats.get("skipped"),
+                    stats.get("missing"),
+                    stats.get("failed"),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logging.getLogger("astra").exception("xray heal loop failed")
+        await asyncio.sleep(90)
+
+
 async def _outbound_health_loop() -> None:
     """Re-ping Astra outbounds so recovered ones reappear in subscription.
 
@@ -541,6 +564,9 @@ async def lifespan(_app: FastAPI):
     outbound_task = asyncio.create_task(
         _outbound_health_loop(), name="astra-outbound-health"
     )
+    xray_heal_task = asyncio.create_task(
+        _astra_xray_heal_loop(), name="astra-xray-heal"
+    )
     order_boot_task = asyncio.create_task(
         _bg_order_kind_boot(), name="astra-order-kind-boot"
     )
@@ -554,6 +580,7 @@ async def lifespan(_app: FastAPI):
         analytics_task.cancel()
         retry_errors_task.cancel()
         outbound_task.cancel()
+        xray_heal_task.cancel()
         order_boot_task.cancel()
         pool_task.cancel()
         for task in (
@@ -563,6 +590,7 @@ async def lifespan(_app: FastAPI):
             analytics_task,
             retry_errors_task,
             outbound_task,
+            xray_heal_task,
             order_boot_task,
             pool_task,
         ):

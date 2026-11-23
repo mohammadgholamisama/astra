@@ -145,6 +145,59 @@ def _systemctl_usable() -> bool:
     return bool(_SYSTEMCTL_OK)
 
 
+def _xray_listen_port(panel_id: str) -> int | None:
+    """Read inbound port from panel config.json (fast, no DB)."""
+    import json
+
+    cfg = Path(f"/opt/astra/xray/panel_{panel_id}/config.json")
+    if not cfg.is_file():
+        return None
+    try:
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    for ib in data.get("inbounds") or []:
+        if not isinstance(ib, dict):
+            continue
+        try:
+            port = int(ib.get("port") or 0)
+        except (TypeError, ValueError):
+            continue
+        if port > 0:
+            return port
+    return None
+
+
+def _xray_panel_running(panel_id: str, cmds: list[str]) -> bool:
+    """True when xray for this panel is live (process, listen port, or unit)."""
+    pid = str(panel_id).strip()
+    if not pid.isdigit():
+        return False
+    if _cmd_has(
+        cmds,
+        f"/opt/astra/xray/panel_{pid}/config.json",
+        f"/opt/astra/xray/panel_{pid}/",
+        f"panel_{pid}/config.json",
+    ):
+        return True
+    port = _xray_listen_port(pid)
+    if port and _port_listening(int(port)):
+        return True
+    if _systemctl_usable():
+        try:
+            r = subprocess.run(
+                ["systemctl", "is-active", f"astra-xray@{pid}"],
+                capture_output=True,
+                text=True,
+                timeout=0.35,
+            )
+            if (r.stdout or "").strip().lower() == "active":
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+    return False
+
+
 def _service_active(name: str, cmds: list[str] | None = None) -> str:
     """Return active / inactive / failed / unknown — never hang."""
     cmds = cmds if cmds is not None else _snapshot_cmdlines()
@@ -177,11 +230,7 @@ def _service_active(name: str, cmds: list[str] | None = None) -> str:
         return "inactive"
     if name.startswith("astra-xray@"):
         panel_id = name.replace("astra-xray@", "").replace(".service", "")
-        return (
-            "active"
-            if _cmd_has(cmds, f"/opt/astra/xray/panel_{panel_id}")
-            else "inactive"
-        )
+        return "active" if _xray_panel_running(panel_id, cmds) else "inactive"
 
     if not _systemctl_usable():
         return "unknown"
@@ -205,15 +254,18 @@ def _list_xray_units(cmds: list[str]) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
     xdir = Path("/opt/astra/xray")
     if xdir.is_dir():
-        for p in sorted(xdir.glob("panel_*")):
+        for p in sorted(xdir.glob("panel_*"), key=lambda x: x.name):
             if not p.is_dir():
                 continue
             pid = p.name.replace("panel_", "")
             if not pid.isdigit():
                 continue
+            # Skip empty dirs with no config (never started)
+            if not (p / "config.json").is_file():
+                continue
             unit = f"astra-xray@{pid}"
             out.append({"name": unit, "state": _service_active(unit, cmds)})
-            if len(out) >= 12:
+            if len(out) >= 80:
                 break
     return out
 

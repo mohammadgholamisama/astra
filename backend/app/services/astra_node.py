@@ -1252,6 +1252,109 @@ async def rebuild_xray_config(
     return cfg_path
 
 
+def _xray_process_up(panel_id: int) -> bool:
+    """True if an xray process for this panel dir is visible in /proc or listening."""
+    needle = f"/opt/astra/xray/panel_{int(panel_id)}/"
+    needle2 = f"panel_{int(panel_id)}/config.json"
+    try:
+        for p in Path("/proc").iterdir():
+            if not p.name.isdigit():
+                continue
+            try:
+                raw = (p / "cmdline").read_bytes()
+            except OSError:
+                continue
+            if not raw:
+                continue
+            cmd = raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+            if needle in cmd or needle2 in cmd:
+                return True
+    except OSError:
+        pass
+    cfg = DEFAULT_XRAY_DIR / f"panel_{int(panel_id)}" / "config.json"
+    if cfg.is_file():
+        try:
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+            for ib in data.get("inbounds") or []:
+                if not isinstance(ib, dict):
+                    continue
+                port = int(ib.get("port") or 0)
+                if port <= 0:
+                    continue
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.35):
+                        return True
+                except OSError:
+                    continue
+        except Exception:  # noqa: BLE001
+            pass
+    return False
+
+
+async def ensure_all_astra_xray_running(*, limit: int = 64) -> dict[str, int]:
+    """Enable+start ``astra-xray@N`` for every active Astra panel with a config.
+
+    Dashboard «Xray پنل N خاموش» after reboot / failed unit — heal without
+    waiting for an admin to open each panel page.
+    """
+    from app.core.database import AsyncSessionLocal
+
+    started = skipped = failed = missing = 0
+    async with AsyncSessionLocal() as db:
+        rows = (
+            await db.execute(
+                select(Panel)
+                .where(
+                    Panel.type == PanelType.astra,
+                    Panel.is_active.is_(True),
+                )
+                .order_by(Panel.id.asc())
+                .limit(max(1, int(limit)))
+            )
+        ).scalars().all()
+        panels = list(rows)
+
+    for panel in panels:
+        xdir = panel_xray_dir(panel)
+        cfg = xdir / "config.json"
+        if not cfg.is_file():
+            missing += 1
+            continue
+        if _xray_process_up(int(panel.id)):
+            skipped += 1
+            continue
+        try:
+            await _reload_xray(panel, xdir, cfg)
+            await asyncio.sleep(0.15)
+            if _xray_process_up(int(panel.id)) or node_health(panel).get("listen_open"):
+                started += 1
+            else:
+                failed += 1
+                logger.warning(
+                    "ensure xray still down panel=%s", panel.id
+                )
+        except Exception:  # noqa: BLE001
+            failed += 1
+            logger.warning(
+                "ensure xray failed panel=%s", panel.id, exc_info=True
+            )
+    if started or failed:
+        logger.info(
+            "ensure astra-xray started=%s skipped=%s missing_cfg=%s failed=%s",
+            started,
+            skipped,
+            missing,
+            failed,
+        )
+    return {
+        "started": started,
+        "skipped": skipped,
+        "missing": missing,
+        "failed": failed,
+        "panels": len(panels),
+    }
+
+
 async def _reload_xray(panel: Panel, xdir: Path, cfg_path: Path) -> None:
     """Restart unit astra-xray@{panel_id} via astra-helper (sudo) or systemctl."""
     helper = "/usr/local/bin/astra-helper"
