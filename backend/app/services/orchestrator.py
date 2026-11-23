@@ -9339,10 +9339,10 @@ async def run_quota_watch_cycle() -> dict[str, int]:
     from app.services import panel_usage_bulk as bulk_usage
 
     t0 = time.monotonic()
-        try:
-            await heal_users_missing_panel_accounts(limit_users=3)
-        except Exception:  # noqa: BLE001
-            logger.debug("quota-watch missing-account heal skipped", exc_info=True)
+    try:
+        await heal_users_missing_panel_accounts(limit_users=3)
+    except Exception:  # noqa: BLE001
+        logger.debug("quota-watch missing-account heal skipped", exc_info=True)
 
     stats = {
         "astra_panels": 0,
