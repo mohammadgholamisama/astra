@@ -76,9 +76,9 @@ _bg_heavy = asyncio.Semaphore(3)
 
 # Live usage pull on sub refresh — must stay accurate (quota / money).
 _bg_usage_last: dict[int, float] = {}
-_BG_USAGE_INTERVAL = 2.0
+_BG_USAGE_INTERVAL = 8.0
 # Parallel /sub usage pulls — keep under DB pool headroom.
-_bg_usage_sem = asyncio.Semaphore(6)
+_bg_usage_sem = asyncio.Semaphore(3)
 
 # Tiny in-process feed cache — VPN clients often refresh in bursts.
 # Incomplete coverage also caches (shorter TTL) so Iran-edge clients don't

@@ -314,12 +314,12 @@ async def _usage_sync_loop() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("quota watch loop failed")
             elapsed = _time.monotonic() - t0
-        interval = max(8, int(settings.USAGE_REFRESH_SECONDS or 12))
+        interval = max(180, int(settings.USAGE_REFRESH_SECONDS or 180))
         # Heavy cycle → cool down so we don't re-enter while remotes still drain CPU
         if elapsed > interval:
-            cooldown = min(35.0, max(float(interval), elapsed * 0.45))
+            cooldown = min(90.0, max(float(interval), elapsed * 0.5))
         else:
-            cooldown = max(2.0, float(interval) - elapsed)
+            cooldown = max(30.0, float(interval) - elapsed)
         await asyncio.sleep(cooldown)
 
 
@@ -356,10 +356,10 @@ async def _fleet_usage_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("fleet usage loop failed")
-        interval = max(120, int(getattr(settings, "USAGE_FLEET_SECONDS", 150) or 150))
+        interval = max(180, int(getattr(settings, "USAGE_FLEET_SECONDS", 180) or 180))
         elapsed = _time.monotonic() - t0
-        # After a long fleet pass, always rest so API/hot keep CPU headroom.
-        await asyncio.sleep(max(45.0, float(interval) - elapsed))
+        # After a long fleet pass, always rest so API/SSH keep CPU headroom.
+        await asyncio.sleep(max(60.0, float(interval) - elapsed))
 
 
 async def _hot_usage_loop() -> None:
@@ -451,9 +451,9 @@ async def _hot_usage_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("hot usage loop failed")
-        interval = max(8, int(getattr(settings, "USAGE_HOT_SECONDS", 8) or 8))
+        interval = max(180, int(getattr(settings, "USAGE_HOT_SECONDS", 180) or 180))
         elapsed = _time.monotonic() - t0
-        await asyncio.sleep(max(5.0, float(interval) - elapsed))
+        await asyncio.sleep(max(60.0, float(interval) - elapsed))
 
 
 async def _analytics_sample_loop() -> None:

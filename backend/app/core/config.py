@@ -40,13 +40,13 @@ class Settings(BaseSettings):
     # when a user spans many panels; wall time still ≈ ceil(N/limit)×slowest.
     PANEL_REMOTE_CONCURRENCY: int = 14
     # Background quota watch cadence (seconds). Exhausted users are frozen
-    # on every remote in the same cycle. Keep ≥8 so heavy cycles cool down.
-    USAGE_REFRESH_SECONDS: int = 10
+    # on every remote in the same cycle. ~3 min keeps CPU calm on busy hosts.
+    USAGE_REFRESH_SECONDS: int = 180
     # Full-fleet usage pull (all panels + dirty recount), seconds.
-    # Expensive; live accuracy comes from hot/sub + remaining remote caps.
-    USAGE_FLEET_SECONDS: int = 150
-    # Hot loop for /sub-active users (seconds).
-    USAGE_HOT_SECONDS: int = 8
+    # Accuracy still comes from remaining remote caps + /sub live pulls.
+    USAGE_FLEET_SECONDS: int = 180
+    # Hot loop for recent /sub users (seconds). Same ~3 min cadence.
+    USAGE_HOT_SECONDS: int = 180
     # Official install helper for SSL / nginx (empty = SSL UI disabled)
     ASTRA_HELPER: str = ""
     ASTRA_APP_PORT: int = 8000
