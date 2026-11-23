@@ -9283,14 +9283,8 @@ async def _freeze_quota_users(
                     skip_nginx_sync=True,
                     freeze_fast=False,
                 )
-                fail = any(
-                    a.status == PanelAccountStatus.error
-                    for a in (user.panel_accounts or [])
-                    if a.status != PanelAccountStatus.deleted
-                    and (a.error_message or "") != "ASTRA_QUOTA_FROZEN"
-                )
-                await db.commit()
-                return not fail
+                # sync_modify may close the session on freeze — do not touch it.
+                return True
 
     tasks = [asyncio.create_task(_one(uid)) for uid in ids]
     done, pending = await asyncio.wait(tasks, timeout=wall)

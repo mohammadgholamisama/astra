@@ -34,6 +34,10 @@ from app.services.users import load_user, to_user_response
 
 router = APIRouter(tags=["User"])
 
+# Bot/API clients often stampede /api/users?search=&limit=100 — cap concurrency
+# so interactive panel pages keep DB pool headroom.
+_USERS_LIST_SEM = asyncio.Semaphore(6)
+
 
 def _hold_required_error() -> HTTPException:
     return HTTPException(
@@ -1592,10 +1596,36 @@ async def list_users(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
+    async with _USERS_LIST_SEM:
+        return await _list_users_impl(
+            offset=offset,
+            limit=limit,
+            search=search,
+            group_id=group_id,
+            filter=filter,
+            refresh=refresh,
+            db=db,
+        )
+
+
+async def _list_users_impl(
+    *,
+    offset: int,
+    limit: int,
+    search: str | None,
+    group_id: int | None,
+    filter: str | None,
+    refresh: bool,
+    db: AsyncSession,
+):
     now_ts = int(time.time())
     status_filter = (filter or "all").strip().lower()
     if status_filter not in ("all", "active", "error", "expired"):
         status_filter = "all"
+    is_search = bool((search or "").strip())
+    # Bot stampede often uses limit=100 search — keep payload tiny.
+    if is_search and limit > 40:
+        limit = 40
 
     base_filters, needs_group_join, group_filter = _user_list_scope(
         search=search, group_id=group_id
@@ -1607,11 +1637,6 @@ async def list_users(
     active_c = _active_user_clause(now_ts)
     error_c = _error_user_clause(now_ts)
 
-    # Chip totals — single SQL (keeps filters accurate without 4 round-trips).
-    counts = await _users_list_chip_counts(
-        db, search=search, group_id=group_id, now_ts=now_ts
-    )
-
     status_extra = None
     if status_filter == "active":
         status_extra = active_c
@@ -1620,34 +1645,46 @@ async def list_users(
     elif status_filter == "expired":
         status_extra = expired_c
 
-    if status_filter == "all":
-        total = counts.all
-    elif status_filter == "active":
-        total = counts.active
-    elif status_filter == "error":
-        total = counts.error
-    elif status_filter == "expired":
-        total = counts.expired
-    else:
+    if is_search:
+        # Search: one COUNT + lean rows (no panel_accounts / no error EXISTS).
         total = await _count_users(
             db, search=search, group_id=group_id, extra=status_extra
         )
-
-    # Light list load: skip huge share-link JSON + unused panel columns.
-    q = select(User).options(
-        selectinload(User.groups),
-        selectinload(User.panel_accounts).options(
-            defer(PanelAccount.links),
-            defer(PanelAccount.links_by_group),
-            selectinload(PanelAccount.panel).load_only(
-                Panel.id,
-                Panel.name,
-                Panel.type,
-                Panel.is_active,
-                Panel.base_url,
+        # Chips are for the full board; search replies only need matching total.
+        counts = UsersListCounts(all=total, active=0, error=0, expired=0)
+        q = select(User).options(selectinload(User.groups))
+    else:
+        # Chip totals — single SQL (keeps filters accurate without 4 round-trips).
+        counts = await _users_list_chip_counts(
+            db, search=search, group_id=group_id, now_ts=now_ts
+        )
+        if status_filter == "all":
+            total = counts.all
+        elif status_filter == "active":
+            total = counts.active
+        elif status_filter == "error":
+            total = counts.error
+        elif status_filter == "expired":
+            total = counts.expired
+        else:
+            total = await _count_users(
+                db, search=search, group_id=group_id, extra=status_extra
+            )
+        # Light list load: skip huge share-link JSON + unused panel columns.
+        q = select(User).options(
+            selectinload(User.groups),
+            selectinload(User.panel_accounts).options(
+                defer(PanelAccount.links),
+                defer(PanelAccount.links_by_group),
+                selectinload(PanelAccount.panel).load_only(
+                    Panel.id,
+                    Panel.name,
+                    Panel.type,
+                    Panel.is_active,
+                    Panel.base_url,
+                ),
             ),
-        ),
-    )
+        )
     if needs_group_join:
         q = q.join(UserGroup, UserGroup.user_id == User.id)
     if base_filters:
@@ -1658,32 +1695,33 @@ async def list_users(
         q.order_by(User.id.desc()).offset(offset).limit(limit)
     )
     users = list(result.scalars().unique().all())
-    missing = [
-        u
-        for u in users
-        if (u.groups or [])
-        and not any(
-            a.status != PanelAccountStatus.deleted
-            for a in (u.panel_accounts or [])
-        )
-    ]
-    if missing:
-        try:
-            asyncio.create_task(
-                orchestrator.heal_users_missing_panel_accounts(limit_users=20),
-                name="astra-heal-missing-on-list",
+    if not is_search:
+        missing = [
+            u
+            for u in users
+            if (u.groups or [])
+            and not any(
+                a.status != PanelAccountStatus.deleted
+                for a in (u.panel_accounts or [])
             )
-        except Exception:  # noqa: BLE001
-            pass
+        ]
+        if missing:
+            try:
+                asyncio.create_task(
+                    orchestrator.heal_users_missing_panel_accounts(limit_users=3),
+                    name="astra-heal-missing-on-list",
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
-    if refresh and users:
+    if refresh and users and not is_search:
         # End list-read txn before parallel remote pulls (idle-in-transaction).
         from app.core.database import release_db_txn
 
         await release_db_txn(db)
         # Isolated pool-safe pulls — never hold list request txn across remotes.
         await orchestrator.refresh_users_usage_batch(
-            db, users, force=True, concurrency=4, push_remotes=False, quick=True
+            db, users, force=True, concurrency=2, push_remotes=False, quick=True
         )
         await db.commit()
         ids = [u.id for u in users]
@@ -1709,6 +1747,9 @@ async def list_users(
         by_id = {u.id: u for u in result.scalars().unique().all()}
         users = [by_id[i] for i in ids if i in by_id]
 
+    from app.core.database import release_db_txn
+
+    await release_db_txn(db)
     return UsersListResponse(
         users=[to_user_response(u, include_links=False) for u in users],
         total=total,
