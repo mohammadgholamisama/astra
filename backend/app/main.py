@@ -333,9 +333,9 @@ async def _fleet_usage_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("fleet usage loop failed")
-        interval = max(20, int(getattr(settings, "USAGE_FLEET_SECONDS", 30) or 30))
+        interval = max(90, int(getattr(settings, "USAGE_FLEET_SECONDS", 120) or 120))
         elapsed = _time.monotonic() - t0
-        await asyncio.sleep(max(8.0, float(interval) - elapsed))
+        await asyncio.sleep(max(15.0, float(interval) - elapsed))
 
 
 async def _hot_usage_loop() -> None:

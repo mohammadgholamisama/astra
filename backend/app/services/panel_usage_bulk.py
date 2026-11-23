@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -24,6 +25,12 @@ from app.models.panel import Panel, PanelType
 from app.models.user import PanelAccount, PanelAccountStatus, User, UserStatus
 
 logger = logging.getLogger("astra.usage")
+
+# foo_g12 / foo_p3 / foo_p3a1 — Astra aliases on shared panels
+_ALIAS_RE = re.compile(
+    r"^(?P<base>.+?)_(?P<kind>[gp])(?P<num>\d+)(?P<extra>[0-9a-fA-F]*)?$",
+    re.IGNORECASE,
+)
 
 _BULK_TYPES = {
     PanelType.pasarguard,
@@ -47,16 +54,26 @@ def _as_int(raw: object) -> int | None:
 
 
 def parse_user_used_traffic(data: dict[str, Any]) -> int:
-    """Same priority as MarzbanAdapter._parse_used_traffic (current period)."""
-    for key in ("used_traffic", "current_usage", "total_usage"):
+    """Current-period used bytes (Marzban / PasarGuard / Rebecca).
+
+    Prefer ``used_traffic``. Some PasarGuard list payloads omit/zero the field
+    while ``lifetime_used_traffic`` still reflects real consumption — use
+    lifetime only when the current key is missing (not when it is legitimately 0
+    after a reset).
+    """
+    has_used_key = "used_traffic" in data
+    used = _as_int(data.get("used_traffic"))
+    if has_used_key and used is not None and used > 0:
+        return used
+    for key in ("current_usage", "total_usage"):
         got = _as_int(data.get(key))
-        if got is not None:
+        if got is not None and got > 0:
             return got
     traffic = data.get("traffic")
     if isinstance(traffic, dict):
         for key in ("used", "used_traffic", "total"):
             got = _as_int(traffic.get(key))
-            if got is not None:
+            if got is not None and got > 0:
                 return got
         try:
             up = int(traffic.get("upload") or traffic.get("up") or 0)
@@ -67,8 +84,11 @@ def parse_user_used_traffic(data: dict[str, Any]) -> int:
             pass
     for key in ("lifetime_used_traffic", "total_traffic"):
         got = _as_int(data.get(key))
-        if got is not None:
+        if got is not None and got > 0:
             return got
+    # Explicit zero from used_traffic key (reset / unused)
+    if has_used_key and used is not None:
+        return used
     return 0
 
 
@@ -186,9 +206,15 @@ async def fetch_panel_usage_map(
                 if not isinstance(row, dict):
                     continue
                 uname = str(row.get("username") or "").strip()
-                if not uname:
-                    continue
-                out[uname] = parse_user_used_traffic(row)
+                used = parse_user_used_traffic(row)
+                if uname:
+                    # Keep the larger reading if the same name appears twice
+                    out[uname] = max(int(out.get(uname) or 0), used)
+                # PasarGuard also keys remotes by numeric id in remote_id
+                uid = row.get("id")
+                if uid is not None and str(uid).strip():
+                    kid = str(uid).strip()
+                    out[kid] = max(int(out.get(kid) or 0), used)
             if len(users) < int(page_size):
                 break
             offset += int(page_size)
@@ -205,20 +231,96 @@ async def fetch_panel_usage_map(
     return out
 
 
-def _lookup_usage_bytes(
-    usage_exact: dict[str, int], usage_lower: dict[str, int], *names: str
-) -> int | None:
-    """Match remote meters by exact name, then case-insensitive."""
-    for raw in names:
-        name = (raw or "").strip()
-        if not name:
+def _build_usage_indexes(
+    usage_map: dict[str, int],
+) -> tuple[dict[str, int], dict[str, int], dict[tuple[str, str, int], int]]:
+    """exact, lower, and (base, g|p, num) alias indexes."""
+    usage_exact = {
+        str(k).strip(): int(v) for k, v in usage_map.items() if str(k).strip()
+    }
+    usage_lower = {k.lower(): v for k, v in usage_exact.items()}
+    alias_idx: dict[tuple[str, str, int], int] = {}
+    for name, used in usage_exact.items():
+        m = _ALIAS_RE.match(name)
+        if not m:
             continue
+        base = (m.group("base") or "").strip().lower()
+        kind = (m.group("kind") or "").lower()
+        try:
+            num = int(m.group("num") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not base or kind not in ("g", "p") or num <= 0:
+            continue
+        key = (base, kind, num)
+        prev = alias_idx.get(key)
+        alias_idx[key] = used if prev is None else max(prev, used)
+    return usage_exact, usage_lower, alias_idx
+
+
+def _lookup_usage_bytes(
+    usage_exact: dict[str, int],
+    usage_lower: dict[str, int],
+    alias_idx: dict[tuple[str, str, int], int],
+    *,
+    astra_username: str,
+    remote_username: str | None,
+    remote_id: str | None,
+    panel_id: int,
+    group_id: int | None,
+) -> int | None:
+    """Match remote meters across base / ``_g`` / ``_p`` aliases."""
+    from app.services.orchestrator import (
+        _remote_username_candidates,
+        sanitize_remote_username,
+    )
+
+    names = _remote_username_candidates(
+        astra_username=astra_username or "",
+        remote_username=remote_username,
+        remote_id=remote_id,
+        uuid=None,
+        panel_id=int(panel_id),
+        group_id=int(group_id) if group_id is not None else None,
+    )
+    for name in names:
         if name in usage_exact:
             return int(usage_exact[name])
         hit = usage_lower.get(name.lower())
         if hit is not None:
             return int(hit)
+
+    base = sanitize_remote_username(astra_username or "").lower()
+    if not base:
+        return None
+    if group_id is not None:
+        hit = alias_idx.get((base, "g", int(group_id)))
+        if hit is not None:
+            return int(hit)
+    hit = alias_idx.get((base, "p", int(panel_id)))
+    if hit is not None:
+        return int(hit)
     return None
+
+
+def _apply_got_to_account(
+    acc: PanelAccount, got: int, *, now: datetime, dirty: set[int]
+) -> None:
+    prev = int(acc.used_traffic or 0)
+    if got < prev:
+        return
+    if got == prev:
+        acc.last_sync_at = now
+        return
+    acc.used_traffic = got
+    acc.last_sync_at = now
+    if (acc.error_message or "") == QUOTA_FROZEN_MARK:
+        acc.error_message = None
+    if acc.status == PanelAccountStatus.error:
+        acc.status = PanelAccountStatus.active
+        if (acc.error_message or "") != QUOTA_FROZEN_MARK:
+            acc.error_message = None
+    dirty.add(int(acc.user_id))
 
 
 async def apply_usage_map_to_panel(
@@ -227,8 +329,7 @@ async def apply_usage_map_to_panel(
     """Write raw counters onto panel_accounts. Returns dirty user ids."""
     if not usage_map:
         return set()
-    usage_exact = {str(k).strip(): int(v) for k, v in usage_map.items() if str(k).strip()}
-    usage_lower = {k.lower(): v for k, v in usage_exact.items()}
+    usage_exact, usage_lower, alias_idx = _build_usage_indexes(usage_map)
     result = await db.execute(
         select(PanelAccount, User.username)
         .join(User, User.id == PanelAccount.user_id)
@@ -245,34 +346,190 @@ async def apply_usage_map_to_panel(
     rows = list(result.all())
     now = datetime.now(timezone.utc)
     dirty: set[int] = set()
+    matched = 0
     for acc, astra_uname in rows:
         got_i = _lookup_usage_bytes(
             usage_exact,
             usage_lower,
-            (acc.remote_username or "").strip(),
-            str(astra_uname or "").strip(),
-            str(acc.remote_id or "").strip()
+            alias_idx,
+            astra_username=str(astra_uname or ""),
+            remote_username=(acc.remote_username or "").strip() or None,
+            remote_id=str(acc.remote_id).strip()
             if acc.remote_id and not str(acc.remote_id).startswith("{")
-            else "",
+            else None,
+            panel_id=int(panel_id),
+            group_id=int(acc.group_id) if getattr(acc, "group_id", None) is not None else None,
         )
         if got_i is None:
             continue
-        got = int(got_i)
-        prev = int(acc.used_traffic or 0)
-        if got < prev:
+        matched += 1
+        _apply_got_to_account(acc, int(got_i), now=now, dirty=dirty)
+    if rows and matched < max(1, len(rows) // 4):
+        logger.warning(
+            "bulk match sparse panel=%s accounts=%s matched=%s map=%s dirty=%s",
+            panel_id,
+            len(rows),
+            matched,
+            len(usage_exact),
+            len(dirty),
+        )
+    return dirty
+
+
+async def heal_zero_accounts_via_get_usage(
+    panel: Panel,
+    *,
+    limit: int = 400,
+    concurrency: int = 20,
+) -> set[int]:
+    """Per-remote get_usage for accounts still at 0 after bulk map miss.
+
+    Covers PasarGuard/Marzban aliases that the list map did not match
+    (``_g`` / ``_p`` / empty remote_username).
+    """
+    from app.services.orchestrator import _remote_username_candidates
+
+    if panel.type not in (
+        PanelType.pasarguard,
+        PanelType.marzban,
+        PanelType.rebecca,
+        PanelType.sanaei,
+    ):
+        return set()
+    pid = int(panel.id)
+    # Prefer never-synced / unknown-remote first (most likely alias miss).
+    async with AsyncSessionLocal() as db:
+        rows = (
+            await db.execute(
+                select(PanelAccount, User.username)
+                .join(User, User.id == PanelAccount.user_id)
+                .where(
+                    PanelAccount.panel_id == pid,
+                    PanelAccount.status.in_(
+                        (
+                            PanelAccountStatus.active,
+                            PanelAccountStatus.error,
+                        )
+                    ),
+                    PanelAccount.used_traffic <= 0,
+                )
+                .order_by(
+                    PanelAccount.last_sync_at.asc().nullsfirst(),
+                    PanelAccount.id.desc(),
+                )
+                .limit(max(1, int(limit)))
+            )
+        ).all()
+        # Touch panel attrs for detached get_adapter use
+        _ = (
+            panel.id,
+            panel.type,
+            panel.name,
+            panel.is_active,
+            getattr(panel, "base_url", None),
+            getattr(panel, "url", None),
+            getattr(panel, "username", None),
+            getattr(panel, "password", None),
+            getattr(panel, "token", None),
+            getattr(panel, "meta", None),
+        )
+
+    if not rows:
+        return set()
+
+    jobs: list[tuple[int, int, list[str]]] = []
+    for acc, astra_uname in rows:
+        names = _remote_username_candidates(
+            astra_username=str(astra_uname or ""),
+            remote_username=(acc.remote_username or "").strip() or None,
+            remote_id=str(acc.remote_id).strip()
+            if acc.remote_id and not str(acc.remote_id).startswith("{")
+            else None,
+            uuid=None,
+            panel_id=pid,
+            group_id=int(acc.group_id)
+            if getattr(acc, "group_id", None) is not None
+            else None,
+        )
+        if not names:
             continue
-        if got == prev:
-            acc.last_sync_at = now
-            continue
-        acc.used_traffic = got
-        acc.last_sync_at = now
-        if (acc.error_message or "") == QUOTA_FROZEN_MARK:
-            acc.error_message = None
-        if acc.status == PanelAccountStatus.error:
-            acc.status = PanelAccountStatus.active
-            if (acc.error_message or "") != QUOTA_FROZEN_MARK:
-                acc.error_message = None
-        dirty.add(int(acc.user_id))
+        jobs.append((int(acc.id), int(acc.user_id), names))
+
+    if not jobs:
+        return set()
+
+    sem = asyncio.Semaphore(max(4, int(concurrency)))
+    found: dict[int, tuple[int, str]] = {}  # account_id -> (used, remote_name)
+
+    async def _one(aid: int, names: list[str]) -> None:
+        async with sem:
+            adapter = get_adapter(panel)
+            try:
+                for name in names:
+                    if not name:
+                        continue
+                    try:
+                        try:
+                            res = await asyncio.wait_for(
+                                adapter.get_usage(  # type: ignore[call-arg]
+                                    name, name, expand_links=False
+                                ),
+                                timeout=8.0,
+                            )
+                        except TypeError:
+                            res = await asyncio.wait_for(
+                                adapter.get_usage(name, name),
+                                timeout=8.0,
+                            )
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if res is not None and res.success:
+                        got = int(res.used_traffic or 0)
+                        if got > 0:
+                            hit_name = (
+                                str(res.remote_username or "").strip() or name
+                            )
+                            found[aid] = (got, hit_name)
+                            return
+            finally:
+                close = getattr(adapter, "close", None)
+                if callable(close):
+                    try:
+                        await close()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+    await asyncio.gather(
+        *[_one(aid, names) for aid, _uid, names in jobs],
+        return_exceptions=True,
+    )
+    if not found:
+        return set()
+
+    dirty: set[int] = set()
+    now = datetime.now(timezone.utc)
+    async with AsyncSessionLocal() as db:
+        accs = (
+            await db.execute(
+                select(PanelAccount).where(PanelAccount.id.in_(list(found.keys())))
+            )
+        ).scalars().all()
+        by_id = {int(a.id): a for a in accs}
+        for aid, (got, hit_name) in found.items():
+            acc = by_id.get(int(aid))
+            if acc is None:
+                continue
+            if hit_name and (acc.remote_username or "").strip() != hit_name:
+                acc.remote_username = hit_name
+            _apply_got_to_account(acc, int(got), now=now, dirty=dirty)
+        await db.commit()
+    logger.info(
+        "heal-zero panel=%s tried=%s found=%s dirty=%s",
+        pid,
+        len(jobs),
+        len(found),
+        len(dirty),
+    )
     return dirty
 
 
@@ -364,7 +621,7 @@ async def recount_users_usage(user_ids: list[int], *, concurrency: int = 6) -> l
 async def sync_one_panel_bulk(
     panel_id: int, *, recount: bool = True, recount_concurrency: int = 24
 ) -> dict[str, int]:
-    """Fetch /api/users for one panel, apply, recount dirty users."""
+    """Fetch /api/users for one panel, apply, heal zeros, recount dirty users."""
     t0 = time.monotonic()
     async with AsyncSessionLocal() as db:
         panel = (
@@ -375,12 +632,24 @@ async def sync_one_panel_bulk(
         pid = int(panel.id)
         panel_ref = panel
     usage_map = await fetch_panel_usage_map(panel_ref)
-    if not usage_map:
-        return {"accounts": 0, "dirty": 0, "flipped": 0, "listed": 0}
+    dirty: set[int] = set()
+    if usage_map:
+        async with AsyncSessionLocal() as db:
+            dirty = await apply_usage_map_to_panel(db, pid, usage_map)
+            await db.commit()
+    # Always try per-account heal for remotes still at 0 (alias miss / empty map)
+    try:
+        healed = await heal_zero_accounts_via_get_usage(
+            panel_ref,
+            limit=500 if panel_ref.type == PanelType.pasarguard else 250,
+            concurrency=24 if panel_ref.type == PanelType.pasarguard else 16,
+        )
+        dirty |= healed
+    except Exception:  # noqa: BLE001
+        logger.warning("heal-zero panel=%s failed", pid, exc_info=True)
 
-    async with AsyncSessionLocal() as db:
-        dirty = await apply_usage_map_to_panel(db, pid, usage_map)
-        await db.commit()
+    if not usage_map and not dirty:
+        return {"accounts": 0, "dirty": 0, "flipped": 0, "listed": 0}
 
     recount_ids = list(dict.fromkeys(int(x) for x in dirty))
     flipped: list[int] = []
@@ -601,7 +870,7 @@ async def run_fleet_usage_cycle() -> dict[str, int]:
 
     try:
         bulk = await sync_all_panels_bulk(
-            concurrency=14, recount=True, recount_concurrency=24
+            concurrency=16, recount=True, recount_concurrency=28
         )
         stats["panels"] = int(bulk.get("panels") or 0)
         stats["listed"] = int(bulk.get("listed") or 0)

@@ -352,8 +352,9 @@ class MarzbanAdapter(BasePanelAdapter):
     def _parse_used_traffic(data: dict) -> int:
         """Current-period used bytes from Marzban / PasarGuard / Rebecca forks.
 
-        Prefer `used_traffic` (resets with plan). Do NOT take max with
-        `lifetime_used_traffic` — that inflates Astra quota after resets.
+        Prefer `used_traffic` (resets with plan). Fall back to
+        `lifetime_used_traffic` only when the current key is missing/empty —
+        some PasarGuard list payloads omit used_traffic while lifetime is set.
         """
         def _as_int(raw: object) -> int | None:
             if raw is None or raw == "":
@@ -363,18 +364,21 @@ class MarzbanAdapter(BasePanelAdapter):
             except (TypeError, ValueError):
                 return None
 
-        # 1) Canonical current usage
-        for key in ("used_traffic", "current_usage", "total_usage"):
+        has_used_key = "used_traffic" in data
+        used = _as_int(data.get("used_traffic"))
+        if has_used_key and used is not None and used > 0:
+            return used
+
+        for key in ("current_usage", "total_usage"):
             got = _as_int(data.get(key))
-            if got is not None:
+            if got is not None and got > 0:
                 return got
 
-        # 2) Nested traffic object
         traffic = data.get("traffic")
         if isinstance(traffic, dict):
             for key in ("used", "used_traffic", "total"):
                 got = _as_int(traffic.get(key))
-                if got is not None:
+                if got is not None and got > 0:
                     return got
             try:
                 up = int(traffic.get("upload") or traffic.get("up") or 0)
@@ -384,11 +388,13 @@ class MarzbanAdapter(BasePanelAdapter):
             except (TypeError, ValueError):
                 pass
 
-        # 3) Last resort — lifetime (only if current missing)
         for key in ("lifetime_used_traffic", "total_traffic"):
             got = _as_int(data.get(key))
-            if got is not None:
+            if got is not None and got > 0:
                 return got
+
+        if has_used_key and used is not None:
+            return used
         return 0
 
     def _from_user_response(self, data: dict, fallback_username: str) -> AdapterResult:
