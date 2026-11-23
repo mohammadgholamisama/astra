@@ -362,36 +362,9 @@ async def create_user(
         ) from exc
 
     # From here the user EXISTS — never return 5xx for provision/serialize issues.
-    db.expire_all()
-    user = await load_user(db, body.username)
-    if not user:
-        # Extremely rare — commit succeeded but read failed; still not a hard 500
-        # for the admin retry path (next try is idempotent).
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "code": "CREATE_READBACK",
-                "message": "کاربر ثبت شد ولی خواندن پاسخ طول کشید — لیست را رفرش کنید",
-            },
-        )
-
-    # Brief first wave so some configs land; rest finishes in background.
-    try:
-        await asyncio.wait_for(
-            orchestrator.provision_users_now(db, [user], panels, wait=5.0),
-            timeout=7.0,
-        )
-    except Exception:  # noqa: BLE001
-        log.warning(
-            "create brief provision user=%s — continuing in background",
-            body.username,
-            exc_info=True,
-        )
-        try:
-            await db.rollback()
-        except Exception:  # noqa: BLE001
-            pass
-
+    # Do NOT wait on remotes here: «همه گروه‌ها» can be 30+ panels and the
+    # admin UI / edge aborts while Astra already committed → false timeout.
+    # All panel creates run concurrently in background.
     try:
         asyncio.create_task(
             _bg_finish_create_provision(body.username, list(body.group_ids)),
@@ -400,13 +373,23 @@ async def create_user(
     except Exception:  # noqa: BLE001
         pass
 
+    db.expire_all()
     try:
-        user = await load_user(db, body.username) or user
+        user = await load_user(db, body.username)
     except Exception:  # noqa: BLE001
         try:
             await db.rollback()
         except Exception:  # noqa: BLE001
             pass
+        user = None
+    if not user:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "CREATE_READBACK",
+                "message": "کاربر ثبت شد ولی خواندن پاسخ طول کشید — لیست را رفرش کنید",
+            },
+        )
     try:
         return to_user_response(user)
     except Exception as exc:  # noqa: BLE001
@@ -920,31 +903,16 @@ async def modify_user(
         except Exception:  # noqa: BLE001
             pass
 
-    # Fast path for volume/expire edits: push Astra node immediately (local DB),
-    # then sync foreign remotes in the background so the admin UI isn't blocked.
-    from app.models.panel import PanelType
-
+    # Commit local fields first; push ALL remotes (Astra + foreign) in background
+    # so edit with many panels never times out the admin modal.
     uid = int(user.id)
     try:
-        await orchestrator.sync_modify_user(
-            db,
-            user,
-            only_types={PanelType.astra},
-            remote_timeout=12,
-            skip_nginx_sync=True,
-        )
         await db.commit()
-        asyncio.create_task(
-            orchestrator.sync_modify_user_background(
-                uid, exclude_types={PanelType.astra}
-            ),
-            name=f"astra-sync-remotes-{username}",
-        )
     except Exception:  # noqa: BLE001
         import logging
 
         logging.getLogger("astra.users").exception(
-            "modify_user sync soft-fail user=%s", username
+            "modify_user commit soft-fail user=%s", username
         )
         try:
             await db.rollback()
@@ -957,6 +925,13 @@ async def modify_user(
                 await db.rollback()
             except Exception:  # noqa: BLE001
                 pass
+    try:
+        asyncio.create_task(
+            orchestrator.sync_modify_user_background(uid),
+            name=f"astra-sync-remotes-{username}",
+        )
+    except Exception:  # noqa: BLE001
+        pass
     if body.include_promo_first is not None:
         try:
             from app.api.subscription import invalidate_user_feed_cache

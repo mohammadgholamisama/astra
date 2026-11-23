@@ -654,14 +654,29 @@ async def create_user_with_collision_alias(
                 last.remote_username = payload.username
             return last
 
-        # Readable "already exists" that we could use would have succeeded inside adapter.
-        # Taken / conflict → try alias. Other errors → stop (except first preferred try).
+        # Username taken / exists → MODIFY in place (apply new data_limit).
+        # Never invent `{base}_p{panel}` twins when the real remote is already there.
         if _is_username_taken_err(last.error) or (
             attempt < 0 and _is_not_found_err(last.error)
         ):
-            continue
-        # Non-collision failure on preferred name: still try one alias (some panels
-        # return opaque errors for taken names)
+            try:
+                mod = await asyncio.wait_for(
+                    adapter.modify_user(payload), timeout=timeout
+                )
+                if mod and mod.success:
+                    if not mod.remote_username:
+                        mod.remote_username = payload.username
+                    return mod
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                pass
+            # Only alias when modify also failed — last resort for brand-new creates.
+            if _is_username_taken_err(last.error) or (
+                attempt < 0 and _is_not_found_err(last.error)
+            ):
+                continue
+        # Opaque failure on preferred: one alias try only for true first-time create
         if attempt < 0 and alias_limit > 0:
             continue
         break
@@ -986,7 +1001,12 @@ async def provision_user_on_panels(
         jobs[i] = (account, panel, payload, gid)
 
     async def _remote(
-        panel: Panel, payload: UserPayload, *, prefer_modify: bool
+        panel: Panel,
+        payload: UserPayload,
+        account: PanelAccount,
+        gid: int,
+        *,
+        prefer_modify: bool,
     ) -> AdapterResult:
         adapter = get_adapter(panel)
         t0 = time.monotonic()
@@ -1000,15 +1020,24 @@ async def provision_user_on_panels(
             async with sem:
                 if prefer_modify:
                     try:
-                        mod = await asyncio.wait_for(
-                            adapter.modify_user(payload), timeout=panel_timeout
+                        mod = await _modify_user_all_names(
+                            adapter,
+                            payload,
+                            astra_username=str(user.username or ""),
+                            panel_id=int(panel.id),
+                            group_id=int(gid) or None,
+                            remote_username=(account.remote_username or "").strip()
+                            or (payload.username or "").strip()
+                            or None,
+                            remote_id=(account.remote_id or "").strip() or None,
+                            uuid=(account.uuid or payload.uuid or "").strip() or None,
+                            timeout=panel_timeout,
                         )
                         if mod.success:
                             return mod
-                        # Missing on remote → fall through to create
+                        # Only create when every known name is truly missing
                         if not _is_not_found_err(mod.error):
-                            # Still try create/upsert path for forks that reject modify
-                            pass
+                            return mod
                     except asyncio.CancelledError:
                         raise
                     except Exception:  # noqa: BLE001
@@ -1046,6 +1075,8 @@ async def provision_user_on_panels(
             _remote(
                 panel,
                 payload,
+                account,
+                int(gid or 0),
                 prefer_modify=bool((account.remote_username or "").strip())
                 and account.status
                 in (
@@ -1054,7 +1085,7 @@ async def provision_user_on_panels(
                 ),
             )
         )
-        for account, panel, payload, _ in jobs
+        for account, panel, payload, gid in jobs
     ]
     logger.info(
         "provision start user=%s targets=%s sem=%s budget=%.1fs create_timeout=%.1fs fast=%s",
@@ -1739,8 +1770,17 @@ async def _provision_account_now(account_id: int) -> bool:
                     "panel": panel,
                     "payload": payload,
                     "astra_username": str(user.username or ""),
-                    "remote_id": acc.remote_id,
+                    "remote_id": (acc.remote_id or "").strip() or None,
+                    "remote_username": (acc.remote_username or "").strip() or None,
+                    "uuid": (acc.uuid or "").strip() or None,
+                    "group_id": int(gid) if gid else None,
                     "prev_used": int(acc.used_traffic or 0),
+                    "has_remote": bool(
+                        (acc.remote_username or "").strip()
+                        or (acc.remote_id or "").strip()
+                        or (acc.uuid or "").strip()
+                        or bool(acc.links or [])
+                    ),
                 }
                 await db.commit()
             # Session closed → connection returned before remote HTTP.
@@ -1758,18 +1798,35 @@ async def _provision_account_now(account_id: int) -> bool:
                 else 18.0
             )
             try:
-                res = await asyncio.wait_for(
-                    create_user_with_collision_alias(
-                        adapter,
-                        payload,
-                        astra_username=job["astra_username"],
-                        panel_id=panel.id,
-                        timeout=panel_timeout,
-                        max_alias_attempts=1,
-                        probe_timeout=3.0,
-                    ),
-                    timeout=panel_timeout + 2.0,
+                # Heal/edit: modify every known name first — never mint _p* twins
+                # when the live remote already exists under _g* / base.
+                res = await _modify_user_all_names(
+                    adapter,
+                    payload,
+                    astra_username=job["astra_username"],
+                    panel_id=int(panel.id),
+                    group_id=job.get("group_id"),
+                    remote_username=job.get("remote_username"),
+                    remote_id=job.get("remote_id"),
+                    uuid=job.get("uuid"),
+                    timeout=panel_timeout,
                 )
+                if (not res.success) and (
+                    (not job.get("has_remote"))
+                    or _is_not_found_err(res.error)
+                ):
+                    res = await asyncio.wait_for(
+                        create_user_with_collision_alias(
+                            adapter,
+                            payload,
+                            astra_username=job["astra_username"],
+                            panel_id=panel.id,
+                            timeout=panel_timeout,
+                            max_alias_attempts=1,
+                            probe_timeout=3.0,
+                        ),
+                        timeout=panel_timeout + 2.0,
+                    )
             except Exception as exc:  # noqa: BLE001
                 res = _fail_result(_exc_msg(exc) or "خطای پنل")
             finally:
@@ -3352,56 +3409,34 @@ async def sync_modify_user(
         else:
             attempts = 1
         last = _fail_result("modify failed")
+        gid = int(getattr(account, "group_id", 0) or 0) or None
         for i in range(attempts):
             adapter = get_adapter(panel)
             try:
                 async with sem:
-                    last = await asyncio.wait_for(
-                        adapter.modify_user(payload),
+                    # Parallel PUT on every known name (base / _g* / _p* / uuid).
+                    # NEVER create here — volume edits must update live remotes.
+                    last = await _modify_user_all_names(
+                        adapter,
+                        payload,
+                        astra_username=str(user.username or ""),
+                        panel_id=int(panel.id),
+                        group_id=gid,
+                        remote_username=(account.remote_username or "").strip()
+                        or None,
+                        remote_id=(account.remote_id or "").strip() or None,
+                        uuid=(account.uuid or "").strip() or None,
                         timeout=timeout,
                     )
                 if last.success:
                     return last
-                # Create-on-modify ONLY for never-provisioned rows.
-                # Editing data_limit/expire on an existing PanelAccount must NEVER
-                # POST a new remote user (that orphaned old configs and showed
-                # brand-new 500MB accounts next to the old 1GB ones).
-                has_remote_identity = bool(
-                    (account.remote_username or "").strip()
-                    or (account.remote_id or "").strip()
-                    or (account.uuid or "").strip()
-                    or bool(account.links or [])
+                logger.warning(
+                    "sync_modify no-create panel=%s user=%s remote=%s err=%s",
+                    getattr(panel, "name", panel.id),
+                    user.username,
+                    (account.remote_username or payload.username or "")[:40],
+                    (last.error or "")[:160],
                 )
-                if (
-                    not freeze_fast
-                    and not blocked
-                    and not has_remote_identity
-                    and (
-                        _is_not_found_err(last.error)
-                        or _is_username_taken_err(last.error)
-                    )
-                ):
-                    created = await create_user_with_collision_alias(
-                        adapter,
-                        payload,
-                        astra_username=user.username,
-                        panel_id=panel.id,
-                        timeout=min(30.0, timeout + 5),
-                    )
-                    if created.success:
-                        return created
-                    last = created
-                elif has_remote_identity and (
-                    _is_not_found_err(last.error)
-                    or _is_username_taken_err(last.error)
-                ):
-                    logger.warning(
-                        "sync_modify skip-create panel=%s user=%s remote=%s err=%s",
-                        getattr(panel, "name", panel.id),
-                        user.username,
-                        (account.remote_username or "")[:40],
-                        (last.error or "")[:160],
-                    )
             except Exception as e:  # noqa: BLE001
                 last = _fail_result(_exc_msg(e))
             finally:
@@ -3600,7 +3635,7 @@ async def sync_modify_user(
     await db.flush()
 
 
-def _delete_username_candidates(
+def _remote_username_candidates(
     *,
     astra_username: str,
     remote_username: str | None,
@@ -3623,21 +3658,79 @@ def _delete_username_candidates(
     add(remote_username)
     add(astra_username)
     add(sanitize_remote_username(astra_username))
-    try:
-        add(make_remote_username_alias(astra_username, panel_id=int(panel_id), attempt=0))
-    except Exception:  # noqa: BLE001
-        pass
     if group_id is not None:
         try:
             add(make_group_remote_username(astra_username, int(group_id)))
         except Exception:  # noqa: BLE001
             pass
+    try:
+        add(make_remote_username_alias(astra_username, panel_id=int(panel_id), attempt=0))
+    except Exception:  # noqa: BLE001
+        pass
     rid = (remote_id or "").strip()
     # Username-like / uuid remote_id — not bare PasarGuard numeric id as username
     if rid and not rid.isdigit():
         add(rid)
     add(uuid)
     return out
+
+
+# Back-compat alias used by delete purge path
+_delete_username_candidates = _remote_username_candidates
+
+
+async def _modify_user_all_names(
+    adapter,
+    payload: UserPayload,
+    *,
+    astra_username: str,
+    panel_id: int,
+    group_id: int | None,
+    remote_username: str | None,
+    remote_id: str | None,
+    uuid: str | None,
+    timeout: float,
+) -> AdapterResult:
+    """PUT every known remote name in parallel — update existing, never create.
+
+    Covers base / ``_g{group}`` / ``_p{panel}`` so volume edits hit the live
+    account instead of minting a twin under a new alias.
+    """
+    from dataclasses import replace
+
+    names = _remote_username_candidates(
+        astra_username=astra_username,
+        remote_username=remote_username or payload.username,
+        remote_id=remote_id,
+        uuid=uuid,
+        panel_id=int(panel_id),
+        group_id=group_id,
+    )
+    if not names:
+        names = [sanitize_remote_username(payload.username or astra_username)]
+
+    async def _one(name: str) -> AdapterResult:
+        p = replace(payload, username=name, config=dict(payload.config or {}))
+        return await asyncio.wait_for(adapter.modify_user(p), timeout=timeout)
+
+    results = await asyncio.gather(
+        *[_one(n) for n in names],
+        return_exceptions=True,
+    )
+    last = _fail_result("modify failed")
+    # Prefer success on stored remote_username / group name order (names list order)
+    for name, res in zip(names, results):
+        if isinstance(res, BaseException):
+            if isinstance(res, asyncio.CancelledError):
+                raise res
+            last = _fail_result(_exc_msg(res))
+            continue
+        if res.success:
+            if not res.remote_username:
+                res.remote_username = name
+            return res
+        last = res
+    return last
 
 
 def _freeze_panel_for_bg(panel: Panel):

@@ -514,8 +514,10 @@ export default function UsersPage() {
   const [includePromoFirst, setIncludePromoFirst] = useState(true);
   const [groupIds, setGroupIds] = useState<number[]>([]);
   const [groupSearch, setGroupSearch] = useState("");
-  /** Filter/focus in create modal: all | uncategorized | category id */
-  const [createCatTab, setCreateCatTab] = useState<number | "all" | "none">("all");
+  /** Filter/focus in create modal: null=unset | all | uncategorized | category id */
+  const [createCatTab, setCreateCatTab] = useState<
+    number | "all" | "none" | null
+  >(null);
   /** When set, user tracks this category (subs sync on category changes) */
   const [createBoundCategoryId, setCreateBoundCategoryId] = useState<number | null>(
     null
@@ -533,7 +535,9 @@ export default function UsersPage() {
   const [bulkIncludePromoFirst, setBulkIncludePromoFirst] = useState(true);
   const [bulkGroupIds, setBulkGroupIds] = useState<number[]>([]);
   const [bulkGroupSearch, setBulkGroupSearch] = useState("");
-  const [bulkCatTab, setBulkCatTab] = useState<number | "all" | "none">("all");
+  const [bulkCatTab, setBulkCatTab] = useState<
+    number | "all" | "none" | null
+  >(null);
   const [bulkBoundCategoryId, setBulkBoundCategoryId] = useState<number | null>(
     null
   );
@@ -740,11 +744,28 @@ export default function UsersPage() {
           : 0;
       const dn = displayName.trim();
       const uname = username.trim();
+      const recoverExisting = async (): Promise<User | null> => {
+        for (let i = 0; i < 6; i++) {
+          if (i > 0) {
+            await new Promise((r) => window.setTimeout(r, 350 * i));
+          }
+          try {
+            const existing = await api<User>(
+              `/api/user/${encodeURIComponent(uname)}`,
+              { timeoutMs: 12_000 }
+            );
+            if (existing?.username) return existing;
+          } catch {
+            /* retry */
+          }
+        }
+        return null;
+      };
       try {
         return await api<User>("/api/user", {
           method: "POST",
-          // Remotes finish in background — don't wait until edge kills the request.
-          timeoutMs: 25_000,
+          // Server commits then returns; remotes finish in background.
+          timeoutMs: 20_000,
           body: JSON.stringify({
             username: uname,
             display_name: dn || null,
@@ -758,25 +779,19 @@ export default function UsersPage() {
           }),
         });
       } catch (err) {
-        // First shot timed out / 5xx after commit → user often already exists.
-        if (
+        // Timeout / 5xx after commit → user is often already in Astra.
+        const soft =
           err instanceof ApiError &&
           (err.status === 409 ||
             err.code === "USERNAME_EXISTS" ||
             err.status === 502 ||
             err.status === 503 ||
             err.status === 504 ||
-            err.status >= 500)
-        ) {
-          try {
-            const existing = await api<User>(
-              `/api/user/${encodeURIComponent(uname)}`,
-              { timeoutMs: 8_000 }
-            );
-            if (existing?.username) return existing;
-          } catch {
-            /* fall through */
-          }
+            err.status >= 500 ||
+            /تایم‌اوت|نرسید/.test(err.message));
+        if (soft) {
+          const existing = await recoverExisting();
+          if (existing) return existing;
         }
         throw err;
       }
@@ -792,9 +807,12 @@ export default function UsersPage() {
       setIncludePromoFirst(true);
       setGroupIds([]);
       setGroupSearch("");
-      setCreateCatTab("all");
+      setCreateCatTab(null);
       setCreateBoundCategoryId(null);
-      setActionMsg({ type: "ok", text: "کاربر ساخته شد" });
+      setActionMsg({
+        type: "ok",
+        text: "کاربر ساخته شد — ساخت کانفیگ روی پنل‌ها در پس‌زمینه",
+      });
     },
   });
 
@@ -903,7 +921,7 @@ export default function UsersPage() {
     setBulkStartOnFirstUse(false);
     setBulkGroupIds([]);
     setBulkGroupSearch("");
-    setBulkCatTab("all");
+    setBulkCatTab(null);
     setBulkBoundCategoryId(null);
   }
 
@@ -1123,11 +1141,12 @@ export default function UsersPage() {
   });
 
   const saveEdit = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       if (!editUser) throw new Error("کاربر انتخاب نشده");
       if (editGroupIds.length === 0) {
         throw new Error("حداقل یک گروه باید انتخاب شود");
       }
+      const uname = editUser.username;
       const gb = Number(editDataGb);
       const dayN = Number(editDays);
       const stillHold = editUser.status === "on_hold";
@@ -1161,10 +1180,38 @@ export default function UsersPage() {
       } else if (prevCat != null && groupsChanged) {
         body.clear_category = true;
       }
-      return api<User>(`/api/user/${encodeURIComponent(editUser.username)}`, {
-        method: "PUT",
-        body: JSON.stringify(body),
-      });
+      try {
+        return await api<User>(`/api/user/${encodeURIComponent(uname)}`, {
+          method: "PUT",
+          timeoutMs: 20_000,
+          body: JSON.stringify(body),
+        });
+      } catch (err) {
+        const soft =
+          err instanceof ApiError &&
+          (err.status === 502 ||
+            err.status === 503 ||
+            err.status === 504 ||
+            err.status >= 500 ||
+            /تایم‌اوت|نرسید/.test(err.message));
+        if (soft) {
+          for (let i = 0; i < 5; i++) {
+            if (i > 0) {
+              await new Promise((r) => window.setTimeout(r, 300 * i));
+            }
+            try {
+              const existing = await api<User>(
+                `/api/user/${encodeURIComponent(uname)}`,
+                { timeoutMs: 12_000 }
+              );
+              if (existing?.username) return existing;
+            } catch {
+              /* retry */
+            }
+          }
+        }
+        throw err;
+      }
     },
     onSuccess: (updated) => {
       const initial = new Set(editInitialGroupIds);
@@ -1180,8 +1227,8 @@ export default function UsersPage() {
       setActionMsg({
         type: "ok",
         text: parts.length
-          ? `ذخیره شد · ${parts.join(" · ")}`
-          : "ذخیره شد",
+          ? `ذخیره شد · ${parts.join(" · ")} · همگام‌سازی پنل‌ها در پس‌زمینه`
+          : "ذخیره شد · همگام‌سازی پنل‌ها در پس‌زمینه",
       });
       void qc.invalidateQueries({ queryKey: ["users"] });
     },
@@ -1353,13 +1400,13 @@ export default function UsersPage() {
   }, [activeGroups]);
 
   function filterGroupsByCatAndSearch(
-    catTab: number | "all" | "none",
+    catTab: number | "all" | "none" | null,
     searchQ: string
   ): Group[] {
     let list = activeGroups;
     if (catTab === "none") {
       list = uncategorizedActive;
-    } else if (catTab !== "all") {
+    } else if (catTab != null && catTab !== "all") {
       list = groupsInCategory.get(catTab) || [];
     }
     const q = searchQ.trim().toLowerCase();
@@ -1437,6 +1484,21 @@ export default function UsersPage() {
     setGroupIds(ids);
     setCreateCatTab(categoryId == null ? "none" : categoryId);
     setCreateBoundCategoryId(bindId);
+  }
+
+  /** Tab «همه»: select every active group so create/bulk runs on all of them. */
+  function selectAllGroups(mode: "create" | "bulk" = "create") {
+    const ids = activeGroups.map((g) => g.id);
+    if (!ids.length) return;
+    if (mode === "bulk") {
+      setBulkGroupIds(ids);
+      setBulkCatTab("all");
+      setBulkBoundCategoryId(null);
+      return;
+    }
+    setGroupIds(ids);
+    setCreateCatTab("all");
+    setCreateBoundCategoryId(null);
   }
 
   const editAddedCount = useMemo(() => {
@@ -1618,7 +1680,10 @@ export default function UsersPage() {
             type="button"
             className="btn users-add"
             onClick={() => {
-              setCreateCatTab("all");
+              setGroupIds([]);
+              setGroupSearch("");
+              setCreateCatTab(null);
+              setCreateBoundCategoryId(null);
               setOpen(true);
             }}
           >
@@ -1791,7 +1856,10 @@ export default function UsersPage() {
             <button
               className="btn"
               onClick={() => {
-                setCreateCatTab("all");
+                setGroupIds([]);
+                setGroupSearch("");
+                setCreateCatTab(null);
+                setCreateBoundCategoryId(null);
                 setOpen(true);
               }}
             >
@@ -2336,7 +2404,8 @@ export default function UsersPage() {
                       role="tab"
                       className={`user-create-cat${createCatTab === "all" ? " on" : ""}`}
                       aria-selected={createCatTab === "all"}
-                      onClick={() => setCreateCatTab("all")}
+                      title="انتخاب همه گروه‌ها"
+                      onClick={() => selectAllGroups("create")}
                     >
                       همه
                       <em>{toFaDigits(activeGroups.length)}</em>
@@ -2384,12 +2453,17 @@ export default function UsersPage() {
                     بردارید. بعداً با افزودن یا حذف گروه در همین دسته، کانفیگ برای این
                     کاربر هم ساخته یا از پنل و ساب حذف می‌شود.
                   </p>
-                ) : createCatTab !== "all" ? (
+                ) : createCatTab === "all" ? (
                   <p className="field-hint user-create-cat-hint">
-                    روی نام دسته بزنید تا همه گروه‌هایش انتخاب شوند و کاربر به آن دسته
-                    وصل شود.
+                    همه گروه‌ها انتخاب شدند — کاربر روی همه ساخته می‌شود. می‌توانید یکی
+                    را بردارید.
                   </p>
-                ) : null}
+                ) : (
+                  <p className="field-hint user-create-cat-hint">
+                    روی «همه» بزنید تا همه گروه‌ها انتخاب شوند، یا روی نام دسته تا فقط
+                    گروه‌های همان دسته انتخاب و وصل شوند.
+                  </p>
+                )}
 
                 <div className="user-create-groups-search">
                   <Search size={16} aria-hidden />
@@ -2735,7 +2809,8 @@ export default function UsersPage() {
                       className={`user-create-cat${bulkCatTab === "all" ? " on" : ""}`}
                       aria-selected={bulkCatTab === "all"}
                       disabled={bulkCreate.isPending}
-                      onClick={() => setBulkCatTab("all")}
+                      title="انتخاب همه گروه‌ها"
+                      onClick={() => selectAllGroups("bulk")}
                     >
                       همه
                       <em>{toFaDigits(activeGroups.length)}</em>
@@ -2778,11 +2853,15 @@ export default function UsersPage() {
                     بعداً با اد/ریمو گروه در این دسته، کانفیگ این کاربران هم ساخته یا
                     از پنل و ساب حذف می‌شود.
                   </p>
-                ) : bulkCatTab !== "all" ? (
+                ) : bulkCatTab === "all" ? (
                   <p className="field-hint user-create-cat-hint">
-                    روی نام دسته بزنید تا همه گروه‌هایش انتخاب شوند.
+                    همه گروه‌ها انتخاب شدند — روی همه ساخته می‌شود.
                   </p>
-                ) : null}
+                ) : (
+                  <p className="field-hint user-create-cat-hint">
+                    روی «همه» بزنید تا همه گروه‌ها انتخاب شوند، یا روی نام دسته.
+                  </p>
+                )}
 
                 <div className="user-create-groups-search">
                   <Search size={16} aria-hidden />

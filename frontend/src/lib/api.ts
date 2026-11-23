@@ -69,7 +69,10 @@ export async function api<T>(
     });
   } catch (e) {
     if (timer != null) window.clearTimeout(timer);
-    if (e instanceof DOMException && e.name === "AbortError") {
+    const aborted =
+      (e instanceof DOMException && e.name === "AbortError") ||
+      (e instanceof Error && e.name === "AbortError");
+    if (aborted) {
       throw new ApiError(504, "پاسخ از سرور نرسید (تایم‌اوت) — دوباره تلاش کنید");
     }
     throw e;
