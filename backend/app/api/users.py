@@ -2,13 +2,13 @@ import asyncio
 import time
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import and_, delete, exists, func, or_, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer, load_only, selectinload
 
-from app.api.deps import get_current_admin
+from app.api.deps import get_current_admin, oauth2_scheme
 from app.core.database import get_db
 from app.models.group import Group, UserGroup
 from app.models.panel import Panel
@@ -1596,6 +1596,7 @@ async def _users_list_chip_counts(
 
 @router.get("/api/users", response_model=UsersListResponse)
 async def list_users(
+    request: Request,
     offset: int = Query(0, ge=0),
     limit: int = Query(10, ge=1, le=100),
     search: str | None = None,
@@ -1609,19 +1610,24 @@ async def list_users(
         False,
         description="Pull live usage from remote panels for this page (read-only; no remote push)",
     ),
-    db: AsyncSession = Depends(get_db),
-    _admin=Depends(get_current_admin),
+    token: str | None = Depends(oauth2_scheme),
 ):
+    # Acquire the list gate BEFORE opening a DB session — otherwise bot stampedes
+    # hold dozens of idle-in-transaction checkouts while queued on the semaphore.
     async with _USERS_LIST_SEM:
-        return await _list_users_impl(
-            offset=offset,
-            limit=limit,
-            search=search,
-            group_id=group_id,
-            filter=filter,
-            refresh=refresh,
-            db=db,
-        )
+        from app.core.database import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as db:
+            await get_current_admin(request, token, db)
+            return await _list_users_impl(
+                offset=offset,
+                limit=limit,
+                search=search,
+                group_id=group_id,
+                filter=filter,
+                refresh=refresh,
+                db=db,
+            )
 
 
 async def _list_users_impl(
