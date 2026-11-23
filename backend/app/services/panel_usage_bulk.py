@@ -330,6 +330,7 @@ async def apply_usage_map_to_panel(
     if not usage_map:
         return set()
     usage_exact, usage_lower, alias_idx = _build_usage_indexes(usage_map)
+    # Skip expired/disabled users — no background usage work for dead subs.
     result = await db.execute(
         select(PanelAccount, User.username)
         .join(User, User.id == PanelAccount.user_id)
@@ -339,6 +340,13 @@ async def apply_usage_map_to_panel(
                 (
                     PanelAccountStatus.active,
                     PanelAccountStatus.error,
+                )
+            ),
+            User.status.in_(
+                (
+                    UserStatus.active,
+                    UserStatus.on_hold,
+                    UserStatus.limited,
                 )
             ),
         )
@@ -568,8 +576,11 @@ async def recount_users_usage(user_ids: list[int], *, concurrency: int = 6) -> l
                         UserStatus.active,
                         UserStatus.on_hold,
                         UserStatus.limited,
-                        UserStatus.expired,
                     ):
+                        return
+                    # Wall-clock expired: flip once via quota, don't re-pull forever.
+                    exp = int(getattr(user, "expire", 0) or 0)
+                    if exp > 0 and exp <= int(time.time()):
                         return
                     await recount_user_used_traffic(db, user)
                     activated = await activate_on_hold_if_used(db, user)
@@ -799,8 +810,14 @@ async def sync_all_panels_bulk(
 async def recount_all_live_users(
     *, concurrency: int = 28, chunk: int = 1000
 ) -> dict[str, int]:
-    """Recompute weighted used_traffic for every live/limited user (DB only)."""
+    """Recompute weighted used_traffic for live users only (DB only).
+
+    Skips expired/disabled — they no longer need background usage work.
+    """
+    from sqlalchemy import or_
+
     t0 = time.monotonic()
+    now_ts = int(time.time())
     async with AsyncSessionLocal() as db:
         rows = (
             await db.execute(
@@ -810,9 +827,13 @@ async def recount_all_live_users(
                             UserStatus.active,
                             UserStatus.on_hold,
                             UserStatus.limited,
-                            UserStatus.expired,
                         )
-                    )
+                    ),
+                    or_(
+                        User.expire == 0,
+                        User.expire.is_(None),
+                        User.expire > now_ts,
+                    ),
                 )
             )
         ).all()

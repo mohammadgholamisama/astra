@@ -76,8 +76,8 @@ _bg_heavy = asyncio.Semaphore(3)
 
 # Live usage pull on sub refresh — must stay accurate (quota / money).
 _bg_usage_last: dict[int, float] = {}
-# Was 8s — too aggressive under 10k users; hot/fleet already cover accuracy.
-_BG_USAGE_INTERVAL = 20.0
+# Sub-triggered pulls; fleet/hot run every ~5 min for the rest.
+_BG_USAGE_INTERVAL = 30.0
 # Parallel /sub usage pulls — keep under DB pool headroom.
 _bg_usage_sem = asyncio.Semaphore(2)
 

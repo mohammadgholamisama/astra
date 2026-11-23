@@ -9383,7 +9383,37 @@ async def run_quota_watch_cycle() -> dict[str, int]:
 
     priority_ids = list(
         dict.fromkeys(take_live_usage_priority(300.0, 48) + recent_sub_ids)
-    )[:24]
+    )[:40]
+    # Drop expired/disabled / wall-clock-expired before remote usage pulls.
+    if priority_ids:
+        try:
+            from sqlalchemy import or_
+
+            now_ts = int(time.time())
+            async with AsyncSessionLocal() as db:
+                live = (
+                    await db.execute(
+                        select(User.id).where(
+                            User.id.in_(priority_ids),
+                            User.status.in_(
+                                (
+                                    UserStatus.active,
+                                    UserStatus.on_hold,
+                                    UserStatus.limited,
+                                )
+                            ),
+                            or_(
+                                User.expire == 0,
+                                User.expire.is_(None),
+                                User.expire > now_ts,
+                            ),
+                        )
+                    )
+                ).all()
+                priority_ids = [int(r[0]) for r in live][:24]
+                await db.rollback()
+        except Exception:  # noqa: BLE001
+            priority_ids = priority_ids[:24]
     extra_flip = await _quota_pull_users(
         priority_ids,
         deadline=t0 + 24.0,

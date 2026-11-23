@@ -219,7 +219,7 @@ async def _astra_xray_heal_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logging.getLogger("astra").exception("xray heal loop failed")
-        await asyncio.sleep(180)
+        await asyncio.sleep(300)
 
 
 async def _outbound_health_loop() -> None:
@@ -312,12 +312,12 @@ async def _usage_sync_loop() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("quota watch loop failed")
             elapsed = _time.monotonic() - t0
-        interval = max(180, int(settings.USAGE_REFRESH_SECONDS or 180))
+        interval = max(300, int(settings.USAGE_REFRESH_SECONDS or 300))
         # Heavy cycle → cool down so we don't re-enter while remotes still drain CPU
         if elapsed > interval:
-            cooldown = min(90.0, max(float(interval), elapsed * 0.5))
+            cooldown = min(120.0, max(float(interval), elapsed * 0.5))
         else:
-            cooldown = max(30.0, float(interval) - elapsed)
+            cooldown = max(60.0, float(interval) - elapsed)
         await asyncio.sleep(cooldown)
 
 
@@ -354,10 +354,10 @@ async def _fleet_usage_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("fleet usage loop failed")
-        interval = max(180, int(getattr(settings, "USAGE_FLEET_SECONDS", 180) or 180))
+        interval = max(300, int(getattr(settings, "USAGE_FLEET_SECONDS", 300) or 300))
         elapsed = _time.monotonic() - t0
         # After a long fleet pass, always rest so API/SSH keep CPU headroom.
-        await asyncio.sleep(max(60.0, float(interval) - elapsed))
+        await asyncio.sleep(max(90.0, float(interval) - elapsed))
 
 
 async def _hot_usage_loop() -> None:
@@ -382,8 +382,11 @@ async def _hot_usage_loop() -> None:
             ids = list(take_live_usage_priority(300.0, 16))
             try:
                 from app.models.user_analytics import UserUsageState
+                from app.models.user import User, UserStatus
+                from sqlalchemy import or_
 
                 since = datetime.now(timezone.utc) - timedelta(minutes=12)
+                now_ts = int(_time.time())
                 async with AsyncSessionLocal() as db:
                     recent = [
                         int(uid)
@@ -397,7 +400,30 @@ async def _hot_usage_loop() -> None:
                             )
                         ).all()
                     ]
-                ids = list(dict.fromkeys(ids + recent))[:12]
+                    ids = list(dict.fromkeys(ids + recent))[:24]
+                    # Drop expired/disabled / wall-clock-expired — no live usage needed.
+                    if ids:
+                        live = (
+                            await db.execute(
+                                select(User.id).where(
+                                    User.id.in_(ids),
+                                    User.status.in_(
+                                        (
+                                            UserStatus.active,
+                                            UserStatus.on_hold,
+                                            UserStatus.limited,
+                                        )
+                                    ),
+                                    or_(
+                                        User.expire == 0,
+                                        User.expire.is_(None),
+                                        User.expire > now_ts,
+                                    ),
+                                )
+                            )
+                        ).all()
+                        ids = [int(r[0]) for r in live]
+                    await db.rollback()
             except Exception:  # noqa: BLE001
                 pass
 
@@ -413,9 +439,7 @@ async def _hot_usage_loop() -> None:
                                 refresh_usage_pool_safe(
                                     int(uid), force=True, quick=True
                                 ),
-                                # Multi-panel users need real time; short cancels
-                                # mid-apply left users.used_traffic stuck.
-                                timeout=75.0,
+                                timeout=32.0,
                             )
                         except asyncio.TimeoutError:
                             try:
@@ -449,13 +473,13 @@ async def _hot_usage_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("hot usage loop failed")
-        interval = max(180, int(getattr(settings, "USAGE_HOT_SECONDS", 180) or 180))
+        interval = max(300, int(getattr(settings, "USAGE_HOT_SECONDS", 300) or 300))
         elapsed = _time.monotonic() - t0
-        await asyncio.sleep(max(60.0, float(interval) - elapsed))
+        await asyncio.sleep(max(90.0, float(interval) - elapsed))
 
 
 async def _analytics_sample_loop() -> None:
-    """Every ~60s: snapshot usage; every ~3 min: live Astra sync into panel stats."""
+    """Cadenced analytics snapshot; live Astra sync stays light."""
     from app.core.database import AsyncSessionLocal, background_db_sem
     from app.services import panel_analytics as panel_analytics_svc
     from app.services import user_analytics as analytics_svc
@@ -500,7 +524,7 @@ async def _analytics_sample_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("analytics sample loop failed")
-        await asyncio.sleep(180)
+        await asyncio.sleep(300)
 
 
 def _resolve_frontend_dist() -> Path | None:

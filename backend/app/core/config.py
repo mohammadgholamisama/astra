@@ -41,13 +41,13 @@ class Settings(BaseSettings):
     # when a user spans many panels; wall time still ≈ ceil(N/limit)×slowest.
     PANEL_REMOTE_CONCURRENCY: int = 6
     # Background quota watch cadence (seconds). Exhausted users are frozen
-    # on every remote in the same cycle. ~3 min keeps CPU calm on busy hosts.
-    USAGE_REFRESH_SECONDS: int = 180
+    # on every remote in the same cycle. ~5 min keeps CPU calm; accuracy via
+    # remaining caps + live /sub pulls for active clients.
+    USAGE_REFRESH_SECONDS: int = 300
     # Full-fleet usage pull (all panels + dirty recount), seconds.
-    # Accuracy still comes from remaining remote caps + /sub live pulls.
-    USAGE_FLEET_SECONDS: int = 180
-    # Hot loop for recent /sub users (seconds). Same ~3 min cadence.
-    USAGE_HOT_SECONDS: int = 180
+    USAGE_FLEET_SECONDS: int = 300
+    # Hot loop for recent /sub users (seconds). Same ~5 min cadence.
+    USAGE_HOT_SECONDS: int = 300
     # Auto «رفع خطا» on Users page — off by default; use the button manually.
     AUTO_RETRY_ERRORS: bool = False
     # Official install helper for SSL / nginx (empty = SSL UI disabled)

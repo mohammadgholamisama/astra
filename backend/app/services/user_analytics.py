@@ -930,7 +930,6 @@ async def sample_all_users_once() -> dict[str, int]:
                                 UserStatus.active,
                                 UserStatus.on_hold,
                                 UserStatus.limited,
-                                UserStatus.expired,
                             )
                         ),
                         User.used_traffic > 0,
