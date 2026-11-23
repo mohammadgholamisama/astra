@@ -233,7 +233,30 @@ async def recount_users_usage(user_ids: list[int], *, concurrency: int = 6) -> l
                         elif changed:
                             flipped.append(int(user.id))
             except Exception:  # noqa: BLE001
-                logger.debug("recount failed user_id=%s", uid, exc_info=True)
+                logger.warning("recount failed user_id=%s", uid, exc_info=True)
+                try:
+                    async with AsyncSessionLocal() as db2:
+                        result2 = await db2.execute(
+                            select(User)
+                            .where(User.id == uid)
+                            .options(
+                                selectinload(User.panel_accounts).selectinload(
+                                    PanelAccount.panel
+                                ),
+                                selectinload(User.groups),
+                            )
+                        )
+                        user2 = result2.scalar_one_or_none()
+                        if user2 is None:
+                            return
+                        await recount_user_used_traffic(db2, user2)
+                        await activate_on_hold_if_used(db2, user2)
+                        await enforce_user_quota(db2, user2)
+                        await db2.commit()
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "recount retry failed user_id=%s", uid, exc_info=True
+                    )
 
     await asyncio.gather(*[_one(uid) for uid in ids])
     return list(dict.fromkeys(flipped))

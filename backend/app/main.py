@@ -391,10 +391,29 @@ async def _hot_usage_loop() -> None:
                                 refresh_usage_pool_safe(
                                     int(uid), force=True, quick=True
                                 ),
-                                timeout=12.0,
+                                # Multi-panel users need real time; 12s cancelled
+                                # mid-apply and left users.used_traffic=0 forever.
+                                timeout=75.0,
                             )
+                        except asyncio.TimeoutError:
+                            try:
+                                from app.services.orchestrator import (
+                                    recount_user_usage_pool_safe,
+                                )
+
+                                await recount_user_usage_pool_safe(int(uid))
+                            except Exception:  # noqa: BLE001
+                                logger.warning(
+                                    "hot usage timeout recount user_id=%s",
+                                    uid,
+                                    exc_info=True,
+                                )
                         except Exception:  # noqa: BLE001
-                            pass
+                            logger.warning(
+                                "hot usage pull user_id=%s failed",
+                                uid,
+                                exc_info=True,
+                            )
 
                 await asyncio.gather(
                     *[_one(uid) for uid in ids], return_exceptions=True

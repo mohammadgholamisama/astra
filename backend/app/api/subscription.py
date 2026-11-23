@@ -76,7 +76,7 @@ _bg_heavy = asyncio.Semaphore(3)
 
 # Live usage pull on sub refresh — must stay accurate (quota / money).
 _bg_usage_last: dict[int, float] = {}
-_BG_USAGE_INTERVAL = 25.0
+_BG_USAGE_INTERVAL = 8.0
 # Keep low so /sub Update stays ahead of usage scrapes.
 # /sub usage pulls — capped so QueuePool keeps headroom for analytics pages.
 _bg_usage_sem = asyncio.Semaphore(5)
@@ -534,12 +534,21 @@ async def _bg_usage_pull(user_id: int) -> None:
                         "used": before,
                     },
                 )
+                # Instant: apply already-synced panel meters to users.used_traffic
+                # (bulk often filled raw bytes while user total stayed 0).
+                try:
+                    from app.services.orchestrator import recount_user_usage_pool_safe
+
+                    instant = await recount_user_usage_pool_safe(int(user_id))
+                    if instant >= 0:
+                        before = max(before, int(instant))
+                except Exception:  # noqa: BLE001
+                    pass
                 after, activated, changed, status_now = await asyncio.wait_for(
                     refresh_usage_pool_safe(
                         int(user_id), force=True, quick=True
                     ),
-                    # Must finish all remotes — 28s cancelled mid-pull and
-                    # left Astra usage far below the main panel total.
+                    # Must finish all remotes — short cancels left usage at 0.
                     timeout=75.0,
                 )
                 if after < 0:

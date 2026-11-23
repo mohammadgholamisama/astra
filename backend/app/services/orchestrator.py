@@ -7619,6 +7619,49 @@ async def recount_user_used_traffic(
     return _assign_user_used_traffic(user, total)
 
 
+async def recount_user_usage_pool_safe(user_id: int) -> int:
+    """DB-only weighted recount + quota in its own session (no remote HTTP).
+
+    Use when panel_accounts already have fresh raw meters (bulk/hot) but
+    ``users.used_traffic`` lagged at 0 due to cancelled pull / PendingRollback.
+    """
+    from app.core.database import AsyncSessionLocal
+
+    uid = int(user_id)
+    for attempt in range(2):
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(User)
+                    .where(User.id == uid)
+                    .options(
+                        selectinload(User.panel_accounts).selectinload(
+                            PanelAccount.panel
+                        ),
+                        selectinload(User.groups),
+                    )
+                )
+                user = result.scalar_one_or_none()
+                if user is None:
+                    return -1
+                total = await recount_user_used_traffic(db, user)
+                await activate_on_hold_if_used(db, user)
+                await enforce_user_quota(db, user)
+                await db.commit()
+                return int(total)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "recount_user_usage_pool_safe user_id=%s attempt=%s",
+                uid,
+                attempt,
+                exc_info=True,
+            )
+            if attempt >= 1:
+                return -1
+            await asyncio.sleep(0.15)
+    return -1
+
+
 async def recount_users_used_traffic_batch(
     db: AsyncSession,
     users: list[User],
@@ -8433,41 +8476,84 @@ async def refresh_usage_pool_safe(
     sem = asyncio.Semaphore(28 if quick else 20)
 
     async def _one(
-        aid: int, panel: Panel, uname: str, rid: str | None
+        aid: int,
+        panel: Panel,
+        uname: str,
+        rid: str | None,
+        group_id: int | None,
     ) -> None:
+        names = _remote_username_candidates(
+            astra_username=username,
+            remote_username=uname,
+            remote_id=rid,
+            uuid=None,
+            panel_id=int(panel.id),
+            group_id=group_id,
+        ) or [uname]
         async with sem:
-            for attempt in range(2 if quick else 1):
-                adapter = get_adapter(panel)
-                try:
-                    try:
-                        coro = adapter.get_usage(  # type: ignore[call-arg]
-                            uname, rid, expand_links=False
-                        )
-                    except TypeError:
-                        coro = adapter.get_usage(uname, rid)
-                    res = await asyncio.wait_for(coro, timeout=per_try)
-                    if res is not None and res.success:
-                        results[aid] = res
-                        return
-                except Exception as exc:  # noqa: BLE001
-                    if attempt == 0:
-                        logger.warning(
-                            "pool-safe get_usage user=%s panel=%s: %s",
-                            username,
-                            panel.id,
-                            _exc_msg(exc),
-                        )
-                finally:
-                    close = getattr(adapter, "close", None)
-                    if callable(close):
+            adapter = get_adapter(panel)
+            try:
+                for name in names:
+                    if not name:
+                        continue
+                    for attempt in range(2 if quick else 1):
                         try:
-                            await close()
-                        except Exception:  # noqa: BLE001
-                            pass
+                            try:
+                                coro = adapter.get_usage(  # type: ignore[call-arg]
+                                    name, rid or name, expand_links=False
+                                )
+                            except TypeError:
+                                coro = adapter.get_usage(name, rid or name)
+                            res = await asyncio.wait_for(coro, timeout=per_try)
+                            if res is not None and res.success:
+                                results[aid] = res
+                                return
+                        except Exception as exc:  # noqa: BLE001
+                            if attempt == 0 and name == names[0]:
+                                logger.warning(
+                                    "pool-safe get_usage user=%s panel=%s name=%s: %s",
+                                    username,
+                                    panel.id,
+                                    name[:40],
+                                    _exc_msg(exc),
+                                )
+            finally:
+                close = getattr(adapter, "close", None)
+                if callable(close):
+                    try:
+                        await close()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+    # Reload group_id for candidates (stored in pullable as prev used only).
+    # Re-query light map: aid -> group_id
+    aid_gid: dict[int, int | None] = {}
+    try:
+        async with AsyncSessionLocal() as sdb:
+            rows = (
+                await sdb.execute(
+                    select(PanelAccount.id, PanelAccount.group_id).where(
+                        PanelAccount.id.in_([p[0] for p in pullable] or [-1])
+                    )
+                )
+            ).all()
+            for aid, gid in rows:
+                aid_gid[int(aid)] = int(gid) if gid is not None else None
+    except Exception:  # noqa: BLE001
+        pass
 
     if pullable:
         await asyncio.gather(
-            *[_one(aid, panel, uname, rid) for aid, panel, uname, rid, _prev in pullable]
+            *[
+                _one(
+                    aid,
+                    panel,
+                    uname,
+                    rid,
+                    aid_gid.get(int(aid)),
+                )
+                for aid, panel, uname, rid, _prev in pullable
+            ]
         )
         logger.info(
             "pool-safe usage user=%s pullable=%s ok=%s miss=%s quick=%s per_try=%.1f",
@@ -8479,58 +8565,84 @@ async def refresh_usage_pool_safe(
             per_try,
         )
 
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(User)
-            .where(User.id == int(user_id))
-            .options(
-                selectinload(User.panel_accounts).selectinload(PanelAccount.panel),
-                selectinload(User.groups),
-            )
-        )
-        user = result.scalar_one_or_none()
-        if user is None:
-            return (-1, False, False, "")
-        now = datetime.now(timezone.utc)
-        from app.adapters.http_utils import is_share_link
+    for attempt in range(2):
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(User)
+                    .where(User.id == int(user_id))
+                    .options(
+                        selectinload(User.panel_accounts).selectinload(
+                            PanelAccount.panel
+                        ),
+                        selectinload(User.groups),
+                    )
+                )
+                user = result.scalar_one_or_none()
+                if user is None:
+                    return (-1, False, False, "")
+                now = datetime.now(timezone.utc)
+                from app.adapters.http_utils import is_share_link
 
-        by_id = {int(a.id): a for a in (user.panel_accounts or [])}
-        for aid, res in results.items():
-            account = by_id.get(int(aid))
-            if account is None:
-                continue
-            got = int(res.used_traffic or 0)
-            prev = int(account.used_traffic or 0)
-            panel = account.panel
-            if panel is not None and panel.type == PanelType.astra:
-                account.used_traffic = got
-            else:
-                account.used_traffic = max(prev, got)
-            new_shares = [
-                str(x) for x in (res.links or []) if x and is_share_link(str(x))
-            ]
-            if new_shares:
-                old_shares = [
-                    str(x)
-                    for x in (account.links or [])
-                    if x and is_share_link(str(x))
-                ]
-                if not old_shares or len(new_shares) >= len(old_shares):
-                    account.links = new_shares
-                    account.links_by_group = None
-            account.last_sync_at = now
-            if account.status == PanelAccountStatus.error:
-                account.status = PanelAccountStatus.active
-                account.error_message = None
-        accounts = list(user.panel_accounts or [])
-        account_coeffs = await account_coefficients_for_user(db, user, accounts)
-        total = await _weighted_total(accounts, account_coeffs)
-        total = _assign_user_used_traffic(user, total)
-        activated = await activate_on_hold_if_used(db, user)
-        changed = bool(activated) or await enforce_user_quota(db, user)
-        await db.commit()
-        st = getattr(user.status, "value", user.status)
-        return (int(user.used_traffic or total or 0), bool(activated), bool(changed), str(st))
+                by_id = {int(a.id): a for a in (user.panel_accounts or [])}
+                for aid, res in results.items():
+                    account = by_id.get(int(aid))
+                    if account is None:
+                        continue
+                    got = int(res.used_traffic or 0)
+                    prev = int(account.used_traffic or 0)
+                    panel = account.panel
+                    if panel is not None and panel.type == PanelType.astra:
+                        account.used_traffic = got
+                    else:
+                        account.used_traffic = max(prev, got)
+                    new_shares = [
+                        str(x)
+                        for x in (res.links or [])
+                        if x and is_share_link(str(x))
+                    ]
+                    if new_shares:
+                        old_shares = [
+                            str(x)
+                            for x in (account.links or [])
+                            if x and is_share_link(str(x))
+                        ]
+                        if not old_shares or len(new_shares) >= len(old_shares):
+                            account.links = new_shares
+                            account.links_by_group = None
+                    account.last_sync_at = now
+                    if account.status == PanelAccountStatus.error:
+                        account.status = PanelAccountStatus.active
+                        account.error_message = None
+                accounts = list(user.panel_accounts or [])
+                account_coeffs = await account_coefficients_for_user(
+                    db, user, accounts
+                )
+                total = await _weighted_total(accounts, account_coeffs)
+                total = _assign_user_used_traffic(user, total)
+                activated = await activate_on_hold_if_used(db, user)
+                changed = bool(activated) or await enforce_user_quota(db, user)
+                await db.commit()
+                st = getattr(user.status, "value", user.status)
+                return (
+                    int(user.used_traffic or total or 0),
+                    bool(activated),
+                    bool(changed),
+                    str(st),
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "pool-safe apply/recount user=%s attempt=%s",
+                username,
+                attempt,
+                exc_info=True,
+            )
+            if attempt >= 1:
+                # Last resort: DB recount from whatever meters already stored
+                total = await recount_user_usage_pool_safe(int(user_id))
+                return (int(total), False, False, "")
+            await asyncio.sleep(0.2)
+    return (-1, False, False, "")
 
 
 async def enforce_user_quota(db: AsyncSession, user: User) -> bool:

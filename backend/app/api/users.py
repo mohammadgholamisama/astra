@@ -688,34 +688,32 @@ async def get_user(
     user = await load_user(db, username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    # Never block the edit dialog on a full remote scrape — und2-style users
-    # with dozens of panels used to 500/timeout here and the UI looked "broken".
+    # Fast path: recount from panel_accounts already in DB (no remote HTTP on
+    # the request session — that caused PendingRollback / used_traffic stuck at 0).
     try:
-        await asyncio.wait_for(
-            orchestrator.refresh_usage(db, user, force=True, quick=True),
-            timeout=12.0,
-        )
-        changed = await orchestrator.enforce_user_quota(db, user)
-        if await orchestrator.should_push_remotes(
-            db, user, status_changed=changed, force=False
-        ):
-            await asyncio.wait_for(
-                orchestrator.sync_modify_user(
-                    db, user, skip_nginx_sync=True, remote_timeout=8.0
-                ),
-                timeout=15.0,
-            )
+        await orchestrator.recount_user_used_traffic(db, user)
+        await orchestrator.enforce_user_quota(db, user)
         await db.commit()
     except Exception:  # noqa: BLE001
         import logging
 
         logging.getLogger("astra.users").exception(
-            "get_user refresh soft-fail user=%s", username
+            "get_user recount soft-fail user=%s", username
         )
         try:
             await db.rollback()
         except Exception:  # noqa: BLE001
             pass
+    # Live panel scrape in background so the dialog stays instant.
+    try:
+        asyncio.create_task(
+            orchestrator.refresh_usage_pool_safe(
+                int(user.id), force=True, quick=True
+            ),
+            name=f"astra-get-user-usage-{username[:24]}",
+        )
+    except Exception:  # noqa: BLE001
+        pass
     user = await load_user(db, username)
     return to_user_response(user)  # type: ignore[arg-type]
 
