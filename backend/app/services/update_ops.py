@@ -22,9 +22,12 @@ _SAFE_VER = re.compile(r"^[0-9A-Za-z._+-]{1,32}$")
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 
 # Check budget: dashboard must answer well under nginx/proxy timeouts.
-_CHECK_HTTP_TIMEOUT = httpx.Timeout(2.5, connect=1.5)
-_CHECK_OVERALL_SEC = 6.0
-_SHA_WAVE_SEC = 2.5
+_CHECK_HTTP_TIMEOUT = httpx.Timeout(2.0, connect=1.2)
+_CHECK_OVERALL_SEC = 4.0
+_SHA_WAVE_SEC = 2.0
+# Soft-cache remote VERSION so repeated modal opens stay fast under load.
+_REMOTE_VER_CACHE_TTL = 90.0
+_remote_ver_cache: tuple[float, str] = (0.0, "")
 
 _NNP_HINT = (
     "سرویس astra با NoNewPrivileges اجرا می‌شود و sudo کار نمی‌کند. "
@@ -220,8 +223,18 @@ async def _fetch_head_sha(client: httpx.AsyncClient, bust: str) -> str:
     return ""
 
 
-async def _fetch_remote_version() -> str:
+async def _fetch_remote_version(*, bypass_cache: bool = False) -> str:
     """Fetch newest VERSION from mirrors concurrently; pick max semver within budget."""
+    global _remote_ver_cache
+    now = time.monotonic()
+    cached_at, cached_ver = _remote_ver_cache
+    if (
+        not bypass_cache
+        and cached_ver
+        and (now - cached_at) < _REMOTE_VER_CACHE_TTL
+    ):
+        return cached_ver
+
     bust = str(int(time.time()))
     found: list[str] = []
 
@@ -234,16 +247,17 @@ async def _fetch_remote_version() -> str:
         timeout=_CHECK_HTTP_TIMEOUT,
         follow_redirects=True,
         headers=headers_nocache,
-        limits=httpx.Limits(max_connections=12, max_keepalive_connections=6),
+        limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
     ) as client:
+        # Prefer raw/CDN first (faster than GitHub API under load).
         main_sources: list[tuple[str, dict[str, str] | None]] = [
+            (f"{_VERSION_URL}?_={bust}", None),
+            (f"https://cdn.jsdelivr.net/gh/{_REPO}@main/VERSION?_={bust}", None),
+            (f"https://fastly.jsdelivr.net/gh/{_REPO}@main/VERSION?_={bust}", None),
             (
                 f"https://api.github.com/repos/{_REPO}/contents/VERSION?ref=main&_={bust}",
                 {"Accept": "application/vnd.github.raw"},
             ),
-            (f"{_VERSION_URL}?_={bust}", None),
-            (f"https://cdn.jsdelivr.net/gh/{_REPO}@main/VERSION?_={bust}", None),
-            (f"https://fastly.jsdelivr.net/gh/{_REPO}@main/VERSION?_={bust}", None),
         ]
 
         async def collect(sources: list[tuple[str, dict[str, str] | None]]) -> list[str]:
@@ -278,17 +292,31 @@ async def _fetch_remote_version() -> str:
         main_task = asyncio.create_task(collect(main_sources))
         sha_task = asyncio.create_task(sha_wave())
         try:
+            # First wave: if raw/CDN already answered, skip waiting on SHA race.
             done, pending = await asyncio.wait(
                 {main_task, sha_task},
                 timeout=_CHECK_OVERALL_SEC,
+                return_when=asyncio.FIRST_COMPLETED,
             )
-            for t in pending:
-                t.cancel()
             for t in done:
                 try:
                     found.extend(t.result())
                 except Exception:  # noqa: BLE001
                     continue
+            if found:
+                for t in pending:
+                    t.cancel()
+            else:
+                more_done, still = await asyncio.wait(
+                    pending, timeout=max(0.5, _CHECK_OVERALL_SEC - 1.0)
+                )
+                for t in still:
+                    t.cancel()
+                for t in more_done:
+                    try:
+                        found.extend(t.result())
+                    except Exception:  # noqa: BLE001
+                        continue
         finally:
             for t in (main_task, sha_task):
                 if not t.done():
@@ -296,7 +324,11 @@ async def _fetch_remote_version() -> str:
 
     best = _newest_version(*found)
     if best:
+        _remote_ver_cache = (time.monotonic(), best)
         logger.info("update check remote candidates=%s → %s", found, best)
+    elif cached_ver:
+        # Stale is better than empty when GitHub is slow — UI still works.
+        return cached_ver
     return best
 
 
@@ -412,12 +444,75 @@ async def check_update() -> dict:
     }
 
 
-async def apply_update() -> dict:
-    """Kick off update without waiting — waiting deadlocks with astra restart.
+async def _kick_update_bg() -> None:
+    """Queue astra-update / detached helper. Never block the HTTP worker long."""
+    last_err = ""
+    # 1) oneshot --no-block (avoids deadlock with astra restart)
+    for systemctl in ("/bin/systemctl", "/usr/bin/systemctl", "systemctl"):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "sudo",
+                "-n",
+                systemctl,
+                "start",
+                "--no-block",
+                "astra-update.service",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            try:
+                _, err_b = await asyncio.wait_for(proc.communicate(), timeout=4.0)
+            except asyncio.TimeoutError:
+                # systemd may be slow under load; --no-block usually already queued.
+                logger.warning("systemctl --no-block kick timed out; assuming queued")
+                return
+            err = (err_b or b"").decode("utf-8", errors="replace")
+            if _sudo_blocked(err):
+                logger.error("update kick blocked by NNP:\n%s", _NNP_HINT)
+                return
+            if proc.returncode == 0:
+                logger.info("astra-update.service queued via %s", systemctl)
+                return
+            last_err = err.strip() or f"exit {proc.returncode}"
+            low = last_err.lower()
+            if "not allowed" in low or "a password is required" in low:
+                break
+            if (
+                proc.returncode == 5
+                or "not found" in low
+                or "could not be found" in low
+            ):
+                last_err = "astra-update.service missing"
+                break
+        except Exception as exc:  # noqa: BLE001
+            last_err = str(exc)
+            logger.warning("systemctl update kick failed: %s", exc)
 
-    Panel used to `systemctl start astra-update` (blocking). The oneshot runs
-    apply-update → restart astra while uvicorn is still waiting on that start →
-    systemd deadlock / nginx 504, so the dashboard looked like "نصب نشد".
+    # 2) Detached helper (sudoers: astra-helper *)
+    helper = helper_path()
+    try:
+        await asyncio.create_subprocess_exec(
+            "sudo",
+            "-n",
+            helper,
+            "apply-update",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        logger.info("detached astra-helper apply-update spawned (%s)", last_err or "ok")
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "failed to spawn apply-update (last_err=%s)", last_err or "?"
+        )
+
+
+async def apply_update() -> dict:
+    """Return immediately and queue update in the background.
+
+    Waiting on systemctl/helper here caused dashboard «تایم‌اوت» under load and
+    could deadlock when the oneshot restarts astra while the request still waits.
     """
     if not available():
         raise ValueError(
@@ -427,53 +522,15 @@ async def apply_update() -> dict:
     from app.services.version_info import clear_version_cache, get_version
 
     local_before = get_version()
-    started = False
-    last_err = ""
-
-    # 1) oneshot --no-block (never blocking start — that deadlocks with astra restart)
-    for systemctl in ("/bin/systemctl", "/usr/bin/systemctl", "systemctl"):
-        code, out, err = await _run(
-            ["sudo", "-n", systemctl, "start", "--no-block", "astra-update.service"],
-            timeout=30,
-        )
-        combined = (err or "") + (out or "")
-        if _sudo_blocked(combined):
-            raise RuntimeError(_NNP_HINT)
-        if code == 0:
-            started = True
-            break
-        last_err = combined.strip() or f"exit {code}"
-        if "not allowed" in combined.lower() or "a password is required" in combined.lower():
-            # old sudoers without --no-block — fall through to detached helper
-            break
-        if code == 5 or "not found" in combined.lower() or "could not be found" in combined.lower():
-            last_err = "astra-update.service missing"
-            break
-
-    # 2) Detached helper (works with existing sudoers: astra-helper *)
-    if not started:
-        helper = helper_path()
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "sudo",
-                "-n",
-                helper,
-                "apply-update",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            await asyncio.sleep(0.3)
-            if proc.returncode is not None and proc.returncode != 0:
-                raise RuntimeError(last_err or "failed to start update")
-            started = True
-        except FileNotFoundError as exc:
-            raise RuntimeError(last_err or str(exc)) from exc
-
-    if not started:
-        raise RuntimeError(last_err or "failed to start update")
-
     clear_version_cache()
+    try:
+        asyncio.get_running_loop().create_task(
+            _kick_update_bg(), name="astra-update-kick"
+        )
+    except RuntimeError:
+        # No running loop (tests) — kick inline with short budget
+        await asyncio.wait_for(_kick_update_bg(), timeout=6.0)
+
     return {
         "ok": True,
         "started": True,

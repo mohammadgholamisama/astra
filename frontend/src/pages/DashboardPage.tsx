@@ -190,8 +190,8 @@ export default function DashboardPage() {
   const checkUpdate = useMutation({
     mutationFn: () =>
       api<UpdateStatus>("/api/system/update", {
-        // Backend check is concurrent and budgeted (~6s); keep UI tight.
-        timeoutMs: 12_000,
+        // Backend check is cached/budgeted (~4s); leave headroom for busy hosts.
+        timeoutMs: 18_000,
       }),
     onSuccess: (res) => {
       setUpdateInfo(res);
@@ -207,16 +207,46 @@ export default function DashboardPage() {
     },
   });
 
+  async function pollUpdateUntilDone() {
+    const target = updateTargetRef.current;
+    const startedAt = Date.now();
+    setUpdateInstalling(true);
+    try {
+      while (Date.now() - startedAt < 10 * 60_000) {
+        await new Promise((r) => window.setTimeout(r, 8000));
+        try {
+          qc.invalidateQueries({ queryKey: ["system"] });
+          await refetch();
+          const st = await checkUpdate.mutateAsync();
+          if (st && !st.update_available && st.check_ok !== false) {
+            setUpdateErr("");
+            return;
+          }
+          if (target && st?.local_version && st.local_version === target) {
+            setUpdateErr("");
+            return;
+          }
+        } catch {
+          // panel may be restarting — keep waiting
+        }
+      }
+      setUpdateErr(
+        "آپدیت هنوز تمام نشده یا پنل بالا نیامده — چند دقیقه دیگر رفرش کنید"
+      );
+    } finally {
+      setUpdateInstalling(false);
+    }
+  }
+
   const applyUpdate = useMutation({
     mutationFn: () =>
       api<{ ok: boolean; started?: boolean; message: string }>("/api/system/update", {
         method: "POST",
-        // kickoff only — install runs in background (avoids deadlock/504)
-        timeoutMs: 60_000,
+        // Kickoff returns immediately; install runs in background.
+        timeoutMs: 20_000,
       }),
     onSuccess: async (res) => {
       setUpdateErr("");
-      setUpdateInstalling(true);
       setUpdateInfo((prev) =>
         prev
           ? {
@@ -226,35 +256,26 @@ export default function DashboardPage() {
             }
           : prev
       );
-      const target = updateTargetRef.current;
-      const startedAt = Date.now();
-      try {
-        while (Date.now() - startedAt < 10 * 60_000) {
-          await new Promise((r) => window.setTimeout(r, 8000));
-          try {
-        qc.invalidateQueries({ queryKey: ["system"] });
-            await refetch();
-            const st = await checkUpdate.mutateAsync();
-            if (st && !st.update_available && st.check_ok !== false) {
-              setUpdateErr("");
-              return;
-            }
-            if (target && st?.local_version && st.local_version === target) {
-              setUpdateErr("");
-              return;
-            }
-          } catch {
-            // panel may be restarting — keep waiting
-          }
-        }
-        setUpdateErr(
-          "آپدیت هنوز تمام نشده یا پنل بالا نیامده — چند دقیقه دیگر رفرش کنید"
-        );
-      } finally {
-        setUpdateInstalling(false);
-      }
+      await pollUpdateUntilDone();
     },
     onError: (e: Error) => {
+      // Under load the kick may succeed before the HTTP response; keep polling.
+      const timedOut =
+        e instanceof ApiError && (e.status === 504 || e.status === 502);
+      if (timedOut) {
+        setUpdateErr("ارتباط کند بود؛ در حال بررسی نصب آپدیت…");
+        setUpdateInfo((prev) =>
+          prev
+            ? {
+                ...prev,
+                message: "آپدیت احتمالاً شروع شده — منتظر بمانید…",
+                update_available: true,
+              }
+            : prev
+        );
+        void pollUpdateUntilDone();
+        return;
+      }
       setUpdateInstalling(false);
       setUpdateErr(e instanceof ApiError ? e.message : e.message);
     },
