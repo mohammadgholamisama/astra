@@ -1769,14 +1769,17 @@ async def _list_users_impl(
         by_id = {u.id: u for u in result.scalars().unique().all()}
         users = [by_id[i] for i in ids if i in by_id]
 
-    from app.core.database import release_db_txn
-
-    await release_db_txn(db)
-    return UsersListResponse(
+    # Serialize WHILE the session is still usable — release_db_txn/rollback
+    # expires ORM attrs and to_user_response would MissingGreenlet on lazy IO.
+    payload = UsersListResponse(
         users=[to_user_response(u, include_links=False) for u in users],
         total=total,
         counts=counts,
     )
+    from app.core.database import release_db_txn
+
+    await release_db_txn(db)
+    return payload
 
 
 @router.post("/api/user/from_template", response_model=UserResponse)

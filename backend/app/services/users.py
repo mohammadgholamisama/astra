@@ -96,18 +96,25 @@ def to_user_response(user: User, *, include_links: bool = True) -> UserResponse:
             ptype = getattr(panel, "type", None)
             panel_type = ptype.value if hasattr(ptype, "value") else (str(ptype) if ptype else None)
             panel_base = getattr(panel, "base_url", None) or getattr(panel, "url", None)
-        # Deferred links on list path — do not access (would lazy-load under async).
+        # Never touch deferred/unloaded attrs (async lazy-load → MissingGreenlet).
+        adict = a.__dict__
         unloaded = set()
         try:
             unloaded = set(sa_inspect(a).unloaded or ())
         except Exception:  # noqa: BLE001
             unloaded = set()
-        if is_deleted or "links" in unloaded:
+        if is_deleted or "links" in unloaded or not include_links:
+            # List view: skip share-link payloads entirely (count stays 0).
             raw_links: list = []
         else:
-            raw_links = [x for x in (a.links or []) if x]
+            raw_links = [x for x in (adict.get("links") or []) if x]
         # Never surface stale error_message on healthy accounts (UI false positives)
-        err = a.error_message if a.status == PanelAccountStatus.error else None
+        status_val = adict.get("status", a.status)
+        err = (
+            adict.get("error_message")
+            if status_val == PanelAccountStatus.error
+            else None
+        )
         panel_accounts.append(
             PanelAccountOut(
                 id=a.id,
@@ -118,25 +125,28 @@ def to_user_response(user: User, *, include_links: bool = True) -> UserResponse:
                 panel_name=getattr(panel, "name", None) if panel is not None else None,
                 panel_type=panel_type,
                 panel_base_url=str(panel_base).rstrip("/") if panel_base else None,
-                remote_username=a.remote_username,
-                status=a.status,
+                remote_username=adict.get("remote_username"),
+                status=status_val,
                 # List view: keep count only (placeholder) — avoid shipping huge URLs
                 links=list(raw_links) if include_links else (["x"] * len(raw_links)),
                 error_message=err,
-                used_traffic=a.used_traffic,
-                coeff_anchor_raw=int(getattr(a, "coeff_anchor_raw", 0) or 0),
-                coeff_anchor_weighted=int(getattr(a, "coeff_anchor_weighted", 0) or 0),
-                applied_coefficient=getattr(a, "applied_coefficient", None),
-                last_sync_at=a.last_sync_at,
+                used_traffic=int(adict.get("used_traffic") or 0),
+                coeff_anchor_raw=int(adict.get("coeff_anchor_raw") or 0),
+                coeff_anchor_weighted=int(adict.get("coeff_anchor_weighted") or 0),
+                applied_coefficient=adict.get("applied_coefficient"),
+                last_sync_at=adict.get("last_sync_at"),
                 configs_count=len(raw_links),
             )
         )
 
     groups = list(user.__dict__.get("groups") or [])
-    created_at = user.__dict__.get("created_at") or user.created_at
+    created_at = user.__dict__.get("created_at")
     proxies: dict = {}
     if include_links:
-        proxies = (user.proxy_settings or {}).get("proxies") or user.proxy_settings or {}
+        psettings = user.__dict__.get("proxy_settings") or {}
+        proxies = (psettings.get("proxies") if isinstance(psettings, dict) else None) or (
+            psettings if isinstance(psettings, dict) else {}
+        )
 
     return UserResponse(
         username=user.username,
