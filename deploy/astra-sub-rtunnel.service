@@ -9,7 +9,8 @@ Type=simple
 User=root
 ExecStart=/usr/local/bin/astra-sub-rtunnel-run
 Restart=always
-RestartSec=3
+# Avoid SSH reconnect storms that exhaust MaxSessions on both sides
+RestartSec=8
 TimeoutStartSec=40
 
 [Install]

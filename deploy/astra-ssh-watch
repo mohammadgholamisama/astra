@@ -1,0 +1,10 @@
+#!/bin/bash
+# Restart sshd if too many sessions (prevents permanent MaxSessions lockout).
+set +e
+n=$(ss -tnp 2>/dev/null | grep -c ':22' || echo 0)
+n=${n%%[^0-9]*}
+n=${n:-0}
+if [ "$n" -gt 80 ]; then
+  logger -t astra-ssh-watch "high ssh conns n=$n — restarting sshd"
+  systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+fi

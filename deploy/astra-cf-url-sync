@@ -1,0 +1,9 @@
+#!/bin/bash
+# Local-only CF URL sync — do NOT SSH to Iran edge (that caused MaxSessions lockups).
+URL_FILE=/var/lib/astra-cf-sub.url
+url=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /var/log/astra-cf-sub.log 2>/dev/null | tail -1)
+[ -z "$url" ] && exit 0
+echo "$url" > "$URL_FILE"
+chmod 644 "$URL_FILE"
+cp -f "$URL_FILE" /opt/astra/frontend/dist/astra-cf-url.txt 2>/dev/null || true
+logger -t astra-cf-sync wrote=${url#https://}

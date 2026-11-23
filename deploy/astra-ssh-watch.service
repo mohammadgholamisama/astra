@@ -1,0 +1,6 @@
+[Unit]
+Description=Astra sshd session watchdog
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/astra-ssh-watch
