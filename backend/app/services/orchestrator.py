@@ -1653,15 +1653,14 @@ _account_prov_sem: asyncio.Semaphore | None = None
 
 
 def _get_account_prov_sem() -> asyncio.Semaphore:
-    """Cap concurrent creates — each used to hold a DB checkout during HTTP.
+    """Cap concurrent creates — pool-safe sessions (open → HTTP → close).
 
-    48 parallel sessions starved QueuePool (32+40) → /sub «Temporarily unavailable».
-    Keep under pool capacity so login/API/sub always have headroom; 8 was so
-    low that a 30+ panel category user sat pending for minutes after create.
+    Was 4 and left bulk users with 100+ pending accounts for quarter-hours.
+    16 stays under QueuePool headroom while finishing category/bulk waves.
     """
     global _account_prov_sem
     if _account_prov_sem is None:
-        _account_prov_sem = asyncio.Semaphore(4)
+        _account_prov_sem = asyncio.Semaphore(16)
     return _account_prov_sem
 
 

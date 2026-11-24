@@ -112,7 +112,7 @@ class UserBulkCreate(BaseModel):
         max_length=28,
         pattern=r"^[a-zA-Z0-9_]+$",
     )
-    count: int = Field(ge=1, le=50)
+    count: int = Field(ge=1, le=500)
     display_name: str | None = Field(default=None, max_length=64)
     status: UserStatus = UserStatus.active
     data_limit: int = 0

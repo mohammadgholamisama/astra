@@ -984,7 +984,7 @@ export default function UsersPage() {
     return err instanceof Error ? err.message : "خطا در ساخت گروهی";
   })();
 
-  const bulkCountN = Math.min(50, Math.max(0, Math.floor(Number(bulkCount) || 0)));
+  const bulkCountN = Math.min(500, Math.max(0, Math.floor(Number(bulkCount) || 0)));
   const bulkPreviewNames = useMemo(() => {
     const p = bulkPrefix.trim();
     if (!p || bulkCountN < 1) return [];
@@ -2922,7 +2922,7 @@ export default function UsersPage() {
                     type="number"
                     required
                     min={1}
-                    max={50}
+                    max={500}
                     step={1}
                     inputMode="numeric"
                     value={bulkCount}
@@ -2931,7 +2931,9 @@ export default function UsersPage() {
                     placeholder="5"
                     disabled={bulkCreate.isPending}
                   />
-                  <p className="field-hint">حداکثر ۵۰ کاربر در هر بار</p>
+                  <p className="field-hint">
+                    تا ۵۰۰ کاربر در هر بار — ساخت پنل‌ها در پس‌زمینه ادامه می‌یابد
+                  </p>
                 </div>
               </div>
 

@@ -639,6 +639,7 @@ async def create_users_bulk(
 
     if user_ids and panel_id_set:
         specs = list(panel_specs)
+        uids = list(user_ids)
 
         async def _bulk_provision_bg() -> None:
             from app.core.database import AsyncSessionLocal
@@ -646,7 +647,7 @@ async def create_users_bulk(
             try:
                 async with AsyncSessionLocal() as sdb:
                     loaded = await sdb.execute(
-                        select(User).where(User.id.in_(user_ids))
+                        select(User).where(User.id.in_(uids))
                     )
                     bg_users = list(loaded.scalars().all())
                     if not bg_users:
@@ -663,9 +664,16 @@ async def create_users_bulk(
                     ]
                     if not local_panels:
                         return
-                    # wait=0: queue remotes and return — workers keep running.
-                    await orchestrator.provision_users_now(
-                        sdb, bg_users, local_panels, wait=0
+                    n_jobs = max(1, len(bg_users) * max(1, len(local_panels)))
+                    # High-concurrency wave — not the tiny start_account_provisions
+                    # queue that left mamadmamd_* pending for 15+ minutes.
+                    await orchestrator.provision_users_batch(
+                        sdb,
+                        bg_users,
+                        local_panels,
+                        create_timeout=8.0,
+                        concurrency=min(56, max(24, n_jobs)),
+                        overall_timeout=min(180.0, 12.0 + 0.35 * n_jobs),
                     )
                     try:
                         await sdb.commit()
@@ -674,13 +682,43 @@ async def create_users_bulk(
                             await sdb.rollback()
                         except Exception:  # noqa: BLE001
                             pass
-                # Soft heal leftovers without blocking the admin UI.
+
+                # Fill share links so /sub is not empty after remotes land.
+                for uid in uids:
+                    try:
+                        await orchestrator.hydrate_share_links_pool_safe(int(uid))
+                    except Exception:  # noqa: BLE001
+                        log.debug(
+                            "bulk hydrate soft-fail user_id=%s", uid, exc_info=True
+                        )
+
+                # Keep draining any leftover pending/error accounts.
                 try:
                     await orchestrator.heal_failed_panel_accounts_batch(
-                        limit_users=max(10, len(user_ids))
+                        limit_users=max(20, len(uids) * 3)
                     )
                 except Exception:  # noqa: BLE001
                     log.debug("bulk bg heal soft-fail", exc_info=True)
+                try:
+                    pending_ids: list[int] = []
+                    async with AsyncSessionLocal() as sdb:
+                        rows = await sdb.execute(
+                            select(PanelAccount.id).where(
+                                PanelAccount.user_id.in_(uids),
+                                PanelAccount.status.in_(
+                                    (
+                                        PanelAccountStatus.pending,
+                                        PanelAccountStatus.error,
+                                    )
+                                ),
+                            )
+                        )
+                        pending_ids = [int(r[0]) for r in rows.all() if r[0]]
+                        await sdb.rollback()
+                    if pending_ids:
+                        orchestrator.start_account_provisions(pending_ids)
+                except Exception:  # noqa: BLE001
+                    log.debug("bulk leftover enqueue soft-fail", exc_info=True)
             except Exception:  # noqa: BLE001
                 log.exception("bulk background provision failed")
 
@@ -698,7 +736,7 @@ async def create_users_bulk(
         total_requested=len(names),
         remote_bg=bool(user_ids and panel_id_set),
         message=(
-            "کاربران و لینک ساب ساخته شدند — ساخت روی پنل‌ها در پس‌زمینه ادامه دارد"
+            "کاربران و لینک ساب ساخته شدند — ساخت پنل‌ها و کانفیگ در پس‌زمینه با سرعت بالا ادامه دارد"
             if user_ids and panel_id_set
             else ""
         ),
