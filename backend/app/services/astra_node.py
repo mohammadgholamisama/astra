@@ -32,6 +32,11 @@ from app.services.outbound_uri import (
 
 logger = logging.getLogger("astra.node")
 
+# Coalesce rapid per-user upserts into one xray rewrite (was pegging CPU at 100%).
+_REBUILD_TASKS: dict[int, asyncio.Task] = {}
+_REBUILD_META: dict[int, dict[str, Any]] = {}
+_REBUILD_SEM = asyncio.Semaphore(1)
+
 DEFAULT_XRAY_DIR = Path(os.environ.get("ASTRA_XRAY_DIR", "/opt/astra/xray"))
 # CF orange-cloud: Xray on loopback; nginx terminates TLS on CF HTTPS ports.
 DEFAULT_LISTEN_PORT = 11020
@@ -1143,7 +1148,10 @@ async def upsert_client(
         row.limit_ip = int(limit_ip or 0)
     await db.flush()
     if rebuild and needs_xray:
-        await rebuild_xray_config(db, panel, sync_nginx=sync_nginx)
+        # Debounce: dozens of modify_user in a wave must not each rewrite xray.
+        schedule_rebuild_xray(
+            int(panel.id), sync_nginx=sync_nginx, delay=1.2
+        )
     return row
 
 
@@ -1189,6 +1197,50 @@ async def client_usage_and_links(
     outbounds = await list_outbounds(db, panel.id)
     links = _client_links(panel, row, outbounds) if row.enable else []
     return row, links, used
+
+
+def schedule_rebuild_xray(
+    panel_id: int, *, sync_nginx: bool = True, delay: float = 1.2
+) -> None:
+    """Queue one rebuild per panel; rapid calls collapse into a single write."""
+    pid = int(panel_id)
+    meta = _REBUILD_META.get(pid) or {"sync_nginx": False}
+    meta["sync_nginx"] = bool(meta.get("sync_nginx")) or bool(sync_nginx)
+    _REBUILD_META[pid] = meta
+
+    old = _REBUILD_TASKS.get(pid)
+    if old is not None and not old.done():
+        old.cancel()
+
+    async def _run() -> None:
+        try:
+            await asyncio.sleep(max(0.2, float(delay)))
+        except asyncio.CancelledError:
+            raise
+        flags = _REBUILD_META.pop(pid, {"sync_nginx": True})
+        _REBUILD_TASKS.pop(pid, None)
+        from app.core.database import AsyncSessionLocal
+
+        async with _REBUILD_SEM:
+            try:
+                async with AsyncSessionLocal() as db:
+                    panel = (
+                        await db.execute(select(Panel).where(Panel.id == pid))
+                    ).scalar_one_or_none()
+                    if panel is None:
+                        return
+                    await rebuild_xray_config(
+                        db, panel, sync_nginx=bool(flags.get("sync_nginx", True))
+                    )
+                    await db.commit()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("debounced xray rebuild failed panel=%s", pid)
+
+    _REBUILD_TASKS[pid] = asyncio.create_task(
+        _run(), name=f"xray-rebuild-{pid}"
+    )
 
 
 async def rebuild_xray_config(
@@ -1240,7 +1292,8 @@ async def rebuild_xray_config(
             continue
         el = email.lower()
         if el in seen_emails or uid in seen_uuids:
-            logger.warning(
+            # debug — warning spam here burned a full CPU core under batch upserts
+            logger.debug(
                 "skip duplicate xray client panel=%s email=%s uuid=%s",
                 panel.id,
                 email,
