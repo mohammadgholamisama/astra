@@ -51,25 +51,61 @@ class AstraAdapter(BasePanelAdapter):
         raise RuntimeError("پنل Astra پیدا نشد — panel_id در meta لازم است")
 
     async def test_connection(self) -> AdapterResult:
-        """Fast local probe — never rebuild Xray config (that froze test-all)."""
+        """Accurate node + outbound probe — never rebuild Xray (test-all safe).
+
+        Local listen alone is not enough: if every enabled outbound is down,
+        report قطع so operators don't see false «وصل».
+        """
         try:
             panel = await self._load_panel()
-            health = node.node_health(panel)
-            if health.get("ok") or health.get("listen_open") or health.get("config_exists"):
+            health = dict(node.node_health(panel) or {})
+            if not health.get("listen_open"):
+                if health.get("config_exists"):
+                    return AdapterResult(
+                        success=False,
+                        error="نود Astra قطع است — config هست ولی xray گوش نمی‌دهد",
+                        raw=health,
+                    )
                 return AdapterResult(
-                    success=True,
+                    success=False,
+                    error="نود Astra آماده نیست (config/xray)",
                     raw=health,
-                    error=None
-                    if (health.get("ok") or health.get("listen_open"))
-                    else "config هست؛ سرویس xray را استارت کنید",
+                )
+
+            # test-all sets _probe_quick — prefer recent bg pings to avoid
+            # stampede false «قطع» while staying accurate when cache is stale.
+            quick = bool((self.meta or {}).get("_probe_quick"))
+            ob = await node.probe_panel_outbounds_health(
+                int(panel.id),
+                concurrency=2,
+                ping_timeout=5.0 if not quick else 4.0,
+                prefer_cache_sec=180.0 if quick else 0.0,
+            )
+            health["outbounds"] = ob
+            enabled = int(ob.get("enabled") or 0)
+            ok_n = int(ob.get("ok") or 0)
+            if enabled <= 0:
+                return AdapterResult(
+                    success=False,
+                    error="اوتباند فعالی روی این نود نیست",
+                    raw=health,
+                )
+            if ok_n <= 0:
+                bad = int(ob.get("bad") or 0)
+                return AdapterResult(
+                    success=False,
+                    error=f"اوتباند قطع است ({bad}/{enabled})",
+                    raw=health,
                 )
             return AdapterResult(
-                success=False,
-                error="نود Astra آماده نیست (config/xray)",
-                raw=health if isinstance(health, dict) else {},
+                success=True,
+                raw=health,
+                error=None,
             )
         except Exception as e:  # noqa: BLE001
-            return AdapterResult(success=False, error=str(e).strip() or e.__class__.__name__)
+            return AdapterResult(
+                success=False, error=str(e).strip() or e.__class__.__name__
+            )
 
     async def create_user(self, payload: UserPayload) -> AdapterResult:
         return await self._upsert(payload)

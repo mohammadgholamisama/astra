@@ -35,6 +35,20 @@ async def load_user_by_token_light(db: AsyncSession, token: str) -> User | None:
     return result.scalar_one_or_none()
 
 
+async def load_user_by_token_accounts(db: AsyncSession, token: str) -> User | None:
+    """User + panel_accounts(+panel) only — emergency/fast /sub (no groups tree)."""
+    from app.models.user import PanelAccount
+
+    result = await db.execute(
+        select(User)
+        .where(User.sub_token == token)
+        .options(
+            selectinload(User.panel_accounts).selectinload(PanelAccount.panel),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
 async def load_user_by_token(db: AsyncSession, token: str) -> User | None:
     from app.models.group import Group, GroupPanel
     from app.models.user import PanelAccount

@@ -1362,35 +1362,64 @@ async def provision_users_batch(
     if not jobs:
         return {"jobs": 0, "ok": 0, "err": 0, "pending": 0}
 
-    # Same as provision_user_on_panels: defer Astra xray/nginx rebuild until
-    # after the wave so mass Out* creates do not stampede reloads.
-    astra_panel_ids: set[int] = set()
-    for i, (account, panel, payload, user) in enumerate(jobs):
-        if panel.type != PanelType.astra:
-            continue
-        astra_panel_ids.add(int(panel.id))
-        cfg = dict(payload.config or {})
-        cfg["_astra_skip_nginx"] = True
-        cfg["_astra_skip_rebuild"] = True
-        payload.config = cfg
-        jobs[i] = (account, panel, payload, user)
+    # Snapshot ids BEFORE long HTTP — never keep the caller's DB checkout
+    # open across remotes (idle asyncpg dies → flush loses every success).
+    from app.core.database import AsyncSessionLocal
+    from app.api.subscription import invalidate_user_feed_cache
 
-    n_jobs = len(jobs)
-    sem_limit = max(32, min(int(concurrency) or 48, 64, n_jobs))
+    astra_panel_ids: set[int] = set()
+    remote_jobs: list[tuple[int, Panel, UserPayload, str, int]] = []
+    for account, panel, payload, user in jobs:
+        aid = int(account.id)
+        panel = _touch_panel_for_detach(panel)
+        if panel.type == PanelType.astra:
+            astra_panel_ids.add(int(panel.id))
+            cfg = dict(payload.config or {})
+            cfg["_astra_skip_nginx"] = True
+            cfg["_astra_skip_rebuild"] = True
+            payload.config = cfg
+        remote_jobs.append(
+            (
+                aid,
+                panel,
+                payload,
+                str(user.username or ""),
+                int(user.id),
+            )
+        )
+    # End txn AND return the pool checkout before the remote HTTP wave.
+    # Callers must not use ``db`` after this function returns.
+    try:
+        from app.core.database import release_db_txn
+
+        await release_db_txn(db)
+    except Exception:  # noqa: BLE001
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        await db.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+    n_jobs = len(remote_jobs)
+    # Remotes are HTTP-only; keep apply_sem (below) under DB pool capacity.
+    sem_limit = max(12, min(int(concurrency) or 24, 40, n_jobs))
     waves = max(1, (n_jobs + sem_limit - 1) // sem_limit)
     budget = (
         float(overall_timeout)
         if overall_timeout is not None
-        else min(28.0, waves * min(create_timeout, 5.0) + 3.0)
+        else min(45.0, waves * min(create_timeout, 6.0) + 5.0)
     )
     sem = asyncio.Semaphore(sem_limit)
 
     async def _remote(
-        panel: Panel, payload: UserPayload, user: User
+        panel: Panel, payload: UserPayload, astra_username: str
     ) -> AdapterResult:
         adapter = get_adapter(panel)
         panel_timeout = (
-            max(float(create_timeout), 20.0)
+            max(float(create_timeout), 18.0)
             if panel.type == PanelType.astra
             else float(create_timeout)
         )
@@ -1400,13 +1429,13 @@ async def provision_users_batch(
                     create_user_with_collision_alias(
                         adapter,
                         payload,
-                        astra_username=user.username,
+                        astra_username=astra_username,
                         panel_id=panel.id,
                         timeout=panel_timeout,
                         max_alias_attempts=1,
-                        probe_timeout=2.0,
+                        probe_timeout=1.5,
                     ),
-                    timeout=panel_timeout + 0.8,
+                    timeout=panel_timeout + 0.6,
                 )
         except asyncio.CancelledError:
             return _fail_result(_PROVISION_BUDGET_SOFT)
@@ -1419,8 +1448,8 @@ async def provision_users_batch(
                 pass
 
     tasks = [
-        asyncio.create_task(_remote(panel, payload, user))
-        for account, panel, payload, user in jobs
+        asyncio.create_task(_remote(panel, payload, uname))
+        for _aid, panel, payload, uname, _uid in remote_jobs
     ]
     logger.info(
         "bulk provision start users=%s jobs=%s sem=%s budget=%.1fs",
@@ -1429,82 +1458,114 @@ async def provision_users_batch(
         sem_limit,
         budget,
     )
-    done, pending = await asyncio.wait(tasks, timeout=budget)
+    done, _pending = await asyncio.wait(tasks, timeout=budget)
 
-    now = datetime.now(timezone.utc)
+    async def _apply_one(
+        account_id: int,
+        panel_id: int,
+        preferred: str,
+        user_id: int,
+        result: AdapterResult,
+    ) -> str:
+        try:
+            async with AsyncSessionLocal() as sdb:
+                acc = await sdb.get(PanelAccount, int(account_id))
+                if acc is None or acc.status == PanelAccountStatus.deleted:
+                    return "skip"
+                now = datetime.now(timezone.utc)
+                if result.success:
+                    acc.status = PanelAccountStatus.active
+                    acc.remote_username = (
+                        result.remote_username or preferred or acc.remote_username
+                    )
+                    acc.remote_id = result.remote_id or acc.remote_id
+                    acc.uuid = result.uuid or acc.uuid
+                    if result.links:
+                        acc.links = result.links
+                    acc.used_traffic = max(
+                        int(acc.used_traffic or 0), int(result.used_traffic or 0)
+                    )
+                    acc.error_message = None
+                    acc.last_sync_at = now
+                    panel_row = await sdb.get(Panel, int(panel_id))
+                    if panel_row is not None:
+                        panel_row.last_ok_at = now
+                    await sdb.commit()
+                    try:
+                        invalidate_user_feed_cache(int(user_id))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return "ok"
+                if (result.error or "") == _PROVISION_BUDGET_SOFT or _is_timeout_err(
+                    result.error
+                ) or (
+                    _is_unreachable_err(result.error)
+                    and not _is_hard_down_err(result.error)
+                ):
+                    acc.remote_username = acc.remote_username or preferred
+                    acc.error_message = None
+                    if acc.links:
+                        acc.status = PanelAccountStatus.active
+                        acc.last_sync_at = now
+                        await sdb.commit()
+                        return "ok"
+                    acc.status = PanelAccountStatus.pending
+                    await sdb.commit()
+                    return "pend"
+                acc.status = PanelAccountStatus.error
+                acc.error_message = (
+                    result.error or "ایجاد در پنل ناموفق"
+                )[:400]
+                await sdb.commit()
+                return "err"
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "batch apply account=%s failed", account_id, exc_info=True
+            )
+            return "err"
+
     ok_n = 0
     err_n = 0
     pend_n = 0
     leftover: list[tuple[int, asyncio.Task]] = []
     leftover_uids: set[int] = set()
-    for (account, panel, payload, user), task in zip(jobs, tasks):
+    apply_coros = []
+    for (aid, panel, payload, uname, uid), task in zip(remote_jobs, tasks):
+        preferred = (payload.username or uname or "").strip()
         if task not in done:
-            account.status = PanelAccountStatus.pending
-            account.remote_username = (
-                account.remote_username or payload.username or user.username
-            )
-            account.error_message = None
             pend_n += 1
-            leftover.append((int(account.id), task))
-            leftover_uids.add(int(user.id))
+            leftover.append((int(aid), task))
+            leftover_uids.add(int(uid))
             continue
         try:
             result = task.result()
         except Exception as exc:  # noqa: BLE001
             result = _fail_result(_exc_msg(exc) or "خطای پنل")
-        if result.success:
-            account.status = PanelAccountStatus.active
-            account.remote_username = (
-                result.remote_username or payload.username or user.username
-            )
-            account.remote_id = result.remote_id or account.remote_id
-            account.uuid = result.uuid or account.uuid
-            if result.links:
-                account.links = result.links
-            got = int(result.used_traffic or 0)
-            prev = int(account.used_traffic or 0)
-            account.used_traffic = max(prev, got)
-            account.error_message = None
-            account.last_sync_at = now
-            panel.last_ok_at = now
-            ok_n += 1
-        elif (result.error or "") == _PROVISION_BUDGET_SOFT or _is_timeout_err(
-            result.error
-        ) or (
-            _is_unreachable_err(result.error)
-            and not _is_hard_down_err(result.error)
-        ):
-            # Slow/busy panel — pending for heal, not sticky fake error
-            account.remote_username = (
-                account.remote_username or payload.username or user.username
-            )
-            account.error_message = None
-            if account.links:
-                account.status = PanelAccountStatus.active
-                account.last_sync_at = now
-                ok_n += 1
-            else:
-                account.status = PanelAccountStatus.pending
-                pend_n += 1
-        else:
-            account.status = PanelAccountStatus.error
-            account.error_message = _format_remote_error(
-                panel,
-                action="ساخت کاربر",
-                err=result.error or "ایجاد در پنل ناموفق",
-                username=payload.username,
-            )
-            err_n += 1
+        apply_coros.append(
+            _apply_one(int(aid), int(panel.id), preferred, int(uid), result)
+        )
 
-    await db.flush()
-    try:
-        await db.commit()
-    except Exception:  # noqa: BLE001
-        pass
+    if apply_coros:
+        # Parallel short DB writes — keep pool moving.
+        apply_sem = asyncio.Semaphore(8)
+
+        async def _gated(coro):
+            async with apply_sem:
+                return await coro
+
+        applied = await asyncio.gather(
+            *[_gated(c) for c in apply_coros], return_exceptions=True
+        )
+        for item in applied:
+            if item == "ok":
+                ok_n += 1
+            elif item == "pend":
+                pend_n += 1
+            elif item == "err":
+                err_n += 1
 
     if astra_panel_ids and ok_n:
         try:
-            from app.core.database import AsyncSessionLocal
             from app.services import astra_node as astra_node_svc
 
             async with AsyncSessionLocal() as sdb:
@@ -1655,17 +1716,25 @@ _account_prov_sem: asyncio.Semaphore | None = None
 def _get_account_prov_sem() -> asyncio.Semaphore:
     """Cap concurrent creates — pool-safe sessions (open → HTTP → close).
 
-    Was 4 and left bulk users with 100+ pending accounts for quarter-hours.
-    16 stays under QueuePool headroom while finishing category/bulk waves.
+    Was 4/16/32 — leftovers after the main wave still need high fan-out.
     """
     global _account_prov_sem
     if _account_prov_sem is None:
-        _account_prov_sem = asyncio.Semaphore(16)
+        # Keep modest: each leftover opens short DB sessions; too high → QueuePool critical.
+        _account_prov_sem = asyncio.Semaphore(10)
     return _account_prov_sem
 
 
-def _touch_panel_for_detach(panel: Panel) -> Panel:
-    """Force-load attrs so get_adapter works after the session closes."""
+def _touch_panel_for_detach(panel: Panel, db: AsyncSession | None = None) -> Panel:
+    """Force-load attrs so get_adapter works after the session closes.
+
+    Critical: ``Session.rollback()`` expires instances even with
+    ``expire_on_commit=False``. If we only *read* attrs then rollback, the
+    next ``panel.password`` access tries to refresh and raises
+    ``MissingGreenlet`` / ``DetachedInstanceError`` — usage pull then reports
+    success=0 forever while the remote panel already has real traffic.
+    Expunge (or make_transient) after loading so attrs stay in memory.
+    """
     _ = (
         panel.id,
         panel.type,
@@ -1675,9 +1744,21 @@ def _touch_panel_for_detach(panel: Panel) -> Panel:
         getattr(panel, "url", None),
         getattr(panel, "username", None),
         getattr(panel, "password", None),
+        getattr(panel, "api_token", None),
         getattr(panel, "token", None),
-        getattr(panel, "meta", None),
+        getattr(panel, "worker_id", None),
+        dict(getattr(panel, "meta", None) or {}),
     )
+    if db is not None:
+        try:
+            db.expunge(panel)
+        except Exception:  # noqa: BLE001
+            try:
+                from sqlalchemy.orm import make_transient
+
+                make_transient(panel)
+            except Exception:  # noqa: BLE001
+                pass
     return panel
 
 
@@ -3896,6 +3977,7 @@ def _freeze_panel_for_bg(panel: Panel):
 
     _touch_panel_for_detach(panel)
     meta = panel.meta if isinstance(panel.meta, dict) else {}
+    wid = getattr(panel, "worker_id", None)
     return SimpleNamespace(
         id=panel.id,
         type=panel.type,
@@ -3906,6 +3988,8 @@ def _freeze_panel_for_bg(panel: Panel):
         password=panel.password,
         api_token=getattr(panel, "api_token", None),
         meta=dict(meta or {}),
+        # Required so delete/modify bg jobs route through WorkerRoutedAdapter.
+        worker_id=int(wid) if wid is not None else None,
     )
 
 
@@ -4927,6 +5011,9 @@ async def sweep_stale_panel_errors(db: AsyncSession) -> dict[str, int]:
                      OR pa.error_message ILIKE '%PendingRollback%'
                      OR pa.error_message ILIKE '%شلوغ%'
                      OR pa.error_message ILIKE '%waiting for panel response%'
+                     OR pa.error_message ILIKE '%Group not found%'
+                     OR pa.error_message ILIKE '%هنوز ساخته نشده%'
+                     OR pa.error_message ILIKE '%کاربر روی این پنل وجود ندارد%'
                   )
                   AND pa.error_message NOT ILIKE '%401%'
                   AND pa.error_message NOT ILIKE '%unauthorized%'
@@ -7716,7 +7803,8 @@ _LIVE_USAGE_PRIORITY: dict[int, float] = {}
 # starved the panel with QueuePool TimeoutError → «Temporarily unavailable».
 # Cap concurrent usage pulls so interactive /sub + admin keep DB headroom.
 # Keep well under DB_POOL_SIZE — /api/users board must stay responsive.
-_USAGE_PULL_GATE = asyncio.Semaphore(3)
+# 4 is enough with Worker offload; 8 stampeded QueuePool after restart.
+_USAGE_PULL_GATE = asyncio.Semaphore(4)
 
 
 def mark_live_usage_priority(user_id: int) -> None:
@@ -8585,19 +8673,9 @@ async def _refresh_usage_pool_safe_inner(
             uname = (account.remote_username or user.username or "").strip()
             if not uname and not account.remote_id:
                 continue
-            # Touch attrs so get_adapter works on the detached Panel after close.
-            _ = (
-                panel.id,
-                panel.type,
-                panel.name,
-                panel.is_active,
-                getattr(panel, "base_url", None),
-                getattr(panel, "url", None),
-                getattr(panel, "username", None),
-                getattr(panel, "password", None),
-                getattr(panel, "token", None),
-                getattr(panel, "meta", None),
-            )
+            # Expunge after load — rollback would expire password/url and break
+            # get_adapter (usage stuck at 0 while remote already has traffic).
+            panel = _touch_panel_for_detach(panel, db)
             rid = account.remote_id or account.remote_username or uname or None
             pullable.append(
                 (
@@ -8609,6 +8687,7 @@ async def _refresh_usage_pool_safe_inner(
                 )
             )
         # End read txn before any xray/OS/remote await (idle-in-transaction fix).
+        # Panels already expunged above — rollback will not strip their attrs.
         await db.rollback()
     # Session closed → pool connection returned.
 
@@ -8720,12 +8799,14 @@ async def _refresh_usage_pool_safe_inner(
                     if now_m - last >= 60.0:
                         _usage_warn_ts[pid] = now_m
                         logger.info(
-                            "pool-safe get_usage soft-fail user=%s panel=%s: %s",
+                            "pool-safe get_usage soft-fail user=%s panel=%s name=%s: %s",
                             username,
                             pid,
+                            name,
                             _exc_msg(exc),
                         )
-                    return
+                    # Try next candidate name — do not abort the whole panel.
+                    continue
         finally:
             close = getattr(adapter, "close", None)
             if callable(close):
@@ -8848,6 +8929,16 @@ async def _refresh_usage_pool_safe_inner(
                 activated = await activate_on_hold_if_used(db, user)
                 changed = bool(activated) or await enforce_user_quota(db, user)
                 await db.commit()
+                try:
+                    mark_live_usage_priority(int(user_id))
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    from app.api.subscription import invalidate_user_feed_cache
+
+                    invalidate_user_feed_cache(int(user_id))
+                except Exception:  # noqa: BLE001
+                    pass
                 st = getattr(user.status, "value", user.status)
                 blocked_now = user.status in (
                     UserStatus.limited,
@@ -9179,11 +9270,16 @@ async def _freeze_pasarguard_limited_accounts(
                                 uname, hint=hint or None
                             )
                         if uid is None:
-                            acc.status = PanelAccountStatus.error
-                            acc.error_message = (
-                                "PasarGuard user id پیدا نشد؛ خاموش‌سازی ممکن نیست"
-                            )
-                            return False
+                            # Already gone on remote — treat as frozen so quota
+                            # watch stops retrying and the user stays cut.
+                            acc.status = PanelAccountStatus.active
+                            acc.error_message = QUOTA_FROZEN_MARK
+                            try:
+                                acc.links = []
+                            except Exception:  # noqa: BLE001
+                                pass
+                            acc.last_sync_at = datetime.now(timezone.utc)
+                            return True
                         res = await adapter._set_disabled_by_id(uid, True)  # type: ignore[attr-defined]
                         if res.success:
                             acc.remote_id = str(uid)
@@ -9598,6 +9694,32 @@ async def run_quota_watch_cycle() -> dict[str, int]:
         stats["flipped"] += int(bulk.get("flipped") or 0)
     except Exception:  # noqa: BLE001
         logger.warning("quota-watch bulk sync failed", exc_info=True)
+
+    # --- Phase 2.5: recount lagging + raw-over → flip limited (DB-only) ---
+    # Fixes stuck used_traffic and users whose panel meters already exceed limit.
+    try:
+        catchup = await bulk_usage.recount_and_flip_exhausted(
+            limit=600, concurrency=6
+        )
+        stats["checked"] += int(catchup.get("lagging") or 0) + int(
+            catchup.get("raw_over") or 0
+        )
+        stats["flipped"] += int(catchup.get("flipped") or 0)
+        catchup_flip = int(catchup.get("flipped") or 0)
+        if catchup_flip or int(catchup.get("exhausted") or 0):
+            exhausted_now = await bulk_usage.find_exhausted_user_ids(limit=150)
+            if exhausted_now:
+                flipped_ids.extend(exhausted_now)
+                ok_n, fail_n = await _freeze_quota_users(
+                    exhausted_now[:80],
+                    remote_timeout=8.0,
+                    concurrency=10,
+                    wall=24.0,
+                )
+                stats["freeze_ok"] += ok_n
+                stats["freeze_fail"] += fail_n
+    except Exception:  # noqa: BLE001
+        logger.warning("quota-watch recount/flip catchup failed", exc_info=True)
 
     # --- Phase 3a: false «اتمام حجم» (limited but used < limit) → active + unfreeze ---
     try:

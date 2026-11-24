@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import Any
 
@@ -11,6 +12,8 @@ import httpx
 from app.adapters.base import AdapterResult, UserPayload, apply_remote_state
 from app.adapters.http_utils import err_msg, ok_json
 from app.adapters.marzban import MarzbanAdapter
+
+logger = logging.getLogger("astra.adapter.pasarguard")
 
 # Process-wide short cache so Groups UI reopen / multi-panel apply stays snappy.
 # value: (groups, fresh_until, hard_expire) — serve stale until hard_expire while
@@ -258,16 +261,57 @@ class PasarGuardAdapter(MarzbanAdapter):
         )
 
     async def _resolve_group_ids(self, payload: UserPayload) -> list[int]:
-        configured = (
+        """Return remote group ids that actually exist on this panel.
+
+        Stale ``remote_group_ids`` in Astra group×panel config (deleted on the
+        panel) used to make every create fail with «Group not found» and then
+        surface as «کاربر روی این پنل وجود ندارد». Drop missing ids and keep
+        the rest so provision stays fast and accurate.
+        """
+        configured_raw = (
             payload.config.get("remote_group_ids")
             or payload.config.get("group_ids")
             or self.meta.get("default_group_ids")
             or []
         )
-        if configured:
-            return [int(x) for x in configured]
+        configured: list[int] = []
+        for x in configured_raw or []:
+            try:
+                i = int(x)
+            except (TypeError, ValueError):
+                continue
+            if i > 0 and i not in configured:
+                configured.append(i)
 
         groups = await self.list_groups()
+        live_enabled = {
+            int(g["id"])
+            for g in groups
+            if g.get("id") is not None and not g.get("is_disabled")
+        }
+        live_all = {
+            int(g["id"]) for g in groups if g.get("id") is not None
+        }
+
+        if configured:
+            # Prefer enabled; if an id exists but is disabled, still skip it.
+            filtered = [i for i in configured if i in live_enabled]
+            if filtered:
+                dropped = [i for i in configured if i not in live_enabled]
+                if dropped:
+                    logger.warning(
+                        "pasarguard drop missing/disabled group_ids=%s keep=%s url=%s",
+                        dropped,
+                        filtered,
+                        (self.base_url or "")[:80],
+                    )
+                return filtered
+            # Configured ids are all gone — clear error, do not invent all groups.
+            raise RuntimeError(
+                "Group not found — هیچ‌کدام از group_ids تنظیم‌شده روی این پنل "
+                f"نیستند: {configured} (موجود: {sorted(live_all)})"
+            )
+
         ids = [int(g["id"]) for g in groups if not g.get("is_disabled")]
         if ids:
             return ids
@@ -606,6 +650,29 @@ class PasarGuardAdapter(MarzbanAdapter):
                             f"(group_ids={group_ids}): {err}"
                         ),
                     )
+                # Stale group ids slipped through cache — refresh + retry once.
+                if (
+                    attempt < 1
+                    and ("group not found" in low or "group_ids" in low)
+                    and ("not found" in low or "یافت" in err or "پیدا" in err)
+                ):
+                    self._groups_memo = None
+                    from app.adapters import pasarguard as _pg_mod
+
+                    _pg_mod._PG_GROUPS_CACHE.pop(self._groups_cache_key(), None)
+                    try:
+                        group_ids = await self._resolve_group_ids(payload)
+                        body = self._build_pg_body(payload, group_ids)
+                    except Exception as re:  # noqa: BLE001
+                        return AdapterResult(
+                            success=False,
+                            error=(
+                                f"{err} — پس از همگام‌سازی گروه‌ها: "
+                                f"{str(re).strip() or re.__class__.__name__}"
+                            ),
+                        )
+                    await asyncio.sleep(0.15)
+                    continue
                 if resp.status_code in (401, 403) and attempt < 1:
                     self._token = None
                     from app.adapters.marzban import _TOKEN_CACHE
@@ -692,13 +759,12 @@ class PasarGuardAdapter(MarzbanAdapter):
 
         if uid is None:
             if want_disabled:
+                # Remote already gone — treat as successful freeze so Astra
+                # marks ASTRA_QUOTA_FROZEN and stops retrying forever.
                 return AdapterResult(
-                    success=False,
-                    error=(
-                        (mod.error + " | " if mod.error else "")
-                        + "PasarGuard user id پیدا نشد؛ خاموش‌سازی by-id ممکن نیست"
-                    ),
+                    success=True,
                     remote_username=payload.username,
+                    raw={"astra_ghost_frozen": True, "mod_error": mod.error},
                 )
             return mod
 
@@ -713,6 +779,23 @@ class PasarGuardAdapter(MarzbanAdapter):
                     remote_username=payload.username,
                     remote_id=str(uid),
                     raw=dis.raw,
+                )
+            err_l = (dis.error or "").lower()
+            if any(
+                x in err_l
+                for x in (
+                    "not found",
+                    "یافت نشد",
+                    "پیدا نشد",
+                    "وجود ندارد",
+                    "does not exist",
+                )
+            ):
+                return AdapterResult(
+                    success=True,
+                    remote_username=payload.username,
+                    remote_id=str(uid),
+                    raw={"astra_ghost_frozen": True, "disable_error": dis.error},
                 )
             return AdapterResult(
                 success=False,

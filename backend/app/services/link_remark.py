@@ -250,12 +250,16 @@ def _is_digit_char(ch: str) -> bool:
 
 
 def _clip_config_tag(raw: object) -> str:
-    """Keep admin tag; strip only controls/brackets that break client parsers."""
+    """Keep admin tag exactly as typed in Groups (گیگی… / [گیگی…] / …).
+
+    Only strip controls and quotes that break URI fragments. Keep ``[](){}``
+    because admins put them in ``config_tag`` on purpose.
+    """
     tag = " ".join(str(raw or "").split()).strip()
     if not tag:
         return ""
-    # [] {} () and quotes break remark/URI parsing on some v2ray builds
-    tag = re.sub(r"[\x00-\x1f\x7f<>\"'`\[\]{}()]", "", tag)
+    # Quotes / angle brackets break weak URI parsers; keep [] () {} for branding
+    tag = re.sub(r"[\x00-\x1f\x7f<>\"'`]", "", tag)
     tag = re.sub(r"\s+", " ", tag).strip()
     if len(tag) <= _TAG_MAX:
         return tag

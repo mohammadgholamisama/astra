@@ -44,6 +44,34 @@ _ROTATE_CURSOR = 0
 QUOTA_FROZEN_MARK = "ASTRA_QUOTA_FROZEN"
 
 
+def _worker_owns_bulk(panel: Panel) -> bool:
+    """True when a healthy Worker agent already collects this panel's meters."""
+    wid = getattr(panel, "worker_id", None)
+    if not wid:
+        return False
+    try:
+        from app.services.worker_client import worker_health_cached
+
+        ok, _ = worker_health_cached(int(wid))
+        return ok is True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _bulk_local_adapter(adapter: Any) -> Any:
+    """Unwrap WorkerRoutedAdapter so isinstance(_authed) works on failover."""
+    return getattr(adapter, "_local", adapter)
+
+
+async def _close_adapter(adapter: Any) -> None:
+    close = getattr(adapter, "close", None)
+    if callable(close):
+        try:
+            await close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _as_int(raw: object) -> int | None:
     if raw is None or raw == "":
         return None
@@ -96,18 +124,17 @@ async def fetch_sanaei_usage_map(panel: Panel) -> dict[str, int]:
     """email → used bytes from one Sanaei ``inbounds/list`` (all clients)."""
     from app.adapters.sanaei import SanaeiAdapter
 
+    if _worker_owns_bulk(panel):
+        # Healthy worker collect already reports meters — avoid double HTTP.
+        return {}
     adapter = get_adapter(panel)
-    if not isinstance(adapter, SanaeiAdapter):
-        close = getattr(adapter, "close", None)
-        if callable(close):
-            try:
-                await close()
-            except Exception:  # noqa: BLE001
-                pass
+    local = _bulk_local_adapter(adapter)
+    if not isinstance(local, SanaeiAdapter):
+        await _close_adapter(adapter)
         return {}
     out: dict[str, int] = {}
     try:
-        inbounds = await adapter._raw_inbounds_for_usage()
+        inbounds = await local._raw_inbounds_for_usage()
         for inbound in inbounds or []:
             if not isinstance(inbound, dict):
                 continue
@@ -147,12 +174,7 @@ async def fetch_sanaei_usage_map(panel: Panel) -> dict[str, int]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("sanaei bulk usage failed panel=%s: %s", panel.id, exc)
     finally:
-        close = getattr(adapter, "close", None)
-        if callable(close):
-            try:
-                await close()
-            except Exception:  # noqa: BLE001
-                pass
+        await _close_adapter(adapter)
     return out
 
 
@@ -162,21 +184,20 @@ async def fetch_panel_usage_map(
     """username → used_traffic bytes via GET /api/users (paginated)."""
     if panel.type not in _BULK_TYPES:
         return {}
+    if _worker_owns_bulk(panel):
+        # Worker agent owns full concurrent collect for assigned healthy panels.
+        return {}
     if panel.type == PanelType.sanaei:
         return await fetch_sanaei_usage_map(panel)
     adapter = get_adapter(panel)
-    if not isinstance(adapter, MarzbanAdapter):
-        close = getattr(adapter, "close", None)
-        if callable(close):
-            try:
-                await close()
-            except Exception:  # noqa: BLE001
-                pass
+    local = _bulk_local_adapter(adapter)
+    if not isinstance(local, MarzbanAdapter):
+        await _close_adapter(adapter)
         return {}
 
     out: dict[str, int] = {}
     try:
-        client, headers = await adapter._authed()
+        client, headers = await local._authed()
         timeout = httpx.Timeout(25.0, connect=8.0)
         offset = 0
         for _ in range(max(1, int(max_pages))):
@@ -222,12 +243,7 @@ async def fetch_panel_usage_map(
     except Exception as exc:  # noqa: BLE001
         logger.warning("bulk users failed panel=%s: %s", panel.id, exc)
     finally:
-        close = getattr(adapter, "close", None)
-        if callable(close):
-            try:
-                await close()
-            except Exception:  # noqa: BLE001
-                pass
+        await _close_adapter(adapter)
     return out
 
 
@@ -355,7 +371,7 @@ async def apply_usage_map_to_panel(
     now = datetime.now(timezone.utc)
     dirty: set[int] = set()
     matched = 0
-    for acc, astra_uname in rows:
+    for i, (acc, astra_uname) in enumerate(rows):
         got_i = _lookup_usage_bytes(
             usage_exact,
             usage_lower,
@@ -372,6 +388,9 @@ async def apply_usage_map_to_panel(
             continue
         matched += 1
         _apply_got_to_account(acc, int(got_i), now=now, dirty=dirty)
+        # Yield so create/delete/API stay responsive during huge panel maps.
+        if i and i % 250 == 0:
+            await asyncio.sleep(0)
     if rows and matched < max(1, len(rows) // 4):
         logger.warning(
             "bulk match sparse panel=%s accounts=%s matched=%s map=%s dirty=%s",
@@ -428,7 +447,7 @@ async def heal_zero_accounts_via_get_usage(
                 .limit(max(1, int(limit)))
             )
         ).all()
-        # Touch panel attrs for detached get_adapter use
+        # Touch panel attrs for detached get_adapter use (incl. worker route)
         _ = (
             panel.id,
             panel.type,
@@ -438,7 +457,9 @@ async def heal_zero_accounts_via_get_usage(
             getattr(panel, "url", None),
             getattr(panel, "username", None),
             getattr(panel, "password", None),
+            getattr(panel, "api_token", None),
             getattr(panel, "token", None),
+            getattr(panel, "worker_id", None),
             getattr(panel, "meta", None),
         )
 
@@ -641,23 +662,76 @@ async def sync_one_panel_bulk(
         if panel is None or not panel.is_active or panel.type not in _BULK_TYPES:
             return {"accounts": 0, "dirty": 0, "flipped": 0, "listed": 0}
         pid = int(panel.id)
+        # Keep worker_id / creds after session closes for get_adapter routing.
+        _ = (
+            panel.id,
+            panel.type,
+            panel.is_active,
+            getattr(panel, "base_url", None),
+            getattr(panel, "username", None),
+            getattr(panel, "password", None),
+            getattr(panel, "api_token", None),
+            getattr(panel, "worker_id", None),
+            dict(getattr(panel, "meta", None) or {}),
+        )
         panel_ref = panel
+        if _worker_owns_bulk(panel_ref):
+            return {
+                "accounts": 0,
+                "dirty": 0,
+                "flipped": 0,
+                "listed": 0,
+                "worker_owned": 1,
+            }
+        from sqlalchemy import func as _func
+
+        acc_n = int(
+            (
+                await db.execute(
+                    select(_func.count())
+                    .select_from(PanelAccount)
+                    .where(
+                        PanelAccount.panel_id == pid,
+                        PanelAccount.status.in_(
+                            (
+                                PanelAccountStatus.active,
+                                PanelAccountStatus.error,
+                            )
+                        ),
+                    )
+                )
+            ).scalar()
+            or 0
+        )
     usage_map = await fetch_panel_usage_map(panel_ref)
     dirty: set[int] = set()
+    matched_dirty = 0
     if usage_map:
         async with AsyncSessionLocal() as db:
             dirty = await apply_usage_map_to_panel(db, pid, usage_map)
+            matched_dirty = len(dirty)
             await db.commit()
-    # Always try per-account heal for remotes still at 0 (alias miss / empty map)
-    try:
-        healed = await heal_zero_accounts_via_get_usage(
-            panel_ref,
-            limit=500 if panel_ref.type == PanelType.pasarguard else 250,
-            concurrency=24 if panel_ref.type == PanelType.pasarguard else 16,
-        )
-        dirty |= healed
-    except Exception:  # noqa: BLE001
-        logger.warning("heal-zero panel=%s failed", pid, exc_info=True)
+    # Per-account heal is expensive (1 HTTP each). Only for sparse map / small miss
+    # set — unbounded heal was hanging fleet for tens of minutes per panel.
+    map_ratio = (len(usage_map) / acc_n) if acc_n > 0 else 0.0
+    need_heal = (not usage_map) or map_ratio < 0.35 or matched_dirty < max(1, acc_n // 20)
+    if need_heal:
+        heal_lim = 60 if panel_ref.type == PanelType.pasarguard else 40
+        heal_conc = 8 if panel_ref.type == PanelType.pasarguard else 6
+        try:
+            healed = await asyncio.wait_for(
+                heal_zero_accounts_via_get_usage(
+                    panel_ref,
+                    limit=heal_lim,
+                    concurrency=heal_conc,
+                ),
+                timeout=45.0,
+            )
+            dirty |= healed
+        except asyncio.TimeoutError:
+            logger.warning("heal-zero panel=%s timed out", pid)
+        except Exception:  # noqa: BLE001
+            logger.warning("heal-zero panel=%s failed", pid, exc_info=True)
 
     if not usage_map and not dirty:
         return {"accounts": 0, "dirty": 0, "flipped": 0, "listed": 0}
@@ -665,9 +739,13 @@ async def sync_one_panel_bulk(
     recount_ids = list(dict.fromkeys(int(x) for x in dirty))
     flipped: list[int] = []
     if recount and recount_ids:
-        flipped = await recount_users_usage(
-            recount_ids, concurrency=max(8, int(recount_concurrency))
-        )
+        # Cap hard — high concurrency was exhausting QueuePool and freezing
+        # live meters for consuming users while fleet recounted hundreds.
+        conc = max(2, min(4, int(recount_concurrency)))
+        # Prefer largest deltas first; defer the long tail to the next rotate.
+        if len(recount_ids) > 80:
+            recount_ids = recount_ids[:80]
+        flipped = await recount_users_usage(recount_ids, concurrency=conc)
     try:
         from app.services import user_analytics as analytics_svc
 
@@ -694,12 +772,16 @@ async def sync_one_panel_bulk(
 
 
 async def sync_panels_bulk_rotate(*, max_panels: int = 3) -> dict[str, int]:
-    """Round-robin bulk sync across Marzban-family panels."""
+    """Round-robin bulk sync across Marzban-family panels.
+
+    Skips panels owned by a healthy Worker (agent collect reports meters).
+    When the worker is down/unknown, those panels stay in rotation (failover).
+    """
     global _ROTATE_CURSOR
     async with AsyncSessionLocal() as db:
         rows = (
             await db.execute(
-                select(Panel.id)
+                select(Panel.id, Panel.worker_id)
                 .where(
                     Panel.is_active.is_(True),
                     Panel.type.in_(tuple(_BULK_TYPES)),
@@ -707,9 +789,20 @@ async def sync_panels_bulk_rotate(*, max_panels: int = 3) -> dict[str, int]:
                 .order_by(Panel.id.asc())
             )
         ).all()
-    ids = [int(r[0]) for r in rows]
+    ids: list[int] = []
+    for pid, wid in rows:
+        if wid:
+            try:
+                from app.services.worker_client import worker_health_cached
+
+                ok, _ = worker_health_cached(int(wid))
+                if ok is True:
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+        ids.append(int(pid))
     if not ids:
-        return {"panels": 0, "dirty": 0, "flipped": 0, "listed": 0}
+        return {"panels": 0, "dirty": 0, "flipped": 0, "listed": 0, "skipped_worker": 1}
 
     n = max(1, min(int(max_panels), len(ids)))
     start = _ROTATE_CURSOR % len(ids)
@@ -739,12 +832,15 @@ async def sync_all_panels_bulk(
     recount: bool = True,
     recount_concurrency: int = 28,
 ) -> dict[str, int]:
-    """Pull usage from EVERY active Marzban-family panel in parallel."""
+    """Pull usage from EVERY active Marzban-family panel in parallel.
+
+    Healthy worker-owned panels are skipped (agent reports meters).
+    """
     t0 = time.monotonic()
     async with AsyncSessionLocal() as db:
         rows = (
             await db.execute(
-                select(Panel.id)
+                select(Panel.id, Panel.worker_id)
                 .where(
                     Panel.is_active.is_(True),
                     Panel.type.in_(tuple(_BULK_TYPES)),
@@ -752,7 +848,18 @@ async def sync_all_panels_bulk(
                 .order_by(Panel.id.asc())
             )
         ).all()
-    ids = [int(r[0]) for r in rows]
+    ids: list[int] = []
+    for pid, wid in rows:
+        if wid:
+            try:
+                from app.services.worker_client import worker_health_cached
+
+                ok, _ = worker_health_cached(int(wid))
+                if ok is True:
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+        ids.append(int(pid))
     if not ids:
         return {"panels": 0, "dirty": 0, "flipped": 0, "listed": 0, "dt": 0}
 
@@ -863,19 +970,132 @@ async def recount_all_live_users(
 _FLEET_CYCLE_N = 0
 
 
-async def run_fleet_usage_cycle() -> dict[str, int]:
-    """Full-fleet usage: Astra Xray + all remote panels + dirty recount.
+async def find_lagging_usage_user_ids(*, limit: int = 800) -> list[int]:
+    """Users whose live panel meters already exceed stored used_traffic (DB only).
 
-    Full recount of every user runs every 5th cycle so hot /sub users are not
-    starved behind a multi-minute Σ over the whole install.
+    Deleted rows are ignored — migrations inflate raw Σ and falsely look like
+    lag forever when weighted ``used_traffic`` (with coeffs) is already correct.
+    Also catch used=0 while live meters exist.
+    """
+    from sqlalchemy import text
+
+    lim = max(1, min(5000, int(limit)))
+    async with AsyncSessionLocal() as db:
+        rows = (
+            await db.execute(
+                text(
+                    """
+                    SELECT u.id
+                    FROM users u
+                    JOIN panel_accounts pa ON pa.user_id = u.id
+                      AND pa.status IN ('active', 'error', 'pending')
+                    WHERE u.status IN ('active', 'on_hold', 'limited')
+                    GROUP BY u.id, u.used_traffic
+                    HAVING (
+                        coalesce(
+                          sum(
+                            pa.used_traffic
+                            * coalesce(pa.applied_coefficient, 1.0)
+                          ),
+                          0
+                        )
+                          > coalesce(u.used_traffic, 0) + (20 * 1024 * 1024)
+                      )
+                      OR (
+                        coalesce(u.used_traffic, 0) = 0
+                        AND coalesce(sum(pa.used_traffic), 0) > (2 * 1024 * 1024)
+                      )
+                    ORDER BY (
+                      coalesce(
+                        sum(
+                          pa.used_traffic
+                          * coalesce(pa.applied_coefficient, 1.0)
+                        ),
+                        0
+                      ) - coalesce(u.used_traffic, 0)
+                    ) DESC
+                    LIMIT :lim
+                    """
+                ),
+                {"lim": lim},
+            )
+        ).all()
+    return [int(r[0]) for r in rows]
+
+
+async def find_stale_sync_user_ids(
+    *,
+    older_than_sec: int = 90,
+    limit: int = 24,
+) -> list[int]:
+    """Active users whose panel meters have not been pulled recently.
+
+    Fleet rotate can leave a panel for several minutes; these ids must be
+    live-pulled so consuming clients never sit on a frozen used_traffic.
+    """
+    from sqlalchemy import text
+
+    age = max(30, int(older_than_sec))
+    lim = max(1, min(200, int(limit)))
+    async with AsyncSessionLocal() as db:
+        rows = (
+            await db.execute(
+                text(
+                    """
+                    SELECT u.id
+                    FROM users u
+                    JOIN panel_accounts pa ON pa.user_id = u.id
+                      AND pa.status IN ('active', 'error')
+                    WHERE u.status IN ('active', 'on_hold', 'limited')
+                    GROUP BY u.id
+                    HAVING
+                      min(pa.last_sync_at) IS NULL
+                      OR min(pa.last_sync_at)
+                           < now() - make_interval(secs => :age)
+                    ORDER BY min(pa.last_sync_at) NULLS FIRST
+                    LIMIT :lim
+                    """
+                ),
+                {"age": age, "lim": lim},
+            )
+        ).all()
+        await db.rollback()
+    return [int(r[0]) for r in rows]
+
+
+async def recount_lagging_users(
+    *, limit: int = 800, concurrency: int = 6
+) -> dict[str, int]:
+    """Fix used_traffic=0 / lag when panel_accounts already have meters."""
+    ids = await find_lagging_usage_user_ids(limit=limit)
+    if not ids:
+        return {"users": 0, "flipped": 0}
+    flipped = await recount_users_usage(ids, concurrency=max(2, int(concurrency)))
+    logger.info(
+        "lagging recount users=%s flipped=%s",
+        len(ids),
+        len(list(dict.fromkeys(flipped))),
+    )
+    return {
+        "users": len(ids),
+        "flipped": len(list(dict.fromkeys(flipped))),
+    }
+
+
+async def run_fleet_usage_cycle(*, rotate_only: bool = False) -> dict[str, int]:
+    """Fleet usage: Astra + remote bulk (full or rotate) + lagging recount.
+
+    ``rotate_only`` pulls a slice of panels each tick so meters stay fresh
+    without a multi-minute full pass blocking the event loop.
     """
     global _FLEET_CYCLE_N
     from app.services.orchestrator import sync_all_astra_traffic
 
     t0 = time.monotonic()
     _FLEET_CYCLE_N += 1
-    # Full recount of every user is the heavy path — rare so API stays snappy.
-    full_pass = _FLEET_CYCLE_N % 12 == 1
+    # Full panel sweep less often; rotate keeps accuracy between sweeps.
+    full_panels = (not rotate_only) and (_FLEET_CYCLE_N % 8 == 1)
+    full_recount = _FLEET_CYCLE_N % 16 == 1
     stats: dict[str, int] = {
         "astra_panels": 0,
         "panels": 0,
@@ -883,15 +1103,27 @@ async def run_fleet_usage_cycle() -> dict[str, int]:
         "dirty": 0,
         "flipped": 0,
         "recount_users": 0,
-        "full_pass": int(full_pass),
+        "lagging": 0,
+        "full_pass": int(full_panels),
+        "rotate": int(not full_panels),
     }
     try:
-        from app.core.database import pool_pressure_blocks_background
+        from app.core.database import pool_pressure_blocks_fleet
 
-        if pool_pressure_blocks_background():
+        if pool_pressure_blocks_fleet():
+            # Still try lagging recount — DB-only, fixes used=0 when meters exist.
+            try:
+                lag = await recount_lagging_users(limit=400, concurrency=4)
+                stats["lagging"] = int(lag.get("users") or 0)
+                stats["flipped"] += int(lag.get("flipped") or 0)
+            except Exception:  # noqa: BLE001
+                pass
             stats["skipped_pool"] = 1
             stats["dt"] = int(time.monotonic() - t0)
-            logger.warning("fleet usage skipped — db pool under pressure")
+            logger.warning(
+                "fleet remote skipped (critical pool) — lagging=%s",
+                stats["lagging"],
+            )
             return stats
     except Exception:  # noqa: BLE001
         pass
@@ -901,9 +1133,14 @@ async def run_fleet_usage_cycle() -> dict[str, int]:
         logger.warning("fleet astra sync failed", exc_info=True)
 
     try:
-        bulk = await sync_all_panels_bulk(
-            concurrency=2, recount=True, recount_concurrency=3
-        )
+        if full_panels:
+            bulk = await sync_all_panels_bulk(
+                concurrency=3, recount=True, recount_concurrency=4
+            )
+        else:
+            # 4/tick: full PasarGuard list is heavy; more panels starved the DB pool
+            # and froze hot priority pulls (used_traffic stuck while remote grew).
+            bulk = await sync_panels_bulk_rotate(max_panels=4)
         stats["panels"] = int(bulk.get("panels") or 0)
         stats["listed"] = int(bulk.get("listed") or 0)
         stats["dirty"] = int(bulk.get("dirty") or 0)
@@ -911,9 +1148,49 @@ async def run_fleet_usage_cycle() -> dict[str, int]:
     except Exception:  # noqa: BLE001
         logger.warning("fleet remote bulk failed", exc_info=True)
 
-    if full_pass:
+    # Always close the user.used_traffic gap from meters already on disk.
+    # Prefer dirty ids left by worker usage-report queue (cheap, accurate).
+    try:
+        from app.services.worker_ops import drain_report_dirty_for_recount
+
+        report_dirty = await drain_report_dirty_for_recount(
+            limit=600 if full_panels else 350
+        )
+        if report_dirty:
+            flipped_rep = await recount_users_usage(
+                report_dirty, concurrency=3
+            )
+            stats["flipped"] += len(list(dict.fromkeys(flipped_rep)))
+            stats["report_dirty"] = len(report_dirty)
+    except Exception:  # noqa: BLE001
+        logger.warning("fleet report-dirty recount failed", exc_info=True)
+
+    try:
+        # Lighter when workers own most remote panels — avoid competing with
+        # the usage-report queue on the single event-loop core.
+        lag = await recount_lagging_users(
+            limit=500 if full_panels else 280,
+            concurrency=3,
+        )
+        stats["lagging"] = int(lag.get("users") or 0)
+        stats["flipped"] += int(lag.get("flipped") or 0)
+    except Exception:  # noqa: BLE001
+        logger.warning("fleet lagging recount failed", exc_info=True)
+
+    # Raw meters already past data_limit but used_traffic lagged → flip+ready freeze
+    try:
+        catch = await recount_and_flip_exhausted(limit=500, concurrency=5)
+        stats["lagging"] = max(
+            int(stats.get("lagging") or 0), int(catch.get("lagging") or 0)
+        )
+        stats["flipped"] += int(catch.get("flipped") or 0)
+        stats["raw_over"] = int(catch.get("raw_over") or 0)
+    except Exception:  # noqa: BLE001
+        logger.warning("fleet recount/flip exhausted failed", exc_info=True)
+
+    if full_recount:
         try:
-            full = await recount_all_live_users(concurrency=3, chunk=300)
+            full = await recount_all_live_users(concurrency=4, chunk=400)
             stats["recount_users"] = int(full.get("users") or 0)
             stats["flipped"] += int(full.get("flipped") or 0)
         except Exception:  # noqa: BLE001
@@ -922,13 +1199,14 @@ async def run_fleet_usage_cycle() -> dict[str, int]:
     stats["dt"] = int(time.monotonic() - t0)
     logger.info(
         "fleet usage cycle astra=%s panels=%s listed=%s dirty=%s "
-        "recount=%s full=%s flipped=%s dt=%ss",
+        "lagging=%s recount=%s full=%s flipped=%s dt=%ss",
         stats["astra_panels"],
         stats["panels"],
         stats["listed"],
         stats["dirty"],
+        stats["lagging"],
         stats["recount_users"],
-        full_pass,
+        full_panels,
         stats["flipped"],
         stats["dt"],
     )
@@ -950,6 +1228,103 @@ async def find_exhausted_user_ids(*, limit: int = 200) -> list[int]:
             {"lim": max(1, int(limit))},
         )
         return [int(x) for (x,) in result.all()]
+
+
+async def find_raw_over_limit_user_ids(*, limit: int = 400) -> list[int]:
+    """Active users where Σ *live* panel raw meters already exceed data_limit.
+
+    Deleted meters are excluded (migrations inflate totals). Lagging
+    ``users.used_traffic`` after live meters pass the limit means remotes
+    stay online until recount+enforce flips them.
+    """
+    from sqlalchemy import text
+
+    lim = max(1, min(2000, int(limit)))
+    async with AsyncSessionLocal() as db:
+        rows = (
+            await db.execute(
+                text(
+                    """
+                    SELECT u.id
+                    FROM users u
+                    JOIN panel_accounts pa ON pa.user_id = u.id
+                      AND pa.status IN ('active', 'error', 'pending')
+                    WHERE u.status = 'active'
+                      AND u.data_limit > 0
+                    GROUP BY u.id, u.data_limit, u.used_traffic
+                    HAVING coalesce(sum(pa.used_traffic), 0) >= u.data_limit
+                       AND coalesce(u.used_traffic, 0) < u.data_limit
+                    ORDER BY (coalesce(sum(pa.used_traffic), 0) - coalesce(u.used_traffic, 0)) DESC
+                    LIMIT :lim
+                    """
+                ),
+                {"lim": lim},
+            )
+        ).all()
+    return [int(r[0]) for r in rows]
+
+
+async def recount_and_flip_exhausted(
+    *, limit: int = 500, concurrency: int = 6
+) -> dict[str, int]:
+    """Recount lagging / raw-over users, flip quota, return flip counts."""
+    from sqlalchemy.orm import selectinload
+
+    from app.services.orchestrator import (
+        enforce_user_quota,
+        recount_user_used_traffic,
+    )
+
+    lag_ids = await find_lagging_usage_user_ids(limit=limit)
+    raw_ids = await find_raw_over_limit_user_ids(limit=max(100, limit // 2))
+    ids = list(dict.fromkeys([*lag_ids, *raw_ids]))
+    flipped = 0
+    if ids:
+        flipped = len(
+            await recount_users_usage(ids, concurrency=max(2, int(concurrency)))
+        )
+    # Anyone still active with used >= limit after recount
+    exhausted = await find_exhausted_user_ids(limit=limit)
+    extra = 0
+    for uid in exhausted:
+        try:
+            async with AsyncSessionLocal() as db:
+                user = (
+                    await db.execute(
+                        select(User)
+                        .where(User.id == int(uid))
+                        .options(
+                            selectinload(User.panel_accounts).selectinload(
+                                PanelAccount.panel
+                            ),
+                            selectinload(User.groups),
+                        )
+                    )
+                ).scalar_one_or_none()
+                if user is None:
+                    continue
+                await recount_user_used_traffic(db, user)
+                if await enforce_user_quota(db, user):
+                    extra += 1
+                await db.commit()
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "recount_and_flip user_id=%s failed", uid, exc_info=True
+            )
+    logger.info(
+        "recount_and_flip lag=%s raw_over=%s flipped=%s extra=%s exhausted=%s",
+        len(lag_ids),
+        len(raw_ids),
+        flipped,
+        extra,
+        len(exhausted),
+    )
+    return {
+        "lagging": len(lag_ids),
+        "raw_over": len(raw_ids),
+        "flipped": flipped + extra,
+        "exhausted": len(exhausted),
+    }
 
 
 async def find_time_expired_user_ids(*, limit: int = 300) -> list[int]:
@@ -1006,12 +1381,15 @@ async def find_limited_needing_freeze_ids(*, limit: int = 200) -> list[int]:
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             text(
-                "SELECT DISTINCT u.id FROM users u "
-                "JOIN panel_accounts pa ON pa.user_id = u.id "
-                "JOIN panels p ON p.id = pa.panel_id AND p.is_active IS TRUE "
+                "SELECT u.id FROM users u "
                 "WHERE u.status IN ('limited', 'expired') "
-                "AND pa.status IN ('active', 'error', 'pending') "
-                "AND COALESCE(pa.error_message, '') <> :mark "
+                "AND EXISTS ("
+                "  SELECT 1 FROM panel_accounts pa "
+                "  JOIN panels p ON p.id = pa.panel_id AND p.is_active IS TRUE "
+                "  WHERE pa.user_id = u.id "
+                "  AND pa.status IN ('active', 'error', 'pending') "
+                "  AND COALESCE(pa.error_message, '') <> :mark"
+                ") "
                 "ORDER BY CASE WHEN u.status = 'expired' THEN 0 ELSE 1 END, "
                 "u.id DESC LIMIT :lim"
             ),
@@ -1027,13 +1405,16 @@ async def find_expired_needing_freeze_ids(*, limit: int = 200) -> list[int]:
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             text(
-                "SELECT DISTINCT u.id FROM users u "
-                "JOIN panel_accounts pa ON pa.user_id = u.id "
-                "JOIN panels p ON p.id = pa.panel_id AND p.is_active IS TRUE "
+                "SELECT u.id FROM users u "
                 "WHERE u.status = 'expired' "
-                "AND pa.status IN ('active', 'error', 'pending') "
-                "AND COALESCE(pa.error_message, '') <> :mark "
-                "ORDER BY u.expire ASC, u.id DESC LIMIT :lim"
+                "AND EXISTS ("
+                "  SELECT 1 FROM panel_accounts pa "
+                "  JOIN panels p ON p.id = pa.panel_id AND p.is_active IS TRUE "
+                "  WHERE pa.user_id = u.id "
+                "  AND pa.status IN ('active', 'error', 'pending') "
+                "  AND COALESCE(pa.error_message, '') <> :mark"
+                ") "
+                "ORDER BY u.expire ASC NULLS LAST, u.id DESC LIMIT :lim"
             ),
             {"lim": max(1, int(limit)), "mark": QUOTA_FROZEN_MARK},
         )

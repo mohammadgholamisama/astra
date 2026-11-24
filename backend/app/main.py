@@ -29,6 +29,7 @@ from app.api import (
     system,
     templates,
     users,
+    workers as workers_api,
 )
 # ensure new models are registered for schema sync
 from app.models import astra_outbound as _astra_outbound_model  # noqa: F401
@@ -39,6 +40,7 @@ from app.models import group_config_hide as _group_config_hide_model  # noqa: F4
 from app.models import site_setting as _site_setting_model  # noqa: F401
 from app.models import user_analytics as _user_analytics_model  # noqa: F401
 from app.models import panel_analytics as _panel_analytics_model  # noqa: F401
+from app.models import worker as _worker_model  # noqa: F401
 from app.models.user import PanelAccount, User, UserStatus
 from app.core.config import get_settings
 from app.core.database import (
@@ -284,11 +286,54 @@ async def _usage_sync_loop() -> None:
         t0 = _time.monotonic()
         elapsed = 0.0
         try:
-            from app.core.database import pool_pressure_blocks_background
+            from app.core.database import (
+                pool_pressure_blocks_background,
+                pool_pressure_blocks_fleet,
+            )
 
+            # Under high pool pressure still do DB-only recount+flip so
+            # used_traffic catches meters and over-limit users get limited.
             if pool_pressure_blocks_background():
-                logger.warning("quota watch deferred — db pool under pressure")
-                await asyncio.sleep(45)
+                if pool_pressure_blocks_fleet():
+                    logger.warning(
+                        "quota watch deferred — db pool critical"
+                    )
+                    await asyncio.sleep(30)
+                    continue
+                try:
+                    from app.services import panel_usage_bulk as bulk_usage
+
+                    light = await bulk_usage.recount_and_flip_exhausted(
+                        limit=400, concurrency=4
+                    )
+                    exhausted = await bulk_usage.find_exhausted_user_ids(
+                        limit=80
+                    )
+                    freeze_ok = freeze_fail = 0
+                    if exhausted:
+                        from app.services.orchestrator import (
+                            _freeze_quota_users,
+                        )
+
+                        freeze_ok, freeze_fail = await _freeze_quota_users(
+                            exhausted[:60],
+                            remote_timeout=6.0,
+                            concurrency=8,
+                            wall=18.0,
+                        )
+                    logger.warning(
+                        "quota watch light (pool high): lag=%s raw=%s "
+                        "flipped=%s exhausted=%s freeze_ok=%s freeze_fail=%s",
+                        light.get("lagging"),
+                        light.get("raw_over"),
+                        light.get("flipped"),
+                        light.get("exhausted"),
+                        freeze_ok,
+                        freeze_fail,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("quota watch light cycle failed")
+                await asyncio.sleep(35)
                 continue
             sem = background_db_sem()
             await sem.acquire()
@@ -318,46 +363,56 @@ async def _usage_sync_loop() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("quota watch loop failed")
             elapsed = _time.monotonic() - t0
-        interval = max(300, int(settings.USAGE_REFRESH_SECONDS or 300))
+        interval = max(90, int(settings.USAGE_REFRESH_SECONDS or 120))
         # Heavy cycle → cool down so we don't re-enter while remotes still drain CPU
         if elapsed > interval:
-            cooldown = min(120.0, max(float(interval), elapsed * 0.5))
+            cooldown = min(120.0, max(float(interval), elapsed * 0.4))
         else:
             cooldown = max(60.0, float(interval) - elapsed)
+        try:
+            from app.services.worker_client import any_worker_healthy
+            from app.services.worker_ops import usage_report_queue_stats
+
+            if any_worker_healthy():
+                cooldown = max(cooldown, 100.0)
+            if int(usage_report_queue_stats().get("qsize") or 0) >= 6:
+                cooldown = max(cooldown, 140.0)
+        except Exception:  # noqa: BLE001
+            pass
         await asyncio.sleep(cooldown)
 
 
 async def _fleet_usage_loop() -> None:
-    """Periodic full-fleet pull. Live accuracy relies on hot/sub + remaining caps."""
+    """Cadenced fleet/rotate bulk — must NOT hold background_db_sem for HTTP.
+
+    Holding the single BG slot for a full fleet pass starved meters for hours
+    (panel_accounts last_sync stale → users.used_traffic stuck at 0).
+    """
     import time as _time
 
-    from app.core.database import background_db_sem
     from app.services.panel_usage_bulk import run_fleet_usage_cycle
 
-    # Boot delay — let quota/hot settle before the heavy fleet pass.
-    await asyncio.sleep(45)
+    # Let boot upserts settle so fleet does not compete for every pool slot.
+    await asyncio.sleep(35)
     while True:
         t0 = _time.monotonic()
         try:
-            from app.core.database import pool_pressure_blocks_background
+            from app.core.database import pool_pressure_blocks_fleet
 
-            if pool_pressure_blocks_background():
-                logger.warning("fleet usage deferred — db pool under pressure")
-                await asyncio.sleep(60)
+            if pool_pressure_blocks_fleet():
+                logger.warning("fleet usage deferred — db pool critical")
+                await asyncio.sleep(25)
                 continue
-            sem = background_db_sem()
-            await sem.acquire()
-            try:
-                stats = await run_fleet_usage_cycle()
-            finally:
-                sem.release()
+            # No background_db_sem around HTTP — cycle uses short sessions only.
+            stats = await run_fleet_usage_cycle(rotate_only=True)
             logger.info(
                 "fleet usage: astra=%s panels=%s listed=%s dirty=%s "
-                "recount=%s flipped=%s dt=%ss",
+                "lagging=%s recount=%s flipped=%s dt=%ss",
                 stats.get("astra_panels"),
                 stats.get("panels"),
                 stats.get("listed"),
                 stats.get("dirty"),
+                stats.get("lagging"),
                 stats.get("recount_users"),
                 stats.get("flipped"),
                 stats.get("dt"),
@@ -366,139 +421,239 @@ async def _fleet_usage_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("fleet usage loop failed")
-        interval = max(300, int(getattr(settings, "USAGE_FLEET_SECONDS", 360) or 360))
+        interval = max(90, int(getattr(settings, "USAGE_FLEET_SECONDS", 120) or 120))
+        # When a worker is healthy, stretch fleet — it owns remote bulk meters.
+        try:
+            from app.services.worker_client import any_worker_healthy
+            from app.services.worker_ops import usage_report_queue_stats
+
+            if any_worker_healthy():
+                interval = max(interval, 150)
+            if int(usage_report_queue_stats().get("qsize") or 0) >= 8:
+                interval = max(interval, 180)
+        except Exception:  # noqa: BLE001
+            pass
         elapsed = _time.monotonic() - t0
-        # After a long fleet pass, always rest so API/SSH keep CPU headroom.
-        await asyncio.sleep(max(120.0, float(interval) - elapsed))
+        await asyncio.sleep(max(60.0, float(interval) - elapsed))
 
 
 async def _hot_usage_loop() -> None:
-    """Cadenced live-pull for recent /sub users — shares background_db_sem."""
+    """Cadenced live-pull for recent /sub users — short sessions, no BG-sem hold."""
     import time as _time
 
     from datetime import datetime, timedelta, timezone
 
     from sqlalchemy import select
 
-    from app.core.database import AsyncSessionLocal, background_db_sem
+    from app.core.database import AsyncSessionLocal
     from app.services.orchestrator import (
+        recount_user_usage_pool_safe,
         refresh_usage_pool_safe,
         take_live_usage_priority,
     )
 
-    await asyncio.sleep(8)
+    await asyncio.sleep(6)
     while True:
         t0 = _time.monotonic()
         ids: list[int] = []
         try:
-            from app.core.database import pool_pressure_blocks_background
+            from app.core.database import pool_pressure_blocks_fleet
 
-            if pool_pressure_blocks_background():
-                logger.warning("hot usage deferred — db pool under pressure")
-                await asyncio.sleep(45)
-                continue
-            ids = list(take_live_usage_priority(300.0, 16))
+            # Never fully skip on pressure — priority consumers must keep updating.
+            under_pressure = False
             try:
-                from app.models.user_analytics import UserUsageState
-                from app.models.user import User, UserStatus
-                from sqlalchemy import or_
-
-                since = datetime.now(timezone.utc) - timedelta(minutes=12)
-                now_ts = int(_time.time())
-                async with AsyncSessionLocal() as db:
-                    recent = [
-                        int(uid)
-                        for (uid,) in (
-                            await db.execute(
-                                select(UserUsageState.user_id)
-                                .where(UserUsageState.last_sub_fetch_at.is_not(None))
-                                .where(UserUsageState.last_sub_fetch_at >= since)
-                                .order_by(UserUsageState.last_sub_fetch_at.desc())
-                                .limit(12)
-                            )
-                        ).all()
-                    ]
-                    ids = list(dict.fromkeys(ids + recent))[:24]
-                    # Drop expired/disabled / wall-clock-expired — no live usage needed.
-                    if ids:
-                        live = (
-                            await db.execute(
-                                select(User.id).where(
-                                    User.id.in_(ids),
-                                    User.status.in_(
-                                        (
-                                            UserStatus.active,
-                                            UserStatus.on_hold,
-                                            UserStatus.limited,
-                                        )
-                                    ),
-                                    or_(
-                                        User.expire == 0,
-                                        User.expire.is_(None),
-                                        User.expire > now_ts,
-                                    ),
-                                )
-                            )
-                        ).all()
-                        ids = [int(r[0]) for r in live]
-                    await db.rollback()
+                under_pressure = bool(pool_pressure_blocks_fleet())
             except Exception:  # noqa: BLE001
-                pass
-
-            # Parallel live pulls for currently-active /sub users (bounded).
-            ids = ids[:8]
-            if ids:
-                bg = background_db_sem()
-                await bg.acquire()
+                under_pressure = False
+            if under_pressure:
+                logger.warning(
+                    "hot usage pool pressure — priority-only lane"
+                )
+            ids = list(take_live_usage_priority(300.0, 24))
+            if not under_pressure:
                 try:
-                    sem = asyncio.Semaphore(2)
+                    from app.models.user_analytics import UserUsageState
+                    from app.models.user import User, UserStatus
+                    from app.services.panel_usage_bulk import find_stale_sync_user_ids
+                    from sqlalchemy import or_
 
-                    async def _one(uid: int) -> None:
-                        async with sem:
-                            try:
-                                await asyncio.wait_for(
-                                    refresh_usage_pool_safe(
-                                        int(uid), force=True, quick=True
-                                    ),
-                                    timeout=24.0,
+                    since = datetime.now(timezone.utc) - timedelta(minutes=20)
+                    now_ts = int(_time.time())
+                    # Stale meters first — consuming users must not wait for fleet.
+                    try:
+                        stale = await find_stale_sync_user_ids(
+                            older_than_sec=60, limit=12
+                        )
+                        ids = list(dict.fromkeys(stale + ids))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    async with AsyncSessionLocal() as db:
+                        recent = [
+                            int(uid)
+                            for (uid,) in (
+                                await db.execute(
+                                    select(UserUsageState.user_id)
+                                    .where(
+                                        UserUsageState.last_sub_fetch_at.is_not(
+                                            None
+                                        )
+                                    )
+                                    .where(
+                                        UserUsageState.last_sub_fetch_at >= since
+                                    )
+                                    .order_by(
+                                        UserUsageState.last_sub_fetch_at.desc()
+                                    )
+                                    .limit(16)
                                 )
-                            except asyncio.TimeoutError:
-                                try:
-                                    from app.services.orchestrator import (
-                                        recount_user_usage_pool_safe,
+                            ).all()
+                        ]
+                        ids = list(dict.fromkeys(ids + recent))[:32]
+                        if ids:
+                            live = (
+                                await db.execute(
+                                    select(User.id).where(
+                                        User.id.in_(ids),
+                                        User.status.in_(
+                                            (
+                                                UserStatus.active,
+                                                UserStatus.on_hold,
+                                                UserStatus.limited,
+                                            )
+                                        ),
+                                        or_(
+                                            User.expire == 0,
+                                            User.expire.is_(None),
+                                            User.expire > now_ts,
+                                        ),
                                     )
+                                )
+                            ).all()
+                            ids = [int(r[0]) for r in live]
+                        await db.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
 
-                                    await recount_user_usage_pool_safe(int(uid))
-                                except Exception:  # noqa: BLE001
-                                    logger.warning(
-                                        "hot usage timeout recount user_id=%s",
-                                        uid,
-                                        exc_info=True,
-                                    )
+            ids = ids[:3] if under_pressure else ids[:10]
+            if ids:
+                sem = asyncio.Semaphore(1 if under_pressure else 2)
+
+                async def _one(uid: int) -> None:
+                    async with sem:
+                        try:
+                            await recount_user_usage_pool_safe(int(uid))
+                            await asyncio.wait_for(
+                                refresh_usage_pool_safe(
+                                    int(uid), force=True, quick=True
+                                ),
+                                timeout=28.0,
+                            )
+                        except asyncio.TimeoutError:
+                            try:
+                                await recount_user_usage_pool_safe(int(uid))
                             except Exception:  # noqa: BLE001
                                 logger.warning(
-                                    "hot usage pull user_id=%s failed",
+                                    "hot usage timeout recount user_id=%s",
                                     uid,
                                     exc_info=True,
                                 )
+                        except Exception:  # noqa: BLE001
+                            logger.warning(
+                                "hot usage pull user_id=%s failed",
+                                uid,
+                                exc_info=True,
+                            )
 
-                    await asyncio.gather(
-                        *[_one(uid) for uid in ids], return_exceptions=True
-                    )
-                finally:
-                    bg.release()
+                await asyncio.gather(
+                    *[_one(uid) for uid in ids], return_exceptions=True
+                )
                 logger.info(
-                    "hot usage: pulled=%s dt=%.1fs",
+                    "hot usage: pulled=%s pressure=%s dt=%.1fs",
                     len(ids),
+                    int(under_pressure),
                     _time.monotonic() - t0,
                 )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("hot usage loop failed")
-        interval = max(300, int(getattr(settings, "USAGE_HOT_SECONDS", 300) or 300))
+        interval = max(30, int(getattr(settings, "USAGE_HOT_SECONDS", 45) or 45))
         elapsed = _time.monotonic() - t0
-        await asyncio.sleep(max(90.0, float(interval) - elapsed))
+        await asyncio.sleep(max(25.0, float(interval) - elapsed))
+
+
+async def _priority_usage_loop() -> None:
+    """Dedicated lane for live consumers — never deferred by fleet/pool pressure.
+
+    After check-usage / successful pull, users stay in the priority set ~5 min.
+    This loop alone must keep their meters within ~30–45s of remote panels.
+    """
+    import time as _time
+
+    from app.services.orchestrator import (
+        recount_user_usage_pool_safe,
+        refresh_usage_pool_safe,
+        take_live_usage_priority,
+    )
+
+    await asyncio.sleep(10)
+    while True:
+        t0 = _time.monotonic()
+        try:
+            ids = list(take_live_usage_priority(360.0, 6))[:4]
+            if ids:
+                for uid in ids:
+                    try:
+                        await asyncio.wait_for(
+                            refresh_usage_pool_safe(
+                                int(uid), force=True, quick=True
+                            ),
+                            timeout=25.0,
+                        )
+                    except asyncio.TimeoutError:
+                        try:
+                            await recount_user_usage_pool_safe(int(uid))
+                        except Exception:  # noqa: BLE001
+                            pass
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "priority usage pull user_id=%s failed",
+                            uid,
+                            exc_info=True,
+                        )
+                logger.info(
+                    "priority usage: pulled=%s dt=%.1fs",
+                    len(ids),
+                    _time.monotonic() - t0,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("priority usage loop failed")
+        await asyncio.sleep(max(20.0, 30.0 - (_time.monotonic() - t0)))
+
+
+async def _worker_probe_loop() -> None:
+    """Keep worker online/offline status fresh for failover routing."""
+    from app.core.database import AsyncSessionLocal
+    from app.services.worker_ops import probe_all_workers
+
+    await asyncio.sleep(20)
+    while True:
+        try:
+            async with AsyncSessionLocal() as db:
+                stats = await probe_all_workers(db)
+            logger.info(
+                "worker probe: online=%s offline=%s total=%s",
+                stats.get("online"),
+                stats.get("offline"),
+                stats.get("total"),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("worker probe loop failed")
+        await asyncio.sleep(30)
 
 
 async def _analytics_sample_loop() -> None:
@@ -575,6 +730,9 @@ def _resolve_frontend_dist() -> Path | None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     # Minimal boot first — /health must answer before any heavy bg work.
+    from app.core.process_role import acquire_background_role
+
+    run_bg = acquire_background_role()
     await ensure_schema()
     await seed_admin()
     async with AsyncSessionLocal() as db:
@@ -582,6 +740,23 @@ async def lifespan(_app: FastAPI):
         await refresh_config_locations(db)
         await refresh_config_hides(db)
         await refresh_config_orders(db)
+        try:
+            from app.services.worker_ops import (
+                bootstrap_worker_routes,
+                ensure_usage_report_worker,
+            )
+
+            n = await bootstrap_worker_routes(db)
+            if n:
+                logging.getLogger("astra.worker").info(
+                    "worker routes loaded n=%s", n
+                )
+            # Every web worker accepts usage-report and applies via local queue.
+            await ensure_usage_report_worker()
+        except Exception:  # noqa: BLE001
+            logging.getLogger("astra.worker").warning(
+                "worker route bootstrap failed", exc_info=True
+            )
         await db.rollback()
 
     from app.services.config_hides import clear_stale_ping_auto_hides_once
@@ -605,61 +780,142 @@ async def lifespan(_app: FastAPI):
         await asyncio.sleep(delay)
         await coro()
 
-    usage_task = asyncio.create_task(
-        _delayed(_usage_sync_loop, 120, "usage"), name="astra-usage-sync"
+    bg_tasks: list[asyncio.Task] = []
+    if run_bg:
+        # Longer stagger: Worker owns remote bulk; avoid boot stampede.
+        bg_tasks = [
+            asyncio.create_task(
+                _delayed(_usage_sync_loop, 90, "usage"), name="astra-usage-sync"
+            ),
+            asyncio.create_task(
+                _delayed(_fleet_usage_loop, 75, "fleet"), name="astra-fleet-usage"
+            ),
+            asyncio.create_task(
+                _delayed(_hot_usage_loop, 40, "hot"), name="astra-hot-usage"
+            ),
+            asyncio.create_task(
+                _delayed(_priority_usage_loop, 35, "priority"),
+                name="astra-priority-usage",
+            ),
+            asyncio.create_task(
+                _delayed(_worker_probe_loop, 20, "worker-probe"),
+                name="astra-worker-probe",
+            ),
+            asyncio.create_task(
+                _delayed(_analytics_sample_loop, 240, "analytics"),
+                name="astra-analytics-sample",
+            ),
+            asyncio.create_task(
+                _auto_retry_errors_loop(), name="astra-auto-retry-errors"
+            ),
+            asyncio.create_task(
+                _delayed(_outbound_health_loop, 120, "outbound"),
+                name="astra-outbound-health",
+            ),
+            asyncio.create_task(
+                _delayed(_astra_xray_heal_loop, 240, "xray-heal"),
+                name="astra-xray-heal",
+            ),
+            asyncio.create_task(
+                _bg_order_kind_boot(), name="astra-order-kind-boot"
+            ),
+            asyncio.create_task(
+                pool_guardian_loop(), name="astra-db-pool-guard"
+            ),
+        ]
+        logger.info("astra lifespan: background loops ON (this worker)")
+    else:
+        logger.info("astra lifespan: API-only worker (bg loops elsewhere)")
+
+    async def _drain_recent_pending_provisions() -> None:
+        """Finish pending creates that lost in-flight tasks (boot + periodic).
+
+        Bounded concurrency — never stampede the DB pool with thousands of tasks.
+        """
+        await asyncio.sleep(25)
+        from sqlalchemy import text
+
+        from app.services.orchestrator import _provision_account_now
+
+        async def _wave(limit: int = 120) -> int:
+            async with AsyncSessionLocal() as db:
+                rows = await db.execute(
+                    text(
+                        """
+                        SELECT pa.id
+                        FROM panel_accounts pa
+                        JOIN users u ON u.id = pa.user_id
+                        WHERE pa.status IN ('pending', 'error')
+                          AND u.created_at > now() - interval '12 hours'
+                        ORDER BY pa.id DESC
+                        LIMIT :lim
+                        """
+                    ),
+                    {"lim": int(limit)},
+                )
+                ids = [int(r[0]) for r in rows.all()]
+                await db.rollback()
+            if not ids:
+                return 0
+            sem = asyncio.Semaphore(6)
+            ok = 0
+
+            async def _one(aid: int) -> None:
+                nonlocal ok
+                async with sem:
+                    try:
+                        if await _provision_account_now(aid):
+                            ok += 1
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "pending drain aid=%s failed", aid, exc_info=True
+                        )
+
+            await asyncio.gather(*(_one(i) for i in ids))
+            logger.info(
+                "pending provision drain n=%s ok=%s", len(ids), ok
+            )
+            return len(ids)
+
+        # Boot wave, then keep draining every ~90s while recent pending remain.
+        try:
+            await _wave(120)
+        except Exception:  # noqa: BLE001
+            logger.exception("boot pending provision drain failed")
+        while True:
+            try:
+                await asyncio.sleep(90)
+                n = await _wave(100)
+                if n == 0:
+                    await asyncio.sleep(180)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("periodic pending provision drain failed")
+                await asyncio.sleep(90)
+
+    if run_bg:
+        bg_tasks.append(
+            asyncio.create_task(
+                _drain_recent_pending_provisions(), name="astra-pending-drain"
+            )
+        )
+    logger.info(
+        "astra lifespan ready — serving; bg=%s tasks=%s",
+        run_bg,
+        len(bg_tasks),
     )
-    fleet_task = asyncio.create_task(
-        _delayed(_fleet_usage_loop, 180, "fleet"), name="astra-fleet-usage"
-    )
-    hot_task = asyncio.create_task(
-        _delayed(_hot_usage_loop, 90, "hot"), name="astra-hot-usage"
-    )
-    analytics_task = asyncio.create_task(
-        _delayed(_analytics_sample_loop, 150, "analytics"),
-        name="astra-analytics-sample",
-    )
-    retry_errors_task = asyncio.create_task(
-        _auto_retry_errors_loop(), name="astra-auto-retry-errors"
-    )
-    outbound_task = asyncio.create_task(
-        _delayed(_outbound_health_loop, 120, "outbound"),
-        name="astra-outbound-health",
-    )
-    xray_heal_task = asyncio.create_task(
-        _delayed(_astra_xray_heal_loop, 240, "xray-heal"),
-        name="astra-xray-heal",
-    )
-    order_boot_task = asyncio.create_task(
-        _bg_order_kind_boot(), name="astra-order-kind-boot"
-    )
-    pool_task = asyncio.create_task(pool_guardian_loop(), name="astra-db-pool-guard")
-    logger.info("astra lifespan ready — serving; bg loops staggered")
     try:
         yield
     finally:
-        usage_task.cancel()
-        fleet_task.cancel()
-        hot_task.cancel()
-        analytics_task.cancel()
-        retry_errors_task.cancel()
-        outbound_task.cancel()
-        xray_heal_task.cancel()
-        order_boot_task.cancel()
-        pool_task.cancel()
-        for task in (
-            usage_task,
-            fleet_task,
-            hot_task,
-            analytics_task,
-            retry_errors_task,
-            outbound_task,
-            xray_heal_task,
-            order_boot_task,
-            pool_task,
-        ):
+        for task in bg_tasks:
+            task.cancel()
+        for task in bg_tasks:
             try:
                 await task
             except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001
                 pass
         await dispose_engine()
 
@@ -737,6 +993,7 @@ app.include_router(astra_outbounds.router)
 app.include_router(templates.router)
 app.include_router(api_keys.router)
 app.include_router(settings_api.router)
+app.include_router(workers_api.router)
 app.include_router(config_locations.router)
 app.include_router(config_orders.router)
 app.include_router(config_lookup.router)

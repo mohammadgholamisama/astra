@@ -17,7 +17,7 @@ _ADAPTERS = {
 }
 
 
-def get_adapter(panel: Panel) -> BasePanelAdapter:
+def _build_local(panel: Panel) -> BasePanelAdapter:
     cls = _ADAPTERS.get(panel.type)
     if not cls:
         raise ValueError(f"Unsupported panel type: {panel.type}")
@@ -32,3 +32,49 @@ def get_adapter(panel: Panel) -> BasePanelAdapter:
         api_token=token,
         meta=meta,
     )
+
+
+def get_adapter(panel: Panel) -> BasePanelAdapter:
+    """Return local adapter, or worker-routed proxy with local failover.
+
+    Astra node panels always run on master (need local DB / xray) — never Worker.
+    """
+    local = _build_local(panel)
+    if panel.type == PanelType.astra:
+        return local
+    wid = getattr(panel, "worker_id", None)
+    if not wid:
+        return local
+    try:
+        from app.services.worker_client import (
+            WorkerRoutedAdapter,
+            lookup_worker_route,
+            register_worker_route,
+        )
+
+        route = lookup_worker_route(int(wid))
+        if route is None:
+            # Relationship may be loaded — seed route from ORM worker row
+            worker = getattr(panel, "__dict__", {}).get("worker")
+            if worker is not None and getattr(worker, "is_active", False):
+                tok = str((getattr(worker, "meta", None) or {}).get("agent_token") or "")
+                if tok:
+                    register_worker_route(
+                        int(wid),
+                        str(worker.base_url),
+                        tok,
+                        active=True,
+                    )
+                    route = lookup_worker_route(int(wid))
+        if route is None:
+            return local
+        base_url, token = route
+        return WorkerRoutedAdapter(  # type: ignore[return-value]
+            panel,
+            local,
+            worker_id=int(wid),
+            worker_base_url=base_url,
+            worker_token=token,
+        )
+    except Exception:  # noqa: BLE001
+        return local

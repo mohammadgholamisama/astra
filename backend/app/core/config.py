@@ -25,10 +25,12 @@ class Settings(BaseSettings):
     # starve SSH/CPU. Interactive API keeps headroom via background_db_sem.
     # Slightly larger pool so interactive API keeps slots while a few bg
     # remotes run — still capped; leaks are fixed by closing sessions on HTTP.
-    DB_POOL_SIZE: int = 24
-    DB_MAX_OVERFLOW: int = 8
-    DB_POOL_TIMEOUT: float = 4.0
-    DB_POOL_RECYCLE: int = 180
+    # Under Postgres max_connections=100. Too small → QueuePool timeout on
+    # boot; too large → «too many clients» and used_traffic stuck at 0.
+    DB_POOL_SIZE: int = 16
+    DB_MAX_OVERFLOW: int = 6
+    DB_POOL_TIMEOUT: float = 5.0
+    DB_POOL_RECYCLE: int = 120
     SECRET_KEY: str = "astra-dev-secret-key-change-in-production-32chars"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     SUB_BASE_URL: str = "http://localhost:8000"
@@ -43,13 +45,13 @@ class Settings(BaseSettings):
     # when a user spans many panels; wall time still ≈ ceil(N/limit)×slowest.
     PANEL_REMOTE_CONCURRENCY: int = 4
     # Background quota watch cadence (seconds). Exhausted users are frozen
-    # on every remote in the same cycle. ~5 min keeps CPU calm; accuracy via
-    # remaining caps + live /sub pulls for active clients.
-    USAGE_REFRESH_SECONDS: int = 300
-    # Full-fleet usage pull (all panels + dirty recount), seconds.
-    USAGE_FLEET_SECONDS: int = 360
-    # Hot loop for recent /sub users (seconds). Same calm cadence.
-    USAGE_HOT_SECONDS: int = 300
+    # on every remote in the same cycle. Accuracy via fleet bulk + hot /sub.
+    USAGE_REFRESH_SECONDS: int = 120
+    # Fleet rotate / full bulk cadence (seconds). Worker collect owns assigned
+    # panels every 2 min; master fleet covers unassigned + worker-down failover.
+    USAGE_FLEET_SECONDS: int = 120
+    # Hot loop for recent /sub users (seconds).
+    USAGE_HOT_SECONDS: int = 60
     # Auto «رفع خطا» on Users page — off by default; use the button manually.
     AUTO_RETRY_ERRORS: bool = False
     # Official install helper for SSL / nginx (empty = SSL UI disabled)

@@ -822,7 +822,7 @@ export default function PanelsPage() {
 
   const [testAllOpen, setTestAllOpen] = useState(false);
   const [testAllFilter, setTestAllFilter] = useState<
-    "all" | "fail" | "slow" | "ok" | "fast" | "off"
+    "all" | "fail" | "slow" | "ok" | "fast"
   >("all");
 
   type PanelTestGrade = "fast" | "ok" | "slow" | "fail";
@@ -925,13 +925,21 @@ export default function PanelsPage() {
     },
   });
 
+  const activeVisiblePanels = useMemo(
+    () => visiblePanels.filter((p) => p.is_active),
+    [visiblePanels]
+  );
+
   const testAll = useMutation({
-    mutationFn: () =>
-      api<PanelTestAll>("/api/admin/panels/test-all", {
+    mutationFn: () => {
+      // Only active panels in the current tab/search — never خاموش / other cats.
+      const ids = activeVisiblePanels.map((p) => p.id);
+      return api<PanelTestAll>("/api/admin/panels/test-all", {
         method: "POST",
-        // Two-wave quick probes (≈4s then retry fails ≈5.5s).
-        timeoutMs: 60_000,
-      }),
+        body: JSON.stringify({ panel_ids: ids }),
+        timeoutMs: 75_000,
+      });
+    },
     onSuccess: (res) => {
       setTestAllFilter("all");
       setTestAllOpen(true);
@@ -962,7 +970,6 @@ export default function PanelsPage() {
   const testAllFiltered = useMemo(() => {
     const rows = testAll.data?.results || [];
     if (testAllFilter === "all") return rows;
-    if (testAllFilter === "off") return rows.filter((r) => !r.is_active);
     if (testAllFilter === "fail") return rows.filter((r) => !r.success);
     if (testAllFilter === "fast") return rows.filter((r) => r.grade === "fast");
     if (testAllFilter === "slow") return rows.filter((r) => r.grade === "slow");
@@ -1124,11 +1131,18 @@ export default function PanelsPage() {
         <button
           type="button"
           className="btn ghost"
-          disabled={testAll.isPending || data.length === 0 || reorderMode}
+          disabled={
+            testAll.isPending ||
+            activeVisiblePanels.length === 0 ||
+            reorderMode
+          }
           onClick={() => testAll.mutate()}
+          title="فقط پنل‌های روشن همین لیست تست می‌شوند"
         >
           <Wifi size={16} />
-          {testAll.isPending ? "در حال تست همه…" : "تست کلی اتصال"}
+          {testAll.isPending
+            ? `در حال تست ${toFaDigits(activeVisiblePanels.length)} پنل…`
+            : `تست اتصال (${toFaDigits(activeVisiblePanels.length)})`}
         </button>
         {reorderMode ? (
           <>
@@ -1268,9 +1282,9 @@ export default function PanelsPage() {
         <div className="panels-test-all">
           <div className="panels-test-all-head">
             <div className="panels-test-all-title">
-              <strong>نتیجه تست کلی اتصال</strong>
+              <strong>نتیجه تست اتصال این لیست</strong>
               <span className="muted">
-                {toFaDigits(testAll.data.stats?.total ?? testAll.data.results.length)} پنل
+                {toFaDigits(testAll.data.stats?.total ?? testAll.data.results.length)} پنل همین صفحه
                 {testAll.data.stats?.duration_ms != null
                   ? ` · ${formatLatency(testAll.data.stats.duration_ms)}`
                   : ""}
@@ -1326,20 +1340,10 @@ export default function PanelsPage() {
 
           <div className="panels-test-meta">
             <span>
-              روشن وصل: {toFaDigits(testAll.data.stats?.active_ok ?? 0)}
-              {(testAll.data.stats?.active_fail ?? 0) > 0
-                ? ` · روشن قطع: ${toFaDigits(testAll.data.stats?.active_fail ?? 0)}`
+              وصل: {toFaDigits(testAll.data.stats?.ok ?? testAll.data.ok)}
+              {(testAll.data.stats?.fail ?? testAll.data.fail) > 0
+                ? ` · قطع: ${toFaDigits(testAll.data.stats?.fail ?? testAll.data.fail)}`
                 : ""}
-            </span>
-            <span>
-              {(testAll.data.stats?.inactive_ok ?? 0) +
-                (testAll.data.stats?.inactive_fail ?? 0) >
-              0
-                ? `خاموش: ${toFaDigits(
-                    (testAll.data.stats?.inactive_ok ?? 0) +
-                      (testAll.data.stats?.inactive_fail ?? 0)
-                  )} (${toFaDigits(testAll.data.stats?.inactive_ok ?? 0)} وصل)`
-                : "خاموشی در لیست نیست"}
             </span>
             {testAll.data.stats?.avg_latency_ms != null ? (
               <span>
@@ -1367,12 +1371,6 @@ export default function PanelsPage() {
                 ["slow", "کند", testAll.data.stats?.slow ?? 0],
                 ["ok", "معمولی", testAll.data.stats?.normal ?? 0],
                 ["fast", "سریع", testAll.data.stats?.fast ?? 0],
-                [
-                  "off",
-                  "خاموش",
-                  (testAll.data.stats?.inactive_ok ?? 0) +
-                    (testAll.data.stats?.inactive_fail ?? 0),
-                ],
               ] as const
             ).map(([key, label, count]) => (
               <button

@@ -23,6 +23,7 @@ from app.models.panel_analytics import (
     PanelUsageState,
     PanelUserTrafficState,
 )
+from app.models.worker import WorkerNode
 
 __all__ = [
     "Admin",
@@ -55,4 +56,5 @@ __all__ = [
     "PanelUsageHourBucket",
     "PanelUserTrafficState",
     "PanelTestRun",
+    "WorkerNode",
 ]

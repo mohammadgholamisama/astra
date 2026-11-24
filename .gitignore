@@ -1,5 +1,6 @@
 
 !.env.example
+.monitor_4m/
 # Local ops / probe outputs (often contain host credentials)
 # Mobile ping hub / RN client
 # SQLite / runtime data

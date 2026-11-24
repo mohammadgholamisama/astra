@@ -7,6 +7,7 @@ import {
   Plus,
   RotateCcw,
   Save,
+  Server,
   Settings,
   ShieldCheck,
   Sparkles,
@@ -75,6 +76,35 @@ type SiteSettings = {
   };
 };
 
+type WorkerPanelBrief = {
+  id: number;
+  name: string;
+  type: string;
+  is_active: boolean;
+};
+
+type WorkerNode = {
+  id: number;
+  name: string;
+  base_url: string;
+  is_active: boolean;
+  status: string;
+  last_seen_at: string | null;
+  last_error: string | null;
+  ssh_host: string | null;
+  ssh_user: string | null;
+  listen_port: number;
+  panels: WorkerPanelBrief[];
+  panel_ids: number[];
+  token?: string | null;
+  install_command?: string | null;
+  install_ok?: boolean | null;
+  install_log?: string | null;
+  message?: string | null;
+};
+
+type PanelBrief = { id: number; name: string; type: string; is_active: boolean };
+
 function hostFromUrl(url: string): string {
   const raw = (url || "").trim();
   if (!raw) return "";
@@ -112,6 +142,19 @@ export default function SettingsPage() {
   const [keyNote, setKeyNote] = useState("");
   const [createdKey, setCreatedKey] = useState<string | null>(null);
   const [confirmKey, setConfirmKey] = useState<ApiKey | null>(null);
+  const [workerOpen, setWorkerOpen] = useState(false);
+  const [workerName, setWorkerName] = useState("");
+  const [workerHost, setWorkerHost] = useState("");
+  const [workerSshUser, setWorkerSshUser] = useState("root");
+  const [workerSshPass, setWorkerSshPass] = useState("");
+  const [workerSshPort, setWorkerSshPort] = useState("22");
+  const [workerPort, setWorkerPort] = useState("2090");
+  const [workerPanelIds, setWorkerPanelIds] = useState<number[]>([]);
+  const [createdWorker, setCreatedWorker] = useState<WorkerNode | null>(null);
+  const [confirmWorker, setConfirmWorker] = useState<WorkerNode | null>(null);
+  const [assignWorker, setAssignWorker] = useState<WorkerNode | null>(null);
+  const [reinstallWorker, setReinstallWorker] = useState<WorkerNode | null>(null);
+  const [reinstallPass, setReinstallPass] = useState("");
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["site-settings"],
@@ -121,6 +164,100 @@ export default function SettingsPage() {
   const { data: apiKeys = [], isLoading: keysLoading } = useQuery({
     queryKey: ["api-keys"],
     queryFn: () => api<ApiKey[]>("/api/admin/api-keys"),
+  });
+
+  const { data: workers = [], isLoading: workersLoading } = useQuery({
+    queryKey: ["workers"],
+    queryFn: () => api<WorkerNode[]>("/api/admin/workers"),
+    refetchInterval: 20000,
+  });
+
+  const { data: allPanels = [] } = useQuery({
+    queryKey: ["panels-brief"],
+    queryFn: () => api<PanelBrief[]>("/api/admin/panels"),
+  });
+
+  const createWorker = useMutation({
+    mutationFn: () =>
+      api<WorkerNode>("/api/admin/workers", {
+        method: "POST",
+        timeoutMs: 480_000,
+        body: JSON.stringify({
+          name: workerName.trim(),
+          ssh_host: workerHost.trim(),
+          ssh_user: workerSshUser.trim() || "root",
+          ssh_password: workerSshPass,
+          ssh_port: Number(workerSshPort) || 22,
+          listen_port: Number(workerPort) || 2090,
+          panel_ids: workerPanelIds,
+          auto_install: true,
+        }),
+      }),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["workers"] });
+      setCreatedWorker(res);
+      setWorkerOpen(false);
+      setWorkerName("");
+      setWorkerHost("");
+      setWorkerSshUser("root");
+      setWorkerSshPass("");
+      setWorkerSshPort("22");
+      setWorkerPort("2090");
+      setWorkerPanelIds([]);
+    },
+  });
+
+  const reinstallMut = useMutation({
+    mutationFn: () =>
+      api<WorkerNode>(`/api/admin/workers/${reinstallWorker!.id}/reinstall`, {
+        method: "POST",
+        timeoutMs: 480_000,
+        body: JSON.stringify({ ssh_password: reinstallPass }),
+      }),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["workers"] });
+      setCreatedWorker(res);
+      setReinstallWorker(null);
+      setReinstallPass("");
+    },
+  });
+
+  const removeWorker = useMutation({
+    mutationFn: (id: number) =>
+      api(`/api/admin/workers/${id}`, { method: "DELETE" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["workers"] });
+      setConfirmWorker(null);
+    },
+  });
+
+  const rotateWorker = useMutation({
+    mutationFn: (id: number) =>
+      api<WorkerNode>(`/api/admin/workers/${id}/rotate-token`, {
+        method: "POST",
+      }),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["workers"] });
+      setCreatedWorker(res);
+    },
+  });
+
+  const probeWorker = useMutation({
+    mutationFn: (id: number) =>
+      api(`/api/admin/workers/${id}/probe`, { method: "POST" }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["workers"] }),
+  });
+
+  const saveAssign = useMutation({
+    mutationFn: ({ id, panel_ids }: { id: number; panel_ids: number[] }) =>
+      api<WorkerNode>(`/api/admin/workers/${id}/panels`, {
+        method: "PUT",
+        body: JSON.stringify({ panel_ids }),
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["workers"] });
+      setAssignWorker(null);
+    },
   });
 
   const createKey = useMutation({
@@ -659,6 +796,162 @@ export default function SettingsPage() {
 
           <div className="settings-card settings-card-wide">
             <header className="settings-card-head">
+              <Server size={20} />
+              <div>
+                <h2>سرورهای Worker</h2>
+                <p>
+                  IP و یوزر/رمز SSH بده؛ نصب خودکار می‌شود — ساخت و مصرف پنل‌ها روی
+                  Worker، با failover به همین سرور
+                </p>
+              </div>
+            </header>
+
+            {createdWorker && (
+              <div
+                className={`admin-toast ${createdWorker.install_ok === false ? "err" : "ok"} admin-key-reveal`}
+              >
+                <div>
+                  <strong>
+                    {createdWorker.message ||
+                      (createdWorker.install_ok
+                        ? "Worker نصب و آماده است"
+                        : "وضعیت Worker")}
+                  </strong>
+                  <p className="muted" style={{ marginTop: 6 }} dir="ltr">
+                    {createdWorker.base_url} · {createdWorker.status}
+                  </p>
+                  {createdWorker.install_log ? (
+                    <code
+                      dir="ltr"
+                      className="admin-key-value"
+                      style={{
+                        whiteSpace: "pre-wrap",
+                        maxHeight: 160,
+                        overflow: "auto",
+                        display: "block",
+                        marginTop: 8,
+                        fontSize: 11,
+                      }}
+                    >
+                      {createdWorker.install_log.slice(-2500)}
+                    </code>
+                  ) : null}
+                </div>
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  onClick={() => setCreatedWorker(null)}
+                >
+                  بستن
+                </button>
+              </div>
+            )}
+
+            <div className="toolbar" style={{ margin: "0 0 12px" }}>
+              <span className="muted">{toFaDigits(workers.length)} سرور</span>
+              <button
+                type="button"
+                className="btn toolbar-primary"
+                onClick={() => setWorkerOpen(true)}
+              >
+                <Plus size={16} />
+                افزودن سرور
+              </button>
+            </div>
+
+            {workersLoading ? (
+              <p className="muted">در حال بارگذاری…</p>
+            ) : workers.length === 0 ? (
+              <p className="muted" style={{ margin: 0 }}>
+                هنوز Workerای اضافه نشده — یک VPS جدا بسازید تا ساخت و مصرف سنگین از
+                پنل اصلی جدا شود
+              </p>
+            ) : (
+              <div className="groups-list">
+                {workers.map((w) => (
+                  <article key={w.id} className="groups-row">
+                    <div className="groups-row-main">
+                      <div className="groups-row-title">
+                        <b>{w.name}</b>
+                        <span className="groups-row-desc" dir="ltr">
+                          {w.base_url}
+                        </span>
+                      </div>
+                      <div className="groups-row-meta">
+                        <span
+                          className={`badge ${
+                            w.status === "online"
+                              ? "ok"
+                              : w.status === "offline"
+                                ? "err"
+                                : "muted"
+                          }`}
+                        >
+                          {w.status === "online"
+                            ? "آنلاین"
+                            : w.status === "offline"
+                              ? "قطع"
+                              : "نامشخص"}
+                        </span>
+                        <span className="badge muted">
+                          {toFaDigits(w.panel_ids?.length || 0)} پنل
+                        </span>
+                        {!w.is_active ? (
+                          <span className="badge err">غیرفعال</span>
+                        ) : null}
+                      </div>
+                    </div>
+                    <div className="groups-row-actions">
+                      <button
+                        type="button"
+                        className="btn ghost sm"
+                        onClick={() => probeWorker.mutate(w.id)}
+                      >
+                        تست
+                      </button>
+                      <button
+                        type="button"
+                        className="btn ghost sm"
+                        onClick={() => {
+                          setAssignWorker(w);
+                          setWorkerPanelIds(w.panel_ids || []);
+                        }}
+                      >
+                        پنل‌ها
+                      </button>
+                      <button
+                        type="button"
+                        className="btn ghost sm"
+                        onClick={() => {
+                          setReinstallWorker(w);
+                          setReinstallPass("");
+                        }}
+                      >
+                        نصب مجدد
+                      </button>
+                      <button
+                        type="button"
+                        className="btn ghost sm"
+                        onClick={() => rotateWorker.mutate(w.id)}
+                      >
+                        توکن جدید
+                      </button>
+                      <button
+                        type="button"
+                        className="btn danger sm"
+                        onClick={() => setConfirmWorker(w)}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="settings-card settings-card-wide">
+            <header className="settings-card-head">
               <KeyRound size={20} />
               <div>
                 <h2>کلیدهای API</h2>
@@ -983,6 +1276,381 @@ export default function SettingsPage() {
                 onClick={() => removeKey.mutate(confirmKey.id)}
               >
                 {removeKey.isPending ? "…" : "حذف"}
+              </button>
+            </footer>
+          </div>
+        </div>
+      )}
+
+      {workerOpen && (
+        <div
+          className="modal-backdrop"
+          onClick={() => !createWorker.isPending && setWorkerOpen(false)}
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <header className="modal-head">
+              <div>
+                <h3>افزودن سرور Worker</h3>
+                <p className="modal-sub">
+                  فقط IP و یوزر/رمز SSH بده — نصب خودکار روی VPS انجام می‌شود
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => !createWorker.isPending && setWorkerOpen(false)}
+                aria-label="بستن"
+              >
+                ×
+              </button>
+            </header>
+            <form
+              onSubmit={(e: FormEvent) => {
+                e.preventDefault();
+                createWorker.mutate();
+              }}
+            >
+              <div className="field">
+                <label>نام</label>
+                <input
+                  required
+                  minLength={2}
+                  value={workerName}
+                  onChange={(e) => setWorkerName(e.target.value)}
+                  placeholder="مثلاً worker-eu-1"
+                  disabled={createWorker.isPending}
+                />
+              </div>
+              <div className="field">
+                <label>IP سرور</label>
+                <input
+                  required
+                  dir="ltr"
+                  value={workerHost}
+                  onChange={(e) => setWorkerHost(e.target.value)}
+                  placeholder="1.2.3.4"
+                  disabled={createWorker.isPending}
+                  autoComplete="off"
+                />
+              </div>
+              <div className="field">
+                <label>یوزر SSH</label>
+                <input
+                  required
+                  dir="ltr"
+                  value={workerSshUser}
+                  onChange={(e) => setWorkerSshUser(e.target.value)}
+                  placeholder="root"
+                  disabled={createWorker.isPending}
+                  autoComplete="username"
+                />
+              </div>
+              <div className="field">
+                <label>رمز SSH</label>
+                <input
+                  required
+                  type="password"
+                  dir="ltr"
+                  value={workerSshPass}
+                  onChange={(e) => setWorkerSshPass(e.target.value)}
+                  disabled={createWorker.isPending}
+                  autoComplete="new-password"
+                />
+                <p className="field-hint">رمز ذخیره نمی‌شود — فقط برای نصب یک‌بار مصرف</p>
+              </div>
+              <div className="field" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                <div>
+                  <label>پورت SSH</label>
+                  <input
+                    dir="ltr"
+                    value={workerSshPort}
+                    onChange={(e) => setWorkerSshPort(e.target.value)}
+                    disabled={createWorker.isPending}
+                  />
+                </div>
+                <div>
+                  <label>پورت Worker</label>
+                  <input
+                    dir="ltr"
+                    value={workerPort}
+                    onChange={(e) => setWorkerPort(e.target.value)}
+                    disabled={createWorker.isPending}
+                  />
+                </div>
+              </div>
+              <div className="field">
+                <label>پنل‌هایی که به این سرور بروند</label>
+                <div
+                  style={{
+                    maxHeight: 180,
+                    overflow: "auto",
+                    display: "grid",
+                    gap: 6,
+                  }}
+                >
+                  {allPanels.map((p) => {
+                    const on = workerPanelIds.includes(p.id);
+                    return (
+                      <label
+                        key={p.id}
+                        style={{
+                          display: "flex",
+                          gap: 8,
+                          alignItems: "center",
+                          cursor: "pointer",
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={on}
+                          disabled={createWorker.isPending}
+                          onChange={() =>
+                            setWorkerPanelIds((prev) =>
+                              on
+                                ? prev.filter((x) => x !== p.id)
+                                : [...prev, p.id]
+                            )
+                          }
+                        />
+                        <span>
+                          {p.name}{" "}
+                          <span className="muted" dir="ltr">
+                            ({p.type})
+                          </span>
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+              {createWorker.isPending && (
+                <p className="muted">
+                  در حال نصب خودکار روی سرور… ممکن است ۲–۵ دقیقه طول بکشد
+                </p>
+              )}
+              {createWorker.isError && (
+                <p className="error">{(createWorker.error as Error).message}</p>
+              )}
+              <footer className="modal-foot">
+                <button
+                  type="button"
+                  className="btn ghost"
+                  disabled={createWorker.isPending}
+                  onClick={() => setWorkerOpen(false)}
+                >
+                  انصراف
+                </button>
+                <button
+                  className="btn"
+                  disabled={
+                    createWorker.isPending ||
+                    workerName.trim().length < 2 ||
+                    !workerHost.trim() ||
+                    !workerSshPass
+                  }
+                >
+                  {createWorker.isPending ? "در حال نصب…" : "ساخت و نصب خودکار"}
+                </button>
+              </footer>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {reinstallWorker && (
+        <div
+          className="modal-backdrop"
+          onClick={() => !reinstallMut.isPending && setReinstallWorker(null)}
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <header className="modal-head">
+              <div>
+                <h3>نصب مجدد — {reinstallWorker.name}</h3>
+                <p className="modal-sub" dir="ltr">
+                  {reinstallWorker.ssh_user || "root"}@{reinstallWorker.ssh_host}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setReinstallWorker(null)}
+                aria-label="بستن"
+              >
+                ×
+              </button>
+            </header>
+            <div className="field">
+              <label>رمز SSH</label>
+              <input
+                type="password"
+                dir="ltr"
+                value={reinstallPass}
+                onChange={(e) => setReinstallPass(e.target.value)}
+                disabled={reinstallMut.isPending}
+                autoComplete="new-password"
+              />
+            </div>
+            {reinstallMut.isPending && (
+              <p className="muted">در حال نصب مجدد…</p>
+            )}
+            {reinstallMut.isError && (
+              <p className="error">{(reinstallMut.error as Error).message}</p>
+            )}
+            <footer className="modal-foot">
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={reinstallMut.isPending}
+                onClick={() => setReinstallWorker(null)}
+              >
+                انصراف
+              </button>
+              <button
+                type="button"
+                className="btn"
+                disabled={reinstallMut.isPending || !reinstallPass}
+                onClick={() => reinstallMut.mutate()}
+              >
+                {reinstallMut.isPending ? "…" : "نصب مجدد"}
+              </button>
+            </footer>
+          </div>
+        </div>
+      )}
+
+      {assignWorker && (
+        <div
+          className="modal-backdrop"
+          onClick={() => !saveAssign.isPending && setAssignWorker(null)}
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <header className="modal-head">
+              <div>
+                <h3>تخصیص پنل — {assignWorker.name}</h3>
+                <p className="modal-sub">
+                  درخواست‌های این پنل‌ها به Worker می‌رود؛ قطعی = همین سرور
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setAssignWorker(null)}
+                aria-label="بستن"
+              >
+                ×
+              </button>
+            </header>
+            <div
+              style={{
+                maxHeight: 260,
+                overflow: "auto",
+                display: "grid",
+                gap: 6,
+                marginBottom: 12,
+              }}
+            >
+              {allPanels.map((p) => {
+                const on = workerPanelIds.includes(p.id);
+                return (
+                  <label
+                    key={p.id}
+                    style={{
+                      display: "flex",
+                      gap: 8,
+                      alignItems: "center",
+                      cursor: "pointer",
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={on}
+                      onChange={() =>
+                        setWorkerPanelIds((prev) =>
+                          on ? prev.filter((x) => x !== p.id) : [...prev, p.id]
+                        )
+                      }
+                    />
+                    <span>
+                      {p.name}{" "}
+                      <span className="muted" dir="ltr">
+                        ({p.type})
+                      </span>
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+            {saveAssign.isError && (
+              <p className="error">{(saveAssign.error as Error).message}</p>
+            )}
+            <footer className="modal-foot">
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={saveAssign.isPending}
+                onClick={() => setAssignWorker(null)}
+              >
+                انصراف
+              </button>
+              <button
+                type="button"
+                className="btn"
+                disabled={saveAssign.isPending}
+                onClick={() =>
+                  saveAssign.mutate({
+                    id: assignWorker.id,
+                    panel_ids: workerPanelIds,
+                  })
+                }
+              >
+                {saveAssign.isPending ? "…" : "ذخیره"}
+              </button>
+            </footer>
+          </div>
+        </div>
+      )}
+
+      {confirmWorker && (
+        <div
+          className="modal-backdrop"
+          onClick={() => !removeWorker.isPending && setConfirmWorker(null)}
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <header className="modal-head">
+              <div>
+                <h3>حذف Worker</h3>
+                <p className="modal-sub">
+                  «{confirmWorker.name}» حذف می‌شود و پنل‌هایش به سرور اصلی برمی‌گردند
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setConfirmWorker(null)}
+                aria-label="بستن"
+              >
+                ×
+              </button>
+            </header>
+            {removeWorker.isError && (
+              <p className="error">{(removeWorker.error as Error).message}</p>
+            )}
+            <footer className="modal-foot">
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={removeWorker.isPending}
+                onClick={() => setConfirmWorker(null)}
+              >
+                انصراف
+              </button>
+              <button
+                type="button"
+                className="btn danger"
+                disabled={removeWorker.isPending}
+                onClick={() => removeWorker.mutate(confirmWorker.id)}
+              >
+                {removeWorker.isPending ? "…" : "حذف"}
               </button>
             </footer>
           </div>

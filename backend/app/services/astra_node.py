@@ -414,12 +414,30 @@ def _free_tcp_port() -> int:
         return int(s.getsockname()[1])
 
 
+# Cap concurrent short-lived Xray ping processes (test-all can fan out).
+_outbound_ping_gate: asyncio.Semaphore | None = None
+
+
+def _get_outbound_ping_gate() -> asyncio.Semaphore:
+    global _outbound_ping_gate
+    if _outbound_ping_gate is None:
+        _outbound_ping_gate = asyncio.Semaphore(6)
+    return _outbound_ping_gate
+
+
 async def protocol_ping(row: AstraOutbound, *, timeout: float = 10.0) -> tuple[bool, int | None]:
     """Real protocol ping via short-lived Xray (Reality/TLS/WS/…), not bare TCP.
 
     Spins a local SOCKS inbound → this outbound → HTTP 204 probe.
     Reality that only opens TCP to a decoy host will correctly fail here.
     """
+    async with _get_outbound_ping_gate():
+        return await _protocol_ping_unlocked(row, timeout=timeout)
+
+
+async def _protocol_ping_unlocked(
+    row: AstraOutbound, *, timeout: float = 10.0
+) -> tuple[bool, int | None]:
     host = (row.host or "").strip()
     port = int(row.port or 0)
     if not host or port <= 0:
@@ -610,6 +628,158 @@ async def ping_outbounds_batch(
         r.last_ping_at = now
     await db.flush()
     return [r for r, _, _ in probed]
+
+
+async def probe_panel_outbounds_health(
+    panel_id: int,
+    *,
+    concurrency: int = 3,
+    ping_timeout: float = 4.0,
+    prefer_cache_sec: float = 0.0,
+) -> dict[str, Any]:
+    """Pool-safe outbound health for panel Test / test-all.
+
+    Load enabled rows → release DB → protocol ping → short writeback.
+    When ``prefer_cache_sec`` > 0 and every enabled outbound was pinged
+    recently, reuse that result (fast test-all without false قطع from
+    stampede Xray pings).
+    """
+    from app.core.database import AsyncSessionLocal, release_db_txn
+
+    pid = int(panel_id)
+    async with AsyncSessionLocal() as db:
+        rows = list(
+            (
+                await db.execute(
+                    select(AstraOutbound)
+                    .where(
+                        AstraOutbound.panel_id == pid,
+                        AstraOutbound.is_enabled.is_(True),
+                    )
+                    .order_by(AstraOutbound.sort_order.asc(), AstraOutbound.id.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # Detach fields needed after session close.
+        snap: list[AstraOutbound] = list(rows)
+        for r in snap:
+            _ = (
+                r.id,
+                r.uri,
+                r.protocol,
+                r.host,
+                r.port,
+                r.parsed,
+                r.is_enabled,
+                r.last_ping_ok,
+                r.last_ping_ms,
+                r.last_ping_at,
+            )
+        await release_db_txn(db)
+
+    if not snap:
+        return {"enabled": 0, "ok": 0, "bad": 0, "pinged": 0, "cached": False}
+
+    cache_sec = max(0.0, float(prefer_cache_sec or 0.0))
+    if cache_sec > 0:
+        now = datetime.now(timezone.utc)
+        fresh = True
+        for r in snap:
+            at = r.last_ping_at
+            if at is None:
+                fresh = False
+                break
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+            if (now - at).total_seconds() > cache_sec:
+                fresh = False
+                break
+        if fresh:
+            ok_n = sum(1 for r in snap if r.last_ping_ok is True)
+            bad_n = sum(1 for r in snap if r.last_ping_ok is not True)
+            return {
+                "enabled": len(snap),
+                "ok": ok_n,
+                "bad": bad_n,
+                "pinged": 0,
+                "cached": True,
+            }
+
+    sem = asyncio.Semaphore(max(1, min(4, int(concurrency))))
+    to = max(2.0, float(ping_timeout))
+
+    async def _one(r: AstraOutbound) -> tuple[int, bool, int | None]:
+        async with sem:
+            ok, ms = await protocol_ping(r, timeout=to)
+            return int(r.id), bool(ok), ms
+
+    probed = await asyncio.gather(*[_one(r) for r in snap], return_exceptions=True)
+    results: list[tuple[int, bool, int | None]] = []
+    for item in probed:
+        if isinstance(item, Exception):
+            continue
+        results.append(item)
+
+    # If a ping blew up under load, fall back to last known ok for that row
+    # instead of inventing a hard قطع.
+    by_prev = {
+        int(r.id): (bool(r.last_ping_ok) if r.last_ping_ok is not None else None, r.last_ping_ms)
+        for r in snap
+    }
+    merged: list[tuple[int, bool, int | None]] = []
+    got_ids = {oid for oid, _, _ in results}
+    for oid, ok, ms in results:
+        merged.append((oid, ok, ms))
+    for r in snap:
+        rid = int(r.id)
+        if rid in got_ids:
+            continue
+        prev_ok, prev_ms = by_prev.get(rid, (None, None))
+        if prev_ok is True:
+            merged.append((rid, True, prev_ms))
+        else:
+            merged.append((rid, False, None))
+
+    ok_n = sum(1 for _, ok, _ in merged if ok)
+    bad_n = sum(1 for _, ok, _ in merged if not ok)
+    now = datetime.now(timezone.utc)
+    try:
+        async with AsyncSessionLocal() as db:
+            by_id = {oid: (ok, ms) for oid, ok, ms in results}
+            if by_id:
+                db_rows = list(
+                    (
+                        await db.execute(
+                            select(AstraOutbound).where(
+                                AstraOutbound.id.in_(list(by_id.keys()))
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                for r in db_rows:
+                    ok, ms = by_id.get(int(r.id), (False, None))
+                    r.last_ping_ok = ok
+                    r.last_ping_ms = ms
+                    r.last_ping_at = now
+                await db.commit()
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "probe_panel_outbounds_health writeback soft-fail panel=%s",
+            pid,
+            exc_info=True,
+        )
+
+    return {
+        "enabled": len(snap),
+        "ok": ok_n,
+        "bad": bad_n,
+        "pinged": len(results),
+        "cached": False,
+    }
 
 
 async def reconcile_outbounds_health(

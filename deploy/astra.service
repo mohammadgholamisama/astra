@@ -11,19 +11,21 @@ WorkingDirectory=/opt/astra/backend
 # Defaults — overridden by EnvironmentFile when keys exist
 Environment=ASTRA_BIND_HOST=127.0.0.1
 Environment=ASTRA_APP_PORT=2086
+# Spread API across cores (one process used to peg a single core at 100%).
+# Background loops run in only one worker via /tmp/astra-bg.lock.
+Environment=ASTRA_WEB_CONCURRENCY=3
 EnvironmentFile=-/opt/astra/.env
 Environment=PATH=/opt/astra/backend/.venv/bin:/usr/local/bin:/usr/bin
 # IMPORTANT: systemd supports ${VAR} only — NOT bash ${VAR:-default}
-# limit-concurrency + short keepalive cut CLOSE-WAIT pileups under sub stampede.
-ExecStart=/opt/astra/backend/.venv/bin/uvicorn app.main:app --host ${ASTRA_BIND_HOST} --port ${ASTRA_APP_PORT} --limit-concurrency 120 --timeout-keep-alive 5 --timeout-graceful-shutdown 15
+# limit-concurrency is per-worker; short keepalive cuts CLOSE-WAIT pileups.
+ExecStart=/opt/astra/backend/.venv/bin/uvicorn app.main:app --host ${ASTRA_BIND_HOST} --port ${ASTRA_APP_PORT} --workers ${ASTRA_WEB_CONCURRENCY} --limit-concurrency 80 --timeout-keep-alive 5 --timeout-graceful-shutdown 15
 Restart=always
 RestartSec=3
 KillSignal=SIGTERM
-TimeoutStopSec=30
-# Leave headroom for sshd/nginx so admin SSH never starves under usage sync.
-# 250% ≈ 2.5 cores; raise only if the host has many cores and stays responsive.
-CPUQuota=250%
-TasksMax=4096
+TimeoutStopSec=45
+# ~4 cores max for 3 workers + headroom; leave CPU for sshd/nginx.
+CPUQuota=400%
+TasksMax=8192
 OOMPolicy=continue
 # Must be false so astra can sudo astra-helper (SSL / update / nginx) via /etc/sudoers.d/astra
 NoNewPrivileges=false

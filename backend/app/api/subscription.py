@@ -89,8 +89,10 @@ _bg_usage_sem = asyncio.Semaphore(2)
 # Cache key: (user_id, include_hidden, op_bucket) — op_bucket separates ISP orders
 _feed_cache: dict[tuple[int, bool, str], tuple[float, bytes, bool]] = {}
 # Longer TTL = more instant Update hits (apps still send no-cache; server is warm).
-_FEED_CACHE_TTL = 90.0
-_FEED_CACHE_TTL_PARTIAL = 35.0
+# V2Box / Happ / v2rayNG hammer Update; keep warm bodies for minutes.
+_FEED_CACHE_TTL = 300.0
+# Emergency/raw bodies must expire fast so group config_tag names replace them
+_FEED_CACHE_TTL_PARTIAL = 25.0
 _FEED_CACHE_MAX = 4000
 
 # Token→body cache: serve Update with ZERO DB checkout (survives pool starve).
@@ -99,7 +101,12 @@ _token_feed_cache: dict[tuple[str, str], tuple[float, bytes, dict]] = {}
 _TOKEN_FEED_MAX = 6000
 # Shared across uvicorn workers — memory miss still hits disk warm body.
 _TOKEN_DISK_DIR = Path("/tmp/astra_sub_tok")
-_TOKEN_DISK_TTL = 90.0
+_TOKEN_DISK_TTL = 360.0
+
+# Background ranked rebuild after emergency-first miss (debounced).
+_bg_rank_last: dict[int, float] = {}
+_BG_RANK_INTERVAL = 8.0
+_bg_rank_sem = asyncio.Semaphore(4)
 
 
 def _op_bucket(rank_operator: str | None) -> str:
@@ -111,6 +118,14 @@ def _op_bucket(rank_operator: str | None) -> str:
 def _feed_cache_get(
     user_id: int, include_hidden: bool, rank_operator: str | None = None
 ) -> bytes | None:
+    entry = _feed_cache_entry(user_id, include_hidden, rank_operator)
+    return entry[0] if entry else None
+
+
+def _feed_cache_entry(
+    user_id: int, include_hidden: bool, rank_operator: str | None = None
+) -> tuple[bytes, bool] | None:
+    """Return ``(body, complete)`` — complete=False means emergency/raw names."""
     key = (int(user_id), bool(include_hidden), _op_bucket(rank_operator))
     hit = _feed_cache.get(key)
     if not hit:
@@ -124,7 +139,7 @@ def _feed_cache_get(
     if not body:
         _feed_cache.pop(key, None)
         return None
-    return body
+    return body, bool(complete)
 
 
 def _feed_cache_put(
@@ -288,8 +303,20 @@ def invalidate_user_feed_cache(*user_ids: int) -> None:
                 _token_feed_cache.pop(key, None)
         except Exception:
             _token_feed_cache.pop(key, None)
-    # Shared disk may hold stale active bodies after expire/limit — wipe.
-    _token_disk_clear()
+    # Only purge matching disk entries — full wipe caused fleet-wide cold misses
+    # whenever one user was hydrated/healed (V2Box Update stampede).
+    try:
+        if _TOKEN_DISK_DIR.is_dir():
+            for meta_path in _TOKEN_DISK_DIR.glob("*.meta"):
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    if int(meta.get("user_id") or 0) in want:
+                        meta_path.unlink(missing_ok=True)
+                        meta_path.with_suffix(".bin").unlink(missing_ok=True)
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def clear_feed_cache() -> None:
@@ -559,14 +586,52 @@ async def _bg_usage_pull(user_id: int) -> None:
                         before = max(before, int(instant))
                 except Exception:  # noqa: BLE001
                     pass
+                # Multi-panel users: fleet/hot bulk owns remote meters. Per-user
+                # get_usage×38 was timing out, holding the gate, and starving the
+                # fleet (used_traffic stuck at 0 while remotes kept growing).
+                n_active = 0
                 try:
-                    after, activated, changed, status_now = await asyncio.wait_for(
-                        refresh_usage_pool_safe(
-                            int(user_id), force=True, quick=True
-                        ),
-                        # Waves cover remotes calmly; hard wall protects the event loop.
-                        timeout=32.0,
-                    )
+                    from sqlalchemy import func as _sa_func
+
+                    async with AsyncSessionLocal() as db:
+                        n_active = int(
+                            (
+                                await db.execute(
+                                    select(_sa_func.count())
+                                    .select_from(PanelAccount)
+                                    .where(
+                                        PanelAccount.user_id == int(user_id),
+                                        PanelAccount.status.in_(
+                                            (
+                                                PanelAccountStatus.active,
+                                                PanelAccountStatus.error,
+                                            )
+                                        ),
+                                    )
+                                )
+                            ).scalar()
+                            or 0
+                        )
+                        await db.rollback()
+                except Exception:  # noqa: BLE001
+                    n_active = 40
+                # Fat multi-panel users: fleet/hot update meters; we only recount.
+                do_remote = n_active <= 12
+                try:
+                    if do_remote:
+                        after, activated, changed, status_now = await asyncio.wait_for(
+                            refresh_usage_pool_safe(
+                                int(user_id), force=True, quick=True
+                            ),
+                            timeout=16.0,
+                        )
+                    else:
+                        after, activated, changed, status_now = (
+                            before,
+                            False,
+                            False,
+                            "fleet",
+                        )
                 except asyncio.TimeoutError:
                     # Keep accurate weighted total from meters already on disk.
                     from app.services.orchestrator import recount_user_usage_pool_safe
@@ -872,20 +937,293 @@ def _encode_feed(links: list[str]) -> bytes:
     return base64.b64encode(body.encode("utf-8"))
 
 
-def _emergency_links_from_accounts(user, *, max_n: int | None = None) -> list[str]:
-    """Fast path when ranked collect fails/times out — raw cached share URIs.
+def _share_count_from_body(body: bytes, *, meta: dict | None = None) -> int:
+    """Count real share lines. Base64 bodies have ~0 newlines — never use count(\\n)."""
+    if meta:
+        try:
+            n = int(meta.get("share_count") or 0)
+            if n > 0:
+                return n
+        except (TypeError, ValueError):
+            pass
+    if not body:
+        return 0
+    try:
+        text = base64.b64decode(body, validate=False).decode("utf-8", "ignore")
+        n = sum(1 for line in text.splitlines() if (line or "").strip())
+        if n > 0:
+            return n
+    except Exception:  # noqa: BLE001
+        pass
+    return 1 if body else 0
 
-    Skips claims/ping arrange so Update still gets every ready account link
-    (capped) instead of an empty Base64 body.
-    """
+
+def _feed_meta_for_user(
+    user,
+    *,
+    complete: bool,
+    share_count: int,
+) -> dict:
+    return {
+        "user_id": int(user.id),
+        "username": str(user.username or "user"),
+        "display_name": getattr(user, "display_name", None),
+        "used_traffic": int(user.used_traffic or 0),
+        "data_limit": int(user.data_limit or 0),
+        "expire": user.expire,
+        "status": getattr(user.status, "value", user.status),
+        "complete": bool(complete),
+        "share_count": int(share_count),
+    }
+
+
+async def _bg_ranked_feed_rebuild(
+    user_id: int,
+    token: str,
+    rank_operator: str | None,
+) -> None:
+    """Upgrade emergency/fast body to ranked collect without blocking Update."""
+    uid = int(user_id)
+    now = time.monotonic()
+    last = float(_bg_rank_last.get(uid, 0.0) or 0.0)
+    if now - last < _BG_RANK_INTERVAL:
+        return
+    _bg_rank_last[uid] = now
+    if len(_bg_rank_last) > 8000:
+        cutoff = now - 600.0
+        for k, ts in list(_bg_rank_last.items()):
+            if ts < cutoff:
+                _bg_rank_last.pop(k, None)
+    await asyncio.sleep(0.05)
+    try:
+        async with _bg_rank_sem:
+            async with AsyncSessionLocal() as db:
+                user = await load_user_by_token(db, token)
+                if user is None or int(user.id) != uid:
+                    return
+                if user.status in (
+                    UserStatus.limited,
+                    UserStatus.expired,
+                    UserStatus.disabled,
+                ):
+                    return
+                try:
+                    links = await asyncio.wait_for(
+                        _collect_feed_links(
+                            user,
+                            include_hidden=False,
+                            db=db,
+                            rank_operator=rank_operator,
+                        ),
+                        timeout=8.0,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "bg ranked collect user=%s: %s", user.username, exc
+                    )
+                    return
+                cleaned: list[str] = []
+                seen_l: set[str] = set()
+                for x in links or []:
+                    s = _sanitize_vpn_share_link(x or "")
+                    if not s or s in seen_l:
+                        continue
+                    seen_l.add(s)
+                    cleaned.append(s)
+                links = cleaned
+                from app.adapters.http_utils import is_share_link as _isl
+
+                real_n = sum(
+                    1
+                    for x in links
+                    if _isl(x)
+                    and "127.0.0.1" not in (x or "")
+                    and "localhost" not in (x or "").lower()
+                )
+                if real_n <= 0:
+                    return
+                body = _encode_feed(links)
+                if not body:
+                    return
+                _feed_cache_put(
+                    uid,
+                    False,
+                    body,
+                    complete=True,
+                    rank_operator=rank_operator,
+                )
+                _token_feed_put(
+                    token,
+                    body,
+                    _feed_meta_for_user(user, complete=True, share_count=real_n),
+                    rank_operator=rank_operator,
+                )
+                logger.info(
+                    "bg ranked-feed user=%s n=%s op=%s",
+                    user.username,
+                    real_n,
+                    rank_operator or "global",
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("bg ranked rebuild user_id=%s: %s", uid, exc)
+
+
+def _schedule_bg_ranked_rebuild(
+    user_id: int, token: str, rank_operator: str | None
+) -> None:
+    try:
+        asyncio.create_task(
+            _bg_ranked_feed_rebuild(int(user_id), token, rank_operator),
+            name=f"astra-sub-rank-{int(user_id)}",
+        )
+    except RuntimeError:
+        pass
+
+
+# V2Box / Happ / v2rayNG often reject the *entire* sub import when one URI is
+# absurdly long or uses non-standard encryption= blobs (mlkem… / PQ experiments).
+_MAX_VPN_SHARE_URI = 1800
+
+
+def _sanitize_vpn_share_link(text: str) -> str | None:
+    """Return a client-safe share URI, or None to drop from VPN feeds."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if len(raw) > _MAX_VPN_SHARE_URI:
+        return None
+    if "@[" in raw or _looks_like_ipv6_host(raw):
+        return None
+    low = raw.lower()
+    if "127.0.0.1" in low or "localhost" in low or "@[::1]" in low:
+        return None
+    # Strip huge ``extra=`` JSON that blows URI size / breaks OkHttp parsers.
+    if "extra=" in low:
+        try:
+            from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+            frag = ""
+            main = raw
+            if "#" in raw:
+                main, frag = raw.split("#", 1)
+            parts = urlsplit(main)
+            q = [
+                (k, v)
+                for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                if k.lower() != "extra"
+            ]
+            main = urlunsplit(
+                (parts.scheme, parts.netloc, parts.path, urlencode(q), parts.fragment)
+            )
+            raw = f"{main}#{frag}" if frag else main
+        except Exception:  # noqa: BLE001
+            return None
+        if len(raw) > _MAX_VPN_SHARE_URI:
+            return None
+    # Non-standard vless encryption (must be ``none`` for almost all clients).
+    if raw.lower().startswith("vless://") and "encryption=" in low:
+        try:
+            from urllib.parse import parse_qs, urlsplit
+
+            q = parse_qs(urlsplit(raw.split("#", 1)[0]).query)
+            enc = (q.get("encryption") or [""])[0].strip().lower()
+            if enc and enc not in ("none", "0", "zero"):
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+    return raw
+
+
+def _filter_emergency_link_texts(
+    raw_links: list, *, cap: int, seen: set[str] | None = None
+) -> list[str]:
+    """Filter raw DB link strings into a capped emergency share list."""
     from app.adapters.http_utils import is_share_link
     from app.services.orchestrator import _config_hidden
+
+    out: list[str] = []
+    seen = seen if seen is not None else set()
+    for link in raw_links or []:
+        text = (link or "").strip() if isinstance(link, str) else str(link or "").strip()
+        if not text or text in seen or not is_share_link(text):
+            continue
+        if _config_hidden(text):
+            continue
+        text = _sanitize_vpn_share_link(text)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _stamp_group_tags_on_links(
+    user,
+    rows: list[dict],
+) -> list[str]:
+    """Rewrite share-link remarks with group ``config_tag`` (نامحدود حجم…).
+
+    Emergency/fast paths used to return raw panel remarks (Turbo / flags) and
+    skip the text admins typed on Groups — stamp tags here so Update always
+    shows ``#1. نامحدود حجمDبدون ضریب … | user``.
+    """
+    from app.services.link_remark import apply_display_name
+
+    if not rows:
+        return []
+    used = int(getattr(user, "used_traffic", 0) or 0)
+    limit = int(getattr(user, "data_limit", 0) or 0)
+    uname = (getattr(user, "username", None) or "user").strip() or "user"
+    st = getattr(user, "status", None)
+    user_status = st.value if hasattr(st, "value") else str(st or "")
+    renamed = apply_display_name(
+        rows,
+        getattr(user, "display_name", None),
+        used=used,
+        limit=limit,
+        username=uname,
+        user_status=user_status,
+    )
+    # Status/notice rows use 127.0.0.1 — VPN sanitize drops them; ranked
+    # collect re-adds a proper status line. Here we only stamp real configs.
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in renamed:
+        if item.get("kind") in ("status", "promo", "notice"):
+            continue
+        link = _sanitize_vpn_share_link(str(item.get("link") or ""))
+        if not link or link in seen:
+            continue
+        seen.add(link)
+        out.append(link)
+    return out
+
+
+def _emergency_links_from_accounts(user, *, max_n: int | None = None) -> list[str]:
+    """Fast path — cached share URIs **with group config_tag names**."""
     from app.services.ping_category_order import SUB_MAX_CONFIGS
 
     cap = int(max_n if max_n is not None else SUB_MAX_CONFIGS)
     if cap <= 0:
         cap = int(SUB_MAX_CONFIGS)
-    out: list[str] = []
+
+    # panel_id → first non-empty group tag (fallback when account.group_id empty)
+    panel_tags: dict[int, str] = {}
+    for g in list(getattr(user, "groups", None) or []):
+        tag = str(getattr(g, "config_tag", None) or "").strip()
+        if not tag:
+            continue
+        for gp in list(getattr(g, "group_panels", None) or getattr(g, "panels", None) or []):
+            try:
+                pid = int(getattr(gp, "panel_id", None) or getattr(gp, "id", 0) or 0)
+            except (TypeError, ValueError):
+                pid = 0
+            if pid and pid not in panel_tags:
+                panel_tags[pid] = tag
+
+    tagged: list[dict] = []
     seen: set[str] = set()
     for account in user.panel_accounts or []:
         st = getattr(account, "status", None)
@@ -898,22 +1236,122 @@ def _emergency_links_from_accounts(user, *, max_n: int | None = None) -> list[st
         panel = account.__dict__.get("panel") or getattr(account, "panel", None)
         if panel is not None and not bool(getattr(panel, "is_active", True)):
             continue
-        for link in account.links or []:
-            text = (link or "").strip()
-            if not text or text in seen or not is_share_link(text):
-                continue
-            if _config_hidden(text):
-                continue
-            if "@[" in text or _looks_like_ipv6_host(text):
-                continue
-            low = text.lower()
-            if "127.0.0.1" in low or "localhost" in low or "@[::1]" in low:
-                continue
-            seen.add(text)
-            out.append(text)
-            if len(out) >= cap:
-                return out
-    return out
+        try:
+            pid = int(getattr(account, "panel_id", 0) or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        gid = getattr(account, "group_id", None)
+        tag = ""
+        if gid is not None:
+            for g in list(getattr(user, "groups", None) or []):
+                if int(getattr(g, "id", 0) or 0) == int(gid):
+                    tag = str(getattr(g, "config_tag", None) or "").strip()
+                    break
+        if not tag and pid:
+            tag = panel_tags.get(pid, "")
+        chunk = _filter_emergency_link_texts(
+            list(account.links or []), cap=max(0, cap - len(tagged)), seen=seen
+        )
+        for link in chunk:
+            tagged.append(
+                {
+                    "link": link,
+                    "panel_id": pid,
+                    "group_id": int(gid) if gid is not None else None,
+                    "config_tag": tag,
+                }
+            )
+            if len(tagged) >= cap:
+                return _stamp_group_tags_on_links(user, tagged)
+    return _stamp_group_tags_on_links(user, tagged)
+
+
+async def _sql_emergency_share_links(
+    db: AsyncSession, user, *, max_n: int | None = None
+) -> list[str]:
+    """SQL share URIs with group ``config_tag`` stamped into remarks."""
+    from sqlalchemy import text
+
+    from app.services.ping_category_order import SUB_MAX_CONFIGS
+
+    user_id = int(getattr(user, "id", 0) or 0)
+    cap = int(max_n if max_n is not None else SUB_MAX_CONFIGS)
+    if cap <= 0:
+        cap = int(SUB_MAX_CONFIGS)
+    fetch_n = max(cap * 4, 200)
+    try:
+        result = await db.execute(
+            text(
+                """
+                SELECT t.link,
+                       pa.panel_id,
+                       pa.group_id,
+                       coalesce(
+                         nullif(trim(g.config_tag), ''),
+                         nullif(trim(g2.config_tag), ''),
+                         ''
+                       ) AS config_tag
+                FROM panel_accounts pa
+                LEFT JOIN panels p ON p.id = pa.panel_id
+                LEFT JOIN groups g ON g.id = pa.group_id
+                LEFT JOIN LATERAL (
+                    SELECT gg.config_tag
+                    FROM user_groups ug
+                    JOIN group_panels gp ON gp.group_id = ug.group_id
+                      AND gp.panel_id = pa.panel_id
+                    JOIN groups gg ON gg.id = ug.group_id
+                    WHERE ug.user_id = pa.user_id
+                      AND coalesce(trim(gg.config_tag), '') <> ''
+                    ORDER BY ug.group_id
+                    LIMIT 1
+                ) g2 ON true
+                CROSS JOIN LATERAL jsonb_array_elements_text(
+                    CASE
+                      WHEN pa.links IS NULL THEN '[]'::jsonb
+                      WHEN jsonb_typeof(pa.links::jsonb) = 'array'
+                        THEN pa.links::jsonb
+                      ELSE '[]'::jsonb
+                    END
+                ) AS t(link)
+                WHERE pa.user_id = :uid
+                  AND pa.status IN ('active', 'error', 'pending')
+                  AND COALESCE(p.is_active, true) = true
+                  AND t.link IS NOT NULL
+                  AND length(t.link) > 12
+                ORDER BY pa.id
+                LIMIT :lim
+                """
+            ),
+            {"uid": user_id, "lim": int(fetch_n)},
+        )
+        raw_rows = result.fetchall()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("sql emergency links user_id=%s: %s", user_id, exc)
+        return []
+
+    tagged: list[dict] = []
+    seen: set[str] = set()
+    for link, panel_id, group_id, config_tag in raw_rows:
+        text_l = _sanitize_vpn_share_link(str(link or "").strip())
+        if not text_l or text_l in seen:
+            continue
+        from app.adapters.http_utils import is_share_link
+        from app.services.orchestrator import _config_hidden
+
+        if not is_share_link(text_l) or _config_hidden(text_l):
+            continue
+        seen.add(text_l)
+        tagged.append(
+            {
+                "link": text_l,
+                "panel_id": int(panel_id or 0),
+                "group_id": int(group_id) if group_id is not None else None,
+                "config_tag": str(config_tag or "").strip(),
+            }
+        )
+        if len(tagged) >= cap:
+            break
+    return _stamp_group_tags_on_links(user, tagged)
 
 
 def _looks_like_ipv6_host(link: str) -> bool:
@@ -1227,6 +1665,55 @@ def _fallback_sub_html(username: str = "") -> str:
     )
 
 
+async def _configs_for_info_fallback(
+    db: AsyncSession, user, *, rank_operator: str | None = None
+) -> list[dict]:
+    """Last-resort rows if detailed collect times out — keep fragment remarks."""
+    from urllib.parse import unquote
+
+    links: list[str] = []
+    try:
+        tok = (getattr(user, "sub_token", None) or "").strip()
+        if tok:
+            hit = _token_feed_get(tok, rank_operator) or _token_feed_get(tok, None)
+            if hit:
+                body, _meta = hit
+                text = base64.b64decode(body, validate=False).decode(
+                    "utf-8", "ignore"
+                )
+                links = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    except Exception:  # noqa: BLE001
+        links = []
+    if not links:
+        try:
+            links = await _sql_emergency_share_links(db, user)
+        except Exception:  # noqa: BLE001
+            links = []
+    if not links:
+        try:
+            links = _emergency_links_from_accounts(user)
+        except Exception:  # noqa: BLE001
+            links = []
+    out: list[dict] = []
+    for link in links:
+        safe = (link or "").strip()
+        if not safe:
+            continue
+        remark = ""
+        if "#" in safe:
+            remark = unquote(safe.rsplit("#", 1)[-1]).strip()
+        out.append(
+            {
+                "link": safe,
+                "kind": "config",
+                "name": remark,
+                "remark": remark,
+                "tag": "",
+            }
+        )
+    return out
+
+
 async def _render_info_page_body(
     db: AsyncSession,
     token: str,
@@ -1246,14 +1733,19 @@ async def _render_info_page_body(
     except Exception:  # noqa: BLE001
         pass
 
+    # Primary: full named rows (status / promo / group tags / display names).
+    # live_rebuild=False keeps this under the HTML deadline for most users.
+    configs: list[dict] = []
     try:
-        # Same ISP order as the VPN Base64 feed (Rightel/Shatel/…).
-        configs = await collect_links_detailed(
-            user,
-            include_notices=True,
-            db=db,
-            live_rebuild=False,
-            rank_operator=rank_operator,
+        configs = await asyncio.wait_for(
+            collect_links_detailed(
+                user,
+                include_notices=True,
+                db=db,
+                live_rebuild=False,
+                rank_operator=rank_operator,
+            ),
+            timeout=5.5,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("sub detailed user=%s: %s", user.username, exc)
@@ -1262,6 +1754,13 @@ async def _render_info_page_body(
         except Exception:  # noqa: BLE001
             pass
         configs = []
+    if not configs:
+        try:
+            configs = await _configs_for_info_fallback(
+                db, user, rank_operator=rank_operator
+            )
+        except Exception:  # noqa: BLE001
+            configs = []
     # Skip usage_breakdown SQL on hot HTML path — page ignores panels_usage anyway.
     panels_usage: list = []
     try:
@@ -1329,12 +1828,13 @@ async def _render_info_page(
     """HTML info page — hard wall-clock cap so Iran nginx never 504s the browser."""
     name = getattr(user, "username", "") or ""
     try:
-        # Fast answer only — usage/heal stay in background tasks.
+        # Named collect needs a bit more than the old 3.5s wall — still under
+        # Iran nginx budgets; fallback page only if truly stuck.
         return await asyncio.wait_for(
             _render_info_page_body(
                 db, token, user, rank_operator=rank_operator
             ),
-            timeout=3.5,
+            timeout=8.0,
         )
     except asyncio.TimeoutError:
         logger.warning("sub html deadline user=%s — fallback page", name)
@@ -1395,8 +1895,12 @@ async def get_subscription(token: str, request: Request):
     )
 
     # Zero-DB Update path: token body cache (survives QueuePool / CPU storms).
+    # Fallback to global bucket — emergency/fast bodies are ISP-agnostic until
+    # bg ranked rewrite; avoids a cold miss per Shatel/Irancell/… on first open.
     if curated_early:
         tok_hit = _token_feed_get(token, rank_operator_early)
+        if not tok_hit and rank_operator_early:
+            tok_hit = _token_feed_get(token, None)
         if tok_hit:
             body_hit, meta = tok_hit
             st = str(meta.get("status") or "")
@@ -1455,7 +1959,7 @@ async def get_subscription(token: str, request: Request):
                 return _feed_response(
                     body_hit,
                     _headers_tok(body_hit),
-                    share_count=max(1, body_hit.count(b"\n")),
+                    share_count=_share_count_from_body(body_hit, meta=meta),
                 )
 
     async with AsyncSessionLocal() as db:
@@ -1546,8 +2050,11 @@ async def _serve_subscription_db(
         and user.status != UserStatus.disabled
         and not blocked_early
     ):
-        cached_early = _feed_cache_get(uid_safe, False, rank_operator_early)
-        if cached_early:
+        entry_early = _feed_cache_entry(uid_safe, False, rank_operator_early)
+        if not entry_early and rank_operator_early:
+            entry_early = _feed_cache_entry(uid_safe, False, None)
+        if entry_early:
+            cached_early, cache_complete = entry_early
             try:
                 from app.services.orchestrator import mark_live_usage_priority
 
@@ -1557,19 +2064,20 @@ async def _serve_subscription_db(
             _schedule_bg_usage(uid_safe)
             # Maintain only on debounce — not every Update tap.
             _schedule_bg_maintain(uid_safe)
+            # Emergency/raw cache → keep upgrading to group config_tag names
+            if not cache_complete:
+                _schedule_bg_ranked_rebuild(
+                    uid_safe, token, rank_operator_early
+                )
+            _sc_early = _share_count_from_body(cached_early)
             _token_feed_put(
                 token,
                 cached_early,
-                {
-                    "user_id": uid_safe,
-                    "username": uname_safe,
-                    "display_name": getattr(user, "display_name", None),
-                    "used_traffic": int(user.used_traffic or 0),
-                    "data_limit": int(user.data_limit or 0),
-                    "expire": user.expire,
-                    "status": getattr(user.status, "value", user.status),
-                    "complete": True,
-                },
+                _feed_meta_for_user(
+                    user,
+                    complete=cache_complete,
+                    share_count=_sc_early,
+                ),
                 rank_operator=rank_operator_early,
             )
 
@@ -1581,16 +2089,100 @@ async def _serve_subscription_db(
                     user, body_rev=f"{digest}-{int(time.time())}"
                 )
                 hdrs["x-astra-rank-op"] = (rank_operator_early or "global")[:32]
-                hdrs["x-astra-cache"] = "hit"
+                hdrs["x-astra-cache"] = (
+                    "hit" if cache_complete else "hit-partial"
+                )
                 return hdrs
 
             return _feed_response(
                 cached_early,
                 _headers_hit(cached_early),
-                share_count=max(1, cached_early.count(b"\n")),
+                share_count=_sc_early,
             )
 
-    # Cache miss / HTML / probe: full graph load for collect + membership checks.
+    # VPN Update cold miss: SQL share links only (no ORM of 80+ accounts).
+    # ORM accounts load was still 1–4s for fat users → apps «آپدیت نشد».
+    if (
+        curated_early
+        and not is_probe
+        and not blocked_early
+        and user.status != UserStatus.disabled
+    ):
+        try:
+            emergency = await _sql_emergency_share_links(db, user)
+        except BaseException as exc:  # noqa: BLE001
+            if _is_cancel(exc):
+                raise
+            logger.warning("sub sql-emergency user=%s: %s", uname_safe, exc)
+            emergency = []
+        if emergency:
+            real_n = len(emergency)
+            body = _encode_feed(emergency)
+            if body and real_n > 0:
+                rank_operator = rank_operator_early
+                # Tags already stamped from groups.config_tag — safe to cache.
+                _meta = _feed_meta_for_user(
+                    user, complete=True, share_count=real_n
+                )
+                # Warm global + ISP buckets so next Update from any operator hits.
+                for _op in {None, rank_operator}:
+                    _feed_cache_put(
+                        uid_safe,
+                        False,
+                        body,
+                        complete=True,
+                        rank_operator=_op,
+                    )
+                    _token_feed_put(
+                        token, body, _meta, rank_operator=_op
+                    )
+                _schedule_bg_ranked_rebuild(uid_safe, token, rank_operator)
+                _schedule_bg_maintain(uid_safe)
+                try:
+                    from app.services.orchestrator import mark_live_usage_priority
+
+                    mark_live_usage_priority(uid_safe)
+                    _schedule_bg_usage(uid_safe)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    from app.services.user_analytics import record_sub_fetch
+
+                    hdrs = {k: v for k, v in request.headers.items()}
+                    client_host = (
+                        request.client.host if request.client else None
+                    )
+                    asyncio.create_task(
+                        record_sub_fetch(
+                            user_id=uid_safe,
+                            headers=hdrs,
+                            client_host=client_host,
+                            is_probe=False,
+                        ),
+                        name=f"astra-sub-fetch-{uid_safe}",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+                def _headers_fast(b: bytes) -> dict[str, str]:
+                    digest = hashlib.sha256(b or b"").hexdigest()[:12]
+                    hdrs = _sub_headers(
+                        user, body_rev=f"{digest}-{int(time.time())}"
+                    )
+                    hdrs["x-astra-rank-op"] = (rank_operator or "global")[:32]
+                    hdrs["x-astra-cache"] = "fast"
+                    return hdrs
+
+                logger.info(
+                    "sub sql-fast user=%s n=%s",
+                    uname_safe,
+                    real_n,
+                )
+                return _feed_response(
+                    body, _headers_fast(body), share_count=real_n
+                )
+
+    # Cache miss / HTML / probe / empty: full graph load for collect + claims.
     try:
         user_full = await load_user_by_token(db, token)
         if user_full is not None:
@@ -1807,8 +2399,59 @@ async def _serve_subscription_db(
                 return _feed_response(
                     cached,
                     _headers_for(cached),
-                    share_count=max(1, cached.count(b"\n")),
+                    share_count=_share_count_from_body(cached),
                 )
+
+        from app.adapters.http_utils import is_share_link as _isl
+
+        def _count_real(items: list[str]) -> int:
+            return sum(
+                1
+                for x in items
+                if _isl(x)
+                and "127.0.0.1" not in (x or "")
+                and "localhost" not in (x or "").lower()
+            )
+
+        # VPN Update (V2Box / Happ / v2rayNG): serve DB share links NOW.
+        # Ranked collect was 0.7–8s under load → apps showed empty / no update.
+        # Emergency body caches; bg upgrades to ISP-ranked order within seconds.
+        if curated and not blocked and has_links:
+            emergency = _emergency_links_from_accounts(user)
+            if emergency:
+                real_n = _count_real(emergency)
+                body = _encode_feed(emergency)
+                if body and real_n > 0:
+                    # Group config_tag already stamped on remarks
+                    _feed_cache_put(
+                        int(user.id),
+                        False,
+                        body,
+                        complete=True,
+                        rank_operator=rank_operator,
+                    )
+                    _token_feed_put(
+                        token,
+                        body,
+                        _feed_meta_for_user(
+                            user, complete=True, share_count=real_n
+                        ),
+                        rank_operator=rank_operator,
+                    )
+                    _schedule_bg_ranked_rebuild(
+                        int(user.id), token, rank_operator
+                    )
+                    _schedule_bg_maintain(int(user.id))
+                    logger.info(
+                        "sub fast-emergency user=%s n=%s (ranked bg)",
+                        uname_safe,
+                        real_n,
+                    )
+                    _fast_hdrs = _headers_for(body)
+                    _fast_hdrs["x-astra-cache"] = "fast"
+                    return _feed_response(
+                        body, _fast_hdrs, share_count=real_n
+                    )
 
         # Tunnel nginx 502s if this handler is slow or cancelled. DB links only.
         # Full/probe inventory is heavier — allow more time so AstraPing gets all.
@@ -1829,9 +2472,7 @@ async def _serve_subscription_db(
                         len(links),
                     )
             if not links:
-                # Curated VPN path must stay fast for Cloudflare quick tunnel
-                # (slow origin → CF 502). Prefer a slightly longer collect over
-                # returning an empty body apps show as «۰ کانفیگ».
+                # Empty / no emergency — short collect; never sit on CF 502.
                 links = await asyncio.wait_for(
                     _collect_feed_links(
                         user,
@@ -1839,28 +2480,23 @@ async def _serve_subscription_db(
                         db=db,
                         rank_operator=rank_operator,
                     ),
-                    timeout=25.0 if include_hidden else 4.0,
+                    timeout=25.0 if include_hidden else 1.8,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("sub collect user=%s: %s", user.username, exc)
             links = []
 
-        # Older v2rayNG builds choke on IPv6 literals in the whole sub import.
+        # VPN apps reject the whole import on one bad/huge URI (IPv6 / PQ enc).
         if curated:
-            links = [
-                x
-                for x in links
-                if x and "@[" not in x and not _looks_like_ipv6_host(x)
-            ]
-
-        from app.adapters.http_utils import is_share_link as _isl
-
-        def _count_real(items: list[str]) -> int:
-            return sum(
-                1
-                for x in items
-                if _isl(x) and "127.0.0.1" not in (x or "") and "localhost" not in (x or "").lower()
-            )
+            _seen_c: set[str] = set()
+            _clean_c: list[str] = []
+            for x in links:
+                s = _sanitize_vpn_share_link(x or "")
+                if not s or s in _seen_c:
+                    continue
+                _seen_c.add(s)
+                _clean_c.append(s)
+            links = _clean_c
 
         real_n = _count_real(links)
 
@@ -1878,20 +2514,28 @@ async def _serve_subscription_db(
                     )
                     if n:
                         user = await load_user_by_token(db, token) or user
-                        links = await asyncio.wait_for(
-                            _collect_feed_links(
-                                user,
-                                include_hidden=False,
-                                db=db,
-                                rank_operator=rank_operator,
-                            ),
-                            timeout=2.0,
-                        )
-                        links = [
-                            x
-                            for x in links
-                            if x and "@[" not in x and not _looks_like_ipv6_host(x)
-                        ]
+                        emergency = _emergency_links_from_accounts(user)
+                        if emergency:
+                            links = emergency
+                        else:
+                            links = await asyncio.wait_for(
+                                _collect_feed_links(
+                                    user,
+                                    include_hidden=False,
+                                    db=db,
+                                    rank_operator=rank_operator,
+                                ),
+                                timeout=1.5,
+                            )
+                        _seen_r: set[str] = set()
+                        _clean_r: list[str] = []
+                        for x in links:
+                            s = _sanitize_vpn_share_link(x or "")
+                            if not s or s in _seen_r:
+                                continue
+                            _seen_r.add(s)
+                            _clean_r.append(s)
+                        links = _clean_r
                         real_n = _count_real(links)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
@@ -1943,18 +2587,13 @@ async def _serve_subscription_db(
             _token_feed_put(
                 token,
                 body,
-                {
-                    "user_id": int(user.id),
-                    "username": str(user.username or "user"),
-                    "display_name": getattr(user, "display_name", None),
-                    "used_traffic": int(user.used_traffic or 0),
-                    "data_limit": int(user.data_limit or 0),
-                    "expire": user.expire,
-                    "status": getattr(user.status, "value", user.status),
-                    "complete": _complete,
-                },
+                _feed_meta_for_user(
+                    user, complete=_complete, share_count=real_n
+                ),
                 rank_operator=rank_operator,
             )
+            if not include_hidden:
+                _schedule_bg_ranked_rebuild(int(user.id), token, rank_operator)
 
         # #region agent log
         _dbg(
@@ -2058,7 +2697,45 @@ async def subscription_page(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
+    # VPN apps often paste the browser URL (…/info). HTML cannot be imported →
+    # redirect those UAs to the Base64 feed. Real browsers always get HTML
+    # (do NOT require Sec-Fetch — mobile/proxy often omit it and used to 302
+    # away from the named config list).
+    ua = (request.headers.get("user-agent") or "").lower()
+    vpn_markers = (
+        "v2ray",
+        "v2box",
+        "happ",
+        "clash",
+        "sing-box",
+        "singbox",
+        "shadowrocket",
+        "streisand",
+        "hiddify",
+        "nekobox",
+        "okhttp",
+        "surge",
+        "quantumult",
+        "stash",
+        "loon",
+    )
+    accept = (request.headers.get("accept") or "").lower()
+    wants_html = "text/html" in accept or not accept
+    is_vpn_ua = any(m in ua for m in vpn_markers)
+    if is_vpn_ua and not wants_html:
+        return RedirectResponse(
+            url=f"/sub/{token}",
+            status_code=302,
+            headers={"cache-control": "no-store"},
+        )
+    if is_vpn_ua and "text/html" not in accept and "mozilla" not in ua:
+        return RedirectResponse(
+            url=f"/sub/{token}",
+            status_code=302,
+            headers={"cache-control": "no-store"},
+        )
     try:
+        # Full graph required — group config_tag / display names come from claims.
         user = await load_user_by_token(db, token)
     except BaseException as exc:  # noqa: BLE001
         if _is_cancel(exc):

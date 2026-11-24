@@ -112,7 +112,8 @@ class UserBulkCreate(BaseModel):
         max_length=28,
         pattern=r"^[a-zA-Z0-9_]+$",
     )
-    count: int = Field(ge=1, le=500)
+    # Soft safety only — UI/API used to hard-cap at 50 and starve large agent runs.
+    count: int = Field(ge=1, le=10000)
     display_name: str | None = Field(default=None, max_length=64)
     status: UserStatus = UserStatus.active
     data_limit: int = 0
@@ -159,6 +160,9 @@ class UserRetryErrorsResponse(BaseModel):
     swept_active: int = 0
     swept_pending: int = 0
     swept_inactive: int = 0
+    # True when remotes continue in background (avoids CF/browser Failed to fetch).
+    remote_bg: bool = False
+    message: str = ""
 
 
 class UserFixSubResponse(BaseModel):

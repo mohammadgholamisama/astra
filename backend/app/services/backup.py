@@ -20,6 +20,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -227,13 +228,14 @@ def _pg_dump_to_file(dest: Path, database_url: str | None = None) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         dest.unlink()
-    # Custom format: compressed, supports parallel restore, clean --if-exists
+    # Custom format: compressed, parallel-ready restore. -Z6 balances size/speed
+    # for ~500MB+ panels so CF/browser do not sit idle forever.
     cmd = [
         dump,
         "--format=custom",
         "--no-owner",
         "--no-acl",
-        "--verbose",
+        "--compress=6",
         f"--file={dest}",
         libpq,
     ]
@@ -299,13 +301,21 @@ def build_backup_zip(dest_zip: Path) -> dict[str, Any]:
             db_copy = tmp_dir / DB_ENTRY_SQLITE
             db_copy.parent.mkdir(parents=True, exist_ok=True)
             _online_sqlite_copy(db_path, db_copy)
-            counts = _sqlite_table_counts(db_copy)
+            # Counts are optional sanity — skip on huge DBs to finish before proxy timeout.
+            try:
+                counts = _sqlite_table_counts(db_copy)
+            except Exception:  # noqa: BLE001
+                counts = {}
             db_arc = DB_ENTRY_SQLITE
             source_label = db_path.name
         else:
             db_copy = tmp_dir / DB_ENTRY_PG
             _pg_dump_to_file(db_copy, settings.DATABASE_URL)
-            counts = _pg_table_counts(settings.DATABASE_URL)
+            # Best-effort; never block the zip on slow pg_stat queries.
+            try:
+                counts = _pg_table_counts(settings.DATABASE_URL)
+            except Exception:  # noqa: BLE001
+                counts = {}
             db_arc = DB_ENTRY_PG
             source_label = _pg_safe_label(settings.DATABASE_URL)
 
@@ -774,3 +784,135 @@ def suggested_backup_filename() -> str:
     dialect = dialect_of()
     tag = "pg" if dialect == "postgresql" else "sqlite"
     return f"{panel}-backup-{tag}-{stamp}.zip"
+
+
+# ── Ready-cache so download is instant after a short prepare (avoids CF timeout)
+_BACKUP_CACHE_DIR = Path(
+    os.environ.get("ASTRA_BACKUP_CACHE_DIR", "/opt/astra/data/backups")
+)
+_BACKUP_CACHE_ZIP = _BACKUP_CACHE_DIR / "latest.zip"
+_BACKUP_CACHE_META = _BACKUP_CACHE_DIR / "latest.json"
+_BACKUP_CACHE_TTL_SEC = 20 * 60  # serve for 20 minutes
+_backup_prepare_lock = None  # threading via file flag; asyncio lock set by API
+
+
+def backup_cache_dir() -> Path:
+    _BACKUP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return _BACKUP_CACHE_DIR
+
+
+def backup_cache_meta() -> dict[str, Any]:
+    """Status of the last prepared zip (for UI polling)."""
+    meta: dict[str, Any] = {
+        "ready": False,
+        "building": False,
+        "bytes": 0,
+        "age_sec": None,
+        "filename": None,
+        "error": None,
+        "created_at": None,
+    }
+    flag = backup_cache_dir() / "building.flag"
+    meta["building"] = flag.is_file()
+    if not _BACKUP_CACHE_ZIP.is_file():
+        if _BACKUP_CACHE_META.is_file():
+            try:
+                raw = json.loads(_BACKUP_CACHE_META.read_text(encoding="utf-8"))
+                if isinstance(raw, dict) and raw.get("error"):
+                    meta["error"] = str(raw.get("error"))
+            except Exception:  # noqa: BLE001
+                pass
+        return meta
+    try:
+        size = int(_BACKUP_CACHE_ZIP.stat().st_size)
+        mtime = _BACKUP_CACHE_ZIP.stat().st_mtime
+        age = max(0.0, time.time() - mtime)
+        info: dict[str, Any] = {}
+        if _BACKUP_CACHE_META.is_file():
+            try:
+                loaded = json.loads(_BACKUP_CACHE_META.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    info = loaded
+            except Exception:  # noqa: BLE001
+                info = {}
+        fresh = age <= float(_BACKUP_CACHE_TTL_SEC) and size > 64
+        meta.update(
+            {
+                "ready": fresh,
+                "bytes": size,
+                "age_sec": int(age),
+                "filename": info.get("filename") or suggested_backup_filename(),
+                "created_at": info.get("created_at"),
+                "error": None if fresh else info.get("error"),
+                "manifest": info.get("manifest") if fresh else None,
+            }
+        )
+        return meta
+    except Exception as exc:  # noqa: BLE001
+        meta["error"] = str(exc)
+        return meta
+
+
+def get_fresh_backup_zip() -> tuple[Path, str, int] | None:
+    """Return (path, filename, bytes) if cache is fresh; else None."""
+    meta = backup_cache_meta()
+    if not meta.get("ready"):
+        return None
+    path = _BACKUP_CACHE_ZIP
+    if not path.is_file():
+        return None
+    name = str(meta.get("filename") or suggested_backup_filename())
+    return path, name, int(meta.get("bytes") or path.stat().st_size)
+
+
+def build_backup_zip_cached() -> dict[str, Any]:
+    """Build zip into the durable cache path (safe for bg prepare + download)."""
+    cache_dir = backup_cache_dir()
+    flag = cache_dir / "building.flag"
+    tmp_zip = cache_dir / f"building-{os.getpid()}.zip"
+    flag.write_text(str(time.time()), encoding="utf-8")
+    try:
+        if tmp_zip.exists():
+            tmp_zip.unlink()
+        manifest = build_backup_zip(tmp_zip)
+        filename = suggested_backup_filename()
+        # Atomic replace
+        os.replace(tmp_zip, _BACKUP_CACHE_ZIP)
+        meta = {
+            "filename": filename,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "bytes": _BACKUP_CACHE_ZIP.stat().st_size,
+            "manifest": {
+                "format": manifest.get("format"),
+                "dialect": manifest.get("dialect"),
+                "db_size": manifest.get("db_size"),
+                "app_version": manifest.get("app_version"),
+                "table_counts_highlight": manifest.get("table_counts_highlight"),
+            },
+        }
+        _BACKUP_CACHE_META.write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return meta
+    except Exception as exc:
+        try:
+            _BACKUP_CACHE_META.write_text(
+                json.dumps(
+                    {"error": str(exc), "created_at": datetime.now(timezone.utc).isoformat()},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    finally:
+        try:
+            flag.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if tmp_zip.exists():
+                tmp_zip.unlink()
+        except Exception:  # noqa: BLE001
+            pass

@@ -17,6 +17,15 @@ import { ApiError, api } from "../lib/api";
 import { toFaDigits } from "../lib/format";
 import { useAuth } from "../store/auth";
 
+type BackupCache = {
+  ready?: boolean;
+  building?: boolean;
+  bytes?: number;
+  age_sec?: number | null;
+  filename?: string | null;
+  error?: string | null;
+};
+
 type BackupStatus = {
   supported: boolean;
   dialect: string;
@@ -31,6 +40,16 @@ type BackupStatus = {
   tools_ok?: boolean;
   pg_dump?: boolean;
   pg_restore?: boolean;
+  cache?: BackupCache;
+};
+
+type BackupPrepare = {
+  ok?: boolean;
+  ready?: boolean;
+  building?: boolean;
+  bytes?: number;
+  filename?: string | null;
+  error?: string | null;
 };
 
 type RestoreResult = {
@@ -130,17 +149,58 @@ export default function BackupPage() {
   async function downloadBackup() {
     setMsg(null);
     setDownloading(true);
+    const token = localStorage.getItem("astra_token");
+    const headers: Record<string, string> = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
     const ac = new AbortController();
-    // Large Postgres dumps can take minutes; keep UI waiting with a clear budget.
     const timer = window.setTimeout(() => ac.abort(), 45 * 60 * 1000);
     try {
+      // 1) Prepare in background so Cloudflare never waits on pg_dump.
       setMsg({
         type: "ok",
-        text: "در حال ساخت اسنپ‌شات کامل دیتابیس… لطفاً این تب را باز بگذارید.",
+        text: "در حال آماده‌سازی اسنپ‌شات کامل دیتابیس…",
       });
-      const token = localStorage.getItem("astra_token");
+      await api<BackupPrepare>("/api/admin/backup/prepare", {
+        method: "POST",
+        timeoutMs: 20_000,
+      });
+
+      // 2) Poll until ready (dump continues on server).
+      let readyBytes = 0;
+      let readyName = "";
+      for (let i = 0; i < 180; i++) {
+        if (ac.signal.aborted) throw new DOMException("Aborted", "AbortError");
+        const st = await api<BackupPrepare>("/api/admin/backup/prepare", {
+          method: "GET",
+          timeoutMs: 15_000,
+        });
+        if (st.error && !st.building && !st.ready) {
+          throw new Error(st.error);
+        }
+        if (st.ready) {
+          readyBytes = Number(st.bytes || 0);
+          readyName = String(st.filename || "");
+          break;
+        }
+        const n = Number(st.bytes || 0);
+        setMsg({
+          type: "ok",
+          text: n > 0
+            ? `در حال ساخت بک‌آپ کامل… (${formatBytes(n)})`
+            : "در حال ساخت بک‌آپ کامل روی سرور…",
+        });
+        await new Promise((r) => window.setTimeout(r, 2000));
+      }
+
+      // 3) Fast download of the cached zip.
+      setMsg({
+        type: "ok",
+        text: readyBytes > 0
+          ? `در حال دانلود (${formatBytes(readyBytes)})…`
+          : "در حال دانلود بک‌آپ…",
+      });
       const res = await fetch("/api/admin/backup", {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        headers,
         signal: ac.signal,
         cache: "no-store",
       });
@@ -152,22 +212,20 @@ export default function BackupPage() {
           if (typeof d === "string") message = d;
           else if (d && typeof d === "object" && d.message) message = String(d.message);
         } catch {
-          if (res.status === 502 || res.status === 504) {
-            message =
-              "تایم‌اوت هنگام ساخت بک‌آپ — پنل را آپدیت کنید یا از پورت مستقیم اپ دوباره تلاش کنید";
+          if (res.status === 409) {
+            message = "بک‌آپ هنوز آماده نیست — چند ثانیه بعد دوباره بزنید";
+          } else if (res.status === 502 || res.status === 504) {
+            message = "تایم‌اوت پروکسی — دوباره دانلود را بزنید (فایل روی سرور آماده می‌ماند)";
           } else if (res.status >= 500) {
-            message = "ساخت بک‌آپ روی سرور خطا داد — لاگ astra را ببینید";
+            message = "ساخت بک‌آپ روی سرور خطا داد";
           }
         }
         throw new Error(message);
       }
       const totalHdr = res.headers.get("X-Astra-Backup-Bytes") || res.headers.get("Content-Length");
-      const total = totalHdr ? Number(totalHdr) : 0;
+      const total = totalHdr ? Number(totalHdr) : readyBytes;
       if (total > 0) {
-        setMsg({
-          type: "ok",
-          text: `در حال دانلود بک‌آپ (${formatBytes(total)})…`,
-        });
+        setMsg({ type: "ok", text: `در حال دانلود بک‌آپ (${formatBytes(total)})…` });
       }
       const blob = await res.blob();
       if (!blob || blob.size < 64) {
@@ -176,7 +234,7 @@ export default function BackupPage() {
       const cd = res.headers.get("Content-Disposition") || "";
       const match = /filename\*?=(?:UTF-8''|")?([^\";]+)/i.exec(cd);
       const rawName = match ? decodeURIComponent(match[1].replace(/"/g, "")) : "";
-      const filename = rawName || `Astra-backup-${Date.now()}.zip`;
+      const filename = rawName || readyName || `Astra-backup-${Date.now()}.zip`;
 
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -188,20 +246,21 @@ export default function BackupPage() {
       URL.revokeObjectURL(url);
       setMsg({
         type: "ok",
-        text: `دانلود شد: ${filename} (${formatBytes(blob.size)})`,
+        text: `دانلود شد: ${filename} (${formatBytes(blob.size)}) — برای انتقال کامل پنل آماده است`,
       });
       void refetch();
     } catch (e) {
       const aborted =
         (e instanceof DOMException && e.name === "AbortError") ||
         (e instanceof Error && e.name === "AbortError");
+      const raw = e instanceof Error ? e.message : "دانلود بک‌آپ ناموفق بود";
       setMsg({
         type: "err",
         text: aborted
           ? "زمان ساخت/دانلود بک‌آپ تمام شد — دوباره تلاش کنید"
-          : e instanceof Error
-            ? e.message
-            : "دانلود بک‌آپ ناموفق بود",
+          : /failed to fetch|networkerror|load failed/i.test(raw)
+            ? "ارتباط قطع شد — اگر ساخت تمام شده باشد با زدن دوباره فقط دانلود می‌شود"
+            : raw,
       });
     } finally {
       window.clearTimeout(timer);
@@ -324,8 +383,8 @@ export default function BackupPage() {
               </div>
               <h2>دانلود بک‌آپ کامل</h2>
               <p>
-                کل دیتابیس زنده در یک ZIP — برای انتقال به سرور دیگر همان نوع دیتابیس را
-                بازیابی کنید.
+                کل دیتابیس زنده (کاربران، پنل‌ها، گروه‌ها، مصرف، تنظیمات، نود) در یک ZIP —
+                برای انتقال کامل پنل به سرور دیگر.
               </p>
               <ul className="backup-checklist">
                 <li>کاربران، مصرف و وضعیت محدود/منقضی</li>

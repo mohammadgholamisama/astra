@@ -542,6 +542,7 @@ export default function UsersPage() {
   const [bulkBoundCategoryId, setBulkBoundCategoryId] = useState<number | null>(
     null
   );
+  const [createResult, setCreateResult] = useState<User | null>(null);
   const [bulkResult, setBulkResult] = useState<{
     created: User[];
     failed: { username: string; message: string }[];
@@ -688,12 +689,10 @@ export default function UsersPage() {
   });
 
   // Phase 2 — panel accounts for cards (merge into the same cache).
+  // Must also run on search — otherwise chips stay ۰/N while remotes are already active.
   const { isFetching: detailsFetching } = useQuery({
     queryKey: [...usersQueryKey, "details"],
-    enabled:
-      isSuccess &&
-      !searchDebounced.trim() &&
-      (data?.users?.length ?? 0) > 0,
+    enabled: isSuccess && (data?.users?.length ?? 0) > 0,
     queryFn: async () => {
       const full = await api<UsersListPayload>(
         `/api/users?${buildUsersQs({
@@ -701,7 +700,7 @@ export default function UsersPage() {
           pageIndex: page,
           details: true,
         })}`,
-        { timeoutMs: 25_000 }
+        { timeoutMs: 35_000 }
       );
       qc.setQueryData(
         usersQueryKey,
@@ -820,14 +819,14 @@ export default function UsersPage() {
       const dn = displayName.trim();
       const uname = username.trim();
       const recoverExisting = async (): Promise<User | null> => {
-        for (let i = 0; i < 6; i++) {
+        for (let i = 0; i < 3; i++) {
           if (i > 0) {
-            await new Promise((r) => window.setTimeout(r, 350 * i));
+            await new Promise((r) => window.setTimeout(r, 200 * i));
           }
           try {
             const existing = await api<User>(
               `/api/user/${encodeURIComponent(uname)}`,
-              { timeoutMs: 12_000 }
+              { timeoutMs: 6_000 }
             );
             if (existing?.username) return existing;
           } catch {
@@ -839,8 +838,8 @@ export default function UsersPage() {
       try {
         return await api<User>("/api/user", {
           method: "POST",
-          // Server commits then returns; remotes finish in background.
-          timeoutMs: 20_000,
+          // Local commit + sub URL only; panels finish in background.
+          timeoutMs: 8_000,
           body: JSON.stringify({
             username: uname,
             display_name: dn || null,
@@ -871,7 +870,7 @@ export default function UsersPage() {
         throw err;
       }
     },
-    onSuccess: () => {
+    onSuccess: (user) => {
       qc.invalidateQueries({ queryKey: ["users"] });
       setOpen(false);
       setUsername("");
@@ -884,9 +883,11 @@ export default function UsersPage() {
       setGroupSearch("");
       setCreateCatTab(null);
       setCreateBoundCategoryId(null);
+      setCreateResult(user);
+      setCopied("");
       setActionMsg({
         type: "ok",
-        text: "کاربر ساخته شد — ساخت کانفیگ روی پنل‌ها در پس‌زمینه",
+        text: "کاربر و لینک ساب آماده‌اند — ساخت پنل‌ها در پس‌زمینه",
       });
     },
   });
@@ -984,7 +985,7 @@ export default function UsersPage() {
     return err instanceof Error ? err.message : "خطا در ساخت گروهی";
   })();
 
-  const bulkCountN = Math.min(500, Math.max(0, Math.floor(Number(bulkCount) || 0)));
+  const bulkCountN = Math.min(10000, Math.max(0, Math.floor(Number(bulkCount) || 0)));
   const bulkPreviewNames = useMemo(() => {
     const p = bulkPrefix.trim();
     if (!p || bulkCountN < 1) return [];
@@ -1186,19 +1187,29 @@ export default function UsersPage() {
     panels_down: string[];
     users_recovered: number;
     users_remaining: number;
+    remote_bg?: boolean;
+    message?: string;
   };
 
   const retryAll = useMutation({
     mutationFn: () =>
       api<RetryAllResult>("/api/users/retry-errors", {
         method: "POST",
-        timeoutMs: 320_000,
+        // Instant sweep + bg waves — never wait on thousands of remotes.
+        timeoutMs: 45_000,
       }),
     onSuccess: (r) => {
       qc.invalidateQueries({ queryKey: ["users"] });
+      qc.invalidateQueries({ queryKey: ["users", "counts"] });
       setErrorsUser(null);
-      let text = "خطای فعالی برای تلاش مجدد نبود";
-      if (r.recovered > 0 && r.remaining <= 0) {
+      let text = r.message || "خطای فعالی برای تلاش مجدد نبود";
+      if (r.remote_bg) {
+        text =
+          r.message ||
+          (r.remaining > 0
+            ? `پاک‌سازی انجام شد — رفع ${toFaDigits(r.remaining)} مورد در پس‌زمینه ادامه دارد`
+            : "پاک‌سازی انجام شد");
+      } else if (r.recovered > 0 && r.remaining <= 0) {
         text = `همه خطاها برطرف شد (${toFaDigits(r.recovered)} مورد)`;
       } else if (r.recovered > 0) {
         text = `${toFaDigits(r.recovered)} مورد درست شد — ${toFaDigits(r.remaining)} خطای واقعی باقی ماند`;
@@ -1214,11 +1225,24 @@ export default function UsersPage() {
         text = `پنل قطع است: ${names}`;
       }
       setActionMsg({
-        type: r.remaining > 0 && r.recovered <= 0 ? "err" : "ok",
+        type: "ok",
         text,
       });
+      // Refresh board after bg waves start recovering.
+      window.setTimeout(() => {
+        void qc.invalidateQueries({ queryKey: ["users"] });
+        void qc.invalidateQueries({ queryKey: ["users", "counts"] });
+      }, 12_000);
     },
-    onError: (e: Error) => setActionMsg({ type: "err", text: e.message }),
+    onError: (e: Error) => {
+      const msg = e.message || "تلاش مجدد ناموفق بود";
+      setActionMsg({
+        type: "err",
+        text: /failed to fetch|networkerror|load failed/i.test(msg)
+          ? "ارتباط قطع شد — یک‌بار دیگر بزنید؛ رفع خطا در پس‌زمینه هم ادامه دارد"
+          : msg,
+      });
+    },
   });
 
   const togglePower = useMutation({
@@ -2143,21 +2167,19 @@ export default function UsersPage() {
                   </div>
                   <div
                     className="user-bar"
-                    aria-hidden
+                    role="progressbar"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={pct == null ? undefined : pct}
                     title={pct == null ? undefined : `${pct}%`}
                   >
                     <div
-                      className={`user-bar-fill ${barTone}`}
+                      className={`user-bar-fill ${barTone}${pct != null && pct > 0 ? " has-use" : ""}`}
                       style={{
                         width:
                           pct == null
                             ? "0%"
-                            : `${Math.min(
-                                100,
-                                // Floor at 12% when any usage exists so the chip
-                                // stays readable on light cards (label still shows true %).
-                                Math.max(pct > 0 ? 12 : 0, pct),
-                              )}%`,
+                            : `${Math.min(100, Math.max(0, pct))}%`,
                       }}
                     />
                   </div>
@@ -2922,7 +2944,7 @@ export default function UsersPage() {
                     type="number"
                     required
                     min={1}
-                    max={500}
+                    max={10000}
                     step={1}
                     inputMode="numeric"
                     value={bulkCount}
@@ -2932,7 +2954,7 @@ export default function UsersPage() {
                     disabled={bulkCreate.isPending}
                   />
                   <p className="field-hint">
-                    تا ۵۰۰ کاربر در هر بار — ساخت پنل‌ها در پس‌زمینه ادامه می‌یابد
+                    بدون سقف ۵۰ — هر تعداد کاربر؛ ساخت پنل‌ها و کانفیگ در پس‌زمینه با سرعت بالا ادامه می‌یابد
                   </p>
                 </div>
               </div>
@@ -3239,6 +3261,100 @@ export default function UsersPage() {
           </div>
         </div>
       )}
+
+      {createResult &&
+        createPortal(
+          <div
+            className="modal-backdrop user-bulk-result-backdrop"
+            onClick={() => setCreateResult(null)}
+          >
+            <div
+              className="modal user-bulk-result-modal"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="create-result-title"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <header className="modal-head">
+                <div>
+                  <h3 id="create-result-title">کاربر ساخته شد</h3>
+                  <p className="modal-sub">
+                    لینک ساب آماده‌ است · ساخت کانفیگ روی پنل‌ها در پس‌زمینه
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="modal-close"
+                  onClick={() => setCreateResult(null)}
+                  aria-label="بستن"
+                >
+                  ×
+                </button>
+              </header>
+
+              <p className="user-bulk-result-bg-note">
+                مثل ساخت گروهی: پاسخ فوری است و پنل‌ها با سرعت بالا در پس‌زمینه
+                ساخته می‌شوند.
+              </p>
+
+              <div className="user-bulk-result-meta" style={{ marginBottom: 10 }}>
+                <strong dir="ltr">{createResult.username}</strong>
+                {createResult.display_name ? (
+                  <span>{createResult.display_name}</span>
+                ) : null}
+              </div>
+              <label className="user-bulk-result-all-wrap">
+                <span className="user-bulk-result-all-label">لینک ساب</span>
+                <textarea
+                  id="create-sub-link-box"
+                  className="user-bulk-result-all-links"
+                  readOnly
+                  dir="ltr"
+                  rows={3}
+                  value={createResult.subscription_url || ""}
+                  autoFocus
+                  onFocus={(e) => e.currentTarget.select()}
+                  onClick={(e) => e.currentTarget.select()}
+                />
+              </label>
+
+              <div className="user-bulk-result-actions">
+                <button
+                  type="button"
+                  className="btn user-bulk-copy-all-btn"
+                  disabled={!createResult.subscription_url}
+                  onClick={() => {
+                    const url = createResult.subscription_url || "";
+                    if (!url) return;
+                    const el = document.getElementById(
+                      "create-sub-link-box"
+                    ) as HTMLTextAreaElement | null;
+                    el?.select();
+                    copy(url, "create-sub");
+                  }}
+                >
+                  {copied === "create-sub" ? (
+                    <>
+                      <Check size={16} /> کپی شد
+                    </>
+                  ) : (
+                    <>
+                      <Copy size={16} /> کپی لینک ساب
+                    </>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  className="btn ghost"
+                  onClick={() => setCreateResult(null)}
+                >
+                  بستن
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
 
       {bulkResult &&
         createPortal(

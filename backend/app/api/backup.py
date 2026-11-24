@@ -11,7 +11,6 @@ from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from starlette.background import BackgroundTask
 
 from app.api.deps import oauth2_scheme
 from app.core.database import AsyncSessionLocal, engine, get_db
@@ -78,55 +77,101 @@ def _http_backup_error(exc: bak.BackupError) -> HTTPException:
 
 @router.get("/api/admin/backup/status")
 async def backup_status(_admin: Admin = Depends(get_session_admin_only)):
-    return bak.backup_status()
+    st = bak.backup_status()
+    st["cache"] = bak.backup_cache_meta()
+    return st
+
+
+@router.get("/api/admin/backup/prepare")
+@router.post("/api/admin/backup/prepare")
+async def prepare_backup(_admin: Admin = Depends(get_session_admin_only)):
+    """Build a full DB zip in the background; poll until ready then download.
+
+    Avoids Cloudflare/browser ``Failed to fetch`` while pg_dump runs on large DBs.
+    """
+    meta = bak.backup_cache_meta()
+    if meta.get("ready"):
+        return {"ok": True, "ready": True, "building": False, **meta}
+    if meta.get("building") or _lock.locked():
+        return {"ok": True, "ready": False, "building": True, **meta}
+
+    async def _bg() -> None:
+        async with _lock:
+            try:
+                await asyncio.to_thread(bak.build_backup_zip_cached)
+            except Exception:  # noqa: BLE001
+                logger.exception("bg backup prepare failed")
+
+    try:
+        asyncio.create_task(_bg(), name="astra-backup-prepare")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "BACKUP_PREPARE_FAILED", "message": str(exc)},
+        ) from exc
+    return {"ok": True, "ready": False, "building": True, **bak.backup_cache_meta()}
 
 
 @router.get("/api/admin/backup")
 async def download_backup(_admin: Admin = Depends(get_session_admin_only)):
-    """Download a full consistent DB backup as zip (SQLite or PostgreSQL)."""
-    if _lock.locked():
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"code": "BACKUP_BUSY", "message": "عملیات بک‌آپ/بازیابی دیگری در حال اجراست"},
-        )
-
-    async with _lock:
-        tmp = tempfile.NamedTemporaryFile(prefix="astra-backup-", suffix=".zip", delete=False)
-        tmp_path = Path(tmp.name)
-        tmp.close()
-        try:
-            await asyncio.to_thread(bak.build_backup_zip, tmp_path)
-        except bak.BackupError as exc:
-            tmp_path.unlink(missing_ok=True)
-            raise _http_backup_error(exc) from exc
-        except Exception as exc:  # noqa: BLE001
-            tmp_path.unlink(missing_ok=True)
-            logger.exception("Backup failed")
-            raise HTTPException(
-                status_code=500,
-                detail={"code": "BACKUP_FAILED", "message": f"ساخت بک‌آپ ناموفق: {exc}"},
-            ) from exc
-
-        filename = bak.suggested_backup_filename()
-        size = tmp_path.stat().st_size if tmp_path.exists() else 0
-
-        def _cleanup() -> None:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-
+    """Download full DB backup zip (cache-first; builds once if needed)."""
+    # Fast path: serve a fresh prepared zip without re-dumping.
+    cached = bak.get_fresh_backup_zip()
+    if cached is not None:
+        path, filename, size = cached
         return FileResponse(
-            path=tmp_path,
+            path=path,
             media_type="application/zip",
             filename=filename,
-            background=BackgroundTask(_cleanup),
             headers={
                 "Cache-Control": "no-store",
                 "X-Accel-Buffering": "no",
                 "Content-Length": str(size),
                 "X-Astra-Backup-Format": bak.BACKUP_FORMAT,
                 "X-Astra-Backup-Bytes": str(size),
+                "X-Astra-Backup-Cached": "1",
+            },
+        )
+
+    if _lock.locked():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "BACKUP_BUSY",
+                "message": "بک‌آپ در حال آماده‌سازی است — چند ثانیه بعد دوباره دانلود کنید",
+            },
+        )
+
+    async with _lock:
+        try:
+            meta = await asyncio.to_thread(bak.build_backup_zip_cached)
+        except bak.BackupError as exc:
+            raise _http_backup_error(exc) from exc
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Backup failed")
+            raise HTTPException(
+                status_code=500,
+                detail={"code": "BACKUP_FAILED", "message": f"ساخت بک‌آپ ناموفق: {exc}"},
+            ) from exc
+
+        cached2 = bak.get_fresh_backup_zip()
+        if cached2 is None:
+            raise HTTPException(
+                status_code=500,
+                detail={"code": "BACKUP_FAILED", "message": "فایل بک‌آپ بعد از ساخت پیدا نشد"},
+            )
+        path, filename, size = cached2
+        return FileResponse(
+            path=path,
+            media_type="application/zip",
+            filename=filename or str(meta.get("filename") or bak.suggested_backup_filename()),
+            headers={
+                "Cache-Control": "no-store",
+                "X-Accel-Buffering": "no",
+                "Content-Length": str(size),
+                "X-Astra-Backup-Format": bak.BACKUP_FORMAT,
+                "X-Astra-Backup-Bytes": str(size),
+                "X-Astra-Backup-Cached": "0",
             },
         )
 

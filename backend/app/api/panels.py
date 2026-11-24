@@ -27,6 +27,7 @@ from app.schemas.panel import (
     PanelMoveBody,
     PanelOut,
     PanelReorderBody,
+    PanelTestAllBody,
     PanelTestAllOut,
     PanelTestAllStats,
     PanelTestOut,
@@ -104,12 +105,23 @@ async def _live_test_panel(
 
     t0 = _time.monotonic()
     last_err = "اتصال ناموفق"
+    panel_type = getattr(panel, "type", None)
+    is_astra = panel_type == PanelType.astra or str(
+        getattr(panel_type, "value", panel_type) or ""
+    ) == "astra"
     if quick:
         # One sharp try; caller (test-all) may run a second wave on fails only.
+        # Astra needs room for outbound protocol-ping.
+        # Sanaei/path panels like masterplus often need ~4s — 3.8s caused false قطع.
         tries = 1
-        overall_timeout = min(
-            float(overall_timeout), 6.0 if force_fresh_auth else 4.2
-        )
+        if is_astra:
+            overall_timeout = min(
+                float(overall_timeout), 12.0 if force_fresh_auth else 10.0
+            )
+        else:
+            overall_timeout = min(
+                float(overall_timeout), 7.5 if force_fresh_auth else 6.0
+            )
     else:
         tries = 2
 
@@ -118,7 +130,10 @@ async def _live_test_panel(
         if remaining < 0.5:
             break
         if quick:
-            per_try = min(5.2 if force_fresh_auth else 3.8, remaining)
+            if is_astra:
+                per_try = min(11.0 if force_fresh_auth else 9.5, remaining)
+            else:
+                per_try = min(6.5 if force_fresh_auth else 5.5, remaining)
         elif attempt == 0:
             per_try = min(12.0, remaining)
         else:
@@ -392,6 +407,7 @@ def _to_out(p: Panel) -> PanelOut:
         is_active=p.is_active,
         category_id=getattr(p, "category_id", None),
         sort_order=sort_order,
+        worker_id=getattr(p, "worker_id", None),
         last_ok_at=p.last_ok_at,
         created_at=p.created_at,
     )
@@ -1251,19 +1267,36 @@ def _panel_test_all_stats(
 @router.post("/api/admin/panels/test-all", response_model=PanelTestAllOut)
 @router.post("/api/panel/test-all", response_model=PanelTestAllOut)
 async def test_all_panels(
+    body: PanelTestAllBody | None = None,
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
-    """Probe every *active* panel in parallel — off panels are skipped."""
+    """Probe *active* panels the operator currently sees (tab/search).
+
+    - ``panel_ids`` scopes to the visible list (no other-category ghost names).
+    - خاموش panels are skipped entirely (not shown as قطع).
+    - Two-wave probe: fast JWT reuse, then fresh-auth retry only for fails —
+      kills false «قطع» without slowing healthy panels.
+    """
     import time as _time
 
     from app.core.database import release_db_txn
 
-    rows = await db.execute(
-        select(Panel)
-        .where(Panel.is_active.is_(True))
-        .order_by(Panel.id.asc())
-    )
+    want_ids: list[int] | None = None
+    if body and body.panel_ids is not None:
+        want_ids = sorted({int(x) for x in body.panel_ids if int(x) > 0})
+
+    q = select(Panel).where(Panel.is_active.is_(True)).order_by(Panel.id.asc())
+    if want_ids is not None:
+        if not want_ids:
+            now = datetime.now(timezone.utc)
+            empty = PanelTestAllStats(duration_ms=0)
+            return PanelTestAllOut(
+                results=[], ok=0, fail=0, stats=empty, tested_at=now
+            )
+        q = q.where(Panel.id.in_(want_ids))
+
+    rows = await db.execute(q)
     panels = list(rows.scalars().all())
     now = datetime.now(timezone.utc)
     if not panels:
@@ -1278,6 +1311,10 @@ async def test_all_panels(
 
     snapshots: list[dict] = []
     for p in panels:
+        base = str(getattr(p, "base_url", "") or "").rstrip("/") or None
+        meta = dict(p.meta or {})
+        meta["panel_id"] = int(p.id)
+        meta["_probe_quick"] = True
         probe_panel = SimpleNamespace(
             id=int(p.id),
             name=p.name,
@@ -1287,7 +1324,7 @@ async def test_all_panels(
             username=p.username,
             password=p.password,
             api_token=p.api_token,
-            meta=dict(p.meta or {}),
+            meta=meta,
         )
         snapshots.append(
             {
@@ -1295,18 +1332,17 @@ async def test_all_panels(
                 "name": p.name,
                 "type": p.type,
                 "is_active": True,
-                "base_url": str(getattr(p, "base_url", "") or "").rstrip("/")
-                or None,
+                "base_url": base,
                 "panel": probe_panel,
             }
         )
     # Free Postgres before remote fan-out (idle-in-transaction / SSH rule).
     await release_db_txn(db)
 
-    # Wave 1: sharp parallel probes (reuse JWT). Wave 2: only fails, fresh auth.
-    # This cuts wall time and kills false «قطع» under stampede.
-    sem1 = asyncio.Semaphore(28)
-    sem2 = asyncio.Semaphore(14)
+    # Wave 1: parallel, reuse JWT. Wave 2: only fails, fresh auth.
+    # Sem sized for throughput without stampeding CF/Sanaei panels.
+    sem1 = asyncio.Semaphore(24)
+    sem2 = asyncio.Semaphore(12)
     t0 = _time.monotonic()
 
     def _to_out(snap: dict, probe: dict) -> PanelTestOut:
@@ -1332,68 +1368,84 @@ async def test_all_panels(
         overall: float,
         fresh_auth: bool,
     ) -> PanelTestOut:
+        is_astra = (
+            str(getattr(snap.get("type"), "value", snap.get("type")) or "")
+            == "astra"
+        )
+        # Astra uses cached outbound health in quick mode — still leave headroom.
+        budget = max(overall, 8.0) if is_astra else overall
         async with sem:
             probe = await _live_test_panel(
                 snap["panel"],
-                overall_timeout=overall,
+                overall_timeout=budget,
                 quick=True,
                 force_fresh_auth=fresh_auth,
             )
         return _to_out(snap, probe)
 
-    gathered = await asyncio.gather(
-        *[
-            _one(s, sem=sem1, overall=4.0, fresh_auth=False)
-            for s in snapshots
-        ],
-        return_exceptions=True,
-    )
-
     results: list[PanelTestOut] = []
     retry_snaps: list[dict] = []
-    for snap, item in zip(snapshots, gathered):
-        if isinstance(item, Exception):
-            logger.warning(
-                "test-all panel=%s failed: %s", snap["id"], item, exc_info=False
-            )
-            results.append(
-                PanelTestOut(
-                    id=snap["id"],
-                    name=snap["name"],
-                    type=snap["type"],
-                    is_active=snap["is_active"],
-                    success=False,
-                    error=(str(item).strip() or item.__class__.__name__)[:300],
-                    latency_ms=None,
-                    grade="fail",
-                    base_url=snap["base_url"],
-                )
-            )
-            retry_snaps.append(snap)
-            continue
-        results.append(item)
-        if not item.success:
-            retry_snaps.append(snap)
 
-    if retry_snaps:
-        retry_gathered = await asyncio.gather(
+    if snapshots:
+        gathered = await asyncio.gather(
             *[
-                _one(s, sem=sem2, overall=5.5, fresh_auth=True)
-                for s in retry_snaps
+                _one(s, sem=sem1, overall=6.0, fresh_auth=False)
+                for s in snapshots
             ],
             return_exceptions=True,
         )
-        by_id = {int(r.id): i for i, r in enumerate(results)}
-        for snap, item in zip(retry_snaps, retry_gathered):
-            if isinstance(item, Exception):
-                continue
-            idx = by_id.get(int(snap["id"]))
-            if idx is None:
-                results.append(item)
-            elif item.success or not results[idx].success:
-                # Prefer success; on still-fail keep the fresher error/latency.
-                results[idx] = item
 
+        for snap, item in zip(snapshots, gathered):
+            if isinstance(item, Exception):
+                logger.warning(
+                    "test-all panel=%s failed: %s", snap["id"], item, exc_info=False
+                )
+                results.append(
+                    PanelTestOut(
+                        id=snap["id"],
+                        name=snap["name"],
+                        type=snap["type"],
+                        is_active=snap["is_active"],
+                        success=False,
+                        error=(str(item).strip() or item.__class__.__name__)[:300],
+                        latency_ms=None,
+                        grade="fail",
+                        base_url=snap["base_url"],
+                    )
+                )
+                retry_snaps.append(snap)
+                continue
+            results.append(item)
+            if not item.success:
+                retry_snaps.append(snap)
+
+        if retry_snaps:
+            # Clear quick-cache hint on retry so Astra re-pings for accuracy.
+            for s in retry_snaps:
+                try:
+                    s["panel"].meta["_probe_quick"] = False
+                except Exception:  # noqa: BLE001
+                    pass
+            retry_gathered = await asyncio.gather(
+                *[
+                    _one(s, sem=sem2, overall=8.0, fresh_auth=True)
+                    for s in retry_snaps
+                ],
+                return_exceptions=True,
+            )
+            by_id = {int(r.id): i for i, r in enumerate(results)}
+            for snap, item in zip(retry_snaps, retry_gathered):
+                if isinstance(item, Exception):
+                    continue
+                idx = by_id.get(int(snap["id"]))
+                if idx is None:
+                    results.append(item)
+                elif item.success or not results[idx].success:
+                    # Prefer success; on still-fail keep the fresher error/latency.
+                    results[idx] = item
+
+    # Keep result order aligned with the requested / listed panel ids.
+    results.sort(key=lambda r: int(r.id))
     duration_ms = int((_time.monotonic() - t0) * 1000)
     ok_ids: list[int] = [int(r.id) for r in results if r.success]
 

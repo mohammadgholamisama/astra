@@ -270,6 +270,21 @@ def pool_pressure_blocks_background() -> bool:
     return bool(cap > 0 and checked >= max(1, cap - 2))
 
 
+def pool_pressure_blocks_fleet() -> bool:
+    """Only block fleet bulk on critical pressure.
+
+    Fleet HTTP runs outside the pool; short apply/recount sessions are cheap.
+    Treating ``high`` like critical starved meters for hours (used_traffic=0).
+    """
+    st = pool_status()
+    if (st.get("pressure") or "ok") == "critical":
+        return True
+    checked = int(st.get("checkedout") or st.get("in_use") or 0)
+    cap = int(st.get("capacity") or 0)
+    # Only yield when nearly every connection is checked out.
+    return bool(cap > 0 and checked >= max(2, cap - 1))
+
+
 async def _terminate_stale_idle_in_txn(*, older_than_sec: float = 12.0) -> int:
     """Best-effort: kill Postgres backends stuck idle-in-transaction."""
     if _IS_SQLITE:

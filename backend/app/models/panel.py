@@ -58,10 +58,18 @@ class Panel(Base):
     )
     # Admin UI order on Panels page (drag-reorder within a tab)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    # NULL = ops run on master; set = route create/usage/manage via that worker
+    worker_id: Mapped[int | None] = mapped_column(
+        ForeignKey("worker_nodes.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        default=None,
+    )
     last_ok_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     category = relationship("PanelCategory", back_populates="panels")
+    worker = relationship("WorkerNode", back_populates="panels")
     group_links = relationship("GroupPanel", back_populates="panel", cascade="all, delete-orphan")
     accounts = relationship("PanelAccount", back_populates="panel", cascade="all, delete-orphan")
     astra_outbounds = relationship(

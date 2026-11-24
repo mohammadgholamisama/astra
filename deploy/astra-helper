@@ -957,12 +957,12 @@ cmd_apply_update() {
   if [[ -f "${ASTRA_ROOT}/deploy/astra.service" ]]; then
     install -m 644 "${ASTRA_ROOT}/deploy/astra.service" /etc/systemd/system/astra.service
   fi
-  # Keep SSH usable under heavy usage sync (do not let astra eat the whole CPU)
+  # Keep SSH usable — multi-worker API may use a few cores, never the whole box
   mkdir -p /etc/systemd/system/astra.service.d
   cat > /etc/systemd/system/astra.service.d/cpu-guard.conf <<'EOF'
 [Service]
-CPUQuota=250%
-TasksMax=4096
+CPUQuota=400%
+TasksMax=8192
 OOMPolicy=continue
 EOF
   if [[ -f "${ASTRA_ROOT}/deploy/sshd-astra-harden.conf" ]]; then
@@ -1001,6 +1001,31 @@ EOF
 
   cmd_write_nginx
   cmd_restart_astra
+
+  # Push matching Worker agent (create/usage/delete offload) — hot self-update, no SSH.
+  echo "astra-helper: syncing Astra Workers…"
+  sudo -u astra bash -c "
+    set +e
+    cd '${ASTRA_ROOT}/backend'
+    . .venv/bin/activate
+    python - <<'PY'
+import asyncio
+import sys
+try:
+    from app.core.database import AsyncSessionLocal
+    from app.services.worker_ops import push_agent_update_to_all_workers
+except Exception as exc:
+    print('worker sync import failed:', exc)
+    sys.exit(0)
+
+async def main():
+    async with AsyncSessionLocal() as db:
+        stats = await push_agent_update_to_all_workers(db)
+    print('worker sync', stats)
+
+asyncio.run(main())
+PY
+  " || echo "astra-helper: WARNING — worker sync failed (panel still up)" >&2
 
   # Optional companion: multi-device ping hub (mobile-app/backend-go)
   if [[ -d "${ASTRA_ROOT}/mobile-app/backend-go" && -f "${ASTRA_ROOT}/deploy/ping-hub-install.sh" ]]; then

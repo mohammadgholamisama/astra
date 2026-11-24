@@ -98,43 +98,93 @@ def _user_created_recently(user: User, *, window_sec: int = 600) -> bool:
     return 0 <= age <= float(window_sec)
 
 
+# Parallel single-creates (HTTP remotes; DB only short apply sessions).
+_CREATE_PROVISION_BG_SEM = asyncio.Semaphore(12)
+
+
 async def _bg_finish_create_provision(username: str, group_ids: list[int]) -> None:
-    """Finish remotes after create returned — must not block the HTTP response."""
+    """Finish remotes after create returned — fast parallel wave, non-blocking."""
     from app.core.database import AsyncSessionLocal
+    from app.models.user import PanelAccount, PanelAccountStatus
 
     log = __import__("logging").getLogger("astra.users")
-    try:
-        async with AsyncSessionLocal() as db:
-            user = await load_user(db, username)
-            if user is None:
-                return
-            panels = await orchestrator.resolve_panels_for_groups(db, group_ids)
-            if panels:
+    async with _CREATE_PROVISION_BG_SEM:
+        try:
+            uid = 0
+            panels = None
+            user_row = None
+            async with AsyncSessionLocal() as db:
+                user_row = (
+                    await db.execute(select(User).where(User.username == username))
+                ).scalar_one_or_none()
+                if user_row is None:
+                    return
+                uid = int(user_row.id)
+                panels = await orchestrator.resolve_panels_for_groups(db, group_ids)
+                await db.rollback()
+            if panels and user_row is not None:
+                sdb = AsyncSessionLocal()
                 try:
-                    await orchestrator.provision_users_now(
-                        db, [user], panels, wait=55.0
+                    n_jobs = max(1, len(panels))
+                    await orchestrator.provision_users_batch(
+                        sdb,
+                        [user_row],
+                        panels,
+                        create_timeout=14.0,
+                        concurrency=min(48, max(20, n_jobs)),
+                        overall_timeout=min(180.0, 25.0 + 0.55 * n_jobs),
                     )
                 except Exception:  # noqa: BLE001
-                    log.exception("bg create provision failed user=%s", username)
+                    log.exception(
+                        "bg create batch provision failed user=%s", username
+                    )
+                finally:
                     try:
-                        await db.rollback()
+                        await sdb.close()
                     except Exception:  # noqa: BLE001
                         pass
+
+            if not uid:
+                return
             try:
-                await db.commit()
+                await orchestrator.hydrate_share_links_pool_safe(uid)
             except Exception:  # noqa: BLE001
-                try:
-                    await db.rollback()
-                except Exception:  # noqa: BLE001
-                    pass
-        try:
-            await orchestrator.heal_user_coverage_pool_safe(
-                int(user.id), wait=20.0, include_empty_links=True
-            )
+                log.debug(
+                    "bg create hydrate user=%s failed", username, exc_info=True
+                )
+            # Quick heal — leftover writer already finishes in-flight remotes.
+            try:
+                await orchestrator.heal_user_coverage_pool_safe(
+                    uid, wait=3.0, include_empty_links=True
+                )
+            except Exception:  # noqa: BLE001
+                log.debug("bg create heal user=%s failed", username, exc_info=True)
+            try:
+                pending_ids: list[int] = []
+                async with AsyncSessionLocal() as sdb:
+                    rows = await sdb.execute(
+                        select(PanelAccount.id).where(
+                            PanelAccount.user_id == uid,
+                            PanelAccount.status.in_(
+                                (
+                                    PanelAccountStatus.pending,
+                                    PanelAccountStatus.error,
+                                )
+                            ),
+                        )
+                    )
+                    pending_ids = [int(r[0]) for r in rows.all() if r[0]]
+                    await sdb.rollback()
+                if pending_ids:
+                    orchestrator.start_account_provisions(pending_ids)
+            except Exception:  # noqa: BLE001
+                log.debug(
+                    "bg create leftover enqueue user=%s failed",
+                    username,
+                    exc_info=True,
+                )
         except Exception:  # noqa: BLE001
-            log.debug("bg create heal user=%s failed", username, exc_info=True)
-    except Exception:  # noqa: BLE001
-        log.exception("bg finish create failed user=%s", username)
+            log.exception("bg finish create failed user=%s", username)
 
 
 async def _resolve_source_category(
@@ -368,10 +418,32 @@ async def create_user(
             },
         ) from exc
 
-    # From here the user EXISTS — never return 5xx for provision/serialize issues.
-    # Do NOT wait on remotes here: «همه گروه‌ها» can be 30+ panels and the
-    # admin UI / edge aborts while Astra already committed → false timeout.
-    # All panel creates run concurrently in background.
+    # From here the user EXISTS — return instantly with sub URL.
+    # Remotes finish in a bounded background wave (no HTTP wait, no load_user).
+    from types import SimpleNamespace
+
+    from app.services.users import subscription_url
+
+    snap = SimpleNamespace(
+        username=str(user.username),
+        display_name=(getattr(user, "display_name", None) or None),
+        status=user.status,
+        used_traffic=0,
+        lifetime_used_traffic=0,
+        data_limit=int(getattr(user, "data_limit", 0) or 0),
+        expire=int(getattr(user, "expire", 0) or 0) or 0,
+        on_hold_expire_duration=int(
+            getattr(user, "on_hold_expire_duration", 0) or 0
+        ),
+        include_promo_first=bool(getattr(user, "include_promo_first", True)),
+        data_limit_reset_strategy=str(
+            getattr(user, "data_limit_reset_strategy", None) or "no_reset"
+        ),
+        note=getattr(user, "note", None),
+        created_at=getattr(user, "created_at", None),
+        sub_token=str(getattr(user, "sub_token", "") or ""),
+        source_category_id=getattr(user, "source_category_id", None),
+    )
     try:
         asyncio.create_task(
             _bg_finish_create_provision(body.username, list(body.group_ids)),
@@ -380,54 +452,31 @@ async def create_user(
     except Exception:  # noqa: BLE001
         pass
 
-    db.expire_all()
     try:
-        user = await load_user(db, body.username)
+        await db.rollback()
     except Exception:  # noqa: BLE001
-        try:
-            await db.rollback()
-        except Exception:  # noqa: BLE001
-            pass
-        user = None
-    if not user:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "code": "CREATE_READBACK",
-                "message": "کاربر ثبت شد ولی خواندن پاسخ طول کشید — لیست را رفرش کنید",
-            },
-        )
-    try:
-        return to_user_response(user)
-    except Exception as exc:  # noqa: BLE001
-        log.exception("create serialize failed user=%s", body.username)
-        # Hand-built success body — user is already in Astra
-        from app.services.users import subscription_url
+        pass
 
-        return UserResponse(
-            username=str(user.username),
-            display_name=(getattr(user, "display_name", None) or None),
-            status=user.status,
-            used_traffic=int(getattr(user, "used_traffic", 0) or 0),
-            lifetime_used_traffic=int(getattr(user, "lifetime_used_traffic", 0) or 0),
-            data_limit=int(getattr(user, "data_limit", 0) or 0),
-            expire=int(getattr(user, "expire", 0) or 0) or 0,
-            on_hold_expire_duration=int(
-                getattr(user, "on_hold_expire_duration", 0) or 0
-            ),
-            include_promo_first=bool(getattr(user, "include_promo_first", True)),
-            data_limit_reset_strategy=str(
-                getattr(user, "data_limit_reset_strategy", None) or "no_reset"
-            ),
-            note=getattr(user, "note", None),
-            created_at=getattr(user, "created_at", None),
-            links=[],
-            subscription_url=subscription_url(user),
-            proxies={},
-            group_ids=list(body.group_ids),
-            source_category_id=getattr(user, "source_category_id", None),
-            panel_accounts=[],
-        )
+    return UserResponse(
+        username=snap.username,
+        display_name=snap.display_name,
+        status=snap.status,
+        used_traffic=0,
+        lifetime_used_traffic=0,
+        data_limit=snap.data_limit,
+        expire=snap.expire,
+        on_hold_expire_duration=snap.on_hold_expire_duration,
+        include_promo_first=snap.include_promo_first,
+        data_limit_reset_strategy=snap.data_limit_reset_strategy,
+        note=snap.note,
+        created_at=snap.created_at,
+        links=[],
+        subscription_url=subscription_url(snap),
+        proxies={},
+        group_ids=list(body.group_ids),
+        source_category_id=snap.source_category_id,
+        panel_accounts=[],
+    )
 
 
 @router.post("/api/users/bulk", response_model=UserBulkCreateResponse)
@@ -645,6 +694,8 @@ async def create_users_bulk(
             from app.core.database import AsyncSessionLocal
 
             try:
+                # Load targets, then CLOSE the session before the remote wave
+                # so one bulk create cannot pin a pool checkout for minutes.
                 async with AsyncSessionLocal() as sdb:
                     loaded = await sdb.execute(
                         select(User).where(User.id.in_(uids))
@@ -662,26 +713,27 @@ async def create_users_bulk(
                         if pid in by_id
                         and bool(getattr(by_id[pid], "is_active", True))
                     ]
-                    if not local_panels:
-                        return
-                    n_jobs = max(1, len(bg_users) * max(1, len(local_panels)))
-                    # High-concurrency wave — not the tiny start_account_provisions
-                    # queue that left mamadmamd_* pending for 15+ minutes.
+                    await sdb.rollback()
+                if not local_panels:
+                    return
+                n_jobs = max(1, len(bg_users) * max(1, len(local_panels)))
+                # Cap concurrency under DB pool — stampede left cards at ۰/N.
+                # provision_users_batch closes the session after prepare.
+                sdb = AsyncSessionLocal()
+                try:
                     await orchestrator.provision_users_batch(
                         sdb,
                         bg_users,
                         local_panels,
-                        create_timeout=8.0,
-                        concurrency=min(56, max(24, n_jobs)),
-                        overall_timeout=min(180.0, 12.0 + 0.35 * n_jobs),
+                        create_timeout=9.0,
+                        concurrency=min(32, max(16, min(n_jobs, 32))),
+                        overall_timeout=min(480.0, 25.0 + 0.45 * n_jobs),
                     )
+                finally:
                     try:
-                        await sdb.commit()
+                        await sdb.close()
                     except Exception:  # noqa: BLE001
-                        try:
-                            await sdb.rollback()
-                        except Exception:  # noqa: BLE001
-                            pass
+                        pass
 
                 # Fill share links so /sub is not empty after remotes land.
                 for uid in uids:
@@ -1455,26 +1507,157 @@ async def retry_all_errors(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
-    """Retry every error/pending remote account in one shot.
+    """Start a fleet-wide error heal — never await remotes on the HTTP path.
 
-    Unreachable panels are probed once and skipped (errors stay). Recovered
-    panels clear their user errors. Remaining failures stay on the Users page.
-    Also recreates missing group×panel slots lost during panel outages.
+    Waiting on thousands of panel creates caused Cloudflare/browser
+    ``Failed to fetch``. Instant local sweep + background waves instead.
     """
-    stats = await orchestrator.retry_all_failed_accounts(db)
-    try:
-        healed = await orchestrator.heal_users_missing_panel_accounts(
-            limit_users=40
-        )
-        if isinstance(stats, dict):
-            stats["healed_coverage"] = int(healed or 0)
-    except Exception:  # noqa: BLE001
-        pass
+    import logging
+
+    from app.core.database import AsyncSessionLocal, release_db_txn
+    from sqlalchemy import text
+
+    log = logging.getLogger("astra.users")
+
+    # 1) Instant local cleanup (no remote HTTP) — shrinks the scary banner.
+    sweep = await orchestrator.sweep_stale_panel_errors(db)
     try:
         await db.commit()
     except Exception:  # noqa: BLE001
-        pass
-    return UserRetryErrorsResponse(**stats)
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Remaining actionable error/pending rows (for UI feedback).
+    try:
+        remaining = int(
+            (
+                await db.execute(
+                    text(
+                        """
+                        SELECT count(*) FROM panel_accounts pa
+                        JOIN panels p ON p.id = pa.panel_id
+                        JOIN users u ON u.id = pa.user_id
+                        WHERE pa.status IN ('error', 'pending')
+                          AND p.is_active IS TRUE
+                          AND u.status = 'active'
+                          AND COALESCE(pa.error_message, '') NOT ILIKE '%user limit reached%'
+                          AND COALESCE(pa.error_message, '') NOT ILIKE '%limit reached%'
+                          AND COALESCE(pa.error_message, '') NOT ILIKE '%ظرفیت%'
+                        """
+                    )
+                )
+            ).scalar()
+            or 0
+        )
+    except Exception:  # noqa: BLE001
+        remaining = 0
+
+    await release_db_txn(db)
+
+    # 2) Heavy remote work in background — batch waves under the bulk lock.
+    async def _bg_retry_waves() -> None:
+        try:
+            async with AsyncSessionLocal() as sdb:
+                # First wave: fair batch so healthy panels recover fast.
+                await orchestrator.retry_all_failed_accounts(
+                    sdb,
+                    overall_timeout=240.0,
+                    per_remote_timeout=18.0,
+                    probe_timeout=6.0,
+                    concurrency=28,
+                    limit_accounts=800,
+                )
+                try:
+                    await sdb.commit()
+                except Exception:  # noqa: BLE001
+                    try:
+                        await sdb.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+            # Coverage heal for users missing group×panel slots.
+            try:
+                await orchestrator.heal_users_missing_panel_accounts(
+                    limit_users=80
+                )
+            except Exception:  # noqa: BLE001
+                log.debug("retry-errors bg coverage soft-fail", exc_info=True)
+            # Drain leftover pending via high-concurrency provision queue.
+            try:
+                async with AsyncSessionLocal() as sdb:
+                    rows = await sdb.execute(
+                        select(PanelAccount.id)
+                        .where(
+                            PanelAccount.status.in_(
+                                (
+                                    PanelAccountStatus.pending,
+                                    PanelAccountStatus.error,
+                                )
+                            )
+                        )
+                        .order_by(PanelAccount.id.asc())
+                        .limit(4000)
+                    )
+                    ids = [int(r[0]) for r in rows.all() if r[0]]
+                    await sdb.rollback()
+                if ids:
+                    orchestrator.start_account_provisions(ids)
+            except Exception:  # noqa: BLE001
+                log.debug("retry-errors bg enqueue soft-fail", exc_info=True)
+            # Second wave if backlog remains.
+            try:
+                async with AsyncSessionLocal() as sdb:
+                    await orchestrator.retry_all_failed_accounts(
+                        sdb,
+                        overall_timeout=300.0,
+                        per_remote_timeout=20.0,
+                        probe_timeout=6.0,
+                        concurrency=24,
+                        limit_accounts=1200,
+                    )
+                    try:
+                        await sdb.commit()
+                    except Exception:  # noqa: BLE001
+                        try:
+                            await sdb.rollback()
+                        except Exception:  # noqa: BLE001
+                            pass
+            except Exception:  # noqa: BLE001
+                log.debug("retry-errors second wave soft-fail", exc_info=True)
+        except Exception:  # noqa: BLE001
+            log.exception("retry-errors background failed")
+
+    already = orchestrator.bulk_retry_in_progress()
+    if not already:
+        try:
+            asyncio.create_task(
+                _bg_retry_waves(), name="astra-retry-errors-bg"
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("retry-errors schedule failed")
+
+    swept = (
+        int(sweep.get("swept_active") or 0)
+        + int(sweep.get("swept_pending") or 0)
+        + int(sweep.get("swept_inactive") or 0)
+    )
+    msg = (
+        "پاک‌سازی فوری انجام شد — ساخت/رفع روی پنل‌ها در پس‌زمینه با سرعت بالا ادامه دارد"
+        if not already
+        else "یک تلاش مجدد از قبل در جریان است — همان موج ادامه دارد"
+    )
+    return UserRetryErrorsResponse(
+        attempted=0,
+        recovered=int(sweep.get("swept_active") or 0),
+        remaining=int(remaining),
+        dropped=int(sweep.get("swept_inactive") or 0),
+        swept_active=int(sweep.get("swept_active") or 0),
+        swept_pending=int(sweep.get("swept_pending") or 0),
+        swept_inactive=int(sweep.get("swept_inactive") or 0),
+        remote_bg=True,
+        message=msg if (remaining > 0 or swept > 0 or already) else "خطای فعالی برای تلاش مجدد نبود",
+    )
 
 
 def _exact_username_term(search: str | None) -> str | None:
@@ -1832,35 +2015,70 @@ async def _list_users_impl(
     elif status_filter == "expired":
         status_extra = expired_c
 
-    want_details = bool(details) and not is_search
+    # details=true always loads panel status (board + search). Search used to
+    # force lean-only and left cards stuck at ۰/N after bulk provision finished.
+    want_details = bool(details)
+    lean_user = load_only(
+        User.id,
+        User.username,
+        User.display_name,
+        User.status,
+        User.data_limit,
+        User.used_traffic,
+        User.lifetime_used_traffic,
+        User.expire,
+        User.on_hold_expire_duration,
+        User.include_promo_first,
+        User.data_limit_reset_strategy,
+        User.note,
+        User.created_at,
+        User.sub_token,
+        User.source_category_id,
+    )
+    panel_account_opts = (
+        selectinload(User.panel_accounts).options(
+            load_only(
+                PanelAccount.id,
+                PanelAccount.user_id,
+                PanelAccount.panel_id,
+                PanelAccount.group_id,
+                PanelAccount.remote_username,
+                PanelAccount.status,
+                PanelAccount.error_message,
+                PanelAccount.used_traffic,
+                PanelAccount.coeff_anchor_raw,
+                PanelAccount.coeff_anchor_weighted,
+                PanelAccount.applied_coefficient,
+                PanelAccount.last_sync_at,
+            ),
+            defer(PanelAccount.links),
+            defer(PanelAccount.links_by_group),
+            selectinload(PanelAccount.panel).load_only(
+                Panel.id,
+                Panel.name,
+                Panel.type,
+                Panel.is_active,
+                Panel.base_url,
+            ),
+        )
+        if want_details
+        else None
+    )
     if is_search:
-        # Search: one COUNT + lean rows (no panel_accounts / no error EXISTS).
+        # Search: COUNT + lean rows; optional panel status for card chips.
         # Exact username path stays indexed so bots find users on main panels.
         total = await _count_users(
             db, search=search, group_id=group_id, extra=status_extra
         )
         # Chips are for the full board; search replies only need matching total.
         counts = UsersListCounts(all=total, active=0, error=0, expired=0)
-        q = select(User).options(
-            load_only(
-                User.id,
-                User.username,
-                User.display_name,
-                User.status,
-                User.data_limit,
-                User.used_traffic,
-                User.lifetime_used_traffic,
-                User.expire,
-                User.on_hold_expire_duration,
-                User.include_promo_first,
-                User.data_limit_reset_strategy,
-                User.note,
-                User.created_at,
-                User.sub_token,
-                User.source_category_id,
-            ),
+        opts = [
+            lean_user,
             selectinload(User.groups).load_only(Group.id),
-        )
+        ]
+        if panel_account_opts is not None:
+            opts.append(panel_account_opts)
+        q = select(User).options(*opts)
     else:
         # Fast path: page total only. Chip breakdown arrives via /api/users/counts.
         if include_counts:
@@ -1885,53 +2103,12 @@ async def _list_users_impl(
             )
             counts = UsersListCounts(all=total if status_filter == "all" else 0)
 
-        lean_user = load_only(
-            User.id,
-            User.username,
-            User.display_name,
-            User.status,
-            User.data_limit,
-            User.used_traffic,
-            User.lifetime_used_traffic,
-            User.expire,
-            User.on_hold_expire_duration,
-            User.include_promo_first,
-            User.data_limit_reset_strategy,
-            User.note,
-            User.created_at,
-            User.sub_token,
-            User.source_category_id,
-        )
-        if want_details:
+        if want_details and panel_account_opts is not None:
             # Full cards: panel meters (still defer huge share-link JSON).
             q = select(User).options(
                 lean_user,
                 selectinload(User.groups).load_only(Group.id),
-                selectinload(User.panel_accounts).options(
-                    load_only(
-                        PanelAccount.id,
-                        PanelAccount.user_id,
-                        PanelAccount.panel_id,
-                        PanelAccount.group_id,
-                        PanelAccount.remote_username,
-                        PanelAccount.status,
-                        PanelAccount.error_message,
-                        PanelAccount.used_traffic,
-                        PanelAccount.coeff_anchor_raw,
-                        PanelAccount.coeff_anchor_weighted,
-                        PanelAccount.applied_coefficient,
-                        PanelAccount.last_sync_at,
-                    ),
-                    defer(PanelAccount.links),
-                    defer(PanelAccount.links_by_group),
-                    selectinload(PanelAccount.panel).load_only(
-                        Panel.id,
-                        Panel.name,
-                        Panel.type,
-                        Panel.is_active,
-                        Panel.base_url,
-                    ),
-                ),
+                panel_account_opts,
             )
         else:
             # First paint: usernames + traffic only — panel rows hydrate next.

@@ -67,6 +67,12 @@ class PanelTestAllStats(BaseModel):
     duration_ms: int = 0
 
 
+class PanelTestAllBody(BaseModel):
+    """Scope test-all to the panels the operator currently sees (tab/search)."""
+
+    panel_ids: list[int] | None = None
+
+
 class PanelTestAllOut(BaseModel):
     results: list[PanelTestOut] = Field(default_factory=list)
     ok: int = 0
@@ -87,6 +93,7 @@ class PanelOut(ORMModel):
     is_active: bool
     category_id: int | None = None
     sort_order: int = 0
+    worker_id: int | None = None
     last_ok_at: datetime | None
     created_at: datetime
 
