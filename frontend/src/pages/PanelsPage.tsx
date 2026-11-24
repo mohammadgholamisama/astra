@@ -929,8 +929,8 @@ export default function PanelsPage() {
     mutationFn: () =>
       api<PanelTestAll>("/api/admin/panels/test-all", {
         method: "POST",
-        // Parallel quick probes (~9s each, 16 at a time).
-        timeoutMs: 90_000,
+        // Two-wave quick probes (≈4s then retry fails ≈5.5s).
+        timeoutMs: 60_000,
       }),
     onSuccess: (res) => {
       setTestAllFilter("all");

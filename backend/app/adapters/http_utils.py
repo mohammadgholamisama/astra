@@ -81,7 +81,7 @@ def make_client(
     root = normalize_panel_base_url(base_url).rstrip("/") + "/"
     t = float(timeout if timeout is not None else settings.ADAPTER_TIMEOUT)
     # Fail-fast connect — slow handshakes must not block test-all / usage waves.
-    connect_t = min(4.0, max(2.0, t * 0.15))
+    connect_t = min(2.5, max(1.5, t * 0.08))
     timeout_cfg = httpx.Timeout(t, connect=connect_t)
     headers = {
         "User-Agent": "AstraPanel/1.1 (httpx)",

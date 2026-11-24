@@ -90,11 +90,13 @@ async def _live_test_panel(
     *,
     overall_timeout: float = 18.0,
     quick: bool = False,
+    force_fresh_auth: bool = False,
 ) -> dict:
     """Connectivity probe for Test / test-all.
 
-    ``quick=True`` (test-all): fail-fast connect budget so dozens of panels
-    finish in seconds, not minutes. Single-panel Test keeps fuller retries.
+    ``quick=True`` (test-all): reuse JWT when possible, one short attempt —
+    nested adapter retries + forced re-login were making healthy panels look
+    «کند» (~4–5s) or false «قطع». Single-panel Test keeps fuller retries.
     """
     import time as _time
 
@@ -103,24 +105,20 @@ async def _live_test_panel(
     t0 = _time.monotonic()
     last_err = "اتصال ناموفق"
     if quick:
-        tries = 2
-        overall_timeout = min(float(overall_timeout), 9.0)
+        # One sharp try; caller (test-all) may run a second wave on fails only.
+        tries = 1
+        overall_timeout = min(
+            float(overall_timeout), 6.0 if force_fresh_auth else 4.2
+        )
     else:
-        # Single Test button — allow a soft retry for CF/token blips.
-        tries = 2 if panel.type in (
-            PanelType.marzban,
-            PanelType.rebecca,
-            PanelType.guard,
-            PanelType.pasarguard,
-            PanelType.sanaei,
-        ) else 2
+        tries = 2
 
     for attempt in range(tries):
         remaining = overall_timeout - (_time.monotonic() - t0)
-        if remaining < 0.8:
+        if remaining < 0.5:
             break
         if quick:
-            per_try = min(7.0 if attempt == 0 else 4.0, remaining)
+            per_try = min(5.2 if force_fresh_auth else 3.8, remaining)
         elif attempt == 0:
             per_try = min(12.0, remaining)
         else:
@@ -128,7 +126,13 @@ async def _live_test_panel(
         adapter = get_adapter(panel)
         result: AdapterResult | None = None
         try:
-            _clear_adapter_auth_cache(adapter)
+            # Fresh auth only when asked (retry wave / single Test) — clearing
+            # the JWT on every test-all probe forced a slow login per panel.
+            if force_fresh_auth or (not quick and attempt > 0):
+                _clear_adapter_auth_cache(adapter)
+            elif not quick and attempt == 0:
+                # Single Test: still start clean so the button is authoritative.
+                _clear_adapter_auth_cache(adapter)
             result = await asyncio.wait_for(
                 adapter.test_connection(), timeout=per_try
             )
@@ -159,7 +163,7 @@ async def _live_test_panel(
         if _is_hard_auth_fail(last_err):
             break
         if attempt + 1 < tries:
-            await asyncio.sleep(0.15 if quick else 0.3)
+            await asyncio.sleep(0.12 if quick else 0.3)
 
     ms = int((_time.monotonic() - t0) * 1000)
     # Clarify path: browser OK ≠ Astra server can reach the panel
@@ -1299,15 +1303,13 @@ async def test_all_panels(
     # Free Postgres before remote fan-out (idle-in-transaction / SSH rule).
     await release_db_txn(db)
 
-    # I/O-bound probes — high concurrency + short per-panel budget.
-    sem = asyncio.Semaphore(16)
+    # Wave 1: sharp parallel probes (reuse JWT). Wave 2: only fails, fresh auth.
+    # This cuts wall time and kills false «قطع» under stampede.
+    sem1 = asyncio.Semaphore(28)
+    sem2 = asyncio.Semaphore(14)
     t0 = _time.monotonic()
 
-    async def _one(snap: dict) -> PanelTestOut:
-        async with sem:
-            probe = await _live_test_panel(
-                snap["panel"], overall_timeout=9.0, quick=True
-            )
+    def _to_out(snap: dict, probe: dict) -> PanelTestOut:
         ok = bool(probe.get("success"))
         ms = probe.get("latency_ms")
         latency = int(ms) if isinstance(ms, (int, float)) and ms >= 0 else None
@@ -1323,13 +1325,32 @@ async def test_all_panels(
             base_url=snap["base_url"],
         )
 
+    async def _one(
+        snap: dict,
+        *,
+        sem: asyncio.Semaphore,
+        overall: float,
+        fresh_auth: bool,
+    ) -> PanelTestOut:
+        async with sem:
+            probe = await _live_test_panel(
+                snap["panel"],
+                overall_timeout=overall,
+                quick=True,
+                force_fresh_auth=fresh_auth,
+            )
+        return _to_out(snap, probe)
+
     gathered = await asyncio.gather(
-        *[_one(s) for s in snapshots], return_exceptions=True
+        *[
+            _one(s, sem=sem1, overall=4.0, fresh_auth=False)
+            for s in snapshots
+        ],
+        return_exceptions=True,
     )
-    duration_ms = int((_time.monotonic() - t0) * 1000)
 
     results: list[PanelTestOut] = []
-    ok_ids: list[int] = []
+    retry_snaps: list[dict] = []
     for snap, item in zip(snapshots, gathered):
         if isinstance(item, Exception):
             logger.warning(
@@ -1348,10 +1369,33 @@ async def test_all_panels(
                     base_url=snap["base_url"],
                 )
             )
+            retry_snaps.append(snap)
             continue
         results.append(item)
-        if item.success:
-            ok_ids.append(int(item.id))
+        if not item.success:
+            retry_snaps.append(snap)
+
+    if retry_snaps:
+        retry_gathered = await asyncio.gather(
+            *[
+                _one(s, sem=sem2, overall=5.5, fresh_auth=True)
+                for s in retry_snaps
+            ],
+            return_exceptions=True,
+        )
+        by_id = {int(r.id): i for i, r in enumerate(results)}
+        for snap, item in zip(retry_snaps, retry_gathered):
+            if isinstance(item, Exception):
+                continue
+            idx = by_id.get(int(snap["id"]))
+            if idx is None:
+                results.append(item)
+            elif item.success or not results[idx].success:
+                # Prefer success; on still-fail keep the fresher error/latency.
+                results[idx] = item
+
+    duration_ms = int((_time.monotonic() - t0) * 1000)
+    ok_ids: list[int] = [int(r.id) for r in results if r.success]
 
     # Sequential last_ok_at update — one SQL, no concurrent session writes.
     if ok_ids:

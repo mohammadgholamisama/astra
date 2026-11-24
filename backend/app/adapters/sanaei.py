@@ -405,7 +405,7 @@ class SanaeiAdapter(BasePanelAdapter):
             # Short curl fallback only — never 90s (that froze «تست کلی»).
             if self._token():
                 ok_c, data_c, _st = await self._curl_json(
-                    "panel/api/inbounds/list/slim", max_time=8
+                    "panel/api/inbounds/list/slim", max_time=4
                 )
                 if ok_c:
                     return AdapterResult(success=True, raw=data_c)

@@ -532,67 +532,69 @@ class MarzbanAdapter(BasePanelAdapter):
     async def test_connection(self) -> AdapterResult:
         """Prove admin token works.
 
-        Prefer GET /api/admin (docs); fall back to GET /api/inbounds — some
-        cloud/proxy setups flake on /api/admin while inbounds still works.
+        Prefer GET /api/admin; fall back to GET /api/inbounds in the same
+        attempt. Keep this to one sharp round — test-all wraps retries.
         """
         last_err = "اتصال ناموفق"
-        # Fast probe: short connect, 2 tries — test-all must stay snappy.
-        probe_t = httpx.Timeout(8.0, connect=3.0)
-        for attempt in range(2):
-            try:
-                client, headers = await self._authed()
-                resp = await client.get(
-                    "/api/admin",
-                    headers=headers,
-                    timeout=probe_t,
+        probe_t = httpx.Timeout(3.5, connect=1.6)
+        try:
+            client, headers = await self._authed()
+            resp = await client.get(
+                "/api/admin",
+                headers=headers,
+                timeout=probe_t,
+            )
+            ok, data = ok_json(resp)
+            if ok:
+                return AdapterResult(
+                    success=True, raw=data if isinstance(data, dict) else {}
                 )
-                ok, data = ok_json(resp)
-                if ok:
-                    return AdapterResult(success=True, raw=data if isinstance(data, dict) else {})
 
-                # Token valid but /api/admin flaky → inbounds is enough
-                if resp.status_code in (401, 403):
-                    last_err = err_msg(data, f"HTTP {resp.status_code}")
-                    self._token = None
-                    _TOKEN_CACHE.pop(self._cache_key(), None)
-                    await self.close()
-                    if attempt < 1:
-                        await asyncio.sleep(0.2)
-                        continue
-                    return AdapterResult(success=False, error=last_err)
-
-                try:
-                    client2, headers2 = await self._authed()
-                    resp2 = await client2.get(
-                        "/api/inbounds",
-                        headers=headers2,
-                        timeout=probe_t,
-                    )
-                    ok2, data2 = ok_json(resp2)
-                    if ok2 and isinstance(data2, dict):
-                        return AdapterResult(success=True, raw={"inbounds_ok": True})
-                    last_err = err_msg(data2, err_msg(data, f"HTTP {resp.status_code}"))
-                except Exception as inner:
-                    last_err = str(inner).strip() or err_msg(data, f"HTTP {resp.status_code}")
-
-                if attempt < 1:
-                    await self.close()
-                    await asyncio.sleep(0.2)
-                    continue
-                return AdapterResult(success=False, error=last_err)
-            except Exception as e:
-                last_err = str(e).strip() or e.__class__.__name__
-                low = last_err.lower()
-                if "client has been closed" in low:
-                    last_err = "اتصال پنل قطع شد — دوباره تلاش کنید"
+            if resp.status_code in (401, 403):
+                last_err = err_msg(data, f"HTTP {resp.status_code}")
                 self._token = None
                 _TOKEN_CACHE.pop(self._cache_key(), None)
                 await self.close()
-                if attempt < 2:
-                    await asyncio.sleep(0.5 + attempt * 0.4)
-                    continue
+                try:
+                    client, headers = await self._authed()
+                    resp = await client.get(
+                        "/api/admin",
+                        headers=headers,
+                        timeout=probe_t,
+                    )
+                    ok, data = ok_json(resp)
+                    if ok:
+                        return AdapterResult(
+                            success=True,
+                            raw=data if isinstance(data, dict) else {},
+                        )
+                    last_err = err_msg(data, f"HTTP {resp.status_code}")
+                except Exception as e:  # noqa: BLE001
+                    last_err = str(e).strip() or last_err
                 return AdapterResult(success=False, error=last_err)
-        return AdapterResult(success=False, error=last_err)
+
+            try:
+                resp2 = await client.get(
+                    "/api/inbounds",
+                    headers=headers,
+                    timeout=probe_t,
+                )
+                ok2, data2 = ok_json(resp2)
+                if ok2 and isinstance(data2, dict):
+                    return AdapterResult(success=True, raw={"inbounds_ok": True})
+                last_err = err_msg(
+                    data2, err_msg(data, f"HTTP {resp.status_code}")
+                )
+            except Exception as inner:  # noqa: BLE001
+                last_err = str(inner).strip() or err_msg(
+                    data, f"HTTP {resp.status_code}"
+                )
+            return AdapterResult(success=False, error=last_err)
+        except Exception as e:  # noqa: BLE001
+            last_err = str(e).strip() or e.__class__.__name__
+            if "client has been closed" in last_err.lower():
+                last_err = "اتصال پنل قطع شد — دوباره تلاش کنید"
+            return AdapterResult(success=False, error=last_err)
 
     async def _finalize_user_result(
         self, result: AdapterResult, username: str, *, expand: bool = False

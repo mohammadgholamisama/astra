@@ -440,70 +440,64 @@ class PasarGuardAdapter(MarzbanAdapter):
         )
 
     async def test_connection(self) -> AdapterResult:
-        """Prove admin token — retry soft network/CF blips like Marzban."""
-        import asyncio
-
+        """Prove admin token — one sharp probe (test-all owns retries)."""
         import httpx
 
+        from app.adapters.marzban import _TOKEN_CACHE
+
         last_err = "اتصال ناموفق"
-        probe_t = httpx.Timeout(8.0, connect=3.0)
-        for attempt in range(2):
-            try:
-                client, headers = await self._authed()
-                resp = await client.get(
-                    "/api/admin",
-                    headers=headers,
-                    timeout=probe_t,
+        probe_t = httpx.Timeout(3.5, connect=1.6)
+        try:
+            client, headers = await self._authed()
+            resp = await client.get(
+                "/api/admin",
+                headers=headers,
+                timeout=probe_t,
+            )
+            ok, data = ok_json(resp)
+            if ok:
+                return AdapterResult(
+                    success=True, raw=data if isinstance(data, dict) else {}
                 )
-                ok, data = ok_json(resp)
-                if ok:
-                    return AdapterResult(
-                        success=True, raw=data if isinstance(data, dict) else {}
-                    )
-                if resp.status_code in (401, 403):
-                    last_err = err_msg(data, f"HTTP {resp.status_code}")
-                    self._token = None
-                    from app.adapters.marzban import _TOKEN_CACHE
-
-                    _TOKEN_CACHE.pop(self._cache_key(), None)
-                    await self.close()
-                    if attempt < 1:
-                        await asyncio.sleep(0.2)
-                        continue
-                    return AdapterResult(success=False, error=last_err)
-                # some builds expose /api/system
-                resp2 = await client.get(
-                    "/api/system",
-                    headers=headers,
-                    timeout=probe_t,
-                )
-                ok2, data2 = ok_json(resp2)
-                if ok2:
-                    return AdapterResult(
-                        success=True,
-                        raw=data2 if isinstance(data2, dict) else {},
-                    )
-                last_err = err_msg(data2, err_msg(data, f"HTTP {resp.status_code}"))
-                if attempt < 1:
-                    await self.close()
-                    await asyncio.sleep(0.2)
-                    continue
-                return AdapterResult(success=False, error=last_err)
-            except Exception as e:
-                last_err = str(e).strip() or e.__class__.__name__
+            if resp.status_code in (401, 403):
+                last_err = err_msg(data, f"HTTP {resp.status_code}")
                 self._token = None
-                try:
-                    from app.adapters.marzban import _TOKEN_CACHE
-
-                    _TOKEN_CACHE.pop(self._cache_key(), None)
-                except Exception:
-                    pass
+                _TOKEN_CACHE.pop(self._cache_key(), None)
                 await self.close()
-                if attempt < 2:
-                    await asyncio.sleep(0.45 + attempt * 0.35)
-                    continue
+                try:
+                    client, headers = await self._authed()
+                    resp = await client.get(
+                        "/api/admin",
+                        headers=headers,
+                        timeout=probe_t,
+                    )
+                    ok, data = ok_json(resp)
+                    if ok:
+                        return AdapterResult(
+                            success=True,
+                            raw=data if isinstance(data, dict) else {},
+                        )
+                    last_err = err_msg(data, f"HTTP {resp.status_code}")
+                except Exception as e:  # noqa: BLE001
+                    last_err = str(e).strip() or last_err
                 return AdapterResult(success=False, error=last_err)
-        return AdapterResult(success=False, error=last_err)
+            # some builds expose /api/system
+            resp2 = await client.get(
+                "/api/system",
+                headers=headers,
+                timeout=probe_t,
+            )
+            ok2, data2 = ok_json(resp2)
+            if ok2:
+                return AdapterResult(
+                    success=True,
+                    raw=data2 if isinstance(data2, dict) else {},
+                )
+            last_err = err_msg(data2, err_msg(data, f"HTTP {resp.status_code}"))
+            return AdapterResult(success=False, error=last_err)
+        except Exception as e:  # noqa: BLE001
+            last_err = str(e).strip() or e.__class__.__name__
+            return AdapterResult(success=False, error=last_err)
 
     async def create_user(self, payload: UserPayload) -> AdapterResult:
         """POST /api/user — PasarGuard docs; retry on network blips; idempotent if exists."""
