@@ -22,9 +22,9 @@ WORKER_VERSION = "1.0.3"
 # Assigned panels for background usage collection
 _ASSIGNED: list[dict[str, Any]] = []
 _INTERVAL = 120  # full usage sweep every 2 minutes
-_COLLECT_CONC = 3  # keep master cool — few panels listing at once
-_REPORT_CONC = 1  # serialize posts to master (was stampeding → 500s)
-_METER_CHUNK = 1500  # chunk huge panel maps
+_COLLECT_CONC = 1  # one panel at a time — protects master CPU
+_REPORT_CONC = 1  # serialize posts to master
+_METER_CHUNK = 2500  # fewer HTTP round-trips; master coalesces anyway
 _LAST_MAP: dict[int, dict[str, int]] = {}  # panel_id → last sent meters
 _COLLECT_TASK: asyncio.Task | None = None
 _REPORT_SEM: asyncio.Semaphore | None = None
@@ -405,17 +405,20 @@ async def _list_usage_map(adapter: Any, *, max_pages: int = 80) -> dict[str, int
 def _delta_meters(
     pid: int, usage_map: dict[str, int], *, force_full: bool = False
 ) -> list[dict[str, int | str]]:
-    """Only send changed meters after the first full snapshot (cuts 32k→small)."""
+    """Only send changed meters after the first full snapshot (cuts 32k→small).
+
+    Full snapshot sends used>0 only (zeros don't change Astra meters and
+    were burning master CPU on 20×1500 empty-ish applies).
+    """
     prev = _LAST_MAP.get(pid)
     if force_full or prev is None:
-        items = list(usage_map.items())
+        items = [(n, u) for n, u in usage_map.items() if int(u or 0) > 0]
     else:
         items = [
             (name, used)
             for name, used in usage_map.items()
             if int(prev.get(name, -1)) != int(used)
         ]
-        # Also push removals as 0 if name vanished? skip — Astra keeps last.
     _LAST_MAP[pid] = dict(usage_map)
     return [
         {"remote_username": str(name), "used_traffic": int(used or 0)}
@@ -468,8 +471,8 @@ async def _post_meter_chunks(
                         break
                     except Exception:  # noqa: BLE001
                         await asyncio.sleep(0.8 * (attempt + 1))
-                # Pace chunks so master queue can drain
-                await asyncio.sleep(0.15)
+                # Pace chunks — master coalesces; don't stampede apply lock.
+                await asyncio.sleep(0.4)
     return ok_n
 
 
@@ -486,8 +489,8 @@ async def _collect_one(panel: dict[str, Any], *, wave_n: int) -> None:
         usage_map = await _list_usage_map(adapter)
         if not usage_map:
             return
-        # Full resync every 8th wave so resets/zeros stay accurate.
-        force_full = (wave_n % 8 == 1) or (pid not in _LAST_MAP)
+        # Full resync rarely (every ~16 waves ≈ 30+ min) — deltas keep meters fresh.
+        force_full = (wave_n % 16 == 1) or (pid not in _LAST_MAP)
         meters = _delta_meters(pid, usage_map, force_full=force_full)
         listed = len(usage_map)
         if not meters:

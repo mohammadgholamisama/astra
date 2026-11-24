@@ -27,22 +27,24 @@ from app.services import worker_client as wc
 
 logger = logging.getLogger("astra.worker")
 
-# ---- usage-report queue: never block API / never stampede DB on master ----
-# Worker may dump 20×32k meters; apply one job at a time, drop oldest under load.
-_REPORT_Q: asyncio.Queue | None = None
+# ---- usage-report coalesce queue ----
+# Worker sends many 1500-meter chunks; merging per panel avoids reloading all
+# panel_accounts once per chunk (was pegging both uvicorn workers at ~100%).
+_REPORT_WAKE: asyncio.Event | None = None
 _REPORT_TASK: asyncio.Task | None = None
-_REPORT_SEM = asyncio.Semaphore(1)
-_REPORT_Q_MAX = 24
+_REPORT_PENDING: dict[int, dict[str, Any]] = {}
+_REPORT_LOCK = asyncio.Lock()
 _REPORT_DIRTY: set[int] = set()
 _REPORT_DIRTY_LOCK = asyncio.Lock()
-_REPORT_STATS = {"queued": 0, "applied": 0, "dropped": 0, "errors": 0}
+_REPORT_STATS = {"queued": 0, "applied": 0, "dropped": 0, "errors": 0, "merged": 0}
+_APPLY_LOCK_PATH = "/tmp/astra-usage-apply.lock"
 
 
-def _report_queue() -> asyncio.Queue:
-    global _REPORT_Q
-    if _REPORT_Q is None:
-        _REPORT_Q = asyncio.Queue(maxsize=_REPORT_Q_MAX)
-    return _REPORT_Q
+def _report_wake() -> asyncio.Event:
+    global _REPORT_WAKE
+    if _REPORT_WAKE is None:
+        _REPORT_WAKE = asyncio.Event()
+    return _REPORT_WAKE
 
 
 async def ensure_usage_report_worker() -> None:
@@ -63,80 +65,96 @@ async def enqueue_usage_report(
     listed: int = 0,
     dt_ms: int | None = None,
 ) -> dict[str, Any]:
-    """Queue meters for async apply. Fast: never runs DB apply inline.
-
-    If the queue is full, drop the oldest job so create/delete/API stay alive.
-    """
+    """Merge meters into per-panel pending map (O(1) accept, deferred apply)."""
     await ensure_usage_report_worker()
-    q = _report_queue()
-    job = {
-        "worker_id": int(worker_id),
-        "panel_id": int(panel_id),
-        "usage_map": usage_map,
-        "listed": int(listed or 0),
-        "dt_ms": dt_ms,
-        "enqueued_at": time.monotonic(),
-    }
-    dropped = 0
-    while q.full():
-        try:
-            q.get_nowait()
-            q.task_done()
-            dropped += 1
-            _REPORT_STATS["dropped"] += 1
-        except asyncio.QueueEmpty:
-            break
-    try:
-        q.put_nowait(job)
-        _REPORT_STATS["queued"] += 1
-    except asyncio.QueueFull:
-        _REPORT_STATS["dropped"] += 1
-        return {
-            "queued": False,
-            "dropped": True,
-            "qsize": q.qsize(),
-            "reason": "busy",
-        }
-    if dropped:
-        logger.warning(
-            "usage-report queue full — dropped oldest=%s panel=%s q=%s",
-            dropped,
-            panel_id,
-            q.qsize(),
-        )
+    pid = int(panel_id)
+    async with _REPORT_LOCK:
+        row = _REPORT_PENDING.get(pid)
+        if row is None:
+            if len(_REPORT_PENDING) >= 40:
+                # Drop an arbitrary oldest panel to keep master responsive.
+                drop_pid = next(iter(_REPORT_PENDING))
+                _REPORT_PENDING.pop(drop_pid, None)
+                _REPORT_STATS["dropped"] += 1
+            row = {
+                "worker_id": int(worker_id),
+                "usage_map": {},
+                "listed": 0,
+                "enqueued_at": time.monotonic(),
+            }
+            _REPORT_PENDING[pid] = row
+            _REPORT_STATS["queued"] += 1
+        else:
+            _REPORT_STATS["merged"] += 1
+        umap: dict[str, int] = row["usage_map"]
+        for k, v in (usage_map or {}).items():
+            name = str(k).strip()
+            if not name:
+                continue
+            umap[name] = max(int(umap.get(name) or 0), max(0, int(v or 0)))
+        row["worker_id"] = int(worker_id)
+        row["listed"] = max(int(row.get("listed") or 0), int(listed or 0))
+        meters_n = len(umap)
+        pending_n = len(_REPORT_PENDING)
+    _report_wake().set()
     return {
         "queued": True,
-        "dropped_oldest": dropped,
-        "qsize": q.qsize(),
-        "meters": len(usage_map),
+        "merged": True,
+        "qsize": pending_n,
+        "meters": meters_n,
     }
 
 
 async def _usage_report_consumer() -> None:
-    from app.core.database import AsyncSessionLocal, pool_pressure_blocks_background
+    from app.core.database import pool_pressure_blocks_background
 
+    wake = _report_wake()
     while True:
-        job = await _report_queue().get()
-        try:
-            # Yield under pool pressure so interactive API keeps headroom.
-            if pool_pressure_blocks_background():
-                await asyncio.sleep(1.5)
-            async with _REPORT_SEM:
-                await _apply_usage_report_job(job)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001
-            _REPORT_STATS["errors"] += 1
-            logger.exception(
-                "usage-report job failed panel=%s", job.get("panel_id")
-            )
-        finally:
+        await wake.wait()
+        wake.clear()
+        while True:
+            async with _REPORT_LOCK:
+                if not _REPORT_PENDING:
+                    break
+                # Prefer largest pending map (finish heavy panels first).
+                pid = max(
+                    _REPORT_PENDING.keys(),
+                    key=lambda p: len(_REPORT_PENDING[p].get("usage_map") or {}),
+                )
+                row = _REPORT_PENDING.pop(pid)
+            job = {
+                "panel_id": int(pid),
+                "worker_id": int(row["worker_id"]),
+                "usage_map": row.get("usage_map") or {},
+                "listed": int(row.get("listed") or 0),
+            }
             try:
-                _report_queue().task_done()
+                if pool_pressure_blocks_background():
+                    await asyncio.sleep(2.0)
+                await _apply_usage_report_job(job)
+            except asyncio.CancelledError:
+                raise
             except Exception:  # noqa: BLE001
-                pass
-            # Small gap so event loop can serve create/delete/SSH-adjacent work.
-            await asyncio.sleep(0.05)
+                _REPORT_STATS["errors"] += 1
+                logger.exception(
+                    "usage-report job failed panel=%s", job.get("panel_id")
+                )
+            # Let API / create breathe between heavy applies.
+            await asyncio.sleep(0.35)
+
+
+def _try_acquire_apply_lock():
+    """Cross-process lock so two uvicorn workers don't apply at once."""
+    import fcntl
+
+    try:
+        fd = open(_APPLY_LOCK_PATH, "w", encoding="utf-8")
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except BlockingIOError:
+        return None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 async def _apply_usage_report_job(job: dict[str, Any]) -> None:
@@ -148,40 +166,70 @@ async def _apply_usage_report_job(job: dict[str, Any]) -> None:
     usage_map: dict[str, int] = job.get("usage_map") or {}
     if not usage_map:
         return
+    # Serialize applies across uvicorn workers (shared CPU/DB).
+    lock_fd = await asyncio.to_thread(_try_acquire_apply_lock)
+    if lock_fd is None:
+        # Another process is applying — re-queue and wait.
+        async with _REPORT_LOCK:
+            row = _REPORT_PENDING.get(pid) or {
+                "worker_id": wid,
+                "usage_map": {},
+                "listed": 0,
+                "enqueued_at": time.monotonic(),
+            }
+            umap: dict[str, int] = row["usage_map"]
+            for k, v in usage_map.items():
+                umap[str(k)] = max(int(umap.get(str(k)) or 0), int(v or 0))
+            row["usage_map"] = umap
+            row["worker_id"] = wid
+            _REPORT_PENDING[pid] = row
+        await asyncio.sleep(0.8)
+        _report_wake().set()
+        return
     t0 = time.monotonic()
     dirty: set[int] = set()
-    async with AsyncSessionLocal() as db:
-        panel = (
-            await db.execute(select(Panel).where(Panel.id == pid))
-        ).scalar_one_or_none()
-        if panel is None:
-            return
-        dirty = await apply_usage_map_to_panel(db, pid, usage_map)
-        worker = (
-            await db.execute(select(WorkerNode).where(WorkerNode.id == wid))
-        ).scalar_one_or_none()
-        if worker is not None:
-            worker.last_seen_at = datetime.now(timezone.utc)
-            worker.status = "online"
-            worker.last_error = None
-        await db.commit()
+    try:
+        async with AsyncSessionLocal() as db:
+            panel = (
+                await db.execute(select(Panel.id).where(Panel.id == pid))
+            ).scalar_one_or_none()
+            if panel is None:
+                return
+            dirty = await apply_usage_map_to_panel(db, pid, usage_map)
+            worker = (
+                await db.execute(select(WorkerNode).where(WorkerNode.id == wid))
+            ).scalar_one_or_none()
+            if worker is not None:
+                worker.last_seen_at = datetime.now(timezone.utc)
+                worker.status = "online"
+                worker.last_error = None
+            await db.commit()
+    finally:
+        try:
+            import fcntl
+
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+            lock_fd.close()
+        except Exception:  # noqa: BLE001
+            pass
     if dirty:
         async with _REPORT_DIRTY_LOCK:
             _REPORT_DIRTY.update(int(x) for x in dirty)
-            # Cap pending recount set — fleet/lagging will catch the rest.
             if len(_REPORT_DIRTY) > 2500:
                 keep = list(_REPORT_DIRTY)[:2000]
                 _REPORT_DIRTY.clear()
                 _REPORT_DIRTY.update(keep)
     _REPORT_STATS["applied"] += 1
     wc.mark_worker_health(wid, True, "")
+    async with _REPORT_LOCK:
+        pending_n = len(_REPORT_PENDING)
     logger.info(
-        "usage-report applied panel=%s meters=%s dirty=%s dt=%.2fs q=%s",
+        "usage-report applied panel=%s meters=%s dirty=%s dt=%.2fs pending=%s",
         pid,
         len(usage_map),
         len(dirty),
         time.monotonic() - t0,
-        _report_queue().qsize(),
+        pending_n,
     )
 
 
@@ -197,10 +245,9 @@ async def drain_report_dirty_for_recount(limit: int = 400) -> list[int]:
 
 
 def usage_report_queue_stats() -> dict[str, int]:
-    q = _REPORT_Q
     return {
         **{k: int(v) for k, v in _REPORT_STATS.items()},
-        "qsize": int(q.qsize()) if q is not None else 0,
+        "qsize": len(_REPORT_PENDING),
         "pending_dirty": len(_REPORT_DIRTY),
     }
 

@@ -13,7 +13,8 @@ Environment=ASTRA_BIND_HOST=127.0.0.1
 Environment=ASTRA_APP_PORT=2086
 # Spread API across cores (one process used to peg a single core at 100%).
 # Background loops run in only one worker via /tmp/astra-bg.lock.
-Environment=ASTRA_WEB_CONCURRENCY=3
+# 2 web workers spreads API across cores without 3× DB-pool stampede.
+Environment=ASTRA_WEB_CONCURRENCY=2
 EnvironmentFile=-/opt/astra/.env
 Environment=PATH=/opt/astra/backend/.venv/bin:/usr/local/bin:/usr/bin
 # IMPORTANT: systemd supports ${VAR} only — NOT bash ${VAR:-default}

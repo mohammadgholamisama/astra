@@ -534,19 +534,30 @@ async def _hot_usage_loop() -> None:
                 except Exception:  # noqa: BLE001
                     pass
 
-            ids = ids[:3] if under_pressure else ids[:10]
+            # When a Worker owns remotes, skip per-user HTTP pulls — only
+            # recount from meters already written by usage-report.
+            worker_ok = False
+            try:
+                from app.services.worker_client import any_worker_healthy
+
+                worker_ok = bool(any_worker_healthy())
+            except Exception:  # noqa: BLE001
+                worker_ok = False
+            ids = ids[:4] if (under_pressure or worker_ok) else ids[:10]
             if ids:
-                sem = asyncio.Semaphore(1 if under_pressure else 2)
+                sem = asyncio.Semaphore(1)
 
                 async def _one(uid: int) -> None:
                     async with sem:
                         try:
                             await recount_user_usage_pool_safe(int(uid))
+                            if worker_ok or under_pressure:
+                                return
                             await asyncio.wait_for(
                                 refresh_usage_pool_safe(
                                     int(uid), force=True, quick=True
                                 ),
-                                timeout=28.0,
+                                timeout=20.0,
                             )
                         except asyncio.TimeoutError:
                             try:
@@ -568,18 +579,26 @@ async def _hot_usage_loop() -> None:
                     *[_one(uid) for uid in ids], return_exceptions=True
                 )
                 logger.info(
-                    "hot usage: pulled=%s pressure=%s dt=%.1fs",
+                    "hot usage: pulled=%s pressure=%s worker=%s dt=%.1fs",
                     len(ids),
                     int(under_pressure),
+                    int(worker_ok),
                     _time.monotonic() - t0,
                 )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("hot usage loop failed")
-        interval = max(30, int(getattr(settings, "USAGE_HOT_SECONDS", 45) or 45))
+        interval = max(45, int(getattr(settings, "USAGE_HOT_SECONDS", 60) or 60))
+        try:
+            from app.services.worker_client import any_worker_healthy
+
+            if any_worker_healthy():
+                interval = max(interval, 90)
+        except Exception:  # noqa: BLE001
+            pass
         elapsed = _time.monotonic() - t0
-        await asyncio.sleep(max(25.0, float(interval) - elapsed))
+        await asyncio.sleep(max(35.0, float(interval) - elapsed))
 
 
 async def _priority_usage_loop() -> None:
@@ -751,7 +770,7 @@ async def lifespan(_app: FastAPI):
                 logging.getLogger("astra.worker").info(
                     "worker routes loaded n=%s", n
                 )
-            # Every web worker accepts usage-report and applies via local queue.
+            # Coalesced usage-report consumer (merges chunks per panel).
             await ensure_usage_report_worker()
         except Exception:  # noqa: BLE001
             logging.getLogger("astra.worker").warning(
