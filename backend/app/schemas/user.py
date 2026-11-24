@@ -137,6 +137,9 @@ class UserBulkCreateResponse(BaseModel):
     created: list[UserResponse] = Field(default_factory=list)
     failed: list[UserBulkFail] = Field(default_factory=list)
     total_requested: int = 0
+    # True when panel remotes keep creating after the HTTP response.
+    remote_bg: bool = False
+    message: str = ""
 
 
 class UserRetryErrorsResponse(BaseModel):

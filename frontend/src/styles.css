@@ -4469,6 +4469,16 @@ th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
   display: flex;
   flex-direction: column;
 }
+.user-bulk-result-bg-note {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--line));
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  font-size: 0.86rem;
+  line-height: 1.55;
+  color: var(--text);
+}
 .user-bulk-result-actions {
   display: flex;
   flex-wrap: wrap;
@@ -4479,6 +4489,12 @@ th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+.user-bulk-copy-all-btn {
+  flex: 1 1 220px;
+  justify-content: center;
+  min-height: 44px;
+  font-weight: 800;
 }
 .user-bulk-result-all-wrap {
   display: grid;

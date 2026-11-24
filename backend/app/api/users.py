@@ -592,97 +592,116 @@ async def create_users_bulk(
             },
         ) from exc
 
-    created_names = [u.username for u in users]
-    db.expire_all()
-    loaded = await db.execute(
-        select(User)
-        .where(User.username.in_(created_names))
-        .options(
-            selectinload(User.groups),
-            selectinload(User.panel_accounts).selectinload(PanelAccount.panel),
-        )
-    )
-    users = list(loaded.scalars().unique().all())
-    by_name = {u.username: u for u in users}
-    users = [by_name[n] for n in created_names if n in by_name]
+    from app.core.database import release_db_txn
+    from app.services.users import subscription_url
 
-    rows = await db.execute(select(Panel).where(Panel.id.in_(panel_id_set or [-1])))
-    by_id = {int(p.id): p for p in rows.scalars().all()}
-    local_panels = [
-        (by_id[pid], cfg, gid)
-        for pid, cfg, gid in panel_specs
-        if pid in by_id and bool(getattr(by_id[pid], "is_active", True))
-    ]
-    if users and local_panels:
+    created_names = [u.username for u in users]
+    user_ids = [int(u.id) for u in users if getattr(u, "id", None)]
+
+    # Return sub links immediately — panel remotes continue in background.
+    # Waiting on provision here caused false UI timeouts while users already existed.
+    created: list[UserResponse] = []
+    for user in users:
         try:
-            await orchestrator.provision_users_now(db, users, local_panels)
-        except Exception:  # noqa: BLE001
-            log.exception("bulk provision failed")
+            created.append(
+                UserResponse(
+                    username=user.username,
+                    display_name=user.display_name,
+                    status=user.status,
+                    used_traffic=int(user.used_traffic or 0),
+                    lifetime_used_traffic=int(user.lifetime_used_traffic or 0),
+                    data_limit=int(user.data_limit or 0),
+                    expire=int(user.expire or 0),
+                    on_hold_expire_duration=int(
+                        getattr(user, "on_hold_expire_duration", 0) or 0
+                    ),
+                    include_promo_first=bool(
+                        getattr(user, "include_promo_first", True)
+                    ),
+                    note=user.note,
+                    created_at=getattr(user, "created_at", None),
+                    subscription_url=subscription_url(user),
+                    group_ids=list(ordered_gids),
+                    source_category_id=getattr(user, "source_category_id", None),
+                    panel_accounts=[],
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("bulk serialize user=%s: %s", user.username, exc)
+            failed.append(
+                UserBulkFail(
+                    username=user.username,
+                    message="کاربر ساخته شد ولی لینک قابل ساخت نیست",
+                )
+            )
+
+    await release_db_txn(db)
+
+    if user_ids and panel_id_set:
+        specs = list(panel_specs)
+
+        async def _bulk_provision_bg() -> None:
+            from app.core.database import AsyncSessionLocal
+
             try:
-                await db.rollback()
+                async with AsyncSessionLocal() as sdb:
+                    loaded = await sdb.execute(
+                        select(User).where(User.id.in_(user_ids))
+                    )
+                    bg_users = list(loaded.scalars().all())
+                    if not bg_users:
+                        return
+                    rows = await sdb.execute(
+                        select(Panel).where(Panel.id.in_(panel_id_set or [-1]))
+                    )
+                    by_id = {int(p.id): p for p in rows.scalars().all()}
+                    local_panels = [
+                        (by_id[pid], cfg, gid)
+                        for pid, cfg, gid in specs
+                        if pid in by_id
+                        and bool(getattr(by_id[pid], "is_active", True))
+                    ]
+                    if not local_panels:
+                        return
+                    # wait=0: queue remotes and return — workers keep running.
+                    await orchestrator.provision_users_now(
+                        sdb, bg_users, local_panels, wait=0
+                    )
+                    try:
+                        await sdb.commit()
+                    except Exception:  # noqa: BLE001
+                        try:
+                            await sdb.rollback()
+                        except Exception:  # noqa: BLE001
+                            pass
+                # Soft heal leftovers without blocking the admin UI.
+                try:
+                    await orchestrator.heal_failed_panel_accounts_batch(
+                        limit_users=max(10, len(user_ids))
+                    )
+                except Exception:  # noqa: BLE001
+                    log.debug("bulk bg heal soft-fail", exc_info=True)
             except Exception:  # noqa: BLE001
-                pass
+                log.exception("bulk background provision failed")
+
         try:
             asyncio.create_task(
-                orchestrator.heal_failed_panel_accounts_batch(
-                    limit_users=max(10, len(created_names))
-                ),
-                name="astra-heal-after-bulk",
+                _bulk_provision_bg(),
+                name="astra-bulk-provision-bg",
             )
         except Exception:  # noqa: BLE001
-            pass
-
-    db.expire_all()
-    created: list[UserResponse] = []
-    try:
-        loaded = await db.execute(
-            select(User)
-            .where(User.username.in_(created_names))
-            .options(
-                selectinload(User.groups),
-                selectinload(User.panel_accounts).selectinload(PanelAccount.panel),
-            )
-        )
-        by_name = {u.username: u for u in loaded.scalars().unique().all()}
-        for uname in created_names:
-            user = by_name.get(uname)
-            if not user:
-                failed.append(
-                    UserBulkFail(username=uname, message="کاربر ساخته شد ولی قابل خواندن نیست")
-                )
-                continue
-            try:
-                created.append(to_user_response(user, include_links=True))
-            except Exception as exc:  # noqa: BLE001
-                log.warning("bulk serialize user=%s: %s", uname, exc)
-                created.append(
-                    UserResponse(
-                        username=user.username,
-                        display_name=user.display_name,
-                        status=user.status,
-                        used_traffic=int(user.used_traffic or 0),
-                        lifetime_used_traffic=int(user.lifetime_used_traffic or 0),
-                        data_limit=int(user.data_limit or 0),
-                        expire=int(user.expire or 0),
-                        on_hold_expire_duration=int(
-                            getattr(user, "on_hold_expire_duration", 0) or 0
-                        ),
-                        include_promo_first=bool(
-                            getattr(user, "include_promo_first", True)
-                        ),
-                        note=user.note,
-                        subscription_url="",
-                        group_ids=body.group_ids,
-                        source_category_id=getattr(user, "source_category_id", None),
-                    )
-                )
-    except Exception:  # noqa: BLE001
-        log.exception("bulk final load failed")
+            log.exception("bulk bg task schedule failed")
 
     return UserBulkCreateResponse(
         created=created,
         failed=failed,
         total_requested=len(names),
+        remote_bg=bool(user_ids and panel_id_set),
+        message=(
+            "کاربران و لینک ساب ساخته شدند — ساخت روی پنل‌ها در پس‌زمینه ادامه دارد"
+            if user_ids and panel_id_set
+            else ""
+        ),
     )
 
 

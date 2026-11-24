@@ -546,6 +546,8 @@ export default function UsersPage() {
     created: User[];
     failed: { username: string; message: string }[];
     total_requested: number;
+    remote_bg?: boolean;
+    message?: string;
   } | null>(null);
   const [copied, setCopied] = useState("");
   const [confirmUser, setConfirmUser] = useState<User | null>(null);
@@ -911,6 +913,8 @@ export default function UsersPage() {
     created: User[];
     failed: { username: string; message: string }[];
     total_requested: number;
+    remote_bg?: boolean;
+    message?: string;
   };
 
   const bulkCreate = useMutation({
@@ -925,9 +929,10 @@ export default function UsersPage() {
           ? Math.floor(Date.now() / 1000) + Math.floor(dayN * 86400)
           : 0;
       const dn = bulkDisplayName.trim();
+      // Local users + sub URLs return fast; panel remotes continue in bg.
       return api<BulkCreateResponse>("/api/users/bulk", {
         method: "POST",
-        timeoutMs: 20_000,
+        timeoutMs: 60_000,
         body: JSON.stringify({
           username_prefix: bulkPrefix.trim(),
           count,
@@ -957,6 +962,7 @@ export default function UsersPage() {
       setBulkCatTab("all");
       setBulkBoundCategoryId(null);
       setBulkResult(res);
+      setCopied("");
     },
   });
 
@@ -969,6 +975,9 @@ export default function UsersPage() {
       }
       if (err.code === "HOLD_DURATION_REQUIRED") {
         return "برای شروع از اولین استفاده باید روز اعتبار بیشتر از صفر باشد";
+      }
+      if (err.status === 504) {
+        return "ساخت طولانی شد — اگر کاربران در لیست آمدند، لینک ساب‌ها آماده‌اند و ساخت پنل در پس‌زمینه ادامه دارد";
       }
       return err.message;
     }
@@ -3247,7 +3256,7 @@ export default function UsersPage() {
                   <h3 id="bulk-result-title">کاربران ساخته شدند</h3>
                   <p className="modal-sub">
                     {toFaDigits(bulkResult.created.length)} از{" "}
-                    {toFaDigits(bulkResult.total_requested)} موفق
+                    {toFaDigits(bulkResult.total_requested)} با لینک ساب
                     {bulkResult.failed.length > 0
                       ? ` · ${toFaDigits(bulkResult.failed.length)} ناموفق`
                       : ""}
@@ -3263,20 +3272,46 @@ export default function UsersPage() {
                 </button>
               </header>
 
+              {bulkResult.remote_bg && (
+                <p className="user-bulk-result-bg-note">
+                  {bulkResult.message ||
+                    "لینک ساب‌ها آماده‌اند — ساخت روی پنل‌ها در پس‌زمینه با سرعت بالا ادامه دارد"}
+                </p>
+              )}
+
+              {bulkResult.created.length > 0 && (
+                <label className="user-bulk-result-all-wrap">
+                  <span className="user-bulk-result-all-label">
+                    همه ساب‌ها یک‌جا — انتخاب و کپی
+                  </span>
+                  <textarea
+                    id="bulk-all-links-box"
+                    className="user-bulk-result-all-links"
+                    readOnly
+                    dir="ltr"
+                    rows={Math.min(14, Math.max(6, bulkResult.created.length))}
+                    value={bulkAllLinksText()}
+                    autoFocus
+                    onFocus={(e) => e.currentTarget.select()}
+                    onClick={(e) => e.currentTarget.select()}
+                  />
+                </label>
+              )}
+
               <div className="user-bulk-result-actions">
                 <button
                   type="button"
-                  className="btn"
+                  className="btn user-bulk-copy-all-btn"
                   onClick={copyAllBulkLinksOnly}
                   disabled={!bulkResult.created.length}
                 >
                   {copied === "bulk-links" ? (
                     <>
-                      <Check size={15} /> کپی شد
+                      <Check size={16} /> همه ساب‌ها کپی شد
                     </>
                   ) : (
                     <>
-                      <Copy size={15} /> کپی همه لینک‌ها
+                      <Copy size={16} /> کپی همه ساب‌ها
                     </>
                   )}
                 </button>
@@ -3292,29 +3327,11 @@ export default function UsersPage() {
                     </>
                   ) : (
                     <>
-                      <Copy size={15} /> کپی یوزرنیم + لینک
+                      <Copy size={15} /> یوزرنیم + لینک
                     </>
                   )}
                 </button>
               </div>
-
-              {bulkResult.created.length > 0 && (
-                <label className="user-bulk-result-all-wrap">
-                  <span className="user-bulk-result-all-label">
-                    همه لینک‌ها — یک‌جا انتخاب / کپی
-                  </span>
-                  <textarea
-                    id="bulk-all-links-box"
-                    className="user-bulk-result-all-links"
-                    readOnly
-                    dir="ltr"
-                    rows={Math.min(14, Math.max(5, bulkResult.created.length))}
-                    value={bulkAllLinksText()}
-                    onFocus={(e) => e.currentTarget.select()}
-                    onClick={(e) => e.currentTarget.select()}
-                  />
-                </label>
-              )}
 
               <div className="user-bulk-result-list">
                 {bulkResult.created.map((u, i) => (
@@ -3358,7 +3375,15 @@ export default function UsersPage() {
               )}
 
               <footer className="modal-foot">
-                <button type="button" className="btn" onClick={() => setBulkResult(null)}>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={copyAllBulkLinksOnly}
+                  disabled={!bulkResult.created.length}
+                >
+                  {copied === "bulk-links" ? "کپی شد" : "کپی همه ساب‌ها"}
+                </button>
+                <button type="button" className="btn ghost" onClick={() => setBulkResult(null)}>
                   بستن
                 </button>
               </footer>

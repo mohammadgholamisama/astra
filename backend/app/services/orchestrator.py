@@ -2148,13 +2148,14 @@ async def provision_users_now(
     )
     account_ids = [int(r[0]) for r in rows.all() if r[0]]
     tasks = start_account_provisions(account_ids)
+    # wait=0 → fire-and-forget (bulk API returns sub links immediately).
     wait_s = (
         float(wait)
         if wait is not None
         else min(45.0, max(8.0, 0.35 * max(1, len(account_ids))))
     )
-    if tasks:
-        await asyncio.wait(tasks, timeout=max(0.2, wait_s))
+    if tasks and wait_s > 0:
+        await asyncio.wait(tasks, timeout=wait_s)
     ok = 0
     err = 0
     pending = 0
