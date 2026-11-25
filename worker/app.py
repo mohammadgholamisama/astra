@@ -17,7 +17,7 @@ logger = logging.getLogger("astra.worker.agent")
 MASTER_URL = (os.environ.get("ASTRA_MASTER_URL") or "").rstrip("/")
 WORKER_TOKEN = (os.environ.get("ASTRA_WORKER_TOKEN") or "").strip()
 WORKER_NAME = os.environ.get("ASTRA_WORKER_NAME") or "astra-worker"
-WORKER_VERSION = "1.0.33"
+WORKER_VERSION = "1.0.34"
 
 # Assigned panels for background usage collection (exact lease from Master)
 _ASSIGNED: list[dict[str, Any]] = []
@@ -1481,6 +1481,13 @@ async def _collect_one(
     if _circuit_open(pid):
         logger.info("collect skip panel=%s circuit-open", pid)
         return
+    # Skip types this agent cannot meter — mark mapped so they never eat cold slots.
+    ptype = str(panel.get("type") or "").strip().lower()
+    if ptype in ("astra", ""):
+        _LAST_MAP.setdefault(pid, {})
+        _LAST_MAP_TS[pid] = time.monotonic()
+        _LAST_COLD_TS[pid] = time.monotonic()
+        return
 
     if force_mode == "warm":
         cold = False
@@ -1717,11 +1724,13 @@ async def _collect_loop() -> None:
                         cold_due.append(p)
                     else:
                         warm_due.append(p)
-                # Resume mid-sweep first, then never-mapped panels (post-restart
-                # starve fix), then oldest last-cold. Heavy-first previously
-                # locked out 35/57/59 forever while 3/4/5 recycled every 60s.
+                # Never-cold panels first (35/57/59 were starved by checkpoint
+                # resumes on huge panels). Then mid-sweep resume, then oldest.
                 cold_due.sort(
                     key=lambda p: (
+                        0
+                        if int(p.get("id") or 0) not in _LAST_COLD_TS
+                        else 1,
                         0
                         if int(_COLD_OFFSET.get(int(p.get("id") or 0), 0) or 0) > 0
                         else 1,
@@ -1734,7 +1743,26 @@ async def _collect_loop() -> None:
                 )
                 # Prefer cold when due — warm timeouts were starving 60s sweeps.
                 cold_cap = max(3, int(_COLD_CONC) * 2)
-                cold_batch = cold_due[:cold_cap]
+                # Reserve ≥2 slots for panels that never finished a cold sweep.
+                never_cold = [
+                    p
+                    for p in cold_due
+                    if int(p.get("id") or 0) not in _LAST_COLD_TS
+                ]
+                rest = [
+                    p
+                    for p in cold_due
+                    if int(p.get("id") or 0) in _LAST_COLD_TS
+                ]
+                reserve = min(2, len(never_cold), cold_cap)
+                cold_batch = never_cold[:reserve] + rest[: max(0, cold_cap - reserve)]
+                if len(cold_batch) < cold_cap:
+                    # fill from never_cold tail
+                    for p in never_cold[reserve:]:
+                        if len(cold_batch) >= cold_cap:
+                            break
+                        if p not in cold_batch:
+                            cold_batch.append(p)
                 # Cap warm fan-out so cold always gets slots in the same wave.
                 # Do NOT force overflow cold_due into warm — force_mode=warm
                 # skips cold for never-mapped panels and they stay empty forever.
