@@ -9152,10 +9152,18 @@ async def _refresh_usage_pool_safe_inner(
             try:
                 try:
                     coro = adapter.get_usage(  # type: ignore[call-arg]
-                        name, rid or name, expand_links=False
+                        name,
+                        rid or name,
+                        expand_links=False,
+                        bypass_cache=bool(force),
                     )
                 except TypeError:
-                    coro = adapter.get_usage(name, rid or name)
+                    try:
+                        coro = adapter.get_usage(  # type: ignore[call-arg]
+                            name, rid or name, expand_links=False
+                        )
+                    except TypeError:
+                        coro = adapter.get_usage(name, rid or name)
                 res = await asyncio.wait_for(coro, timeout=per_try)
                 if res is not None and res.success:
                     note_panel_ok(pid)

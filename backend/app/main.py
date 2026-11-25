@@ -632,13 +632,24 @@ async def _hot_usage_loop() -> None:
                                 await _act(local_db, user)
                                 await _enq(local_db, user)
                                 await local_db.commit()
-                            if worker_ok or under_pressure:
+                            # Always live-pull for hot/sub users — even when a
+                            # Worker is healthy. Recount-only left meters stale
+                            # whenever usage-report deltas were dropped.
+                            if under_pressure and worker_ok:
+                                try:
+                                    from app.services import usage_priority as uprio
+
+                                    await uprio.enqueue_user_remotes(
+                                        int(uid), ttl=600.0
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    pass
                                 return
                             await asyncio.wait_for(
                                 refresh_usage_pool_safe(
                                     int(uid), force=True, quick=True
                                 ),
-                                timeout=20.0,
+                                timeout=14.0 if worker_ok else 20.0,
                             )
                         except asyncio.TimeoutError:
                             try:
@@ -670,16 +681,17 @@ async def _hot_usage_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("hot usage loop failed")
-        interval = max(45, int(getattr(settings, "USAGE_HOT_SECONDS", 60) or 60))
+        interval = max(30, int(getattr(settings, "USAGE_HOT_SECONDS", 45) or 45))
         try:
             from app.services.worker_client import any_worker_healthy
 
+            # Worker path is cheap (cache-first) — keep hot cadence tight.
             if any_worker_healthy():
-                interval = max(interval, 90)
+                interval = min(interval, 40)
         except Exception:  # noqa: BLE001
             pass
         elapsed = _time.monotonic() - t0
-        await asyncio.sleep(max(35.0, float(interval) - elapsed))
+        await asyncio.sleep(max(20.0, float(interval) - elapsed))
 
 
 async def _priority_usage_loop() -> None:
@@ -707,18 +719,26 @@ async def _priority_usage_loop() -> None:
                 worker_ok = bool(any_worker_healthy())
             except Exception:  # noqa: BLE001
                 worker_ok = False
-            ids = list(take_live_usage_priority(360.0, 6))[:4]
+            ids = list(take_live_usage_priority(360.0, 6))[:6]
             if ids:
                 for uid in ids:
                     try:
+                        # Always enqueue + live pull (worker cache-first is <100ms
+                        # when fresh; never recount-only for live consumers).
                         if worker_ok:
-                            await recount_user_usage_pool_safe(int(uid))
-                            continue
+                            try:
+                                from app.services import usage_priority as uprio
+
+                                await uprio.enqueue_user_remotes(
+                                    int(uid), ttl=600.0
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
                         await asyncio.wait_for(
                             refresh_usage_pool_safe(
                                 int(uid), force=True, quick=True
                             ),
-                            timeout=25.0,
+                            timeout=12.0 if worker_ok else 25.0,
                         )
                     except asyncio.TimeoutError:
                         try:

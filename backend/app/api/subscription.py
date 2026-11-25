@@ -602,8 +602,9 @@ async def _bg_usage_pull(user_id: int) -> None:
                 except Exception:  # noqa: BLE001
                     worker_ok = False
 
-                # Worker path: enqueue priority probe so meters refresh in <5s,
-                # then DB-only recount from whatever panel_accounts already have.
+                # Worker path: enqueue priority probe, pull via worker (cache-first
+                # / live), then recount. Never recount-only — that left /sub users
+                # stuck on stale panel_accounts while remotes had real traffic.
                 if worker_ok:
                     try:
                         from app.services import usage_priority as uprio
@@ -612,12 +613,32 @@ async def _bg_usage_pull(user_id: int) -> None:
                     except Exception:  # noqa: BLE001
                         pass
                     try:
-                        await recount_user_usage_pool_safe(int(user_id))
+                        await asyncio.wait_for(
+                            refresh_usage_pool_safe(
+                                int(user_id), force=True, quick=True
+                            ),
+                            timeout=12.0,
+                        )
+                    except asyncio.TimeoutError:
+                        try:
+                            await recount_user_usage_pool_safe(int(user_id))
+                        except Exception:  # noqa: BLE001
+                            pass
                     except Exception as exc:  # noqa: BLE001
                         if "connection is closed" not in str(exc).lower():
                             logger.warning(
-                                "bg usage recount user_id=%s: %s", user_id, exc
+                                "bg usage refresh user_id=%s: %s", user_id, exc
                             )
+                        try:
+                            await recount_user_usage_pool_safe(int(user_id))
+                        except Exception:  # noqa: BLE001
+                            pass
+                    # Let priority-probe reports land, then recount once more.
+                    await asyncio.sleep(2.0)
+                    try:
+                        await recount_user_usage_pool_safe(int(user_id))
+                    except Exception:  # noqa: BLE001
+                        pass
                     # Quota flip / freeze without holding a request-tied session.
                     if st == UserStatus.limited:
                         try:

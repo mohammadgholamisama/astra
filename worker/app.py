@@ -17,7 +17,7 @@ logger = logging.getLogger("astra.worker.agent")
 MASTER_URL = (os.environ.get("ASTRA_MASTER_URL") or "").rstrip("/")
 WORKER_TOKEN = (os.environ.get("ASTRA_WORKER_TOKEN") or "").strip()
 WORKER_NAME = os.environ.get("ASTRA_WORKER_NAME") or "astra-worker"
-WORKER_VERSION = "1.0.30"
+WORKER_VERSION = "1.0.31"
 
 # Assigned panels for background usage collection (exact lease from Master)
 _ASSIGNED: list[dict[str, Any]] = []
@@ -409,8 +409,13 @@ async def exec_op(body: ExecBody, _auth: None = Depends(_require_token)):
             uname = str(args.get("username") or "").strip()
             rid = args.get("remote_id")
             expand = bool(args.get("expand_links", False))
+            bypass_cache = bool(args.get("bypass_cache", False))
             pid = int((body.panel or {}).get("id") or 0)
-            cached = _cached_usage(pid, uname) if pid and uname else None
+            cached = (
+                None
+                if bypass_cache
+                else (_cached_usage(pid, uname) if pid and uname else None)
+            )
             if cached is not None and not expand:
                 from types import SimpleNamespace
 
@@ -1850,29 +1855,49 @@ async def _priority_loop() -> None:
                             concurrency=16,
                         )
                         panels_n += 1
-                        # Delta-only: never POST unchanged meters (kills dirty=0 spam).
+                        # ALWAYS post every probed meter (not delta-only).
+                        # Delta-only left Master stale when LAST_MAP advanced
+                        # but the usage-report POST was dropped/deferred.
                         if usage:
-                            delta = _delta_meters(
-                                pid, usage, force_full=False, replace_map=False
+                            norm = _canonicalize_meter_map(
+                                {
+                                    str(n).strip().lower(): int(u or 0)
+                                    for n, u in usage.items()
+                                    if str(n).strip()
+                                }
                             )
-                            if delta:
-                                n_sent = await _post_meter_chunks(
-                                    pid=pid,
-                                    meters=delta,
-                                    listed=len(delta),
-                                    dt_ms=int((time.monotonic() - t0) * 1000),
-                                    full_sync=False,
-                                    mode="hot",
-                                )
-                                async with sent_lock:
-                                    sent_n += int(n_sent or 0)
-                                logger.info(
-                                    "reported panel=%s mode=hot sent=%s listed=%s full=0 dt=%.2fs",
-                                    pid,
-                                    n_sent,
-                                    len(delta),
-                                    time.monotonic() - t0,
-                                )
+                            meters = [
+                                {
+                                    "remote_username": name,
+                                    "used_traffic": int(used or 0),
+                                }
+                                for name, used in norm.items()
+                            ]
+                            # Keep local cache in sync only after a successful post
+                            # so a failed report can still retry next tick.
+                            n_sent = await _post_meter_chunks(
+                                pid=pid,
+                                meters=meters,
+                                listed=len(meters),
+                                dt_ms=int((time.monotonic() - t0) * 1000),
+                                full_sync=False,
+                                mode="hot",
+                            )
+                            if n_sent:
+                                prev = dict(_LAST_MAP.get(pid) or {})
+                                prev.update(norm)
+                                _LAST_MAP[pid] = prev
+                                _LAST_MAP_TS[pid] = time.monotonic()
+                                _persist_meters(pid, dict(norm), replace=False)
+                            async with sent_lock:
+                                sent_n += int(n_sent or 0)
+                            logger.info(
+                                "reported panel=%s mode=hot sent=%s listed=%s full=0 dt=%.2fs",
+                                pid,
+                                n_sent,
+                                len(meters),
+                                time.monotonic() - t0,
+                            )
                     except Exception:  # noqa: BLE001
                         _circuit_fail(pid)
                         logger.debug(
