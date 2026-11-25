@@ -1003,6 +1003,14 @@ export default function UsersPage() {
     },
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["users"] });
+      // Remotes finish in bg — refresh meters so cards leave ۰/۰ / pending ASAP.
+      if (res.remote_bg) {
+        for (const ms of [2500, 8000, 20000]) {
+          window.setTimeout(() => {
+            void qc.invalidateQueries({ queryKey: ["users"] });
+          }, ms);
+        }
+      }
       setBulkOpen(false);
       setBulkPrefix("");
       setBulkCount("5");
