@@ -448,7 +448,7 @@ async def _apply_usage_report_job(job: dict[str, Any]) -> None:
 
         for uid in exhausted[:80]:
             try:
-                await kick_freeze_user(int(uid), remote_timeout=4.0)
+                await kick_freeze_user(int(uid), remote_timeout=8.0, force=True)
             except Exception:  # noqa: BLE001
                 pass
     if dirty:

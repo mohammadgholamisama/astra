@@ -19,7 +19,8 @@ _LOCK = asyncio.Lock()
 
 # Dedup KILL_USER storms from /sub auto-refresh on already-limited users.
 _KILL_DISPATCHED_UNTIL: dict[int, float] = {}
-_KILL_COOLDOWN_SEC = 180.0
+# Was 180s — partial freezes then blocked retries while remotes kept bleeding.
+_KILL_COOLDOWN_SEC = 45.0
 
 
 def _kill_cd_key(user_id: int) -> str:

@@ -243,30 +243,18 @@ function claimCoeff(groups: Group[], groupId: number, panelId: number): number {
   return readCoeff((gp?.config as { coefficient?: number } | undefined)?.coefficient);
 }
 
-/** Coefficient for one PanelAccount: stored period coeff, else group×panel config. */
-function accountCoeff(a: User["panel_accounts"][number], groups: Group[], groupIds: number[]): number {
-  const stored = readCoeff(a.applied_coefficient);
-  if (a.applied_coefficient != null && stored >= 0.01) {
-    // Prefer locked coeff for banked/deleted rows (group link may be gone)
-    if (a.status === "deleted") return stored;
-  }
+/** Live group×panel coefficient (what admin configured). */
+function liveAccountCoeff(
+  a: User["panel_accounts"][number],
+  groups: Group[],
+  groupIds: number[],
+): number {
   if (a.group_id != null) {
-    const live = claimCoeff(groups, a.group_id, a.panel_id);
-    // claimCoeff falls back to 1 when group/panel link missing — keep stored
     const g = groups.find((x) => x.id === a.group_id);
     const hasLink = (g?.panels || []).some((p) => p.panel_id === a.panel_id);
-    if (hasLink) return live;
-    if (a.applied_coefficient != null && stored >= 0.01) return stored;
-    return live;
+    if (hasLink) return claimCoeff(groups, a.group_id, a.panel_id);
   }
-  // Legacy merged account: max across THIS user's current groups on this panel.
-  // Never scan every Astra group when membership is empty — that painted
-  // unrelated group names into the usage modal.
   const want = new Set(groupIds || []);
-  if (!want.size) {
-    if (a.applied_coefficient != null && stored >= 0.01) return stored;
-    return 1;
-  }
   let best = 1;
   for (const g of groups) {
     if (!want.has(g.id)) continue;
@@ -275,13 +263,33 @@ function accountCoeff(a: User["panel_accounts"][number], groups: Group[], groupI
     const c = readCoeff((gp.config as { coefficient?: number } | undefined)?.coefficient);
     if (c > best) best = c;
   }
-  if (best === 1 && a.applied_coefficient != null && stored >= 0.01) return stored;
   return best;
 }
 
-function accountWeighted(raw: number, coefficient: number): number {
+/**
+ * Coefficient used for weighted usage — matches backend period lock:
+ * prefer applied_coefficient (ingest coeff), else live group×panel config.
+ */
+function accountCoeff(a: User["panel_accounts"][number], groups: Group[], groupIds: number[]): number {
+  const stored = readCoeff(a.applied_coefficient);
+  if (a.applied_coefficient != null && stored >= 0.01) return stored;
+  if (a.status === "deleted" && stored >= 0.01) return stored;
+  const live = liveAccountCoeff(a, groups, groupIds);
+  return live >= 0.01 ? live : 1;
+}
+
+/** Period-locked weighted bytes — same formula as backend quota_math.weighted_bytes. */
+function accountWeighted(
+  raw: number,
+  coefficient: number,
+  account?: User["panel_accounts"][number],
+): number {
   const coeff = coefficient >= 0.01 ? coefficient : 1;
-  return Math.round(raw * coeff);
+  const r = Math.max(0, Math.floor(Number(raw) || 0));
+  const ar = Math.max(0, Math.floor(Number(account?.coeff_anchor_raw) || 0));
+  const aw = Math.max(0, Math.floor(Number(account?.coeff_anchor_weighted) || 0));
+  if (ar <= 0 && aw <= 0) return Math.round(r * coeff);
+  return aw + Math.round(Math.max(0, r - ar) * coeff);
 }
 
 function formatCoeff(c: number): string {
@@ -333,6 +341,8 @@ function panelUsageRows(u: User, groups: Group[]): PanelUsageRow[] {
   const gids = u.group_ids || [];
   const accounts = u.panel_accounts || [];
   const liveKeys = liveRemoteKeys(accounts);
+  // Dedupe identical remotes across groups — same rule as backend weighted Σ.
+  const bestByRemote = new Map<string, PanelUsageRow>();
 
   for (const a of accounts) {
     const banked = a.status === "deleted";
@@ -350,18 +360,24 @@ function panelUsageRows(u: User, groups: Group[]): PanelUsageRow[] {
     }
 
     const coefficient = accountCoeff(a, groups, gids);
-    const weighted = accountWeighted(raw, coefficient);
+    const weighted = accountWeighted(raw, coefficient, a);
     let remoteLimit = 0;
     if (astraLimit > 0) {
       const exhausted = usedWeighted >= astraLimit;
-      remoteLimit = exhausted ? Math.max(1, raw || 1) : astraLimit;
+      if (exhausted) {
+        remoteLimit = Math.max(1, raw || 1);
+      } else {
+        const remain = Math.max(0, astraLimit - usedWeighted);
+        const grow = coefficient > 0 ? Math.round(remain / coefficient) : remain;
+        remoteLimit = raw + Math.max(0, grow);
+      }
     }
     const gName =
       a.group_id != null ? groups.find((g) => g.id === a.group_id)?.name : null;
     const baseName = gName
       ? `${a.panel_name || `پنل #${a.panel_id}`} · ${gName}`
       : a.panel_name || `پنل #${a.panel_id}`;
-    rows.push({
+    const row: PanelUsageRow = {
       key: `${a.id}-${a.panel_id}-${a.group_id ?? "x"}-${banked ? "b" : "l"}`,
       panelId: a.panel_id,
       name: banked ? `${baseName} · بانکی` : baseName,
@@ -371,8 +387,18 @@ function panelUsageRows(u: User, groups: Group[]): PanelUsageRow[] {
       remoteLimit,
       configs: banked ? 0 : (a.links || []).filter(Boolean).length,
       banked,
-    });
+    };
+    const rk = remoteKey(a.panel_id, a.remote_username);
+    if (rk && !banked) {
+      const prev = bestByRemote.get(rk);
+      if (!prev || row.weighted > prev.weighted || (row.weighted === prev.weighted && row.coefficient > prev.coefficient)) {
+        bestByRemote.set(rk, row);
+      }
+    } else {
+      rows.push(row);
+    }
   }
+  for (const row of bestByRemote.values()) rows.push(row);
   rows.sort((a, b) => b.weighted - a.weighted || Number(a.banked) - Number(b.banked));
   return rows;
 }
@@ -425,12 +451,9 @@ function groupUsageRows(u: User, groups: Group[]): GroupUsageRow[] {
             raw = gap;
           }
         }
-        const c =
-          a.status === "deleted"
-            ? accountCoeff(a, groups, u.group_ids || [])
-            : claimCoeff(groups, g.id, a.panel_id);
+        const c = accountCoeff(a, groups, u.group_ids || []);
         rawSum += raw;
-        weighted += Math.round(raw * c);
+        weighted += accountWeighted(raw, c, a);
         panels += 1;
         configs += a.status === "deleted" ? 0 : (a.links || []).filter(Boolean).length;
         coeffSet.add(c);
@@ -447,10 +470,10 @@ function groupUsageRows(u: User, groups: Group[]): GroupUsageRow[] {
         );
         if (!a || seenPanel.has(a.panel_id)) continue;
         seenPanel.add(a.panel_id);
-        const c = claimCoeff(groups, g.id, gp.panel_id);
+        const c = accountCoeff(a, groups, u.group_ids || []);
         const raw = Number(a.used_traffic) || 0;
         rawSum += raw;
-        weighted += Math.round(raw * c);
+        weighted += accountWeighted(raw, c, a);
         panels += 1;
         configs += (a.links || []).filter(Boolean).length;
         coeffSet.add(c);

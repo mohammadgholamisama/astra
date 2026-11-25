@@ -2172,7 +2172,9 @@ async def _serve_subscription_db(
         try:
             from app.services.orchestrator import kick_freeze_user
 
-            await kick_freeze_user(uid_safe, remote_timeout=10.0)
+            # force=True bypasses cooldown so a failed partial freeze is retried
+            # on the next /sub open instead of waiting 45–180s while traffic bleeds.
+            await kick_freeze_user(uid_safe, remote_timeout=10.0, force=True)
         except Exception:  # noqa: BLE001
             pass
     if (

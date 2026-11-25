@@ -3465,18 +3465,20 @@ async def _remount_freeze_marks(
             acc = by_id.get(int(aid))
             if acc is None or acc.status == PanelAccountStatus.deleted:
                 continue
+            # Always strip share links on freeze remount so /sub cannot keep
+            # handing out configs while a remote disable is still retrying.
+            try:
+                acc.links = []
+            except Exception:  # noqa: BLE001
+                pass
+            if hasattr(acc, "links_by_group"):
+                try:
+                    acc.links_by_group = None
+                except Exception:  # noqa: BLE001
+                    pass
             if ok:
                 acc.status = PanelAccountStatus.active
                 acc.error_message = QUOTA_FROZEN_MARK
-                try:
-                    acc.links = []
-                except Exception:  # noqa: BLE001
-                    pass
-                if hasattr(acc, "links_by_group"):
-                    try:
-                        acc.links_by_group = None
-                    except Exception:  # noqa: BLE001
-                        pass
         await sdb.commit()
 
 
@@ -3562,7 +3564,7 @@ async def sync_modify_user(
             continue
         if exclude_types is not None and panel.type in exclude_types:
             continue
-        rem_name = (account.remote_username or user.username or "").strip()
+        rem_name = (account.remote_username or uname_safe or "").strip()
         # Expired/limited: never-created Astra rows are already offline — mark frozen
         # so watch does not burn cycles, and skip shared-session upserts that poison
         # the DB transaction (PendingRollbackError wiped successful PG freezes).
@@ -3634,7 +3636,7 @@ async def sync_modify_user(
                     last = await _modify_user_all_names(
                         adapter,
                         payload,
-                        astra_username=str(user.username or ""),
+                        astra_username=uname_safe,
                         panel_id=int(panel.id),
                         group_id=gid,
                         remote_username=(account.remote_username or "").strip()
@@ -3648,7 +3650,7 @@ async def sync_modify_user(
                 logger.warning(
                     "sync_modify no-create panel=%s user=%s remote=%s err=%s",
                     getattr(panel, "name", panel.id),
-                    user.username,
+                    uname_safe,
                     (account.remote_username or payload.username or "")[:40],
                     (last.error or "")[:160],
                 )
@@ -3737,7 +3739,7 @@ async def sync_modify_user(
                 res.remote_username
                 or payload.username
                 or account.remote_username
-                or user.username
+                or uname_safe
             )
             account.remote_id = res.remote_id or account.remote_id
             if res.uuid:
@@ -3782,15 +3784,22 @@ async def sync_modify_user(
             username=payload.username,
         )
         if blocked:
+            # Always strip share links on exhaust — /sub must not keep serving
+            # configs while a remote disable is still timing out / retrying.
+            try:
+                account.links = []
+            except Exception:  # noqa: BLE001
+                pass
+            if hasattr(account, "links_by_group"):
+                try:
+                    account.links_by_group = None
+                except Exception:  # noqa: BLE001
+                    pass
             # Not-found orphans are already offline — mark frozen so watch
             # does not keep retrying forever and leave the user half-cut.
             if _is_not_found_err(res.error):
                 account.status = PanelAccountStatus.active
                 account.error_message = QUOTA_FROZEN_MARK
-                try:
-                    account.links = []
-                except Exception:  # noqa: BLE001
-                    pass
             else:
                 account.status = PanelAccountStatus.error
                 account.error_message = msg
@@ -3862,7 +3871,7 @@ async def sync_modify_user(
             # Session was closed to free the pool — remount marks only.
             try:
                 await _remount_freeze_marks(
-                    int(user.id),
+                    uid_safe,
                     [
                         (
                             int(account.id),
@@ -3895,7 +3904,7 @@ async def sync_modify_user(
                         pass
                     try:
                         await _remount_freeze_marks(
-                            int(user.id),
+                            uid_safe,
                             [
                                 (
                                     int(account.id),
@@ -3909,7 +3918,8 @@ async def sync_modify_user(
                         )
                     except Exception:  # noqa: BLE001
                         logger.exception(
-                            "remount freeze marks failed user=%s", user.username
+                            "remount freeze marks failed user=%s",
+                            uname_safe or uid_safe,
                         )
             else:
                 await db.flush()
@@ -9430,14 +9440,44 @@ async def enforce_user_quota(db: AsyncSession, user: User) -> bool:
         except Exception:  # noqa: BLE001
             pass
     if new in (UserStatus.limited, UserStatus.expired, UserStatus.disabled):
+        # Instantly drop share links so /sub cannot keep serving configs
+        # while remote disables are still in flight.
+        try:
+            for acc in list(getattr(user, "panel_accounts", None) or []):
+                if getattr(acc, "status", None) == PanelAccountStatus.deleted:
+                    continue
+                try:
+                    acc.links = []
+                except Exception:  # noqa: BLE001
+                    pass
+                if hasattr(acc, "links_by_group"):
+                    try:
+                        acc.links_by_group = None
+                    except Exception:  # noqa: BLE001
+                        pass
+            # Also clear via SQL for accounts not loaded on the relationship.
+            await db.execute(
+                PanelAccount.__table__.update()
+                .where(
+                    PanelAccount.user_id == int(user.id),
+                    PanelAccount.status != PanelAccountStatus.deleted,
+                )
+                .values(links=[], links_by_group=None)
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "quota flip link-strip failed user=%s",
+                getattr(user, "username", None),
+                exc_info=True,
+            )
         try:
             uid = int(user.id)
 
             async def _kill_after_commit(u: int = uid) -> None:
                 # Yield so the caller's ``await db.commit()`` lands first —
                 # enqueue_kill_user refuses non-limited users.
-                await asyncio.sleep(0.2)
-                await kick_freeze_user(u, remote_timeout=6.0)
+                await asyncio.sleep(0.15)
+                await kick_freeze_user(u, remote_timeout=8.0, force=True)
 
             asyncio.create_task(
                 _kill_after_commit(), name=f"astra-kill-{uid}"
@@ -9843,8 +9883,9 @@ async def _freeze_quota_users(
     ids = list(dict.fromkeys(int(x) for x in user_ids if x))
     if not ids:
         return 0, 0
-    # Hard cap — /sub used to pass 14 and starve the panel UI.
-    sem = asyncio.Semaphore(max(1, min(int(concurrency), 2)))
+    # Allow enough parallel freezes to cut multi-panel users quickly without
+    # saturating the DB pool (each _one opens its own short sessions).
+    sem = asyncio.Semaphore(max(1, min(int(concurrency), 8)))
     ok_n = 0
     fail_n = 0
 
@@ -9878,13 +9919,16 @@ async def _freeze_quota_users(
                 await sync_modify_user(
                     db,
                     user,
-                    remote_timeout=max(float(remote_timeout), 10.0),
+                    remote_timeout=max(float(remote_timeout), 8.0),
                     skip_nginx_sync=True,
-                    freeze_fast=False,
+                    # Fast path: disable remotes in parallel waves — freeze_fast=False
+                    # left limited users with live configs for minutes.
+                    freeze_fast=True,
                 )
                 # sync_modify may close the session on freeze — do not touch it.
                 return True
 
+    # Cap concurrency higher for exhaust storms (was hard-capped at 2).
     tasks = [asyncio.create_task(_one(uid)) for uid in ids]
     done, pending = await asyncio.wait(tasks, timeout=wall)
     for t in pending:
