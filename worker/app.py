@@ -17,7 +17,7 @@ logger = logging.getLogger("astra.worker.agent")
 MASTER_URL = (os.environ.get("ASTRA_MASTER_URL") or "").rstrip("/")
 WORKER_TOKEN = (os.environ.get("ASTRA_WORKER_TOKEN") or "").strip()
 WORKER_NAME = os.environ.get("ASTRA_WORKER_NAME") or "astra-worker"
-WORKER_VERSION = "1.0.31"
+WORKER_VERSION = "1.0.32"
 
 # Assigned panels for background usage collection (exact lease from Master)
 _ASSIGNED: list[dict[str, Any]] = []
@@ -31,7 +31,10 @@ _METER_CHUNK = 3000
 _LAST_MAP: dict[int, dict[str, int]] = {}  # panel_id → last sent meters
 _LAST_MAP_TS: dict[int, float] = {}  # panel_id → last meter map update (mono)
 _LAST_COLD_TS: dict[int, float] = {}  # panel_id → last full sweep monotonic
-_METER_CACHE_MAX_AGE = 15.0  # serve get_usage from cache when fresher than this
+# Live get_usage stampede was exhausting shared httpx pools (PoolTimeout) and
+# blocking cold /api/users — serve recent meters from cache instead of remote.
+_METER_CACHE_MAX_AGE = 120.0
+_METER_SQLITE_MAX_AGE = 600.0  # sqlite fallback for get_usage (10 min)
 _COLLECT_TASK: asyncio.Task | None = None
 _PRIORITY_TASK: asyncio.Task | None = None
 _COMMANDS_TASK: asyncio.Task | None = None
@@ -63,14 +66,17 @@ _KILL_BACKOFF_SEC = (3.0, 10.0, 25.0)  # before retry 1 / 2 / 3
 _KILL_PANEL_SEMS: dict[int, asyncio.Semaphore] = {}
 # Per-panel live get_usage — one slow tunnel must not starve siblings.
 _USAGE_PANEL_SEMS: dict[int, asyncio.Semaphore] = {}
-_USAGE_PANEL_SEM_LIMIT = 4
+_USAGE_PANEL_SEM_LIMIT = 2
+# Global cap across all panels — leave headroom for cold /api/users + token.
+_USAGE_GLOBAL_SEM: asyncio.Semaphore | None = None
+_USAGE_GLOBAL_LIMIT = 12
 # Per-panel 5xx storm breaker for KILL_USER (5 strikes → 60s cooldown)
 _KILL_5XX: dict[int, int] = {}
 _KILL_COOLDOWN: dict[int, float] = {}
 # get_usage / disable_user 404 negative cache: (panel_id, username_lower) → expiry mono
 _USAGE_404: dict[tuple[int, str], float] = {}
 _USAGE_404_TTL = 900.0  # 15 minutes — never re-query missing remotes
-_PANEL_COLLECT_TIMEOUT = 8.0  # warm hard wall — free slots fast on tunnel stalls
+_PANEL_COLLECT_TIMEOUT = 22.0  # warm wall — enough for bulk /api/users head pages
 _PANEL_PRIO_TIMEOUT = 4.0  # Hot / priority-probe per-panel hard wall
 _PANEL_COLD_TIMEOUT = 60.0  # cold full-panel wall; resume via _COLD_OFFSET
 _COLD_OFFSET: dict[int, int] = {}  # panel_id → next list offset (checkpoint)
@@ -487,11 +493,14 @@ async def exec_op(body: ExecBody, _auth: None = Depends(_require_token)):
                         )
 
                 try:
+                    gsem = _usage_global_sem()
                     if sem is not None:
-                        async with sem:
-                            res = await _live_get_usage()
+                        async with gsem:
+                            async with sem:
+                                res = await _live_get_usage()
                     else:
-                        res = await _live_get_usage()
+                        async with gsem:
+                            res = await _live_get_usage()
                 except Exception as exc:  # noqa: BLE001
                     if pid and uname and _is_404_err(exc):
                         _usage_404_mark(pid, uname)
@@ -994,21 +1003,65 @@ def _cleanup_meter_cache_duplicates() -> int:
     return removed
 
 
+def _usage_global_sem() -> asyncio.Semaphore:
+    global _USAGE_GLOBAL_SEM
+    if _USAGE_GLOBAL_SEM is None:
+        _USAGE_GLOBAL_SEM = asyncio.Semaphore(max(4, int(_USAGE_GLOBAL_LIMIT)))
+    return _USAGE_GLOBAL_SEM
+
+
 def _cached_usage(pid: int, username: str) -> int | None:
-    """Return cached used_traffic when the panel map is fresher than 15s."""
+    """Return cached used_traffic from memory (≤120s) or sqlite (≤10m).
+
+    Prefer cache over live remote so collect cold sweeps keep pool slots.
+    """
     pid = int(pid or 0)
     uname = (username or "").strip().lower()
     if not pid or not uname:
         return None
     ts = float(_LAST_MAP_TS.get(pid, 0.0) or 0.0)
-    if ts <= 0 or (time.monotonic() - ts) > float(_METER_CACHE_MAX_AGE):
-        return None
     umap = _LAST_MAP.get(pid)
-    if not umap:
-        return None
-    if uname in umap:
+    if (
+        umap
+        and ts > 0
+        and (time.monotonic() - ts) <= float(_METER_CACHE_MAX_AGE)
+        and uname in umap
+    ):
         return max(0, int(umap.get(uname) or 0))
-    return None
+    # Sqlite single-row — survives cold-fail windows without hammering remotes.
+    path = os.environ.get("ASTRA_WORKER_CACHE_DB") or "/var/lib/astra-worker/cache.db"
+    if not os.path.isfile(path):
+        return None
+    try:
+        import sqlite3
+        from datetime import datetime, timezone
+
+        con = sqlite3.connect(path, timeout=2)
+        try:
+            row = con.execute(
+                "SELECT used_traffic, updated_at FROM meter_cache "
+                "WHERE panel_id = ? AND lower(remote_username) = ? LIMIT 1",
+                (int(pid), uname),
+            ).fetchone()
+        finally:
+            con.close()
+        if not row:
+            return None
+        used_i, updated_at = int(row[0] or 0), str(row[1] or "")
+        if not updated_at:
+            return None
+        try:
+            ts_dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+            if ts_dt.tzinfo is None:
+                ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - ts_dt).total_seconds()
+        except Exception:  # noqa: BLE001
+            return None
+        if age < 0 or age > float(_METER_SQLITE_MAX_AGE):
+            return None
+        return max(0, used_i)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _load_prev_meters(pid: int) -> dict[str, int] | None:
@@ -1168,10 +1221,11 @@ def _delta_meters(
 
 
 async def _cache_sync_loop() -> None:
-    """Independent freshness loop — POST rotating meter_cache slices every ~45s.
+    """POST rotating meter slices only when the in-memory map is still fresh.
 
-    Live collect often times out on tunnels; this still proves known remotes to
-    master so ``last_sync_at`` (and cold panel stamps) recover fleet-wide.
+    Previously this loop re-posted hours-old sqlite rows and master stamped
+    ``last_sync_at`` as "now" — hiding dead cold sweeps and blocking inflation
+    reconcile (looked fresh, meters were stale).
     """
     await asyncio.sleep(8)
     rr = 0
@@ -1188,6 +1242,12 @@ async def _cache_sync_loop() -> None:
                 for p in batch:
                     pid = int(p.get("id") or 0)
                     if not pid:
+                        continue
+                    map_age = time.monotonic() - float(
+                        _LAST_MAP_TS.get(pid, 0.0) or 0.0
+                    )
+                    # Only prove remotes we actually refreshed recently.
+                    if map_age > 180.0 or pid not in _LAST_MAP:
                         continue
                     try:
                         sent = await _post_cache_sync_touch(

@@ -54,8 +54,10 @@ def normalize_panel_base_url(url: str) -> str:
 _SHARED_CLIENTS: dict[str, httpx.AsyncClient] = {}
 _SHARED_LOCK = asyncio.Lock()
 # Cap sockets per panel; default httpx limits are huge and exhaust process FDs.
-# Enough for parallel test-all / usage waves without exhausting FDs.
-_HTTP_LIMITS = httpx.Limits(max_connections=32, max_keepalive_connections=16)
+# Worker hosts many panels on the SAME base_url (Direct+Tunnel twins) — 32 was
+# too low under live get_usage stampede and caused httpx.PoolTimeout, which then
+# starved cold /api/users sweeps so meter_cache went hours stale.
+_HTTP_LIMITS = httpx.Limits(max_connections=96, max_keepalive_connections=48)
 
 
 def _shared_client_key(base_url: str, verify_ssl: bool, xhr: bool) -> str:
