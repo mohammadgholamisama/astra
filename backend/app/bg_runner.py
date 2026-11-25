@@ -36,6 +36,8 @@ async def _amain() -> None:
         _analytics_sample_loop,
         _astra_xray_heal_loop,
         _auto_retry_errors_loop,
+        _drain_recent_pending_provisions,
+        _empty_user_coverage_heal_loop,
         _fleet_usage_loop,
         _hot_usage_loop,
         _outbound_health_loop,
@@ -95,6 +97,13 @@ async def _amain() -> None:
         ),
         asyncio.create_task(
             _delayed(_astra_xray_heal_loop, 240), name="astra-xray-heal"
+        ),
+        # Durable create/bulk safety nets — survive API worker restarts.
+        asyncio.create_task(
+            _drain_recent_pending_provisions(), name="astra-pending-drain"
+        ),
+        asyncio.create_task(
+            _empty_user_coverage_heal_loop(), name="astra-empty-coverage-heal"
         ),
         asyncio.create_task(pool_guardian_loop(), name="astra-db-pool-guard"),
     ]

@@ -211,6 +211,107 @@ async def _auto_retry_errors_loop() -> None:
         await asyncio.sleep(180 if left > 0 else 600)
 
 
+async def _drain_recent_pending_provisions() -> None:
+    """Finish pending creates that lost in-flight tasks (boot + periodic).
+
+    Bounded concurrency — never stampede the DB pool with thousands of tasks.
+    Runs on ``astra-bg`` (and any process that holds the bg role).
+    """
+    await asyncio.sleep(20)
+    from sqlalchemy import text
+
+    from app.core.database import AsyncSessionLocal
+    from app.services.orchestrator import _provision_account_now
+
+    async def _wave(limit: int = 120) -> int:
+        async with AsyncSessionLocal() as db:
+            rows = await db.execute(
+                text(
+                    """
+                    SELECT pa.id
+                    FROM panel_accounts pa
+                    JOIN users u ON u.id = pa.user_id
+                    WHERE pa.status IN ('pending', 'error')
+                      AND u.created_at > now() - interval '48 hours'
+                    ORDER BY pa.id DESC
+                    LIMIT :lim
+                    """
+                ),
+                {"lim": int(limit)},
+            )
+            ids = [int(r[0]) for r in rows.all() if r[0]]
+            await db.rollback()
+        if not ids:
+            return 0
+        sem = asyncio.Semaphore(8)
+        ok = 0
+
+        async def _one(aid: int) -> None:
+            nonlocal ok
+            async with sem:
+                try:
+                    if await _provision_account_now(aid):
+                        ok += 1
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "pending drain aid=%s failed", aid, exc_info=True
+                    )
+
+        await asyncio.gather(*(_one(i) for i in ids))
+        logger.info("pending provision drain n=%s ok=%s", len(ids), ok)
+        return len(ids)
+
+    try:
+        await _wave(160)
+    except Exception:  # noqa: BLE001
+        logger.exception("boot pending provision drain failed")
+    while True:
+        try:
+            await asyncio.sleep(45)
+            n = await _wave(120)
+            if n == 0:
+                await asyncio.sleep(120)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("periodic pending provision drain failed")
+            await asyncio.sleep(60)
+
+
+async def _empty_user_coverage_heal_loop() -> None:
+    """Never leave recent users stuck at ۰/۰ پنل or empty /sub.
+
+    Independent of AUTO_RETRY_ERRORS — create/bulk bg tasks can die on
+    worker restart; this loop on ``astra-bg`` is the durable guarantee.
+    """
+    await asyncio.sleep(35)
+    from app.services.orchestrator import (
+        heal_recent_empty_users,
+        heal_users_missing_panel_accounts,
+    )
+
+    while True:
+        healed = 0
+        try:
+            healed += int(
+                await heal_recent_empty_users(
+                    limit_users=25, max_age_hours=72.0
+                )
+                or 0
+            )
+            if healed < 10:
+                healed += int(
+                    await heal_users_missing_panel_accounts(limit_users=12)
+                    or 0
+                )
+            if healed:
+                logger.info("coverage heal loop healed=%s", healed)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("empty-user coverage heal loop failed")
+        await asyncio.sleep(30 if healed else 75)
+
 
 async def _astra_xray_heal_loop() -> None:
     """Keep astra-xray@N up — calm cadence; never stampede systemctl/D-Bus.
@@ -970,77 +1071,16 @@ async def lifespan(_app: FastAPI):
     else:
         logger.info("astra lifespan: API-only worker (bg loops elsewhere)")
 
-    async def _drain_recent_pending_provisions() -> None:
-        """Finish pending creates that lost in-flight tasks (boot + periodic).
-
-        Bounded concurrency — never stampede the DB pool with thousands of tasks.
-        """
-        await asyncio.sleep(25)
-        from sqlalchemy import text
-
-        from app.services.orchestrator import _provision_account_now
-
-        async def _wave(limit: int = 120) -> int:
-            async with AsyncSessionLocal() as db:
-                rows = await db.execute(
-                    text(
-                        """
-                        SELECT pa.id
-                        FROM panel_accounts pa
-                        JOIN users u ON u.id = pa.user_id
-                        WHERE pa.status IN ('pending', 'error')
-                          AND u.created_at > now() - interval '12 hours'
-                        ORDER BY pa.id DESC
-                        LIMIT :lim
-                        """
-                    ),
-                    {"lim": int(limit)},
-                )
-                ids = [int(r[0]) for r in rows.all()]
-                await db.rollback()
-            if not ids:
-                return 0
-            sem = asyncio.Semaphore(6)
-            ok = 0
-
-            async def _one(aid: int) -> None:
-                nonlocal ok
-                async with sem:
-                    try:
-                        if await _provision_account_now(aid):
-                            ok += 1
-                    except Exception:  # noqa: BLE001
-                        logger.debug(
-                            "pending drain aid=%s failed", aid, exc_info=True
-                        )
-
-            await asyncio.gather(*(_one(i) for i in ids))
-            logger.info(
-                "pending provision drain n=%s ok=%s", len(ids), ok
-            )
-            return len(ids)
-
-        # Boot wave, then keep draining every ~90s while recent pending remain.
-        try:
-            await _wave(120)
-        except Exception:  # noqa: BLE001
-            logger.exception("boot pending provision drain failed")
-        while True:
-            try:
-                await asyncio.sleep(90)
-                n = await _wave(100)
-                if n == 0:
-                    await asyncio.sleep(180)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001
-                logger.exception("periodic pending provision drain failed")
-                await asyncio.sleep(90)
-
     if run_bg:
         bg_tasks.append(
             asyncio.create_task(
                 _drain_recent_pending_provisions(), name="astra-pending-drain"
+            )
+        )
+        bg_tasks.append(
+            asyncio.create_task(
+                _empty_user_coverage_heal_loop(),
+                name="astra-empty-coverage-heal",
             )
         )
     logger.info(

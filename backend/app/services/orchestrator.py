@@ -2709,6 +2709,122 @@ async def heal_user_coverage_pool_safe(
     return gap_n
 
 
+async def heal_recent_empty_users(
+    *,
+    limit_users: int = 30,
+    max_age_hours: float = 48.0,
+) -> int:
+    """Hard-heal users that still have groups but zero active remotes.
+
+    This is the safety net for bulk/create background tasks that died after
+    the HTTP response — without it, cards can stick at ۰/۰ forever when
+    AUTO_RETRY_ERRORS is off and no pending rows existed yet.
+    """
+    from sqlalchemy import text
+
+    from app.core.database import AsyncSessionLocal, background_db_sem
+    from app.api.subscription import invalidate_user_feed_cache
+
+    n = 0
+    try:
+        hours = max(1.0, float(max_age_hours))
+        lim = max(1, int(limit_users))
+        async with AsyncSessionLocal() as db:
+            rows = await db.execute(
+                text(
+                    """
+                    SELECT u.id
+                    FROM users u
+                    WHERE u.status IN ('active', 'on_hold', 'limited', 'expired')
+                      AND u.created_at > now() - (interval '1 hour' * :hrs)
+                      AND EXISTS (
+                        SELECT 1 FROM user_groups ug WHERE ug.user_id = u.id
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM panel_accounts pa
+                        WHERE pa.user_id = u.id
+                          AND pa.status = 'active'
+                      )
+                    ORDER BY u.id DESC
+                    LIMIT :lim
+                    """
+                ),
+                {"hrs": float(hours), "lim": lim},
+            )
+            empty_ids = [int(r[0]) for r in rows.all() if r[0]]
+            await db.rollback()
+        if not empty_ids:
+            return 0
+
+        sem = background_db_sem()
+        for uid in empty_ids:
+            async with sem:
+                try:
+                    async with AsyncSessionLocal() as db:
+                        result = await db.execute(
+                            select(User)
+                            .where(User.id == int(uid))
+                            .options(
+                                selectinload(User.groups),
+                                selectinload(User.panel_accounts).selectinload(
+                                    PanelAccount.panel
+                                ),
+                            )
+                        )
+                        user = result.scalar_one_or_none()
+                        if user is None:
+                            continue
+                        gids = [
+                            int(g.id)
+                            for g in (user.groups or [])
+                            if getattr(g, "id", None)
+                        ]
+                        if not gids:
+                            ug = await db.execute(
+                                select(UserGroup.group_id).where(
+                                    UserGroup.user_id == int(uid)
+                                )
+                            )
+                            gids = [
+                                int(r[0]) for r in ug.all() if r[0] is not None
+                            ]
+                        targets = (
+                            await resolve_panels_for_groups(db, gids)
+                            if gids
+                            else []
+                        )
+                        if not targets:
+                            continue
+                        await ensure_pending_panel_accounts(db, [user], targets)
+                        await db.commit()
+                        await provision_user_on_panels(
+                            db,
+                            user,
+                            targets,
+                            fast=True,
+                            overall_timeout=min(
+                                120.0, max(40.0, 8.0 + 2.5 * len(targets))
+                            ),
+                            skip_astra_rebuild=True,
+                        )
+                        await db.commit()
+                    await hydrate_share_links_pool_safe(int(uid))
+                    try:
+                        invalidate_user_feed_cache(int(uid))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    n += 1
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "heal_recent_empty_users failed user_id=%s", uid
+                    )
+        if n:
+            logger.info("heal_recent_empty_users healed=%s", n)
+    except Exception:  # noqa: BLE001
+        logger.exception("heal_recent_empty_users failed")
+    return n
+
+
 async def heal_users_missing_panel_accounts(*, limit_users: int = 20) -> int:
     """Heal users with zero OR partial panel coverage (missing group×panel slots).
 
@@ -2717,7 +2833,16 @@ async def heal_users_missing_panel_accounts(*, limit_users: int = 20) -> int:
     """
     from app.core.database import AsyncSessionLocal, background_db_sem
 
+    # Prefer the hard empty-remote safety net first (۰/۰ cards).
     n = 0
+    try:
+        n += await heal_recent_empty_users(
+            limit_users=max(5, min(20, int(limit_users))),
+            max_age_hours=72.0,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("heal_recent_empty_users via coverage skipped", exc_info=True)
+
     try:
         async with AsyncSessionLocal() as db:
             result = await db.execute(

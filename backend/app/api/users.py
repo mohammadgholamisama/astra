@@ -474,13 +474,58 @@ async def create_user(
             },
         ) from exc
 
-    # From here the user EXISTS — return instantly with sub URL.
-    # Remotes finish in a bounded background wave (no HTTP wait, no load_user).
-    from types import SimpleNamespace
+    # From here the user EXISTS — seed pending PanelAccount rows so UI never
+    # shows ۰/۰, kick durable drains, then finish remotes in background.
+    try:
+        await orchestrator.ensure_pending_panel_accounts(db, [user], panels)
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        log.exception("create ensure_pending failed user=%s", body.username)
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        pending_ids = [
+            int(a.id)
+            for a in (
+                (
+                    await db.execute(
+                        select(PanelAccount.id).where(
+                            PanelAccount.user_id == int(user.id),
+                            PanelAccount.status.in_(
+                                (
+                                    PanelAccountStatus.pending,
+                                    PanelAccountStatus.error,
+                                )
+                            ),
+                        )
+                    )
+                ).all()
+            )
+            if a[0]
+        ]
+        if pending_ids:
+            orchestrator.start_account_provisions(pending_ids)
+    except Exception:  # noqa: BLE001
+        log.debug("create kick pending failed user=%s", body.username, exc_info=True)
+
+    try:
+        asyncio.create_task(
+            _bg_finish_create_provision(body.username, list(body.group_ids)),
+            name=f"astra-create-finish-{body.username}",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    user_out = await load_user(db, body.username)
+    if user_out is not None:
+        return to_user_response(user_out, include_links=False)
 
     from app.services.users import subscription_url
 
-    snap = SimpleNamespace(
+    return UserResponse(
         username=str(user.username),
         display_name=(getattr(user, "display_name", None) or None),
         status=user.status,
@@ -497,40 +542,11 @@ async def create_user(
         ),
         note=getattr(user, "note", None),
         created_at=getattr(user, "created_at", None),
-        sub_token=str(getattr(user, "sub_token", "") or ""),
-        source_category_id=getattr(user, "source_category_id", None),
-    )
-    try:
-        asyncio.create_task(
-            _bg_finish_create_provision(body.username, list(body.group_ids)),
-            name=f"astra-create-finish-{body.username}",
-        )
-    except Exception:  # noqa: BLE001
-        pass
-
-    try:
-        await db.rollback()
-    except Exception:  # noqa: BLE001
-        pass
-
-    return UserResponse(
-        username=snap.username,
-        display_name=snap.display_name,
-        status=snap.status,
-        used_traffic=0,
-        lifetime_used_traffic=0,
-        data_limit=snap.data_limit,
-        expire=snap.expire,
-        on_hold_expire_duration=snap.on_hold_expire_duration,
-        include_promo_first=snap.include_promo_first,
-        data_limit_reset_strategy=snap.data_limit_reset_strategy,
-        note=snap.note,
-        created_at=snap.created_at,
         links=[],
-        subscription_url=subscription_url(snap),
+        subscription_url=subscription_url(user),
         proxies={},
         group_ids=list(body.group_ids),
-        source_category_id=snap.source_category_id,
+        source_category_id=getattr(user, "source_category_id", None),
         panel_accounts=[],
     )
 
@@ -721,6 +737,25 @@ async def create_users_bulk(
                     db, users, local_panels
                 )
                 await db.commit()
+                # Durable kick: even if the bulk bg task dies on worker restart,
+                # pending rows + start_account_provisions / drain loop finish remotes.
+                try:
+                    rows_p = await db.execute(
+                        select(PanelAccount.id).where(
+                            PanelAccount.user_id.in_(user_ids),
+                            PanelAccount.status.in_(
+                                (
+                                    PanelAccountStatus.pending,
+                                    PanelAccountStatus.error,
+                                )
+                            ),
+                        )
+                    )
+                    kick_ids = [int(r[0]) for r in rows_p.all() if r[0]]
+                    if kick_ids:
+                        orchestrator.start_account_provisions(kick_ids)
+                except Exception:  # noqa: BLE001
+                    log.debug("bulk kick pending soft-fail", exc_info=True)
         except Exception:  # noqa: BLE001
             log.exception("bulk ensure_pending failed — remotes still scheduled")
             try:
