@@ -17,7 +17,7 @@ logger = logging.getLogger("astra.worker.agent")
 MASTER_URL = (os.environ.get("ASTRA_MASTER_URL") or "").rstrip("/")
 WORKER_TOKEN = (os.environ.get("ASTRA_WORKER_TOKEN") or "").strip()
 WORKER_NAME = os.environ.get("ASTRA_WORKER_NAME") or "astra-worker"
-WORKER_VERSION = "1.0.35"
+WORKER_VERSION = "1.0.36"
 
 # Assigned panels for background usage collection (exact lease from Master)
 _ASSIGNED: list[dict[str, Any]] = []
@@ -1478,9 +1478,9 @@ async def _collect_one(
     pid = int(panel.get("id") or 0)
     if not pid:
         return
-    if _circuit_open(pid):
-        logger.info("collect skip panel=%s circuit-open", pid)
-        return
+    # Circuit only gates live per-user get_usage — NEVER skip Cold/Warm /api/users
+    # collect. Skipping collect left panels like #4 unmetered for minutes while
+    # users kept burning traffic (sub usage looked frozen).
     # Skip types this agent cannot meter — mark mapped so they never eat cold slots.
     ptype = str(panel.get("type") or "").strip().lower()
     if ptype in ("astra", ""):

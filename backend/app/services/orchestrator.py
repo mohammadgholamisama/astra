@@ -8839,6 +8839,12 @@ async def refresh_usage(
                     account.used_traffic = got
                 else:
                     account.used_traffic = max(prev, got)
+                # Keep high-water cursor in sync — stale last_remote_raw made the
+                # next usage-report re-add (got-last) on top of already-applied used.
+                try:
+                    account.last_remote_raw = got
+                except Exception:
+                    pass
                 # Never replace real share links with raw /sub refs from usage pulls.
                 # Never shrink a richer stored set with a partial panel response
                 # (that was the main cause of fluctuating sub config counts).
@@ -9307,6 +9313,10 @@ async def _refresh_usage_pool_safe_inner(
                         account.used_traffic = got
                     else:
                         account.used_traffic = max(prev, got)
+                    try:
+                        account.last_remote_raw = got
+                    except Exception:
+                        pass
                     new_shares = [
                         str(x)
                         for x in (res.links or [])

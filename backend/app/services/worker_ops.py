@@ -339,7 +339,11 @@ async def _apply_usage_report_job(job: dict[str, Any]) -> None:
             )
             if bulk_prove:
                 try:
-                    from datetime import datetime, timedelta, timezone
+                    # IMPORTANT: do NOT `from datetime import datetime` here —
+                    # that made `datetime` a function-local name and crashed
+                    # warm applies (bulk_prove=False) with UnboundLocalError,
+                    # rolling back every meter in the transaction.
+                    from datetime import timedelta
 
                     from sqlalchemy import text
 
