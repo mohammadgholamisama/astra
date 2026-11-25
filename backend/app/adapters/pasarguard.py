@@ -422,6 +422,59 @@ class PasarGuardAdapter(MarzbanAdapter):
             success=False, remote_id=str(user_id), error=last_err
         )
 
+    async def reset_usage(
+        self, username: str, remote_id: str | None = None
+    ) -> AdapterResult:
+        """Reset traffic AND clear PasarGuard ``disabled`` flag.
+
+        Astra quota freeze uses PUT /api/user/by-id/{id}/disabled. Marzban-style
+        POST /reset alone leaves ``disabled=true``, so configs stay cut on the
+        main panel after admin «بازنشانی مصرف».
+        """
+        uname = (username or "").strip()
+        if not uname:
+            return AdapterResult(success=False, error="username خالی است")
+        # 1) zero remote counters (inherited Marzban path)
+        res = await MarzbanAdapter.reset_usage(self, uname, remote_id)
+        # 2) always re-enable — even if reset body looked odd
+        uid: int | None = None
+        if remote_id and str(remote_id).strip().isdigit():
+            uid = int(str(remote_id).strip())
+        if uid is None and res.remote_id and str(res.remote_id).strip().isdigit():
+            uid = int(str(res.remote_id).strip())
+        if uid is None:
+            try:
+                uid = await self._resolve_numeric_user_id(uname, hint=remote_id)
+            except Exception:  # noqa: BLE001
+                uid = None
+        if uid is not None:
+            dis = await self._set_disabled_by_id(uid, False)
+            if not dis.success:
+                # Reset may have worked but user stays offline — surface enable fail.
+                return AdapterResult(
+                    success=False,
+                    remote_username=uname,
+                    remote_id=str(uid),
+                    used_traffic=res.used_traffic,
+                    error=(
+                        f"بازنشانی شد ولی روشن‌سازی پاسارگاد ناموفق: "
+                        f"{dis.error or 'unknown'}"
+                    ),
+                    raw=dis.raw,
+                )
+        # 3) fresh read so callers see post-reset used + active
+        try:
+            linked = await self.get_usage(uname, remote_id or (str(uid) if uid else None))
+            if linked.success:
+                if uid is not None:
+                    linked.remote_id = str(uid)
+                return linked
+        except Exception:  # noqa: BLE001
+            pass
+        if res.success and uid is not None:
+            res.remote_id = str(uid)
+        return res
+
     def _build_pg_body(self, payload: UserPayload, group_ids: list[int]) -> dict[str, Any]:
         # Cloud PasarGuard create/modify schema only accepts status ∈ {active, on_hold}.
         # Freeze (limited/expired/disabled) is done via PUT .../disabled, not status=.

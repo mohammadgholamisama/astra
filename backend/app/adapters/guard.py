@@ -591,6 +591,18 @@ class GuardAdapter(BasePanelAdapter):
         )
         if not ok:
             return AdapterResult(success=False, error=err_msg(data, f"reset HTTP {code}"))
+        # Quota freeze leaves subscriptions disabled — reset alone does NOT
+        # re-enable them. Always flip enable after a successful usage reset so
+        # configs work again on the main panel without waiting for sync_modify.
+        try:
+            await self._set_enabled(uname, True)
+        except Exception:  # noqa: BLE001
+            pass
+        # Re-read after reset+enable — response body from /reset often still
+        # echoes the pre-reset used_traffic.
+        linked = await self.get_usage(uname, remote_id)
+        if linked.success:
+            return linked
         if isinstance(data, list) and data and isinstance(data[0], dict):
             return self._from_sub(data[0], uname)
         return AdapterResult(success=True, remote_username=uname, used_traffic=0, raw=data)
