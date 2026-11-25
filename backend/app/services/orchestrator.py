@@ -8106,16 +8106,28 @@ async def recount_user_used_traffic(
     # Only clear deleted meters when a live twin already holds ≥ those bytes.
     # Never wipe a deleted peak just because a fresh live row exists at 0.
     live_keys = _live_remote_keys(accounts)
-    for account in accounts:
-        if account.status != PanelAccountStatus.deleted:
-            continue
-        raw = int(account.used_traffic or 0)
-        if raw <= 0:
-            continue
-        if not _deleted_usage_superseded(account, live_keys):
-            continue
-        if _live_raw_for_deleted(account, accounts) >= raw:
-            account.used_traffic = 0
+    if allow_shrink:
+        # Inflation reconcile must match what the UI/fleet meters show (live
+        # active/error rows). Deleted banks were keeping used_traffic hundreds
+        # of GB above Σ live meters and blocking shrink forever.
+        for account in accounts:
+            if account.status == PanelAccountStatus.deleted and int(
+                account.used_traffic or 0
+            ) > 0:
+                account.used_traffic = 0
+                if hasattr(account, "last_remote_raw"):
+                    account.last_remote_raw = 0
+    else:
+        for account in accounts:
+            if account.status != PanelAccountStatus.deleted:
+                continue
+            raw = int(account.used_traffic or 0)
+            if raw <= 0:
+                continue
+            if not _deleted_usage_superseded(account, live_keys):
+                continue
+            if _live_raw_for_deleted(account, accounts) >= raw:
+                account.used_traffic = 0
     account_coeffs = await account_coefficients_for_user(db, user, accounts)
     total = await _weighted_total(accounts, account_coeffs)
     return _assign_user_used_traffic(user, total, allow_shrink=allow_shrink)

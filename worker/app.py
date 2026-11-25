@@ -17,7 +17,7 @@ logger = logging.getLogger("astra.worker.agent")
 MASTER_URL = (os.environ.get("ASTRA_MASTER_URL") or "").rstrip("/")
 WORKER_TOKEN = (os.environ.get("ASTRA_WORKER_TOKEN") or "").strip()
 WORKER_NAME = os.environ.get("ASTRA_WORKER_NAME") or "astra-worker"
-WORKER_VERSION = "1.0.34"
+WORKER_VERSION = "1.0.35"
 
 # Assigned panels for background usage collection (exact lease from Master)
 _ASSIGNED: list[dict[str, Any]] = []
@@ -737,7 +737,7 @@ async def _sanaei_usage_map(adapter: Any) -> dict[str, int]:
             for stat in stats:
                 if not isinstance(stat, dict):
                     continue
-                email = str(stat.get("email") or "").strip()
+                email = str(stat.get("email") or "").strip().lower()
                 if not email:
                     continue
                 hit = True
@@ -759,7 +759,7 @@ async def _sanaei_usage_map(adapter: Any) -> dict[str, int]:
         for client in settings.get("clients") or []:
             if not isinstance(client, dict):
                 continue
-            email = str(client.get("email") or "").strip()
+            email = str(client.get("email") or "").strip().lower()
             if not email:
                 continue
             got = int(client.get("up") or 0) + int(client.get("down") or 0)

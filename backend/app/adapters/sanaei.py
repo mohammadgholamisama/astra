@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import secrets
+import time
 import uuid as uuid_lib
 from typing import Any
 
@@ -29,6 +30,11 @@ from app.adapters.http_utils import (
 )
 
 logger = logging.getLogger("astra.sanaei")
+
+# Process-wide inbound list cache — get_usage fallback was re-fetching the full
+# list per email and drowning the Worker HTTP pool on panel 35.
+_INBOUNDS_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_INBOUNDS_TTL = 90.0
 
 
 def _clean_token(raw: str | None) -> str:
@@ -689,15 +695,34 @@ class SanaeiAdapter(BasePanelAdapter):
         except Exception as e:
             return AdapterResult(success=False, error=str(e))
 
+    def _inbounds_cache_key(self) -> str:
+        return f"{(self.base_url or '').rstrip('/')}|{self._token()[:12]}"
+
     async def _raw_inbounds_for_usage(self) -> list[dict[str, Any]]:
         """Full inbound objects (with clientStats) — not the slim UI catalog."""
+        key = self._inbounds_cache_key()
+        hit = _INBOUNDS_CACHE.get(key)
+        if hit and (time.monotonic() - float(hit[0])) < float(_INBOUNDS_TTL):
+            return list(hit[1])
         try:
             resp = await self._request("GET", "panel/api/inbounds/list")
             ok, data = ok_json(resp)
             if not ok:
                 return []
             obj = data.get("obj") if isinstance(data, dict) else data
-            return [x for x in obj if isinstance(x, dict)] if isinstance(obj, list) else []
+            out = (
+                [x for x in obj if isinstance(x, dict)] if isinstance(obj, list) else []
+            )
+            if out:
+                _INBOUNDS_CACHE[key] = (time.monotonic(), out)
+                if len(_INBOUNDS_CACHE) > 32:
+                    # Drop oldest entries — tiny panel fleet.
+                    for old_k, _ in sorted(
+                        ((k, v[0]) for k, v in _INBOUNDS_CACHE.items()),
+                        key=lambda kv: kv[1],
+                    )[:8]:
+                        _INBOUNDS_CACHE.pop(old_k, None)
+            return out
         except Exception as exc:  # noqa: BLE001
             logger.warning("sanaei raw inbounds failed: %s", exc)
             return []

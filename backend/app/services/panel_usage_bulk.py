@@ -500,10 +500,21 @@ async def apply_usage_map_to_panel(
     user_ok = User.status.in_(
         (UserStatus.active, UserStatus.on_hold, UserStatus.limited)
     )
+    # Always case-insensitive — worker cache sync lowercases remotes; PG IN is
+    # case-sensitive and previously dropped mixed-case panel_accounts so meters
+    # never applied (silent under-billing / stale rows).
+    from sqlalchemy import func
+
     if len(name_keys) <= 4000 and name_keys:
         rows: list = []
         chunk_sz = 900
-        keys = list(dict.fromkeys(name_keys + list(base_names)))
+        keys = list(
+            dict.fromkeys(
+                str(k).strip().lower()
+                for k in (name_keys + list(base_names))
+                if str(k).strip()
+            )
+        )
         for off in range(0, len(keys), chunk_sz):
             chunk = keys[off : off + chunk_sz]
             result = await db.execute(
@@ -514,8 +525,8 @@ async def apply_usage_map_to_panel(
                     status_ok,
                     user_ok,
                     or_(
-                        PanelAccount.remote_username.in_(chunk),
-                        User.username.in_(chunk),
+                        func.lower(PanelAccount.remote_username).in_(chunk),
+                        func.lower(User.username).in_(chunk),
                     ),
                 )
             )
@@ -1964,7 +1975,7 @@ async def find_inflated_used_user_ids(
     under = (
         "AND coalesce(sum("
         "(coalesce(pa.used_traffic, 0)::numeric "
-        "* coalesce(pa.applied_coefficient, 1.0))::bigint"
+        "* coalesce(pa.applied_coefficient, 1.0))"
         "), 0) < u.data_limit"
         if only_under_limit
         else ""
@@ -1977,18 +1988,18 @@ async def find_inflated_used_user_ids(
                     SELECT u.id
                     FROM users u
                     LEFT JOIN panel_accounts pa ON pa.user_id = u.id
+                      AND pa.status IN ('active', 'error')
                     WHERE u.status IN ({st_sql})
-                      AND u.data_limit > 0
                     GROUP BY u.id, u.used_traffic, u.data_limit
-                    HAVING u.used_traffic > coalesce(sum(
+                    HAVING u.used_traffic::numeric > coalesce(sum(
                              (coalesce(pa.used_traffic, 0)::numeric
-                              * coalesce(pa.applied_coefficient, 1.0))::bigint
+                              * coalesce(pa.applied_coefficient, 1.0))
                            ), 0) + :gap
                     {under}
                     ORDER BY (
-                      u.used_traffic - coalesce(sum(
+                      u.used_traffic::numeric - coalesce(sum(
                         (coalesce(pa.used_traffic, 0)::numeric
-                         * coalesce(pa.applied_coefficient, 1.0))::bigint
+                         * coalesce(pa.applied_coefficient, 1.0))
                       ), 0)
                     ) DESC
                     LIMIT :lim
