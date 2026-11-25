@@ -3021,6 +3021,7 @@ async def reset_user_traffic_on_panels(
                 ok = False
                 err = _exc_msg(exc)
             account.used_traffic = 0
+            account.last_remote_raw = 0
             account.coeff_anchor_raw = 0
             account.coeff_anchor_weighted = 0
             if ok:
@@ -3056,6 +3057,7 @@ async def reset_user_traffic_on_panels(
             except Exception:
                 pass
         account.used_traffic = 0
+        account.last_remote_raw = 0
         account.coeff_anchor_raw = 0
         account.coeff_anchor_weighted = 0
         if res.success:
@@ -3113,8 +3115,13 @@ async def reset_user_traffic_on_panels(
             if account.status == PanelAccountStatus.deleted:
                 continue
             account.used_traffic = 0
+            account.last_remote_raw = 0
             account.coeff_anchor_raw = 0
             account.coeff_anchor_weighted = 0
+            if account.status != PanelAccountStatus.active:
+                account.status = PanelAccountStatus.active
+            if (account.error_message or "").startswith("ASTRA_QUOTA_FROZEN"):
+                account.error_message = None
     else:
         all_acc_result = await db.execute(
             select(PanelAccount)
@@ -3128,6 +3135,14 @@ async def reset_user_traffic_on_panels(
         int(o["panel_id"]): o for o in outcomes if not o.get("ok")
     }
     if sync_after and ok_ids:
+        # Clear circuits so re-enable isn't skipped right after reset timeouts.
+        try:
+            from app.core.panel_circuit import clear_panel_circuit
+
+            for pid in ok_ids:
+                clear_panel_circuit(int(pid))
+        except Exception:  # noqa: BLE001
+            pass
         # Re-enable / push caps only on panels that reset OK (skip failures)
         await sync_modify_user(
             db,
@@ -3144,8 +3159,13 @@ async def reset_user_traffic_on_panels(
                 continue
             if int(account.panel_id) in ok_ids:
                 account.used_traffic = 0
+                account.last_remote_raw = 0
                 account.coeff_anchor_raw = 0
                 account.coeff_anchor_weighted = 0
+                if account.status != PanelAccountStatus.active:
+                    account.status = PanelAccountStatus.active
+                if (account.error_message or "").startswith("ASTRA_QUOTA_FROZEN"):
+                    account.error_message = None
         # Keep reset failures visible in «خطاها» even if modify touched them
         for account in all_accounts:
             fr = fail_by_pid.get(int(account.panel_id))

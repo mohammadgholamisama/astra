@@ -1349,13 +1349,37 @@ async def reset_user_traffic(
     acc_result = await db.execute(
         select(PanelAccount).where(PanelAccount.user_id == user_id)
     )
+    panel_ids_for_circuit: list[int] = []
     for acc in acc_result.scalars().all():
         if acc.status == PanelAccountStatus.deleted:
             continue
         acc.used_traffic = 0
+        acc.last_remote_raw = 0
         acc.coeff_anchor_raw = 0
         acc.coeff_anchor_weighted = 0
+        # Unfreeze locally so /sub + heal can restore the SAME remotes/links.
+        acc.status = PanelAccountStatus.active
+        acc.error_message = None
+        try:
+            panel_ids_for_circuit.append(int(acc.panel_id))
+        except Exception:  # noqa: BLE001
+            pass
     await db.commit()
+    try:
+        from app.api.subscription import invalidate_user_feed_cache
+
+        invalidate_user_feed_cache(user_id)
+    except Exception:  # noqa: BLE001
+        pass
+    # Reset stampede must not keep circuits open — otherwise hydrate skips
+    # every panel and the subscription stays empty.
+    try:
+        from app.core.panel_circuit import clear_panel_circuit
+
+        for pid in dict.fromkeys(panel_ids_for_circuit):
+            clear_panel_circuit(int(pid))
+    except Exception:  # noqa: BLE001
+        pass
 
     # 2) Astra + all remotes + re-enable/push caps — concurrent background.
     # Never await remotes on the HTTP path (CF/browser → Failed to fetch).
@@ -1369,14 +1393,26 @@ async def reset_user_traffic(
                     sdb,
                     u,
                     prefer_types=None,
-                    remote_timeout=10,
+                    remote_timeout=14,
                     sync_after=True,
-                    sync_remote_timeout=10,
-                    concurrency=24,
+                    sync_remote_timeout=16,
+                    concurrency=12,
                 )
                 u.used_traffic = 0
                 if u.status == UserStatus.limited:
                     u.status = UserStatus.active
+                # Keep local meters/cursors clean after remote echo.
+                for acc in list(getattr(u, "panel_accounts", None) or []):
+                    if acc.status == PanelAccountStatus.deleted:
+                        continue
+                    acc.used_traffic = 0
+                    acc.last_remote_raw = 0
+                    acc.coeff_anchor_raw = 0
+                    acc.coeff_anchor_weighted = 0
+                    if acc.status != PanelAccountStatus.active:
+                        acc.status = PanelAccountStatus.active
+                    if (acc.error_message or "").startswith("ASTRA_QUOTA_FROZEN"):
+                        acc.error_message = None
                 await sdb.commit()
                 failed = [r for r in results if not r.get("ok")]
                 if failed:
@@ -1392,6 +1428,13 @@ async def reset_user_traffic(
                         if r.get("panel_id") is not None
                     }
                     if fail_ids:
+                        try:
+                            from app.core.panel_circuit import clear_panel_circuit
+
+                            for pid in fail_ids:
+                                clear_panel_circuit(int(pid))
+                        except Exception:  # noqa: BLE001
+                            pass
                         async with AsyncSessionLocal() as rdb:
                             uu = await load_user(rdb, username)
                             if not uu:
@@ -1400,15 +1443,39 @@ async def reset_user_traffic(
                                 rdb,
                                 uu,
                                 panel_ids=fail_ids,
-                                remote_timeout=12,
+                                remote_timeout=16,
                                 sync_after=True,
-                                sync_remote_timeout=12,
-                                concurrency=16,
+                                sync_remote_timeout=18,
+                                concurrency=8,
                             )
                             uu.used_traffic = 0
                             if uu.status == UserStatus.limited:
                                 uu.status = UserStatus.active
                             await rdb.commit()
+            # Restore share links so /sub updates on the same configs.
+            try:
+                await orchestrator.hydrate_share_links_pool_safe(user_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("reset hydrate failed user=%s", username)
+            try:
+                from app.api.subscription import invalidate_user_feed_cache
+
+                invalidate_user_feed_cache(user_id)
+            except Exception:  # noqa: BLE001
+                pass
+            # Coverage heal if any slot still has empty links after reset.
+            try:
+                await orchestrator.heal_user_coverage_pool_safe(user_id)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "reset coverage heal soft-fail user=%s", username, exc_info=True
+                )
+            try:
+                from app.api.subscription import invalidate_user_feed_cache
+
+                invalidate_user_feed_cache(user_id)
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:  # noqa: BLE001
             logger.exception("background reset remotes failed user=%s", username)
 
