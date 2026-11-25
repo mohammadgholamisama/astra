@@ -17,15 +17,15 @@ logger = logging.getLogger("astra.worker.agent")
 MASTER_URL = (os.environ.get("ASTRA_MASTER_URL") or "").rstrip("/")
 WORKER_TOKEN = (os.environ.get("ASTRA_WORKER_TOKEN") or "").strip()
 WORKER_NAME = os.environ.get("ASTRA_WORKER_NAME") or "astra-worker"
-WORKER_VERSION = "1.0.32"
+WORKER_VERSION = "1.0.33"
 
 # Assigned panels for background usage collection (exact lease from Master)
 _ASSIGNED: list[dict[str, Any]] = []
 _TIERS: dict[int, dict[str, list[str]]] = {}  # panel_id → {hot, warm}
 _INTERVAL = 20  # Warm-tier staggered waves
-_COLD_EVERY_SEC = 60.0  # Cold full-panel sweep cadence (independent of priority)
-_COLLECT_CONC = 4  # warm Sem(4); cold uses separate Sem(2)
-_COLD_CONC = 2  # cold must not occupy all collect slots for 60s walls
+_COLD_EVERY_SEC = 120.0  # Cold cadence — was 60s and heavy panels starved the rest
+_COLLECT_CONC = 4  # warm Sem(4); cold uses separate Sem
+_COLD_CONC = 3  # enough parallel cold without starving warm
 _REPORT_CONC = 2
 _METER_CHUNK = 3000
 _LAST_MAP: dict[int, dict[str, int]] = {}  # panel_id → last sent meters
@@ -1717,23 +1717,29 @@ async def _collect_loop() -> None:
                         cold_due.append(p)
                     else:
                         warm_due.append(p)
-                # Resume mid-sweep first, then heavy/large panels, then the rest.
-                _HEAVY_COLD = {3, 4, 5, 17, 25, 39, 60, 62, 63}
+                # Resume mid-sweep first, then never-mapped panels (post-restart
+                # starve fix), then oldest last-cold. Heavy-first previously
+                # locked out 35/57/59 forever while 3/4/5 recycled every 60s.
                 cold_due.sort(
                     key=lambda p: (
                         0
                         if int(_COLD_OFFSET.get(int(p.get("id") or 0), 0) or 0) > 0
                         else 1,
-                        0 if int(p.get("id") or 0) in _HEAVY_COLD else 1,
+                        0 if int(p.get("id") or 0) not in _LAST_MAP else 1,
+                        float(
+                            _LAST_COLD_TS.get(int(p.get("id") or 0), 0.0) or 0.0
+                        ),
                         int(p.get("id") or 0),
                     )
                 )
                 # Prefer cold when due — warm timeouts were starving 60s sweeps.
-                cold_cap = max(2, int(_COLD_CONC) * 2)
+                cold_cap = max(3, int(_COLD_CONC) * 2)
                 cold_batch = cold_due[:cold_cap]
                 # Cap warm fan-out so cold always gets slots in the same wave.
+                # Do NOT force overflow cold_due into warm — force_mode=warm
+                # skips cold for never-mapped panels and they stay empty forever.
                 warm_cap = max(2, int(_COLLECT_CONC))
-                warm_batch = (warm_due + cold_due[cold_cap:])[:warm_cap]
+                warm_batch = warm_due[:warm_cap]
 
                 async def _run(p: dict[str, Any], mode: str) -> None:
                     nonlocal cold_n, warm_n
