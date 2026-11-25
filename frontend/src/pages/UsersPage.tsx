@@ -75,17 +75,50 @@ function isSoftTimeoutAccountError(msg?: string | null) {
   );
 }
 
+function isDbBusyAccountError(msg?: string | null) {
+  const m = (msg || "").toLowerCase();
+  if (!m) return false;
+  return (
+    m.includes("too many clients") ||
+    m.includes("remaining connection slots") ||
+    m.includes("queuepool") ||
+    m.includes("too many open files") ||
+    m.includes("connection is closed") ||
+    m.includes("pendingrollback")
+  );
+}
+
 function isNoiseAccountError(msg?: string | null) {
-  return isCapacityAccountError(msg) || isSoftTimeoutAccountError(msg);
+  return (
+    isCapacityAccountError(msg) ||
+    isSoftTimeoutAccountError(msg) ||
+    isDbBusyAccountError(msg)
+  );
+}
+
+function isActionableAccountError(
+  a: PanelAccount,
+  userGroupIds?: number[] | null
+) {
+  if (a.status !== "error") return false;
+  if (a.links && a.links.length > 0) return false;
+  if (a.panel_is_active === false) return false;
+  if (isNoiseAccountError(a.error_message)) return false;
+  // Orphan row for a group the user no longer has — don't surface.
+  if (
+    a.group_id != null &&
+    Array.isArray(userGroupIds) &&
+    userGroupIds.length > 0 &&
+    !userGroupIds.includes(Number(a.group_id))
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function userHasErrors(u: User) {
-  // Real actionable error with no share links — capacity/timeout are not panel faults
-  return (u.panel_accounts || []).some(
-    (a) =>
-      a.status === "error" &&
-      !(a.links && a.links.length > 0) &&
-      !isNoiseAccountError(a.error_message)
+  return (u.panel_accounts || []).some((a) =>
+    isActionableAccountError(a, u.group_ids)
   );
 }
 
@@ -96,13 +129,10 @@ function uniquePanelStats(u: User): { ok: number; total: number; errorPanels: nu
   const active = new Set<number>();
   const errored = new Set<number>();
   for (const a of accounts) {
+    if (a.panel_is_active === false && a.status !== "active") continue;
     all.add(a.panel_id);
     if (a.status === "active") active.add(a.panel_id);
-    if (
-      a.status === "error" &&
-      !(a.links && a.links.length > 0) &&
-      !isNoiseAccountError(a.error_message)
-    ) {
+    if (isActionableAccountError(a, u.group_ids)) {
       errored.add(a.panel_id);
     }
   }
@@ -1786,9 +1816,9 @@ export default function UsersPage() {
 
   const errorAccounts: PanelAccount[] = useMemo(() => {
     if (!errorsUser) return [];
-    // Show capacity notes too (softer badge) — banner/chip still exclude them
-    return (errorsUser.panel_accounts || []).filter(
-      (a) => a.status === "error" && !(a.links && a.links.length > 0)
+    // Only actionable faults — inactive panels / orphan groups / pool noise stay hidden
+    return (errorsUser.panel_accounts || []).filter((a) =>
+      isActionableAccountError(a, errorsUser.group_ids)
     );
   }, [errorsUser]);
 
@@ -2072,11 +2102,8 @@ export default function UsersPage() {
         <>
         <div className="users-list" role="list" ref={listRef}>
           {filtered.map((u) => {
-            const errors = (u.panel_accounts || []).filter(
-              (a) =>
-                a.status === "error" &&
-                !(a.links && a.links.length > 0) &&
-                !isNoiseAccountError(a.error_message)
+            const errors = (u.panel_accounts || []).filter((a) =>
+              isActionableAccountError(a, u.group_ids)
             );
             const { ok, total: panels, errorPanels } = uniquePanelStats(u);
             const pct = usagePercent(u.used_traffic, u.data_limit);
@@ -2216,39 +2243,103 @@ export default function UsersPage() {
         </div>
         {totalUsers > 0 && (
           <nav className="users-pagination" aria-label="صفحه‌بندی کاربران">
-            <button
-              type="button"
-              className="users-page-btn"
-              disabled={page <= 0}
-              onClick={() => setPage((p) => Math.max(0, p - 1))}
-              aria-label="صفحه قبلی"
-            >
-              <ChevronRight size={15} strokeWidth={2.25} aria-hidden />
-              <span>قبلی</span>
-            </button>
-            <div className="users-pagination-mid">
-              <span className="users-page-chip">
-                {toFaDigits(page + 1)}
-                <span className="users-page-chip-sep">/</span>
-                {toFaDigits(totalPages)}
-              </span>
-              <span className="users-pagination-range">
-                {toFaDigits(page * PAGE_SIZE + 1)}–
-                {toFaDigits(Math.min((page + 1) * PAGE_SIZE, totalUsers))} از{" "}
-                {toFaDigits(totalUsers)} کاربر
-                {isFetching ? " · …" : ""}
-              </span>
+            <div className="users-page-nums" role="list">
+              {(() => {
+                // Show ~5 numbered pages around current, plus first/last shortcuts
+                const last = Math.max(0, totalPages - 1);
+                const windowSize = Math.min(5, last + 1);
+                let start = Math.max(0, page - Math.floor(windowSize / 2));
+                let end = start + windowSize - 1;
+                if (end > last) {
+                  end = last;
+                  start = Math.max(0, end - windowSize + 1);
+                }
+                const pages: number[] = [];
+                for (let i = start; i <= end; i += 1) pages.push(i);
+                return (
+                  <>
+                    {start > 0 && (
+                      <>
+                        <button
+                          type="button"
+                          className="users-page-num"
+                          onClick={() => setPage(0)}
+                          aria-label="صفحه ۱"
+                        >
+                          {toFaDigits(1)}
+                        </button>
+                        {start > 1 && (
+                          <span className="users-page-ellipsis" aria-hidden>
+                            …
+                          </span>
+                        )}
+                      </>
+                    )}
+                    {pages.map((i) => (
+                      <button
+                        key={i}
+                        type="button"
+                        role="listitem"
+                        className={`users-page-num${i === page ? " is-active" : ""}`}
+                        aria-current={i === page ? "page" : undefined}
+                        aria-label={`صفحه ${toFaDigits(i + 1)}`}
+                        onClick={() => setPage(i)}
+                      >
+                        {toFaDigits(i + 1)}
+                      </button>
+                    ))}
+                    {end < last && (
+                      <>
+                        {end < last - 1 && (
+                          <span className="users-page-ellipsis" aria-hidden>
+                            …
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          className="users-page-num"
+                          onClick={() => setPage(last)}
+                          aria-label={`صفحه ${toFaDigits(last + 1)}`}
+                        >
+                          {toFaDigits(last + 1)}
+                        </button>
+                      </>
+                    )}
+                  </>
+                );
+              })()}
             </div>
-            <button
-              type="button"
-              className="users-page-btn"
-              disabled={page + 1 >= totalPages}
-              onClick={() => setPage((p) => p + 1)}
-              aria-label="صفحه بعدی"
-            >
-              <span>بعدی</span>
-              <ChevronLeft size={15} strokeWidth={2.25} aria-hidden />
-            </button>
+            <div className="users-pagination-bar">
+              <button
+                type="button"
+                className="users-page-btn"
+                disabled={page <= 0}
+                onClick={() => setPage((p) => Math.max(0, p - 1))}
+                aria-label="صفحه قبلی"
+              >
+                <ChevronRight size={15} strokeWidth={2.25} aria-hidden />
+                <span>قبلی</span>
+              </button>
+              <span className="users-pagination-range">
+                صفحه {toFaDigits(page + 1)} از {toFaDigits(totalPages)}
+                <em>
+                  · {toFaDigits(page * PAGE_SIZE + 1)}–
+                  {toFaDigits(Math.min((page + 1) * PAGE_SIZE, totalUsers))} از{" "}
+                  {toFaDigits(totalUsers)}
+                  {isFetching ? " · …" : ""}
+                </em>
+              </span>
+              <button
+                type="button"
+                className="users-page-btn"
+                disabled={page + 1 >= totalPages}
+                onClick={() => setPage((p) => p + 1)}
+                aria-label="صفحه بعدی"
+              >
+                <span>بعدی</span>
+                <ChevronLeft size={15} strokeWidth={2.25} aria-hidden />
+              </button>
+            </div>
           </nav>
         )}
         </>
@@ -2258,11 +2349,8 @@ export default function UsersPage() {
         const u = menuUser;
         const st = statusLabel(u);
         const isOff = u.status === "disabled";
-        const errors = (u.panel_accounts || []).filter(
-          (a) =>
-            a.status === "error" &&
-            !(a.links && a.links.length > 0) &&
-            !isNoiseAccountError(a.error_message)
+        const errors = (u.panel_accounts || []).filter((a) =>
+          isActionableAccountError(a, u.group_ids)
         );
         const { ok, total: panels } = uniquePanelStats(u);
         const remain = remainingBytes(u.used_traffic, u.data_limit);
@@ -4212,9 +4300,7 @@ export default function UsersPage() {
               <button type="button" className="btn ghost" onClick={() => setErrorsUser(null)}>
                 بستن
               </button>
-              {errorAccounts.some(
-                (a) => a.status === "error" && !isNoiseAccountError(a.error_message)
-              ) && (
+              {errorAccounts.length > 0 && (
                 <button
                   type="button"
                   className="btn"

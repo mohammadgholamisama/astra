@@ -86,6 +86,49 @@ def _is_hard_auth_fail(err: str | None) -> bool:
     return any(m in low for m in _HARD_AUTH_MARKERS)
 
 
+async def _seed_worker_routes(
+    db: AsyncSession, worker_ids: set[int] | list[int]
+) -> dict[int, str]:
+    """Load WorkerNode rows, register HTTP routes, return id→name."""
+    from app.models.worker import WorkerNode
+    from app.services.worker_client import seed_worker_route_from_row
+
+    ids = sorted({int(x) for x in worker_ids if int(x) > 0})
+    if not ids:
+        return {}
+    rows = list(
+        (
+            await db.execute(select(WorkerNode).where(WorkerNode.id.in_(ids)))
+        )
+        .scalars()
+        .all()
+    )
+    names: dict[int, str] = {}
+    for w in rows:
+        wid = int(w.id)
+        names[wid] = str(w.name or f"worker-{wid}")
+        seed_worker_route_from_row(w)
+    return names
+
+
+def _probe_via_worker(panel: Panel) -> bool:
+    """True when get_adapter will route this probe through a worker."""
+    panel_type = getattr(panel, "type", None)
+    if panel_type == PanelType.astra or str(
+        getattr(panel_type, "value", panel_type) or ""
+    ) == "astra":
+        return False
+    wid = getattr(panel, "worker_id", None)
+    if not wid:
+        return False
+    try:
+        from app.services.worker_client import lookup_worker_route
+
+        return lookup_worker_route(int(wid)) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def _live_test_panel(
     panel: Panel,
     *,
@@ -109,6 +152,7 @@ async def _live_test_panel(
     is_astra = panel_type == PanelType.astra or str(
         getattr(panel_type, "value", panel_type) or ""
     ) == "astra"
+    via_worker = _probe_via_worker(panel)
     if quick:
         # One sharp try; caller (test-all) may run a second wave on fails only.
         # Astra needs room for outbound protocol-ping.
@@ -170,6 +214,7 @@ async def _live_test_panel(
                 "error": None,
                 "latency_ms": ms,
                 "raw": result.raw if isinstance(result.raw, dict) else {},
+                "via_worker": via_worker,
             }
 
         last_err = (
@@ -198,14 +243,19 @@ async def _live_test_panel(
             "network",
         )
     ) and "رمز" not in last_err and "password" not in low and "401" not in low:
+        path_hint = (
+            "تست از مسیر ورکر است."
+            if via_worker
+            else "تست از مسیر سرور Astra است."
+        )
         last_err = (
-            f"{last_err} — از اینترنت شما ممکن است باز شود؛ "
-            "تست از مسیر سرور Astra است."
+            f"{last_err} — از اینترنت شما ممکن است باز شود؛ {path_hint}"
         )
     return {
         "success": False,
         "error": last_err,
         "latency_ms": ms,
+        "via_worker": via_worker,
         "raw": {},
     }
 
@@ -1305,6 +1355,15 @@ async def test_all_panels(
             results=[], ok=0, fail=0, stats=empty, tested_at=now
         )
 
+    worker_names = await _seed_worker_routes(
+        db,
+        {
+            int(w)
+            for p in panels
+            if (w := getattr(p, "worker_id", None))
+        },
+    )
+
     # Detach probe inputs from the request AsyncSession. Concurrent workers
     # must not mutate/read the same session (that broke commit with rvf5).
     from types import SimpleNamespace
@@ -1315,6 +1374,12 @@ async def test_all_panels(
         meta = dict(p.meta or {})
         meta["panel_id"] = int(p.id)
         meta["_probe_quick"] = True
+        wid = getattr(p, "worker_id", None)
+        try:
+            wid_i = int(wid) if wid is not None else None
+        except (TypeError, ValueError):
+            wid_i = None
+        wname = worker_names.get(wid_i) if wid_i else None
         probe_panel = SimpleNamespace(
             id=int(p.id),
             name=p.name,
@@ -1325,6 +1390,7 @@ async def test_all_panels(
             password=p.password,
             api_token=p.api_token,
             meta=meta,
+            worker_id=wid_i,
         )
         snapshots.append(
             {
@@ -1334,6 +1400,8 @@ async def test_all_panels(
                 "is_active": True,
                 "base_url": base,
                 "panel": probe_panel,
+                "worker_id": wid_i,
+                "worker_name": wname,
             }
         )
     # Free Postgres before remote fan-out (idle-in-transaction / SSH rule).
@@ -1359,6 +1427,9 @@ async def test_all_panels(
             latency_ms=latency,
             grade=_panel_test_grade(ok, latency),
             base_url=snap["base_url"],
+            worker_id=snap.get("worker_id"),
+            worker_name=snap.get("worker_name"),
+            via_worker=bool(probe.get("via_worker")),
         )
 
     async def _one(
@@ -1411,6 +1482,9 @@ async def test_all_panels(
                         latency_ms=None,
                         grade="fail",
                         base_url=snap["base_url"],
+                        worker_id=snap.get("worker_id"),
+                        worker_name=snap.get("worker_name"),
+                        via_worker=False,
                     )
                 )
                 retry_snaps.append(snap)
@@ -1486,15 +1560,56 @@ async def test_panel(
     panel = await db.get(Panel, panel_id)
     if not panel:
         raise HTTPException(status_code=404, detail="Panel not found")
-    probe = await _live_test_panel(panel, overall_timeout=22.0)
+    wid = getattr(panel, "worker_id", None)
+    worker_name: str | None = None
+    if wid:
+        names = await _seed_worker_routes(db, {int(wid)})
+        worker_name = names.get(int(wid))
+    # Detach probe inputs so request session can commit last_ok_at later
+    # without holding the connection during remote/Xray work.
+    from types import SimpleNamespace
+
+    from app.core.database import release_db_txn
+
+    meta = dict(panel.meta or {})
+    meta["panel_id"] = int(panel.id)
+    probe_panel = SimpleNamespace(
+        id=int(panel.id),
+        name=panel.name,
+        type=panel.type,
+        is_active=bool(panel.is_active),
+        base_url=panel.base_url,
+        username=panel.username,
+        password=panel.password,
+        api_token=panel.api_token,
+        meta=meta,
+        worker_id=int(wid) if wid else None,
+    )
+    await release_db_txn(db)
+    probe = await _live_test_panel(probe_panel, overall_timeout=22.0)
+    via_worker = bool(probe.get("via_worker"))
     if probe.get("success"):
-        panel.last_ok_at = datetime.now(timezone.utc)
-        await db.commit()
+        try:
+            await db.execute(
+                update(Panel)
+                .where(Panel.id == int(panel_id))
+                .values(last_ok_at=datetime.now(timezone.utc))
+            )
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception("test_panel last_ok_at commit failed id=%s", panel_id)
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
     return {
         "success": bool(probe.get("success")),
         "error": probe.get("error"),
         "latency_ms": probe.get("latency_ms"),
         "raw": probe.get("raw") or {},
+        "worker_id": int(wid) if wid else None,
+        "worker_name": worker_name,
+        "via_worker": via_worker,
     }
 
 

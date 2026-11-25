@@ -58,8 +58,16 @@ class Panel(Base):
     )
     # Admin UI order on Panels page (drag-reorder within a tab)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, index=True)
-    # NULL = ops run on master; set = route create/usage/manage via that worker
+    # Active routing lease — which worker currently owns this panel.
     worker_id: Mapped[int | None] = mapped_column(
+        ForeignKey("worker_nodes.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        default=None,
+    )
+    # Sticky affinity — failback target when that worker is healthy again.
+    # NULL = auto-balance across healthy workers.
+    preferred_worker_id: Mapped[int | None] = mapped_column(
         ForeignKey("worker_nodes.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
@@ -69,7 +77,15 @@ class Panel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     category = relationship("PanelCategory", back_populates="panels")
-    worker = relationship("WorkerNode", back_populates="panels")
+    worker = relationship(
+        "WorkerNode",
+        foreign_keys=[worker_id],
+        back_populates="panels",
+    )
+    preferred_worker = relationship(
+        "WorkerNode",
+        foreign_keys=[preferred_worker_id],
+    )
     group_links = relationship("GroupPanel", back_populates="panel", cascade="all, delete-orphan")
     accounts = relationship("PanelAccount", back_populates="panel", cascade="all, delete-orphan")
     astra_outbounds = relationship(

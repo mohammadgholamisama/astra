@@ -83,6 +83,10 @@ class WorkerUsageReport(BaseModel):
     listed: int = 0
     worker_id: int | None = None
     dt_ms: int | None = None
+    # Periodic full snapshot — allow meters to shrink (remote reset / delete).
+    full_sync: bool = False
+    # Worker collect mode: hot | warm | cold (priority-probe posts hot).
+    mode: str | None = None
 
 
 class WorkerHeartbeatIn(BaseModel):

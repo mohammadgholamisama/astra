@@ -79,7 +79,8 @@ _BG_MAINTAIN_GATE = asyncio.Semaphore(2)
 # Live usage pull on sub refresh — must stay accurate (quota / money).
 _bg_usage_last: dict[int, float] = {}
 # Sub-triggered pulls; fleet/hot run every ~5 min for the rest.
-_BG_USAGE_INTERVAL = 30.0
+# 5s single-flight so concurrent /sub Update taps coalesce (was 15s).
+_BG_USAGE_INTERVAL = 5.0
 # Parallel /sub usage pulls — keep under DB pool headroom.
 _bg_usage_sem = asyncio.Semaphore(2)
 
@@ -255,6 +256,17 @@ def _token_feed_get(
             _token_feed_cache.pop(key, None)
         else:
             return body, meta
+    # Shared Redis L2 — hits across uvicorn workers without DB.
+    try:
+        from app.core.redis_cache import sub_cache_get
+
+        rbody = sub_cache_get(token, _op_bucket(rank_operator))
+        if rbody:
+            meta = {"complete": True, "from": "redis"}
+            _token_feed_cache[key] = (time.monotonic(), rbody, meta)
+            return rbody, meta
+    except Exception:  # noqa: BLE001
+        pass
     disk = _token_disk_get(token, rank_operator)
     if disk:
         body, meta = disk
@@ -287,6 +299,20 @@ def _token_feed_put(
         payload,
     )
     _token_disk_put(token, body, payload, rank_operator=rank_operator)
+    # Redis L2 — only complete feeds (partial/emergency stay short-lived local).
+    if bool(payload.get("complete", True)):
+        try:
+            from app.core.redis_cache import sub_cache_set
+
+            uid = payload.get("user_id")
+            sub_cache_set(
+                token,
+                body,
+                op_bucket=_op_bucket(rank_operator),
+                user_id=int(uid) if uid is not None else None,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def invalidate_user_feed_cache(*user_ids: int) -> None:
@@ -315,6 +341,12 @@ def invalidate_user_feed_cache(*user_ids: int) -> None:
                         meta_path.with_suffix(".bin").unlink(missing_ok=True)
                 except Exception:  # noqa: BLE001
                     pass
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from app.core.redis_cache import sub_cache_invalidate_users
+
+        sub_cache_invalidate_users(*sorted(want))
     except Exception:  # noqa: BLE001
         pass
 
@@ -454,14 +486,16 @@ async def _bg_sub_maintain(user_id: int, *, force: bool = False) -> None:
                         timeout=25.0,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("bg heal user_id=%s: %s", user_id, exc)
+                    if "connection is closed" not in str(exc).lower():
+                        logger.warning("bg heal user_id=%s: %s", user_id, exc)
                 try:
                     await asyncio.wait_for(
                         hydrate_share_links_pool_safe(int(user_id)), timeout=14.0
                     )
                     invalidate_user_feed_cache(int(user_id))
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("bg hydrate user_id=%s: %s", user_id, exc)
+                    if "connection is closed" not in str(exc).lower():
+                        logger.warning("bg hydrate user_id=%s: %s", user_id, exc)
 
             async with AsyncSessionLocal() as db:
                 result = await db.execute(
@@ -515,28 +549,30 @@ async def _bg_sub_maintain(user_id: int, *, force: bool = False) -> None:
 
 
 async def _bg_usage_pull(user_id: int) -> None:
-    """Pull live remote usage into PanelAccount + User.used_traffic (weighted).
+    """Advance quota from meters after /sub — never reuse the request session.
 
-    Runs after /sub returns so the tunnel stays fast, but every active client
-    refresh still advances quota / analytics accurately. When Astra quota is
-    exhausted, freezes ALL remotes in the same task.
+    Always opens its own ``AsyncSessionLocal`` sessions and never holds a DB
+    connection across remote HTTP (that caused InterfaceError after the pool
+    guardian / idle-in-txn timeout closed the backend).
 
-    Uses ``refresh_usage_pool_safe`` so the DB connection is not held during
-    remote HTTP (that was starving QueuePool → «Temporarily unavailable»).
+    When a Worker is healthy it owns remote meters — this task only recounts
+    ``users.used_traffic`` from ``panel_accounts`` already written by usage-report.
     """
     from app.services.orchestrator import (
         _USAGE_PULL_GATE,
         mark_live_usage_priority,
+        recount_user_usage_pool_safe,
         refresh_usage_pool_safe,
-        should_push_remotes,
+        sync_modify_user_background,
     )
 
     mark_live_usage_priority(int(user_id))
-    await asyncio.sleep(0.15)
+    # Let the HTTP request finish and release its session first.
+    await asyncio.sleep(0.2)
     async with _bg_usage_sem:
         try:
             async with _USAGE_PULL_GATE:
-                before = 0
+                st = None
                 try:
                     async with AsyncSessionLocal() as db:
                         row = (
@@ -548,163 +584,87 @@ async def _bg_usage_pull(user_id: int) -> None:
                         ).one_or_none()
                         if row is None:
                             return
-                        before = int(row[0] or 0)
                         st = row[1]
                         if st not in (
                             UserStatus.active,
                             UserStatus.on_hold,
                             UserStatus.limited,
                         ):
-                            _dbg(
-                                "H3",
-                                "subscription.py:_bg_usage_pull",
-                                "skip_status",
-                                {
-                                    "user_id": int(user_id),
-                                    "status": str(st),
-                                },
-                            )
                             return
                 except Exception:  # noqa: BLE001
-                    pass
-                _dbg(
-                    "H2",
-                    "subscription.py:_bg_usage_pull",
-                    "before_refresh",
-                    {
-                        "user_id": int(user_id),
-                        "used": before,
-                    },
-                )
-                # Instant: apply already-synced panel meters to users.used_traffic
-                # (bulk often filled raw bytes while user total stayed 0).
-                try:
-                    from app.services.orchestrator import recount_user_usage_pool_safe
+                    return
 
-                    instant = await recount_user_usage_pool_safe(int(user_id))
-                    if instant >= 0:
-                        before = max(before, int(instant))
-                except Exception:  # noqa: BLE001
-                    pass
-                # Multi-panel users: fleet/hot bulk owns remote meters. Per-user
-                # get_usage×38 was timing out, holding the gate, and starving the
-                # fleet (used_traffic stuck at 0 while remotes kept growing).
-                n_active = 0
+                worker_ok = False
                 try:
-                    from sqlalchemy import func as _sa_func
+                    from app.services.worker_client import any_worker_healthy
 
-                    async with AsyncSessionLocal() as db:
-                        n_active = int(
-                            (
-                                await db.execute(
-                                    select(_sa_func.count())
-                                    .select_from(PanelAccount)
-                                    .where(
-                                        PanelAccount.user_id == int(user_id),
-                                        PanelAccount.status.in_(
-                                            (
-                                                PanelAccountStatus.active,
-                                                PanelAccountStatus.error,
-                                            )
-                                        ),
-                                    )
-                                )
-                            ).scalar()
-                            or 0
-                        )
-                        await db.rollback()
+                    worker_ok = bool(any_worker_healthy())
                 except Exception:  # noqa: BLE001
-                    n_active = 40
-                # Fat multi-panel users: fleet/hot update meters; we only recount.
-                do_remote = n_active <= 12
+                    worker_ok = False
+
+                # Worker path: enqueue priority probe so meters refresh in <5s,
+                # then DB-only recount from whatever panel_accounts already have.
+                if worker_ok:
+                    try:
+                        from app.services import usage_priority as uprio
+
+                        await uprio.enqueue_user_remotes(int(user_id), ttl=900.0)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        await recount_user_usage_pool_safe(int(user_id))
+                    except Exception as exc:  # noqa: BLE001
+                        if "connection is closed" not in str(exc).lower():
+                            logger.warning(
+                                "bg usage recount user_id=%s: %s", user_id, exc
+                            )
+                    # Quota flip / freeze without holding a request-tied session.
+                    if st == UserStatus.limited:
+                        try:
+                            from app.services.orchestrator import kick_freeze_user
+
+                            await kick_freeze_user(
+                                int(user_id), remote_timeout=8.0
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                    return
+
+                # No worker: light remote refresh (own sessions inside pool-safe).
                 try:
-                    if do_remote:
-                        after, activated, changed, status_now = await asyncio.wait_for(
-                            refresh_usage_pool_safe(
-                                int(user_id), force=True, quick=True
-                            ),
-                            timeout=16.0,
-                        )
-                    else:
-                        after, activated, changed, status_now = (
-                            before,
-                            False,
-                            False,
-                            "fleet",
-                        )
+                    after, _activated, changed, _status = await asyncio.wait_for(
+                        refresh_usage_pool_safe(
+                            int(user_id), force=True, quick=True
+                        ),
+                        timeout=16.0,
+                    )
                 except asyncio.TimeoutError:
-                    # Keep accurate weighted total from meters already on disk.
-                    from app.services.orchestrator import recount_user_usage_pool_safe
-
                     after = await recount_user_usage_pool_safe(int(user_id))
-                    activated, changed, status_now = False, False, ""
+                    changed = False
                     logger.info(
                         "bg usage pull timeout user_id=%s — kept recount=%s",
                         user_id,
                         after,
                     )
+                except Exception as exc:  # noqa: BLE001
+                    if "connection is closed" in str(exc).lower():
+                        return
+                    logger.warning("bg usage pull user_id=%s: %s", user_id, exc)
+                    return
                 if after < 0:
                     return
-                async with AsyncSessionLocal() as db:
-                    result = await db.execute(
-                        select(User)
-                        .where(User.id == int(user_id))
-                        .options(
-                            selectinload(User.panel_accounts).selectinload(
-                                PanelAccount.panel
-                            ),
+                if changed or st == UserStatus.limited:
+                    # Fire-and-forget — opens its own sessions; never pass ours.
+                    try:
+                        asyncio.create_task(
+                            sync_modify_user_background(int(user_id)),
+                            name=f"astra-sub-sync-{int(user_id)}",
                         )
-                    )
-                    user = result.scalar_one_or_none()
-                    if user is None:
-                        return
-                    after = int(user.used_traffic or 0)
-                    _dbg(
-                        "H2",
-                        "subscription.py:_bg_usage_pull",
-                        "after_refresh",
-                        {
-                            "user_id": int(user_id),
-                            "username": user.username,
-                            "used_before": before,
-                            "used_after": after,
-                            "changed": bool(changed),
-                            "activated": bool(activated),
-                            "status": str(user.status),
-                        },
-                    )
-                    blocked = user.status in (
-                        UserStatus.limited,
-                        UserStatus.expired,
-                        UserStatus.disabled,
-                    )
-                    need_push = changed or blocked
-                    if not need_push:
-                        need_push = await should_push_remotes(
-                            db,
-                            user,
-                            status_changed=False,
-                            force=False,
-                            shrink_shared_caps=True,
-                        )
-                    if need_push:
-                        await asyncio.wait_for(
-                            sync_modify_user(
-                                db,
-                                user,
-                                skip_nginx_sync=True,
-                                freeze_fast=True,
-                            ),
-                            timeout=14.0,
-                        )
-                        await db.commit()
+                    except Exception:  # noqa: BLE001
+                        pass
         except Exception as exc:  # noqa: BLE001
-            _dbg(
-                "H2",
-                "subscription.py:_bg_usage_pull",
-                "pull_failed",
-                {"user_id": int(user_id), "err": str(exc)[:200]},
-            )
+            if "connection is closed" in str(exc).lower():
+                return
             logger.warning("bg usage pull user_id=%s: %s", user_id, exc)
 
 
@@ -737,6 +697,23 @@ def _schedule_bg_usage(user_id: int) -> None:
 
     uid = int(user_id)
     mark_live_usage_priority(uid)
+    try:
+        from app.services.usage_tiers import mark_sub_touch
+
+        mark_sub_touch(uid)
+    except Exception:  # noqa: BLE001
+        pass
+    # Always push exact remotes into Worker priority-probe (cheap, deduped)
+    # so meters refresh within ~3s even when the heavier pull is debounced.
+    try:
+        from app.services import usage_priority as uprio
+
+        asyncio.create_task(
+            uprio.enqueue_user_remotes(uid, ttl=900.0),
+            name=f"astra-prio-enqueue-{uid}",
+        )
+    except Exception:  # noqa: BLE001
+        pass
     now = time.monotonic()
     last = float(_bg_usage_last.get(uid, 0.0) or 0.0)
     if now - last < _BG_USAGE_INTERVAL:
@@ -1665,6 +1642,138 @@ def _fallback_sub_html(username: str = "") -> str:
     )
 
 
+def _gone_sub_html(*, brand: str = "") -> str:
+    """Polished page when the subscription token is missing / revoked."""
+    title = (brand or "اشتراک").replace("<", "").replace(">", "")[:48] or "اشتراک"
+    return f"""<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta name="robots" content="noindex,nofollow"/>
+<title>لینک نامعتبر · {title}</title>
+<style>
+  :root {{
+    --bg0:#061018; --bg1:#0b1c28; --card:#0f2433;
+    --line:rgba(140,200,190,.14); --text:#e8f7f2; --muted:#7fa39a;
+    --accent:#3dbea0; --warn:#e8b86d;
+  }}
+  * {{ box-sizing:border-box; }}
+  body {{
+    margin:0; min-height:100vh; color:var(--text);
+    font-family:"Vazirmatn",Tahoma,system-ui,sans-serif;
+    background:
+      radial-gradient(900px 420px at 85% -10%, rgba(61,190,160,.16), transparent 55%),
+      radial-gradient(700px 380px at -10% 110%, rgba(232,184,109,.10), transparent 50%),
+      linear-gradient(165deg, var(--bg0), var(--bg1) 55%, #08151f);
+    display:grid; place-items:center; padding:28px 18px;
+  }}
+  .card {{
+    width:min(440px,100%);
+    background:linear-gradient(180deg, rgba(15,36,51,.92), rgba(8,22,32,.96));
+    border:1px solid var(--line); border-radius:22px;
+    padding:28px 24px 22px; text-align:center;
+    box-shadow:0 24px 60px rgba(0,0,0,.35);
+    animation:rise .45s ease both;
+  }}
+  @keyframes rise {{
+    from {{ opacity:0; transform:translateY(12px); }}
+    to {{ opacity:1; transform:none; }}
+  }}
+  .mark {{
+    width:64px; height:64px; margin:0 auto 16px; border-radius:20px;
+    display:grid; place-items:center;
+    background:rgba(232,184,109,.12); border:1px solid rgba(232,184,109,.28);
+    color:var(--warn);
+  }}
+  .mark svg {{ width:30px; height:30px; }}
+  .brand {{
+    font-size:.78rem; letter-spacing:.04em; color:var(--accent);
+    font-weight:700; margin:0 0 8px; opacity:.9;
+  }}
+  h1 {{ margin:0 0 10px; font-size:1.28rem; font-weight:800; line-height:1.35; }}
+  p {{ margin:0; color:var(--muted); font-size:.95rem; line-height:1.7; }}
+  .tips {{
+    margin:18px 0 0; padding:14px 14px 12px; text-align:right;
+    border-radius:14px; background:rgba(255,255,255,.03);
+    border:1px solid var(--line);
+  }}
+  .tips li {{
+    margin:0 0 8px; color:var(--muted); font-size:.86rem; line-height:1.55;
+  }}
+  .tips li:last-child {{ margin-bottom:0; }}
+  .tips strong {{ color:var(--text); font-weight:700; }}
+  .foot {{
+    margin-top:18px; font-size:.75rem; color:rgba(127,163,154,.75);
+  }}
+</style>
+</head>
+<body>
+  <main class="card" role="main">
+    <div class="mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="9"/>
+        <path d="M12 8v5"/>
+        <path d="M12 16h.01"/>
+      </svg>
+    </div>
+    <p class="brand">{title}</p>
+    <h1>این لینک اشتراک در دسترس نیست</h1>
+    <p>لینک حذف شده، منقضی شده، یا اشتباه وارد شده است. اگر اشتراک فعال دارید، لینک جدید را از پشتیبانی بگیرید.</p>
+    <ul class="tips">
+      <li><strong>حذف‌شده؟</strong> اشتراک توسط پنل غیرفعال یا پاک شده است.</li>
+      <li><strong>اشتباه؟</strong> آدرس را کامل از پیام پشتیبانی کپی کنید.</li>
+      <li><strong>اشتراک جدید؟</strong> با پشتیبان تماس بگیرید تا لینک تازه برایتان ارسال شود.</li>
+    </ul>
+    <p class="foot">Subscription link unavailable</p>
+  </main>
+</body>
+</html>"""
+
+
+def _sub_not_found_response(
+    request: Request | None = None, *, force_html: bool = False
+) -> Response:
+    """Browser → polished HTML; VPN/clients → short clear 404 text."""
+    brand = ""
+    try:
+        brand = str(get_brand_name() or "").strip()
+    except Exception:  # noqa: BLE001
+        brand = ""
+    wants_html = bool(force_html)
+    if request is not None and not wants_html:
+        accept = (request.headers.get("accept") or "").lower()
+        ua = (request.headers.get("user-agent") or "").lower()
+        path = str(getattr(request.url, "path", "") or "")
+        if "/info" in path:
+            wants_html = True
+        elif "text/html" in accept:
+            wants_html = True
+        elif "mozilla" in ua and not any(
+            m in ua
+            for m in (
+                "clash",
+                "v2ray",
+                "streisand",
+                "shadowrocket",
+                "quantumult",
+                "hiddify",
+                "sing-box",
+                "okhttp",
+            )
+        ):
+            wants_html = True
+    if wants_html:
+        return HTMLResponse(_gone_sub_html(brand=brand), status_code=404)
+    return PlainTextResponse(
+        "این لینک اشتراک حذف شده یا اشتباه است.\n"
+        "This subscription link was removed or is invalid.\n",
+        status_code=404,
+        media_type="text/plain; charset=utf-8",
+    )
+
+
 async def _configs_for_info_fallback(
     db: AsyncSession, user, *, rank_operator: str | None = None
 ) -> list[dict]:
@@ -1996,7 +2105,7 @@ async def _serve_subscription_db(
         return PlainTextResponse("Temporarily unavailable", status_code=503)
 
     if not user:
-        return PlainTextResponse("Not found", status_code=404)
+        return _sub_not_found_response(request, force_html=bool(is_html))
 
     # Flip expire → expired on the request path (do not wait for quota-watch).
     # Then schedule a hard remote freeze so main panels cut traffic immediately.
@@ -2744,7 +2853,7 @@ async def subscription_page(
         await _safe_rollback(db)
         return HTMLResponse(_fallback_sub_html(), status_code=200)
     if not user:
-        return HTMLResponse("<h1>Not found</h1>", status_code=404)
+        return _sub_not_found_response(request, force_html=True)
     return await _render_info_page(
         db,
         token,

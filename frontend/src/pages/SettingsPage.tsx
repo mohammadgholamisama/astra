@@ -1,12 +1,14 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  Check,
   KeyRound,
   Link2,
   Megaphone,
   Plus,
   RotateCcw,
   Save,
+  Search,
   Server,
   Settings,
   ShieldCheck,
@@ -104,6 +106,148 @@ type WorkerNode = {
 };
 
 type PanelBrief = { id: number; name: string; type: string; is_active: boolean };
+
+function WorkerPanelPicker({
+  panels,
+  selected,
+  onChange,
+  disabled,
+}: {
+  panels: PanelBrief[];
+  selected: number[];
+  onChange: (ids: number[]) => void;
+  disabled?: boolean;
+}) {
+  const [q, setQ] = useState("");
+  const selectedSet = useMemo(() => new Set(selected), [selected]);
+  const activePanels = useMemo(
+    () => panels.filter((p) => p.is_active !== false),
+    [panels]
+  );
+  const filtered = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    const list = [...activePanels].sort((a, b) => {
+      const aOn = selectedSet.has(a.id) ? 0 : 1;
+      const bOn = selectedSet.has(b.id) ? 0 : 1;
+      if (aOn !== bOn) return aOn - bOn;
+      return a.name.localeCompare(b.name, "fa");
+    });
+    if (!needle) return list;
+    return list.filter(
+      (p) =>
+        p.name.toLowerCase().includes(needle) ||
+        p.type.toLowerCase().includes(needle) ||
+        String(p.id).includes(needle)
+    );
+  }, [activePanels, q, selectedSet]);
+  const allIds = filtered.map((p) => p.id);
+  const allOn =
+    allIds.length > 0 && allIds.every((id) => selectedSet.has(id));
+  const selectedPanels = activePanels.filter((p) => selectedSet.has(p.id));
+
+  function toggle(id: number) {
+    if (selectedSet.has(id)) onChange(selected.filter((x) => x !== id));
+    else onChange([...selected, id]);
+  }
+
+  return (
+    <div className="worker-panel-picker">
+      <div className="worker-panel-picker-head">
+        <div className="worker-panel-search">
+          <Search size={15} aria-hidden />
+          <input
+            type="search"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="جستجوی نام یا نوع پنل…"
+            disabled={disabled}
+            autoComplete="off"
+          />
+        </div>
+        <div className="worker-panel-picker-actions">
+          <button
+            type="button"
+            className="worker-panel-link-btn"
+            disabled={disabled || allIds.length === 0}
+            onClick={() => {
+              if (allOn) {
+                onChange(selected.filter((id) => !allIds.includes(id)));
+              } else {
+                onChange(Array.from(new Set([...selected, ...allIds])));
+              }
+            }}
+          >
+            {allOn ? "لغو همهٔ فیلتر" : "انتخاب همهٔ فیلتر"}
+          </button>
+          {selected.length > 0 && (
+            <button
+              type="button"
+              className="worker-panel-link-btn danger"
+              disabled={disabled}
+              onClick={() => onChange([])}
+            >
+              پاک‌کردن انتخاب
+            </button>
+          )}
+          <span className="worker-panel-count">
+            {toFaDigits(selected.length)} از {toFaDigits(activePanels.length)}
+          </span>
+        </div>
+      </div>
+
+      {selectedPanels.length > 0 && (
+        <div className="worker-panel-selected" aria-label="پنل‌های انتخاب‌شده">
+          {selectedPanels.map((p) => (
+            <button
+              key={p.id}
+              type="button"
+              className="worker-panel-tag"
+              disabled={disabled}
+              onClick={() => toggle(p.id)}
+              title="حذف از انتخاب"
+            >
+              <span>{p.name}</span>
+              <span aria-hidden>×</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div className="worker-panel-list" role="list">
+        {filtered.length === 0 ? (
+          <p className="muted worker-panel-empty">پنلی پیدا نشد</p>
+        ) : (
+          filtered.map((p) => {
+            const on = selectedSet.has(p.id);
+            return (
+              <label
+                key={p.id}
+                role="listitem"
+                className={`worker-panel-row${on ? " on" : ""}${disabled ? " is-disabled" : ""}`}
+              >
+                <input
+                  type="checkbox"
+                  checked={on}
+                  disabled={disabled}
+                  onChange={() => toggle(p.id)}
+                />
+                <span className="worker-panel-check" aria-hidden>
+                  {on ? <Check size={13} strokeWidth={2.5} /> : null}
+                </span>
+                <span className="worker-panel-row-body">
+                  <b>{p.name}</b>
+                  <span className="worker-panel-type" dir="ltr">
+                    {p.type}
+                  </span>
+                </span>
+              </label>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}
 
 function hostFromUrl(url: string): string {
   const raw = (url || "").trim();
@@ -1287,13 +1431,21 @@ export default function SettingsPage() {
           className="modal-backdrop"
           onClick={() => !createWorker.isPending && setWorkerOpen(false)}
         >
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <header className="modal-head">
-              <div>
-                <h3>افزودن سرور Worker</h3>
-                <p className="modal-sub">
-                  فقط IP و یوزر/رمز SSH بده — نصب خودکار روی VPS انجام می‌شود
-                </p>
+          <div
+            className="modal worker-modal"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <header className="modal-head worker-modal-head">
+              <div className="worker-modal-title">
+                <span className="worker-modal-icon" aria-hidden>
+                  <Server size={20} />
+                </span>
+                <div>
+                  <h3>افزودن سرور Worker</h3>
+                  <p className="modal-sub">
+                    فقط IP و یوزر/رمز SSH بده — نصب خودکار روی VPS انجام می‌شود
+                  </p>
+                </div>
               </div>
               <button
                 type="button"
@@ -1304,62 +1456,70 @@ export default function SettingsPage() {
                 ×
               </button>
             </header>
+            <div className="worker-modal-banner">
+              <Sparkles size={16} aria-hidden />
+              <p>
+                ساخت و مصرف پنل‌ها روی این سرور اجرا می‌شود؛ اگر قطع شد، خودکار به
+                پنل اصلی برمی‌گردد.
+              </p>
+            </div>
             <form
+              className="worker-modal-form"
               onSubmit={(e: FormEvent) => {
                 e.preventDefault();
                 createWorker.mutate();
               }}
             >
-              <div className="field">
-                <label>نام</label>
-                <input
-                  required
-                  minLength={2}
-                  value={workerName}
-                  onChange={(e) => setWorkerName(e.target.value)}
-                  placeholder="مثلاً worker-eu-1"
-                  disabled={createWorker.isPending}
-                />
-              </div>
-              <div className="field">
-                <label>IP سرور</label>
-                <input
-                  required
-                  dir="ltr"
-                  value={workerHost}
-                  onChange={(e) => setWorkerHost(e.target.value)}
-                  placeholder="1.2.3.4"
-                  disabled={createWorker.isPending}
-                  autoComplete="off"
-                />
-              </div>
-              <div className="field">
-                <label>یوزر SSH</label>
-                <input
-                  required
-                  dir="ltr"
-                  value={workerSshUser}
-                  onChange={(e) => setWorkerSshUser(e.target.value)}
-                  placeholder="root"
-                  disabled={createWorker.isPending}
-                  autoComplete="username"
-                />
-              </div>
-              <div className="field">
-                <label>رمز SSH</label>
-                <input
-                  required
-                  type="password"
-                  dir="ltr"
-                  value={workerSshPass}
-                  onChange={(e) => setWorkerSshPass(e.target.value)}
-                  disabled={createWorker.isPending}
-                  autoComplete="new-password"
-                />
-                <p className="field-hint">رمز ذخیره نمی‌شود — فقط برای نصب یک‌بار مصرف</p>
-              </div>
-              <div className="field" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-                <div>
+              <div className="worker-modal-grid">
+                <div className="field">
+                  <label>نام نمایشی</label>
+                  <input
+                    required
+                    minLength={2}
+                    value={workerName}
+                    onChange={(e) => setWorkerName(e.target.value)}
+                    placeholder="مثلاً Worker اروپا"
+                    disabled={createWorker.isPending}
+                  />
+                </div>
+                <div className="field">
+                  <label>IP سرور</label>
+                  <input
+                    required
+                    dir="ltr"
+                    value={workerHost}
+                    onChange={(e) => setWorkerHost(e.target.value)}
+                    placeholder="1.2.3.4"
+                    disabled={createWorker.isPending}
+                    autoComplete="off"
+                  />
+                </div>
+                <div className="field">
+                  <label>یوزر SSH</label>
+                  <input
+                    required
+                    dir="ltr"
+                    value={workerSshUser}
+                    onChange={(e) => setWorkerSshUser(e.target.value)}
+                    placeholder="root"
+                    disabled={createWorker.isPending}
+                    autoComplete="username"
+                  />
+                </div>
+                <div className="field">
+                  <label>رمز SSH</label>
+                  <input
+                    required
+                    type="password"
+                    dir="ltr"
+                    value={workerSshPass}
+                    onChange={(e) => setWorkerSshPass(e.target.value)}
+                    disabled={createWorker.isPending}
+                    autoComplete="new-password"
+                  />
+                  <p className="field-hint">ذخیره نمی‌شود — فقط برای نصب یک‌بار</p>
+                </div>
+                <div className="field">
                   <label>پورت SSH</label>
                   <input
                     dir="ltr"
@@ -1368,7 +1528,7 @@ export default function SettingsPage() {
                     disabled={createWorker.isPending}
                   />
                 </div>
-                <div>
+                <div className="field">
                   <label>پورت Worker</label>
                   <input
                     dir="ltr"
@@ -1378,54 +1538,21 @@ export default function SettingsPage() {
                   />
                 </div>
               </div>
-              <div className="field">
+              <div className="field worker-modal-panels">
                 <label>پنل‌هایی که به این سرور بروند</label>
-                <div
-                  style={{
-                    maxHeight: 180,
-                    overflow: "auto",
-                    display: "grid",
-                    gap: 6,
-                  }}
-                >
-                  {allPanels.map((p) => {
-                    const on = workerPanelIds.includes(p.id);
-                    return (
-                      <label
-                        key={p.id}
-                        style={{
-                          display: "flex",
-                          gap: 8,
-                          alignItems: "center",
-                          cursor: "pointer",
-                        }}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={on}
-                          disabled={createWorker.isPending}
-                          onChange={() =>
-                            setWorkerPanelIds((prev) =>
-                              on
-                                ? prev.filter((x) => x !== p.id)
-                                : [...prev, p.id]
-                            )
-                          }
-                        />
-                        <span>
-                          {p.name}{" "}
-                          <span className="muted" dir="ltr">
-                            ({p.type})
-                          </span>
-                        </span>
-                      </label>
-                    );
-                  })}
-                </div>
+                <p className="field-hint" style={{ marginTop: 0 }}>
+                  تیک بزنید تا درخواست‌های همان پنل‌ها از این Worker برود — بعداً هم قابل تغییر است
+                </p>
+                <WorkerPanelPicker
+                  panels={allPanels}
+                  selected={workerPanelIds}
+                  onChange={setWorkerPanelIds}
+                  disabled={createWorker.isPending}
+                />
               </div>
               {createWorker.isPending && (
-                <p className="muted">
-                  در حال نصب خودکار روی سرور… ممکن است ۲–۵ دقیقه طول بکشد
+                <p className="worker-modal-pending">
+                  در حال نصب خودکار روی سرور… معمولاً ۲ تا ۵ دقیقه طول می‌کشد
                 </p>
               )}
               {createWorker.isError && (
@@ -1523,13 +1650,21 @@ export default function SettingsPage() {
           className="modal-backdrop"
           onClick={() => !saveAssign.isPending && setAssignWorker(null)}
         >
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <header className="modal-head">
-              <div>
-                <h3>تخصیص پنل — {assignWorker.name}</h3>
-                <p className="modal-sub">
-                  درخواست‌های این پنل‌ها به Worker می‌رود؛ قطعی = همین سرور
-                </p>
+          <div
+            className="modal worker-modal"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <header className="modal-head worker-modal-head">
+              <div className="worker-modal-title">
+                <span className="worker-modal-icon" aria-hidden>
+                  <Server size={20} />
+                </span>
+                <div>
+                  <h3>تخصیص پنل — {assignWorker.name}</h3>
+                  <p className="modal-sub">
+                    درخواست‌های این پنل‌ها به Worker می‌رود؛ قطعی = همین سرور
+                  </p>
+                </div>
               </div>
               <button
                 type="button"
@@ -1540,45 +1675,13 @@ export default function SettingsPage() {
                 ×
               </button>
             </header>
-            <div
-              style={{
-                maxHeight: 260,
-                overflow: "auto",
-                display: "grid",
-                gap: 6,
-                marginBottom: 12,
-              }}
-            >
-              {allPanels.map((p) => {
-                const on = workerPanelIds.includes(p.id);
-                return (
-                  <label
-                    key={p.id}
-                    style={{
-                      display: "flex",
-                      gap: 8,
-                      alignItems: "center",
-                      cursor: "pointer",
-                    }}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={on}
-                      onChange={() =>
-                        setWorkerPanelIds((prev) =>
-                          on ? prev.filter((x) => x !== p.id) : [...prev, p.id]
-                        )
-                      }
-                    />
-                    <span>
-                      {p.name}{" "}
-                      <span className="muted" dir="ltr">
-                        ({p.type})
-                      </span>
-                    </span>
-                  </label>
-                );
-              })}
+            <div className="field worker-modal-panels" style={{ marginTop: 4 }}>
+              <WorkerPanelPicker
+                panels={allPanels}
+                selected={workerPanelIds}
+                onChange={setWorkerPanelIds}
+                disabled={saveAssign.isPending}
+              />
             </div>
             {saveAssign.isError && (
               <p className="error">{(saveAssign.error as Error).message}</p>
@@ -1603,7 +1706,7 @@ export default function SettingsPage() {
                   })
                 }
               >
-                {saveAssign.isPending ? "…" : "ذخیره"}
+                {saveAssign.isPending ? "…" : "ذخیره تخصیص"}
               </button>
             </footer>
           </div>

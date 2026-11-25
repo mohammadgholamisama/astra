@@ -837,6 +837,9 @@ export default function PanelsPage() {
       latency_ms?: number | null;
       grade?: PanelTestGrade | string;
       base_url?: string | null;
+      worker_id?: number | null;
+      worker_name?: string | null;
+      via_worker?: boolean;
     }[];
     ok: number;
     fail: number;
@@ -860,6 +863,27 @@ export default function PanelsPage() {
     tested_at?: string | null;
   };
 
+  type WorkerBrief = { id: number; name: string; status?: string; is_active?: boolean };
+
+  const workersQ = useQuery({
+    queryKey: ["workers-brief"],
+    queryFn: () => api<WorkerBrief[]>("/api/admin/workers"),
+    staleTime: 60_000,
+  });
+  const workerNameById = useMemo(() => {
+    const map = new Map<number, string>();
+    for (const w of workersQ.data || []) {
+      map.set(Number(w.id), String(w.name || `worker-${w.id}`));
+    }
+    return map;
+  }, [workersQ.data]);
+
+  function workerLabelForPanel(p: Panel): string | null {
+    const wid = p.worker_id;
+    if (wid == null) return null;
+    return workerNameById.get(Number(wid)) || `ورکر ${toFaDigits(wid)}`;
+  }
+
   function formatLatency(ms: number | null | undefined): string {
     if (ms == null || !Number.isFinite(ms) || ms < 0) return "—";
     if (ms < 1000) return `${toFaDigits(Math.round(ms))}ms`;
@@ -882,13 +906,17 @@ export default function PanelsPage() {
 
   const test = useMutation({
     mutationFn: (id: number) =>
-      api<{ success: boolean; error?: string; latency_ms?: number }>(
-        `/api/admin/panels/${id}/test`,
-        {
-          method: "POST",
-          timeoutMs: 28_000,
-        }
-      ),
+      api<{
+        success: boolean;
+        error?: string;
+        latency_ms?: number;
+        worker_id?: number | null;
+        worker_name?: string | null;
+        via_worker?: boolean;
+      }>(`/api/admin/panels/${id}/test`, {
+        method: "POST",
+        timeoutMs: 28_000,
+      }),
     onSuccess: (res, id) => {
       const panelName = data.find((p) => p.id === id)?.name;
       const ms =
@@ -903,13 +931,24 @@ export default function PanelsPage() {
               ? "معمولی"
               : "کند"
           : "";
+      const wName =
+        res.worker_name ||
+        (res.worker_id != null
+          ? workerNameById.get(Number(res.worker_id)) || null
+          : null);
+      const via =
+        wName != null
+          ? res.via_worker
+            ? ` · ورکر «${wName}»`
+            : ` · ورکر «${wName}» (نود مستر)`
+          : "";
       showTestToast(
         !!res.success,
         res.success
           ? panelName
-            ? `اتصال «${panelName}» برقرار است${ms}${grade ? ` · ${grade}` : ""}`
-            : `اتصال برقرار است${ms}${grade ? ` · ${grade}` : ""}`
-          : res.error || "اتصال به پنل ریموت برقرار نشد"
+            ? `اتصال «${panelName}» برقرار است${ms}${grade ? ` · ${grade}` : ""}${via}`
+            : `اتصال برقرار است${ms}${grade ? ` · ${grade}` : ""}${via}`
+          : `${res.error || "اتصال به پنل ریموت برقرار نشد"}${via}`
       );
       qc.invalidateQueries({ queryKey: ["panels"] });
     },
@@ -1408,6 +1447,13 @@ export default function PanelsPage() {
                         )}
                         <b>{r.name}</b>
                         <em className="panels-test-type">{typeLabel}</em>
+                        {r.worker_name ? (
+                          <em className="panels-test-type">
+                            {r.via_worker
+                              ? `ورکر ${r.worker_name}`
+                              : `ورکر ${r.worker_name} · مستر`}
+                          </em>
+                        ) : null}
                         {!r.is_active ? <em className="panels-test-off">خاموش</em> : null}
                       </span>
                       <span className={`panels-test-grade ${gClass}`}>
@@ -1641,6 +1687,11 @@ export default function PanelsPage() {
                 <p className="admin-card-url" dir="ltr" title={p.base_url}>
                   {p.base_url}
                 </p>
+                {workerLabelForPanel(p) ? (
+                  <p className="muted" style={{ margin: "4px 0 0", fontSize: "0.78rem" }}>
+                    ورکر: {workerLabelForPanel(p)}
+                  </p>
+                ) : null}
                 <div className="admin-card-actions">
                   {p.type === "astra" && (
                     <Link to={`/panels/${p.id}/outbounds`} className="btn ghost sm">
@@ -1665,6 +1716,11 @@ export default function PanelsPage() {
                     className="btn ghost sm"
                     onClick={() => test.mutate(p.id)}
                     disabled={test.isPending && test.variables === p.id}
+                    title={
+                      workerLabelForPanel(p)
+                        ? `تست از مسیر ورکر «${workerLabelForPanel(p)}»`
+                        : "تست اتصال"
+                    }
                   >
                     <Wifi size={14} />
                     {test.isPending && test.variables === p.id ? "…" : "تست"}

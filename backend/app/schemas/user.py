@@ -50,6 +50,7 @@ class PanelAccountOut(ORMModel):
     panel_name: str | None = None
     panel_type: str | None = None
     panel_base_url: str | None = None
+    panel_is_active: bool = True
     remote_username: str | None
     status: PanelAccountStatus
     links: list[str]

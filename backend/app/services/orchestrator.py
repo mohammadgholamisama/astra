@@ -286,9 +286,13 @@ def _is_username_taken_err(err: str | None) -> bool:
         for x in (
             "already exist",
             "already exists",
+            "already in use",
+            "email already",
+            "username already",
             "user already",
             "duplicate",
             "conflict",
+            "in use",
             "تکراری",
             "قبلا ثبت",
             "قبلاً ثبت",
@@ -307,6 +311,29 @@ def _is_username_taken_err(err: str | None) -> bool:
     ):
         return True
     return False
+
+
+def _existing_remote_from_taken_err(err: str | None) -> str | None:
+    """Parse ``email already in use: foo`` / ``username exists: bar`` → remote name."""
+    raw = (err or "").strip()
+    if not raw:
+        return None
+    m = re.search(
+        r"(?:email|username|user|client)\s+already\s+in\s+use\s*:\s*([A-Za-z0-9_.\-]+)",
+        raw,
+        flags=re.I,
+    )
+    if m:
+        return sanitize_remote_username(m.group(1))
+    m = re.search(
+        r"(?:already exists?|duplicate)\s*[:\-]?\s*([A-Za-z0-9_.\-]+)",
+        raw,
+        flags=re.I,
+    )
+    if m:
+        name = sanitize_remote_username(m.group(1))
+        return name if len(name) >= 3 else None
+    return None
 
 
 def sanitize_remote_username(name: str) -> str:
@@ -434,8 +461,15 @@ def _norm_coeff(raw: float | None, default: float = 1.0) -> float:
 
 
 def account_weighted_usage(account: PanelAccount, coeff: float) -> int:
-    """Astra-facing usage for one panel: raw × live coefficient."""
-    return quota_math.weighted_bytes(int(account.used_traffic or 0), coeff)
+    """Astra-facing usage for one panel (period-locked when anchors are set)."""
+    applied = getattr(account, "applied_coefficient", None)
+    c = _norm_coeff(applied if applied is not None else coeff)
+    return quota_math.weighted_bytes(
+        int(account.used_traffic or 0),
+        c,
+        anchor_raw=int(getattr(account, "coeff_anchor_raw", 0) or 0),
+        anchor_weighted=int(getattr(account, "coeff_anchor_weighted", 0) or 0),
+    )
 
 
 def _assign_user_used_traffic(
@@ -459,22 +493,32 @@ def _assign_user_used_traffic(
 
 
 def apply_coefficient_period(account: PanelAccount, new_coeff: float) -> bool:
-    """Keep applied_coefficient in sync; always recount full raw × live coeff."""
-    new_c = _norm_coeff(new_coeff)
-    # Clear legacy anchors so old period-lock never under-counts
-    dirty = False
-    if int(getattr(account, "coeff_anchor_raw", 0) or 0) or int(
-        getattr(account, "coeff_anchor_weighted", 0) or 0
-    ):
-        account.coeff_anchor_raw = 0
-        account.coeff_anchor_weighted = 0
-        dirty = True
+    """Period-lock prior raw at the old coefficient, then switch to ``new_coeff``.
 
+    When the live group coefficient changes, freeze
+    ``weighted_so_far = anchor_w + (raw - anchor_r) * old_c`` into the new
+    anchors so historical bytes are never re-multiplied by the new rate.
+    """
+    new_c = _norm_coeff(new_coeff)
     applied = getattr(account, "applied_coefficient", None)
-    if applied is None or abs(_norm_coeff(applied) - new_c) >= 1e-9:
+    raw = int(account.used_traffic or 0)
+    if applied is None:
         account.applied_coefficient = new_c
+        if getattr(account, "coeff_anchor_raw", None) is None:
+            account.coeff_anchor_raw = 0
+        if getattr(account, "coeff_anchor_weighted", None) is None:
+            account.coeff_anchor_weighted = 0
         return True
-    return dirty
+    old_c = _norm_coeff(applied)
+    if abs(old_c - new_c) < 1e-9:
+        return False
+    ar = int(getattr(account, "coeff_anchor_raw", 0) or 0)
+    aw = int(getattr(account, "coeff_anchor_weighted", 0) or 0)
+    weighted_so_far = aw + int(round(max(0, raw - ar) * old_c))
+    account.coeff_anchor_raw = raw
+    account.coeff_anchor_weighted = weighted_so_far
+    account.applied_coefficient = new_c
+    return True
 
 
 def remote_data_limit_bytes(
@@ -659,6 +703,11 @@ async def create_user_with_collision_alias(
         if _is_username_taken_err(last.error) or (
             attempt < 0 and _is_not_found_err(last.error)
         ):
+            # Sanaei often says ``email already in use: mamadammmm_p35`` while we
+            # tried ``_g*`` — adopt that live name instead of minting another twin.
+            existing = _existing_remote_from_taken_err(last.error)
+            if existing and existing != payload.username:
+                payload.username = existing
             try:
                 mod = await asyncio.wait_for(
                     adapter.modify_user(payload), timeout=timeout
@@ -669,6 +718,31 @@ async def create_user_with_collision_alias(
                     return mod
             except asyncio.CancelledError:
                 raise
+            except Exception:  # noqa: BLE001
+                pass
+            # Remote already there but modify flaky — adopt via get_usage.
+            try:
+                usage = await asyncio.wait_for(
+                    adapter.get_usage(  # type: ignore[call-arg]
+                        payload.username, expand_links=True
+                    ),
+                    timeout=probe_timeout,
+                )
+                if usage and usage.success:
+                    if not usage.remote_username:
+                        usage.remote_username = payload.username
+                    return usage
+            except TypeError:
+                try:
+                    usage = await asyncio.wait_for(
+                        adapter.get_usage(payload.username), timeout=probe_timeout
+                    )
+                    if usage and usage.success:
+                        if not usage.remote_username:
+                            usage.remote_username = payload.username
+                        return usage
+                except Exception:  # noqa: BLE001
+                    pass
             except Exception:  # noqa: BLE001
                 pass
             # Only alias when modify also failed — last resort for brand-new creates.
@@ -873,11 +947,14 @@ async def provision_user_on_panels(
         probe_timeout = 5.0
         sem_limit = max(28, min(56, n_targets))
         waves = max(1, (n_targets + sem_limit - 1) // sem_limit)
-        # One wave ≈ one create_timeout; do not use a flat 22s that cancels wave 2+.
-        auto_budget = min(110.0, waves * create_timeout + 12.0)
-        budget = float(overall_timeout) if overall_timeout is not None else auto_budget
+        # One wave ≈ one create_timeout; never let a caller 45s cancel wave 2+.
+        auto_budget = min(240.0, waves * create_timeout + 20.0)
+        if overall_timeout is not None:
+            budget = max(float(overall_timeout), auto_budget * 0.9)
+        else:
+            budget = auto_budget
         # PasarGuard create is link-light; hydrate must have room or sub stays empty.
-        hydrate_budget = min(28.0, max(12.0, 6.0 * n_targets + 8.0))
+        hydrate_budget = min(45.0, max(14.0, 0.35 * n_targets + 10.0))
         sem: asyncio.Semaphore = asyncio.Semaphore(sem_limit)
     else:
         create_timeout = 32.0
@@ -885,9 +962,12 @@ async def provision_user_on_panels(
         probe_timeout = 6.0
         sem_limit = max(20, min(48, n_targets))
         waves = max(1, (n_targets + sem_limit - 1) // sem_limit)
-        auto_budget = min(140.0, waves * create_timeout + 15.0)
-        budget = float(overall_timeout) if overall_timeout is not None else auto_budget
-        hydrate_budget = min(36.0, max(16.0, 7.0 * n_targets + 10.0))
+        auto_budget = min(280.0, waves * create_timeout + 25.0)
+        if overall_timeout is not None:
+            budget = max(float(overall_timeout), auto_budget * 0.9)
+        else:
+            budget = auto_budget
+        hydrate_budget = min(50.0, max(16.0, 0.4 * n_targets + 12.0))
         sem = asyncio.Semaphore(sem_limit)
 
     panel_ids = list({p.id for p, _, _ in targets})
@@ -1405,13 +1485,15 @@ async def provision_users_batch(
 
     n_jobs = len(remote_jobs)
     # Remotes are HTTP-only; keep apply_sem (below) under DB pool capacity.
-    sem_limit = max(12, min(int(concurrency) or 24, 40, n_jobs))
+    sem_limit = max(12, min(int(concurrency) or 24, 48, n_jobs))
     waves = max(1, (n_jobs + sem_limit - 1) // sem_limit)
-    budget = (
-        float(overall_timeout)
-        if overall_timeout is not None
-        else min(45.0, waves * min(create_timeout, 6.0) + 5.0)
-    )
+    # Never use a flat 45s ceiling — that cancelled wave-2+ and left 80+ pending.
+    create_floor = max(float(create_timeout), 18.0)
+    auto_budget = min(300.0, waves * create_floor + 25.0)
+    if overall_timeout is not None:
+        budget = max(float(overall_timeout), auto_budget * 0.9)
+    else:
+        budget = auto_budget
     sem = asyncio.Semaphore(sem_limit)
 
     async def _remote(
@@ -1419,9 +1501,9 @@ async def provision_users_batch(
     ) -> AdapterResult:
         adapter = get_adapter(panel)
         panel_timeout = (
-            max(float(create_timeout), 18.0)
+            max(float(create_timeout), 22.0)
             if panel.type == PanelType.astra
-            else float(create_timeout)
+            else max(float(create_timeout), 18.0)
         )
         try:
             async with sem:
@@ -1433,9 +1515,9 @@ async def provision_users_batch(
                         panel_id=panel.id,
                         timeout=panel_timeout,
                         max_alias_attempts=1,
-                        probe_timeout=1.5,
+                        probe_timeout=2.0,
                     ),
-                    timeout=panel_timeout + 0.6,
+                    timeout=panel_timeout + 2.0,
                 )
         except asyncio.CancelledError:
             return _fail_result(_PROVISION_BUDGET_SOFT)
@@ -1624,6 +1706,8 @@ async def _finish_leftover_provision(
     async def _write_one(account_id: int, task: asyncio.Task) -> None:
         try:
             raw = await task
+        except asyncio.CancelledError:
+            raw = _fail_result(_PROVISION_BUDGET_SOFT)
         except Exception as exc:  # noqa: BLE001
             raw = exc
         try:
@@ -1633,8 +1717,14 @@ async def _finish_leftover_provision(
                     return
                 uid = int(acc.user_id)
                 if isinstance(raw, Exception):
-                    acc.status = PanelAccountStatus.error
-                    acc.error_message = _exc_msg(raw)[:300]
+                    # Soft/transient — keep pending so heal can finish the slot.
+                    msg = _exc_msg(raw)[:300]
+                    if _is_timeout_err(msg) or "cancel" in msg.lower():
+                        acc.status = PanelAccountStatus.pending
+                        acc.error_message = None
+                    else:
+                        acc.status = PanelAccountStatus.error
+                        acc.error_message = msg
                 else:
                     result = (
                         raw if isinstance(raw, AdapterResult) else _fail_result("خطای پنل")
@@ -1654,6 +1744,11 @@ async def _finish_leftover_provision(
                         )
                         acc.error_message = None
                         acc.last_sync_at = now
+                    elif (result.error or "") == _PROVISION_BUDGET_SOFT or _is_timeout_err(
+                        result.error
+                    ):
+                        acc.status = PanelAccountStatus.pending
+                        acc.error_message = None
                     else:
                         acc.status = PanelAccountStatus.error
                         acc.error_message = (result.error or "ایجاد در پنل ناموفق")[:400]
@@ -1716,12 +1811,13 @@ _account_prov_sem: asyncio.Semaphore | None = None
 def _get_account_prov_sem() -> asyncio.Semaphore:
     """Cap concurrent creates — pool-safe sessions (open → HTTP → close).
 
-    Was 4/16/32 — leftovers after the main wave still need high fan-out.
+    Was 4/10 — leftovers after a large create (100+ slots) drained too slowly
+    and stayed pending for tens of minutes. 24 keeps fan-out high without
+    saturating the asyncpg pool.
     """
     global _account_prov_sem
     if _account_prov_sem is None:
-        # Keep modest: each leftover opens short DB sessions; too high → QueuePool critical.
-        _account_prov_sem = asyncio.Semaphore(10)
+        _account_prov_sem = asyncio.Semaphore(24)
     return _account_prov_sem
 
 
@@ -1870,12 +1966,12 @@ async def _provision_account_now(account_id: int) -> bool:
             payload = job["payload"]
             uid = int(job["user_id"])
             adapter = get_adapter(panel)
-            # PasarGuard / slow panels need more than 5s; create path used to
-            # leave dozens of pending rows and an empty client sub.
+            # PasarGuard under worker load often needs >18s; short timeouts
+            # left dozens of pending rows after create.
             panel_timeout = (
-                22.0
+                28.0
                 if getattr(panel, "type", None) == PanelType.astra
-                else 18.0
+                else 24.0
             )
             try:
                 # Heal/edit: modify every known name first — never mint _p* twins
@@ -3079,7 +3175,11 @@ async def sync_modify_user_background(
     exclude_types: set[PanelType] | None = None,
     only_types: set[PanelType] | None = None,
 ) -> None:
-    """Best-effort remote sync after a fast Astra-local edit/reset."""
+    """Best-effort remote sync after a fast Astra-local edit/reset.
+
+    Own short-lived session — never inherits a request ``Depends(get_db)``
+    session (that caused InterfaceError after the request closed the conn).
+    """
     from app.core.database import AsyncSessionLocal
     from app.services.ops_progress import finish_job_id, start_job
     from app.services.users import load_user
@@ -3097,21 +3197,37 @@ async def sync_modify_user_background(
             if not row:
                 finish_job_id(job_id, message="کاربر پیدا نشد")
                 return
-            user = await load_user(db, row.username)
+            uname = str(row.username or "")
+            user = await load_user(db, uname)
             if not user:
                 finish_job_id(job_id, message="کاربر پیدا نشد")
                 return
-            await sync_modify_user(
-                db,
-                user,
-                only_types=only_types,
-                exclude_types=exclude_types,
-                remote_timeout=20,
-                skip_nginx_sync=True,
-            )
-            await db.commit()
+            try:
+                await sync_modify_user(
+                    db,
+                    user,
+                    only_types=only_types,
+                    exclude_types=exclude_types,
+                    remote_timeout=20,
+                    skip_nginx_sync=True,
+                )
+                # sync_modify may have closed the session on freeze path
+                try:
+                    if db.is_active:
+                        await db.commit()
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception as exc:  # noqa: BLE001
+                if "connection is closed" in str(exc).lower():
+                    # Freeze path already remounted marks — treat as soft ok.
+                    finish_job_id(job_id, ok=1, message="همگام‌سازی (اتصال بسته شد)")
+                    return
+                raise
         finish_job_id(job_id, ok=1, message="همگام‌سازی پنل‌ها تمام شد")
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        if "connection is closed" in str(exc).lower():
+            finish_job_id(job_id, ok=1, message="همگام‌سازی تمام شد")
+            return
         logger.exception("background sync_modify failed user_id=%s", user_id)
         finish_job_id(job_id, failed=1, message="همگام‌سازی پنل‌ها ناموفق بود")
 
@@ -3381,6 +3497,9 @@ async def sync_modify_user(
     Sanaei / Rebecca / Astra) must receive the freeze. freeze_fast=True cuts all
     remotes in parallel with a ~1s budget (next watch cycle retries misses).
     """
+    # Snapshot before any release_db_txn — logging must not touch expired ORM.
+    uname_safe = str(getattr(user, "username", None) or "")
+    uid_safe = int(getattr(user, "id", 0) or 0)
     result = await db.execute(
         select(PanelAccount)
         .where(PanelAccount.user_id == user.id)
@@ -3677,7 +3796,7 @@ async def sync_modify_user(
                 account.error_message = msg
                 logger.warning(
                     "failed to freeze remote user=%s panel=%s: %s",
-                    user.username,
+                    uname_safe,
                     account.panel_id,
                     msg,
                 )
@@ -3685,7 +3804,7 @@ async def sync_modify_user(
             account.error_message = None
             logger.warning(
                 "soft modify fail kept active user=%s panel=%s: %s",
-                user.username,
+                uname_safe,
                 account.panel_id,
                 msg,
             )
@@ -3694,23 +3813,41 @@ async def sync_modify_user(
             account.error_message = msg
 
     # Release the DB connection BEFORE long HTTP — idle asyncpg dies mid-gather
-    # and the later freeze commit then fails with "connection is closed".
-    # Critical: commit alone is NOT enough — Session keeps the checkout until
-    # close(), which is what exhausted QueuePool and froze the panel UI.
+    # and the later freeze/commit then fails with InterfaceError (connection closed).
+    # Critical: always end the txn before remotes — not only on freeze.
     freeze_closed = False
-    if blocked and other_jobs:
-        try:
-            await db.commit()
-        except Exception:  # noqa: BLE001
+    if other_jobs:
+        from app.core.database import release_db_txn
+
+        # Materialize scalars + detach BEFORE close so parallel _remote
+        # never hits DetachedInstanceError on expired account/panel attrs.
+        detached_jobs: list[tuple[PanelAccount, object, UserPayload]] = []
+        for account, panel, payload in other_jobs:
             try:
-                await db.rollback()
+                _ = (
+                    int(account.id),
+                    int(account.panel_id),
+                    int(getattr(account, "group_id", 0) or 0),
+                    (account.remote_username or ""),
+                    (account.remote_id or ""),
+                    (account.uuid or ""),
+                )
+                frozen_panel = _freeze_panel_for_bg(panel)
+                db.expunge(account)
+                detached_jobs.append((account, frozen_panel, payload))
             except Exception:  # noqa: BLE001
-                pass
+                detached_jobs.append((account, panel, payload))
+        other_jobs = detached_jobs
         try:
-            await db.close()
-            freeze_closed = True
+            await release_db_txn(db)
         except Exception:  # noqa: BLE001
-            freeze_closed = False
+            pass
+        if blocked:
+            try:
+                await db.close()
+                freeze_closed = True
+            except Exception:  # noqa: BLE001
+                freeze_closed = False
 
     # Foreign remotes first (HTTP) — commit when freezing so an Astra DB
     # failure cannot roll back successful PasarGuard /disabled cuts.
@@ -3736,7 +3873,7 @@ async def sync_modify_user(
                 )
             except Exception:  # noqa: BLE001
                 logger.exception(
-                    "remount freeze marks failed user=%s", user.username
+                    "remount freeze marks failed user=%s", uname_safe or uid_safe
                 )
             for (account, panel, payload), res in zip(other_jobs, other_res):
                 results_by_key[(int(account.panel_id), int(account.id))] = res
@@ -3750,7 +3887,7 @@ async def sync_modify_user(
                 except Exception:  # noqa: BLE001
                     logger.exception(
                         "freeze commit after foreign remotes failed user=%s",
-                        user.username,
+                        uname_safe or uid_safe,
                     )
                     try:
                         await db.rollback()
@@ -5014,6 +5151,11 @@ async def sweep_stale_panel_errors(db: AsyncSession) -> dict[str, int]:
                      OR pa.error_message ILIKE '%Group not found%'
                      OR pa.error_message ILIKE '%هنوز ساخته نشده%'
                      OR pa.error_message ILIKE '%کاربر روی این پنل وجود ندارد%'
+                     OR pa.error_message ILIKE '%too many clients%'
+                     OR pa.error_message ILIKE '%sorry, too many clients%'
+                     OR pa.error_message ILIKE '%Too many open files%'
+                     OR pa.error_message ILIKE '%queuepool%'
+                     OR pa.error_message ILIKE '%remaining connection slots%'
                   )
                   AND pa.error_message NOT ILIKE '%401%'
                   AND pa.error_message NOT ILIKE '%unauthorized%'
@@ -7366,6 +7508,11 @@ async def hydrate_share_links_pool_safe(user_id: int) -> int:
                 rid = job["rid"]
                 adapter = None
                 try:
+                    from app.core.panel_circuit import panel_circuit_open
+
+                    pid_h = int(getattr(panel, "id", 0) or 0)
+                    if pid_h and panel_circuit_open(pid_h):
+                        return None
                     if any(is_subscription_ref(x) for x in stored):
                         try:
                             shares = await asyncio.wait_for(
@@ -7427,11 +7574,22 @@ async def hydrate_share_links_pool_safe(user_id: int) -> int:
                         ),
                     }
                 except Exception as exc:  # noqa: BLE001
+                    msg = _exc_msg(exc)
+                    if "Timeout" in msg or isinstance(exc, asyncio.TimeoutError):
+                        try:
+                            from app.core.panel_circuit import note_panel_timeout
+
+                            note_panel_timeout(
+                                int(getattr(panel, "id", 0) or 0),
+                                reason=msg,
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
                     logger.warning(
                         "hydrate pool-safe failed user=%s panel=%s: %s",
                         username,
                         getattr(panel, "id", "?"),
-                        _exc_msg(exc),
+                        msg,
                     )
                     return None
                 finally:
@@ -7649,14 +7807,21 @@ def _sync_account_coeff_periods(
     return changed
 
 
+def _account_counts_toward_usage(account: PanelAccount) -> bool:
+    """Live / error always; pending only when it already holds a real meter."""
+    st = account.status
+    if st in (PanelAccountStatus.active, PanelAccountStatus.error):
+        return True
+    if st == PanelAccountStatus.pending and int(account.used_traffic or 0) > 0:
+        return True
+    return False
+
+
 def _live_remote_keys(accounts: list[PanelAccount]) -> set[tuple[int, str]]:
-    """(panel_id, remote_username|remote_id) for active/error accounts."""
+    """(panel_id, remote_username|remote_id) for accounts that own a live meter."""
     keys: set[tuple[int, str]] = set()
     for account in accounts:
-        if account.status not in (
-            PanelAccountStatus.active,
-            PanelAccountStatus.error,
-        ):
+        if not _account_counts_toward_usage(account):
             continue
         pid = int(account.panel_id)
         for raw_name in (
@@ -7666,6 +7831,74 @@ def _live_remote_keys(accounts: list[PanelAccount]) -> set[tuple[int, str]]:
             if raw_name:
                 keys.add((pid, raw_name))
     return keys
+
+
+def _canonical_remote_key(account: PanelAccount) -> str | None:
+    """Prefer remote_username; fall back to remote_id. None = unique by acc id."""
+    name = (account.remote_username or "").strip().lower()
+    if name:
+        return name
+    rid = (account.remote_id or "").strip().lower()
+    if rid and not rid.startswith("{"):
+        return rid
+    return None
+
+
+def _usage_status_rank(status: object) -> int:
+    st = getattr(status, "value", status)
+    if st == PanelAccountStatus.active.value or st == PanelAccountStatus.active:
+        return 3
+    if st == PanelAccountStatus.error.value or st == PanelAccountStatus.error:
+        return 2
+    if st == PanelAccountStatus.pending.value or st == PanelAccountStatus.pending:
+        return 1
+    return 0
+
+
+def _dedupe_accounts_for_weighted(
+    accounts: list[PanelAccount],
+) -> list[PanelAccount]:
+    """One row per (panel_id, canonical_remote) for usage summation.
+
+    When several group rows share the same remote meter, keep the single best
+    row (highest used_traffic, then coeff, then status) so identical remotes
+    are never summed N times.
+    """
+    best: dict[tuple[int, str], PanelAccount] = {}
+    passthrough: list[PanelAccount] = []
+    for account in accounts:
+        if not _account_counts_toward_usage(account):
+            # deleted / empty pending handled by caller separately
+            passthrough.append(account)
+            continue
+        key_name = _canonical_remote_key(account)
+        if not key_name:
+            passthrough.append(account)
+            continue
+        key = (int(account.panel_id), key_name)
+        prev = best.get(key)
+        if prev is None:
+            best[key] = account
+            continue
+        a_raw = int(account.used_traffic or 0)
+        b_raw = int(prev.used_traffic or 0)
+        if a_raw > b_raw:
+            best[key] = account
+            continue
+        if a_raw < b_raw:
+            continue
+        a_c = float(getattr(account, "applied_coefficient", None) or 1.0)
+        b_c = float(getattr(prev, "applied_coefficient", None) or 1.0)
+        if a_c > b_c:
+            best[key] = account
+            continue
+        if a_c < b_c:
+            continue
+        if _usage_status_rank(account.status) > _usage_status_rank(prev.status):
+            best[key] = account
+    return list(best.values()) + [
+        a for a in passthrough if a.status == PanelAccountStatus.deleted
+    ]
 
 
 def _deleted_usage_superseded(
@@ -7703,16 +7936,13 @@ def _account_remote_keys(account: PanelAccount) -> set[tuple[int, str]]:
 def _live_raw_for_deleted(
     account: PanelAccount, accounts: list[PanelAccount]
 ) -> int:
-    """Max raw on live/error twins that share this deleted row's remote identity."""
+    """Max raw on live twins that share this deleted row's remote identity."""
     keys = _account_remote_keys(account)
     if not keys:
         return 0
     best = 0
     for other in accounts:
-        if other.status not in (
-            PanelAccountStatus.active,
-            PanelAccountStatus.error,
-        ):
+        if not _account_counts_toward_usage(other):
             continue
         if int(other.panel_id) != int(account.panel_id):
             continue
@@ -7724,21 +7954,19 @@ def _live_raw_for_deleted(
 async def _weighted_total(
     accounts: list[PanelAccount], account_coeffs: dict[int, float]
 ) -> int:
-    """Σ (raw_i × coeff_of_account_i's group).
+    """Σ (raw_i × coeff_of_account_i's group), deduped by remote identity.
 
-    Deleted remotes still count when nothing replaced them (removing a config
-    must not refund). If a live account on the same panel reuses the same
-    remote username/id, only the extra deleted bytes beyond the live meter
-    count — a fresh live twin at 0 must not wipe prior volume.
+    Multiple group rows sharing the same ``(panel_id, remote)`` count once
+    (best meter). Pending rows with ``used_traffic > 0`` are included so
+    provision lag does not hide real consumption. Deleted remotes still count
+    when nothing replaced them; a live twin only contributes the gap.
     """
     _sync_account_coeff_periods(accounts, account_coeffs)
     live_keys = _live_remote_keys(accounts)
+    deduped = _dedupe_accounts_for_weighted(accounts)
     total = 0
-    for account in accounts:
-        if account.status in (
-            PanelAccountStatus.active,
-            PanelAccountStatus.error,
-        ):
+    for account in deduped:
+        if _account_counts_toward_usage(account):
             coeff = _norm_coeff(account_coeffs.get(account.id, 1.0))
             total += account_weighted_usage(account, coeff)
             continue
@@ -7767,12 +7995,10 @@ async def _weighted_total(
 def _weighted_total_from_stored(accounts: list[PanelAccount]) -> int:
     """Fast Σ(raw×stored coeff) with no GroupPanel SQL — for quota-watch scans."""
     live_keys = _live_remote_keys(accounts)
+    deduped = _dedupe_accounts_for_weighted(accounts)
     total = 0
-    for account in accounts:
-        if account.status in (
-            PanelAccountStatus.active,
-            PanelAccountStatus.error,
-        ):
+    for account in deduped:
+        if _account_counts_toward_usage(account):
             coeff = _norm_coeff(getattr(account, "applied_coefficient", None) or 1.0)
             total += account_weighted_usage(account, coeff)
             continue
@@ -7805,6 +8031,10 @@ _LIVE_USAGE_PRIORITY: dict[int, float] = {}
 # Keep well under DB_POOL_SIZE — /api/users board must stay responsive.
 # 4 is enough with Worker offload; 8 stampeded QueuePool after restart.
 _USAGE_PULL_GATE = asyncio.Semaphore(4)
+# Per-user 5s single-flight: concurrent /sub + admin views coalesce.
+_USAGE_FLIGHT: dict[int, asyncio.Future] = {}
+_USAGE_FLIGHT_TS: dict[int, float] = {}
+_USAGE_FLIGHT_TTL = 5.0
 
 
 def mark_live_usage_priority(user_id: int) -> None:
@@ -7832,20 +8062,47 @@ def take_live_usage_priority(max_age_sec: float = 180.0, limit: int = 24) -> lis
 
 
 async def recount_user_used_traffic(
-    db: AsyncSession, user: User, accounts: list[PanelAccount] | None = None
+    db: AsyncSession,
+    user: User,
+    accounts: list[PanelAccount] | None = None,
+    *,
+    allow_shrink: bool = False,
 ) -> int:
     """Recompute ``user.used_traffic`` from current panel accounts (no remote I/O).
 
-    Never shrinks below the previous total — panel/config removal must not refund.
-    Deleted meters that a live twin fully absorbs may be cleared; partial gaps stay.
+    By default never shrinks below the previous total — panel/config removal
+    must not refund. Pass ``allow_shrink=True`` only for inflation reconcile
+    (stored used ≫ Σ weighted meters). Deleted meters that a live twin fully
+    absorbs may be cleared; partial gaps stay.
     """
     if accounts is None:
-        result = await db.execute(
-            select(PanelAccount)
-            .where(PanelAccount.user_id == user.id)
-            .options(selectinload(PanelAccount.panel))
+        # Sequential loads only — selectinload races asyncpg under concurrency.
+        from sqlalchemy.orm.attributes import set_committed_value
+
+        accounts = list(
+            (
+                await db.execute(
+                    select(PanelAccount).where(
+                        PanelAccount.user_id == user.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
         )
-        accounts = list(result.scalars().all())
+        if accounts:
+            panel_ids = list({int(a.panel_id) for a in accounts if a.panel_id})
+            panels_by_id: dict[int, Panel] = {}
+            if panel_ids:
+                for p in (
+                    await db.execute(select(Panel).where(Panel.id.in_(panel_ids)))
+                ).scalars().all():
+                    panels_by_id[int(p.id)] = p
+            for acc in accounts:
+                panel = panels_by_id.get(int(acc.panel_id))
+                if panel is not None:
+                    set_committed_value(acc, "panel", panel)
+
     # Only clear deleted meters when a live twin already holds ≥ those bytes.
     # Never wipe a deleted peak just because a fresh live row exists at 0.
     live_keys = _live_remote_keys(accounts)
@@ -7861,7 +8118,7 @@ async def recount_user_used_traffic(
             account.used_traffic = 0
     account_coeffs = await account_coefficients_for_user(db, user, accounts)
     total = await _weighted_total(accounts, account_coeffs)
-    return _assign_user_used_traffic(user, total)
+    return _assign_user_used_traffic(user, total, allow_shrink=allow_shrink)
 
 
 async def recount_user_usage_pool_safe(user_id: int) -> int:
@@ -7876,20 +8133,44 @@ async def recount_user_usage_pool_safe(user_id: int) -> int:
     for attempt in range(2):
         try:
             async with AsyncSessionLocal() as db:
-                result = await db.execute(
-                    select(User)
-                    .where(User.id == uid)
-                    .options(
-                        selectinload(User.panel_accounts).selectinload(
-                            PanelAccount.panel
-                        ),
-                        selectinload(User.groups),
-                    )
-                )
-                user = result.scalar_one_or_none()
+                # Sequential loads only — never selectinload here: under
+                # concurrent gather it still races asyncpg on some drivers.
+                from sqlalchemy.orm.attributes import set_committed_value
+
+                user = (
+                    await db.execute(select(User).where(User.id == uid))
+                ).scalar_one_or_none()
                 if user is None:
                     return -1
-                total = await recount_user_used_traffic(db, user)
+                accounts = list(
+                    (
+                        await db.execute(
+                            select(PanelAccount).where(
+                                PanelAccount.user_id == uid
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if accounts:
+                    panel_ids = list(
+                        {int(a.panel_id) for a in accounts if a.panel_id}
+                    )
+                    panels_by_id: dict[int, Panel] = {}
+                    if panel_ids:
+                        for p in (
+                            await db.execute(
+                                select(Panel).where(Panel.id.in_(panel_ids))
+                            )
+                        ).scalars().all():
+                            panels_by_id[int(p.id)] = p
+                    for acc in accounts:
+                        panel = panels_by_id.get(int(acc.panel_id))
+                        if panel is not None:
+                            set_committed_value(acc, "panel", panel)
+                set_committed_value(user, "panel_accounts", accounts)
+                total = await recount_user_used_traffic(db, user, accounts)
                 await activate_on_hold_if_used(db, user)
                 await enforce_user_quota(db, user)
                 await db.commit()
@@ -8608,22 +8889,64 @@ async def refresh_usage_pool_safe(
     connection), runs get_usage, then opens a new session to apply meters and
     recount. Returns ``(used, activated, quota_changed, status)``; used=-1 if
     the user is missing / not pullable.
+
+    Concurrent calls for the same ``user_id`` within 5s share one in-flight
+    Future (single-flight) so /sub Update bursts never stampede the same panels.
     """
     from app.core.database import pool_pressure_blocks_background
 
+    uid = int(user_id)
     # Under pool pressure: recount from local meters only — never stampede remotes
     # (that froze /api/users for 10s+ and returned 500s).
     if pool_pressure_blocks_background():
         try:
-            total = await recount_user_usage_pool_safe(int(user_id))
+            total = await recount_user_usage_pool_safe(uid)
             return (int(total), False, False, "pool_busy")
         except Exception:  # noqa: BLE001
             return (-1, False, False, "pool_busy")
 
-    async with _USAGE_PULL_GATE:
-        return await _refresh_usage_pool_safe_inner(
-            int(user_id), force=force, quick=quick
-        )
+    now = time.monotonic()
+    if not force:
+        existing = _USAGE_FLIGHT.get(uid)
+        if existing is not None and not existing.done():
+            try:
+                return await existing
+            except Exception:  # noqa: BLE001
+                pass
+        last_ts = float(_USAGE_FLIGHT_TS.get(uid, 0.0) or 0.0)
+        if now - last_ts < _USAGE_FLIGHT_TTL and existing is not None and existing.done():
+            try:
+                return existing.result()
+            except Exception:  # noqa: BLE001
+                pass
+
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+    _USAGE_FLIGHT[uid] = fut
+    _USAGE_FLIGHT_TS[uid] = now
+    try:
+        async with _USAGE_PULL_GATE:
+            result = await _refresh_usage_pool_safe_inner(
+                uid, force=force, quick=quick
+            )
+        if not fut.done():
+            fut.set_result(result)
+        return result
+    except Exception as exc:  # noqa: BLE001
+        if not fut.done():
+            fut.set_exception(exc)
+        raise
+    finally:
+        # Keep completed future briefly for coalescing late joiners.
+        async def _clear(u: int = uid, f: asyncio.Future = fut) -> None:
+            await asyncio.sleep(_USAGE_FLIGHT_TTL)
+            if _USAGE_FLIGHT.get(u) is f:
+                _USAGE_FLIGHT.pop(u, None)
+
+        try:
+            asyncio.create_task(_clear(), name=f"usage-flight-clear-{uid}")
+        except Exception:  # noqa: BLE001
+            _USAGE_FLIGHT.pop(uid, None)
 
 
 async def _refresh_usage_pool_safe_inner(
@@ -8638,15 +8961,13 @@ async def _refresh_usage_pool_safe_inner(
     username = ""
     astra_panel_ids: list[int] = []
     async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(User)
-            .where(User.id == int(user_id))
-            .options(
-                selectinload(User.panel_accounts).selectinload(PanelAccount.panel),
-                selectinload(User.groups),
-            )
-        )
-        user = result.scalar_one_or_none()
+        # Sequential loads only — sibling selectinloads trip asyncpg
+        # "another operation is in progress" on a single AsyncSession.
+        from sqlalchemy.orm.attributes import set_committed_value
+
+        user = (
+            await db.execute(select(User).where(User.id == int(user_id)))
+        ).scalar_one_or_none()
         if user is None:
             return (-1, False, False, "")
         if user.status not in (
@@ -8656,8 +8977,32 @@ async def _refresh_usage_pool_safe_inner(
         ):
             return (-1, False, False, str(getattr(user.status, "value", user.status)))
         username = str(user.username or "")
-        for account in user.panel_accounts or []:
-            panel = account.panel
+        accounts = list(
+            (
+                await db.execute(
+                    select(PanelAccount).where(
+                        PanelAccount.user_id == int(user_id)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        panel_ids = list({int(a.panel_id) for a in accounts if a.panel_id})
+        panels_by_id: dict[int, Panel] = {}
+        if panel_ids:
+            for p in (
+                await db.execute(select(Panel).where(Panel.id.in_(panel_ids)))
+            ).scalars().all():
+                panels_by_id[int(p.id)] = p
+        # Only panels where this user actually has a panel_accounts row.
+        # Dedupe by (panel_id, remote_username) so one hydrate never hits the
+        # same remote twice (was flooding Worker with duplicate get_usage).
+        seen_remote: set[tuple[int, str]] = set()
+        for account in accounts:
+            panel = panels_by_id.get(int(account.panel_id))
+            if panel is not None:
+                set_committed_value(account, "panel", panel)
             if not panel or not _panel_is_active(panel):
                 continue
             if panel.type == PanelType.astra:
@@ -8668,11 +9013,24 @@ async def _refresh_usage_pool_safe_inner(
             if account.status not in (
                 PanelAccountStatus.active,
                 PanelAccountStatus.error,
+                PanelAccountStatus.pending,
             ):
                 continue
-            uname = (account.remote_username or user.username or "").strip()
-            if not uname and not account.remote_id:
+            # Pending without a meter is still provisioning — skip live pull.
+            if (
+                account.status == PanelAccountStatus.pending
+                and int(account.used_traffic or 0) <= 0
+            ):
                 continue
+            uname = (account.remote_username or "").strip()
+            if not uname:
+                uname = (account.remote_id or user.username or "").strip()
+            if not uname:
+                continue
+            dedupe_key = (int(panel.id), uname.lower())
+            if dedupe_key in seen_remote:
+                continue
+            seen_remote.add(dedupe_key)
             # Expunge after load — rollback would expire password/url and break
             # get_adapter (usage stuck at 0 while remote already has traffic).
             panel = _touch_panel_for_detach(panel, db)
@@ -8690,6 +9048,14 @@ async def _refresh_usage_pool_safe_inner(
         # Panels already expunged above — rollback will not strip their attrs.
         await db.rollback()
     # Session closed → pool connection returned.
+
+    # Push exact remotes into Worker priority-probe so meters land in ~3s.
+    try:
+        from app.services import usage_priority as uprio
+
+        await uprio.enqueue_user_remotes(int(user_id), ttl=900.0)
+    except Exception:  # noqa: BLE001
+        pass
 
     # Astra local sync in its own short sessions (no hold across awaits).
     if astra_panel_ids:
@@ -8768,45 +9134,54 @@ async def _refresh_usage_pool_safe_inner(
         rid: str | None,
         group_id: int | None,
     ) -> None:
-        names = _remote_username_candidates(
-            astra_username=username,
-            remote_username=uname,
-            remote_id=rid,
-            uuid=None,
-            panel_id=int(panel.id),
-            group_id=group_id,
-        ) or [uname]
+        from app.core.panel_circuit import (
+            note_panel_ok,
+            note_panel_timeout,
+            panel_circuit_open,
+        )
+
+        pid = int(panel.id)
+        if panel_circuit_open(pid):
+            return
+        # Exact stored remote only — never spray _g/_p aliases (404 storms).
+        name = (uname or "").strip()
+        if not name:
+            return
         adapter = get_adapter(panel)
         try:
-            for name in names:
-                if not name:
-                    continue
+            try:
                 try:
-                    try:
-                        coro = adapter.get_usage(  # type: ignore[call-arg]
-                            name, rid or name, expand_links=False
-                        )
-                    except TypeError:
-                        coro = adapter.get_usage(name, rid or name)
-                    res = await asyncio.wait_for(coro, timeout=per_try)
-                    if res is not None and res.success:
-                        results[aid] = res
-                        return
-                except Exception as exc:  # noqa: BLE001
-                    now_m = time.monotonic()
-                    pid = int(panel.id)
-                    last = float(_usage_warn_ts.get(pid) or 0.0)
-                    if now_m - last >= 60.0:
-                        _usage_warn_ts[pid] = now_m
-                        logger.info(
-                            "pool-safe get_usage soft-fail user=%s panel=%s name=%s: %s",
-                            username,
-                            pid,
-                            name,
-                            _exc_msg(exc),
-                        )
-                    # Try next candidate name — do not abort the whole panel.
-                    continue
+                    coro = adapter.get_usage(  # type: ignore[call-arg]
+                        name, rid or name, expand_links=False
+                    )
+                except TypeError:
+                    coro = adapter.get_usage(name, rid or name)
+                res = await asyncio.wait_for(coro, timeout=per_try)
+                if res is not None and res.success:
+                    note_panel_ok(pid)
+                    results[aid] = res
+                    return
+                err = (getattr(res, "error", None) or "") if res else ""
+                # Terminal miss — do not retry aliases.
+                if "404" in err or "not found" in err.lower():
+                    return
+            except Exception as exc:  # noqa: BLE001
+                msg = _exc_msg(exc)
+                if "Timeout" in msg or isinstance(exc, asyncio.TimeoutError):
+                    note_panel_timeout(pid, reason=msg)
+                    return
+                now_m = time.monotonic()
+                last = float(_usage_warn_ts.get(pid) or 0.0)
+                if now_m - last >= 60.0:
+                    _usage_warn_ts[pid] = now_m
+                    logger.info(
+                        "pool-safe get_usage soft-fail user=%s panel=%s name=%s: %s",
+                        username,
+                        pid,
+                        name,
+                        msg,
+                    )
+            _ = group_id  # retained for call-site compat
         finally:
             close = getattr(adapter, "close", None)
             if callable(close):
@@ -8989,7 +9364,8 @@ async def enforce_user_quota(db: AsyncSession, user: User) -> bool:
 
     When used_astra (sum of all panels × coeffs) hits data_limit → limited.
     Remotes are disabled via sync_modify even if the upstream panel still
-    shows leftover traffic.
+    shows leftover traffic. On flip to limited/expired, schedules immediate
+    multi-panel KILL_USER after the current transaction commits.
     """
     if user.status in (UserStatus.disabled, UserStatus.on_hold):
         return False
@@ -9023,6 +9399,31 @@ async def enforce_user_quota(db: AsyncSession, user: User) -> bool:
         int(user.used_traffic or 0),
         int(user.data_limit or 0),
     )
+    if new == UserStatus.active and old in (
+        UserStatus.limited,
+        UserStatus.expired,
+    ):
+        try:
+            from app.services.worker_commands import clear_kill_cooldown
+
+            clear_kill_cooldown(int(user.id))
+        except Exception:  # noqa: BLE001
+            pass
+    if new in (UserStatus.limited, UserStatus.expired, UserStatus.disabled):
+        try:
+            uid = int(user.id)
+
+            async def _kill_after_commit(u: int = uid) -> None:
+                # Yield so the caller's ``await db.commit()`` lands first —
+                # enqueue_kill_user refuses non-limited users.
+                await asyncio.sleep(0.2)
+                await kick_freeze_user(u, remote_timeout=6.0)
+
+            asyncio.create_task(
+                _kill_after_commit(), name=f"astra-kill-{uid}"
+            )
+        except Exception:  # noqa: BLE001
+            pass
     return True
 
 
@@ -9356,9 +9757,23 @@ def _freeze_kick_lock() -> asyncio.Lock:
     return _FREEZE_KICK_LOCK
 
 
-async def kick_freeze_user(user_id: int, *, remote_timeout: float = 10.0) -> None:
-    """Deduped background freeze — /sub used to spawn concurrency=14 per hit."""
+async def kick_freeze_user(
+    user_id: int, *, remote_timeout: float = 10.0, force: bool = False
+) -> None:
+    """Deduped freeze — Worker fast-lane KILL_USER AND local remotes.
+
+    180s per-user cooldown (shared with ``enqueue_kill_user``) stops /sub
+    auto-refresh from re-disabling 32 panels every few seconds. Pass
+    ``force=True`` to bypass (heal / admin).
+    """
     uid = int(user_id)
+    try:
+        from app.services.worker_commands import kill_on_cooldown
+
+        if not force and kill_on_cooldown(uid):
+            return
+    except Exception:  # noqa: BLE001
+        pass
     async with _freeze_kick_lock():
         if uid in _FREEZE_INFLIGHT:
             return
@@ -9366,11 +9781,18 @@ async def kick_freeze_user(user_id: int, *, remote_timeout: float = 10.0) -> Non
 
     async def _run() -> None:
         try:
+            try:
+                from app.services.worker_commands import enqueue_kill_user
+
+                await enqueue_kill_user(uid, force=force)
+            except Exception:  # noqa: BLE001
+                logger.debug("kill-user enqueue failed user=%s", uid, exc_info=True)
+            # Local / non-leased panels + backup path for worker remotes.
             await _freeze_quota_users(
                 [uid],
-                remote_timeout=remote_timeout,
-                concurrency=1,
-                wall=40.0,
+                remote_timeout=min(float(remote_timeout), 8.0),
+                concurrency=2,
+                wall=25.0,
             )
         except Exception:  # noqa: BLE001
             logger.debug("kick freeze failed user_id=%s", uid, exc_info=True)
@@ -9720,6 +10142,28 @@ async def run_quota_watch_cycle() -> dict[str, int]:
                 stats["freeze_fail"] += fail_n
     except Exception:  # noqa: BLE001
         logger.warning("quota-watch recount/flip catchup failed", exc_info=True)
+
+    # --- Phase 3a0: pending meters with traffic → active, then shrink inflated used ---
+    try:
+        pend = await bulk_usage.activate_pending_with_usage(limit=2000)
+        if int(pend.get("promoted") or 0):
+            logger.info(
+                "quota-watch pending→active promoted=%s",
+                pend.get("promoted"),
+            )
+    except Exception:  # noqa: BLE001
+        logger.warning("quota-watch pending activate failed", exc_info=True)
+    try:
+        recon = await bulk_usage.reconcile_inflated_used_traffic(limit=400)
+        stats["flipped"] += int(recon.get("reactivated") or 0)
+        if int(recon.get("shrunk") or 0):
+            logger.info(
+                "quota-watch reconcile_inflated shrunk=%s reactivated=%s",
+                recon.get("shrunk"),
+                recon.get("reactivated"),
+            )
+    except Exception:  # noqa: BLE001
+        logger.warning("quota-watch inflate reconcile failed", exc_info=True)
 
     # --- Phase 3a: false «اتمام حجم» (limited but used < limit) → active + unfreeze ---
     try:

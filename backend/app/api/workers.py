@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from fastapi.responses import PlainTextResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.settings import get_session_admin_only
@@ -195,19 +196,134 @@ async def worker_heartbeat(
 
 @router.post("/api/internal/worker/usage-report")
 async def worker_usage_report(
-    body: WorkerUsageReport,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     authorization: str | None = Header(default=None),
+    content_encoding: str | None = Header(default=None),
 ):
+    """Accept JSON or gzip-compressed JSON usage maps from workers."""
+    import gzip
+    import json
+
     token = _bearer(authorization)
     worker = await ops.authenticate_worker_token(db, token)
     if worker is None:
         raise HTTPException(status_code=401, detail="Invalid worker token")
+    raw = await request.body()
+    enc = (content_encoding or "").lower()
+    try:
+        if "gzip" in enc or (len(raw) >= 2 and raw[0] == 0x1F and raw[1] == 0x8B):
+            raw = gzip.decompress(raw)
+        data = json.loads(raw.decode("utf-8"))
+        body = WorkerUsageReport.model_validate(data)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"bad usage-report: {exc}") from exc
     try:
         stats = await ops.apply_usage_report(db, worker, body)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"ok": True, **stats}
+
+
+@router.get("/api/internal/worker/priority-probe")
+async def worker_priority_probe(
+    db: AsyncSession = Depends(get_db),
+    authorization: str | None = Header(default=None),
+    limit: int = 400,
+):
+    """Hot-tier keep-alive (~3s). Fair ≤15/panel across ALL panels, ≤400 total."""
+    from app.services import usage_priority as uprio
+
+    token = _bearer(authorization)
+    worker = await ops.authenticate_worker_token(db, token)
+    if worker is None:
+        raise HTTPException(status_code=401, detail="Invalid worker token")
+    try:
+        await ops.touch_heartbeat(db, worker)
+    except Exception:  # noqa: BLE001
+        pass
+    lim = max(1, min(400, int(limit or 400)))
+    items = await uprio.take_for_worker(int(worker.id), limit=lim)
+    # Dual keys (`items` + `probes`) so older/newer Worker parsers both work.
+    return {
+        "ok": True,
+        "items": items,
+        "probes": items,
+        "count": len(items),
+        "worker_id": int(worker.id),
+    }
+
+
+@router.get("/api/internal/worker/assignment")
+async def worker_assignment(
+    db: AsyncSession = Depends(get_db),
+    authorization: str | None = Header(default=None),
+):
+    """Exact leased panels for this worker + Hot/Warm tier hints.
+
+    Workers must never poll panels not listed here (zero duplicate work).
+    """
+    from sqlalchemy.orm import selectinload
+
+    from app.models.worker import WorkerNode
+
+    token = _bearer(authorization)
+    worker = await ops.authenticate_worker_token(db, token)
+    if worker is None:
+        raise HTTPException(status_code=401, detail="Invalid worker token")
+    try:
+        await ops.touch_heartbeat(db, worker)
+    except Exception:  # noqa: BLE001
+        pass
+    # Reload with panels for lease filtering.
+    fresh = (
+        await db.execute(
+            select(WorkerNode)
+            .where(WorkerNode.id == int(worker.id))
+            .options(selectinload(WorkerNode.panels))
+        )
+    ).scalar_one_or_none()
+    if fresh is None:
+        raise HTTPException(status_code=401, detail="Invalid worker token")
+    return await ops.assignment_payload_for_worker(db, fresh)
+
+
+@router.get("/api/internal/worker/commands")
+async def worker_commands_longpoll(
+    db: AsyncSession = Depends(get_db),
+    authorization: str | None = Header(default=None),
+    timeout: float = 15.0,
+    limit: int = 20,
+):
+    """Long-poll fast-lane commands (KILL_USER). Wakes in <100ms when enqueued."""
+    from app.services import worker_commands as wcmd
+
+    token = _bearer(authorization)
+    worker = await ops.authenticate_worker_token(db, token)
+    if worker is None:
+        raise HTTPException(status_code=401, detail="Invalid worker token")
+    # Heartbeat piggyback — no extra HTTP from worker.
+    try:
+        from app.services.worker_lease import note_heartbeat, refresh_leases_for_worker
+
+        note_heartbeat(int(worker.id))
+        refresh_leases_for_worker(int(worker.id))
+        worker.last_seen_at = __import__("datetime").datetime.now(
+            __import__("datetime").timezone.utc
+        )
+        worker.status = "online"
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+    cmds = await wcmd.take_commands(
+        int(worker.id),
+        limit=int(limit or 20),
+        timeout=max(0.5, min(30.0, float(timeout or 15))),
+    )
+    return {"ok": True, "commands": cmds, "worker_id": int(worker.id)}
 
 
 @router.get("/api/public/worker-install.sh", response_class=PlainTextResponse)

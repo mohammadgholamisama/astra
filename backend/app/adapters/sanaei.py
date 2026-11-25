@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import secrets
 import uuid as uuid_lib
 from typing import Any
@@ -441,8 +442,37 @@ class SanaeiAdapter(BasePanelAdapter):
                     raw=data,
                 )
 
+            # Already present (same email/uuid) — treat as success, don't burn
+            # legacy addClient 404 storms on panels that only expose /clients/*.
+            explain = self._explain_fail(resp, data)
+            low = (explain or "").lower()
+            if "already in use" in low or "already exist" in low or "duplicate" in low:
+                email = client_obj["email"]
+                m = re.search(
+                    r"already\s+in\s+use\s*:\s*([A-Za-z0-9_.\-]+)",
+                    explain or "",
+                    flags=re.I,
+                )
+                if m:
+                    email = m.group(1).strip() or email
+                try:
+                    got = await self.get_usage(email, email, expand_links=True)
+                    if got.success:
+                        return got
+                except Exception:  # noqa: BLE001
+                    pass
+                links = await self._fetch_links(email, client_obj.get("subId") or "")
+                return AdapterResult(
+                    success=True,
+                    remote_username=email,
+                    remote_id=email,
+                    uuid=client_obj["id"],
+                    links=links,
+                    raw=data,
+                )
+
             settings_payload = json.dumps({"clients": [client_obj]})
-            last_err = self._explain_fail(resp, data)
+            last_err = explain
             for iid in inbound_ids:
                 legacy = await self._request(
                     "POST",
@@ -723,7 +753,12 @@ class SanaeiAdapter(BasePanelAdapter):
                 best_raw = client
         return (total if found else None), best_raw
 
-    async def get_usage(self, username: str, remote_id: str | None = None) -> AdapterResult:
+    async def get_usage(
+        self,
+        username: str,
+        remote_id: str | None = None,
+        expand_links: bool = True,  # noqa: ARG002 — accepted for Worker API parity
+    ) -> AdapterResult:
         try:
             email = (remote_id or username or "").strip()
             if not email:
@@ -733,6 +768,8 @@ class SanaeiAdapter(BasePanelAdapter):
             last_data: Any = None
             best: int | None = None
             best_raw: Any = None
+            saw_404 = 0
+            tried = 0
             for path in (
                 f"panel/api/clients/traffic/{email}",
                 f"panel/api/inbounds/getClientTraffics/{email}",
@@ -743,7 +780,12 @@ class SanaeiAdapter(BasePanelAdapter):
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("sanaei get_usage %s: %s", path, exc)
                     continue
+                tried += 1
                 last_resp = resp
+                code = int(getattr(resp, "status_code", 0) or 0)
+                if code == 404:
+                    saw_404 += 1
+                    continue
                 ok, data = ok_json(resp)
                 last_data = data
                 if not ok:
@@ -762,7 +804,19 @@ class SanaeiAdapter(BasePanelAdapter):
                     best = used
                     best_raw = data
 
-            scanned, scanned_raw = await self._usage_from_inbounds_scan(email)
+            # Missing client: every traffic path 404'd — do NOT scan all inbounds
+            # (that was the Worker HTTP 404 / timeout storm amplifier).
+            if best is None and saw_404 > 0 and saw_404 >= max(1, tried):
+                return AdapterResult(
+                    success=False,
+                    error="HTTP 404 Not Found",
+                    remote_username=email,
+                )
+
+            scanned = None
+            scanned_raw = None
+            if best is None:
+                scanned, scanned_raw = await self._usage_from_inbounds_scan(email)
             if scanned is not None and (best is None or scanned > best):
                 best = scanned
                 best_raw = scanned_raw if scanned_raw is not None else {

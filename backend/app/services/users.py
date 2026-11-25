@@ -133,6 +133,7 @@ def to_user_response(user: User, *, include_links: bool = True) -> UserResponse:
                 panel_name=panel_name,
                 panel_type=panel_type,
                 panel_base_url=str(panel_base).rstrip("/") if panel_base else None,
+                panel_is_active=panel_active,
                 remote_username=adict.get("remote_username"),
                 status=status_val,
                 # List view: keep count only (placeholder) — avoid shipping huge URLs

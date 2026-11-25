@@ -46,7 +46,11 @@ class WorkerNode(Base):
         onupdate=func.now(),
     )
 
-    panels = relationship("Panel", back_populates="worker")
+    panels = relationship(
+        "Panel",
+        back_populates="worker",
+        foreign_keys="Panel.worker_id",
+    )
 
 
 # Late import style: Panel.worker_id added on Panel model.

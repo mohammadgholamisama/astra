@@ -115,7 +115,12 @@ class PanelAccount(Base):
     # Used when several groups share one panel (PasarGuard remote_group_ids / Marzban protocols).
     links_by_group: Mapped[dict | None] = mapped_column(JSONType, nullable=True, default=dict)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Accumulated raw bytes on Astra (sum of positive remote deltas; survives remote resets).
     used_traffic: Mapped[int] = mapped_column(BigInteger, default=0)
+    # Last observed remote counter (high-water / reset detection). NULL = not primed.
+    # On first schema sync we backfill last_remote_raw = used_traffic so existing
+    # meters do not double-count when the delta pipeline starts.
+    last_remote_raw: Mapped[int | None] = mapped_column(BigInteger, nullable=True, default=None)
     # Coefficient periods: past usage stays at old rate; only delta uses current coeff.
     # weighted = coeff_anchor_weighted + (raw - coeff_anchor_raw) * applied_coefficient
     coeff_anchor_raw: Mapped[int] = mapped_column(BigInteger, default=0)

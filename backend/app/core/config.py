@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     DB_POOL_SIZE: int = 16
     DB_MAX_OVERFLOW: int = 6
     DB_POOL_TIMEOUT: float = 5.0
-    DB_POOL_RECYCLE: int = 120
+    DB_POOL_RECYCLE: int = 300
     SECRET_KEY: str = "astra-dev-secret-key-change-in-production-32chars"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     SUB_BASE_URL: str = "http://localhost:8000"
@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     ASTRA_PANEL_DOMAIN: str = ""
     ASTRA_SUB_DOMAIN: str = ""
     FRONTEND_DIST: str = ""
+    # redis://127.0.0.1:6379/0 — shared /sub cache across uvicorn workers
+    ASTRA_REDIS_URL: str = "redis://127.0.0.1:6379/0"
+    ASTRA_SUB_REDIS_TTL: int = 45
+    LOG_LEVEL: str = "WARNING"
 
     @property
     def cors_origin_list(self) -> list[str]:

@@ -49,23 +49,15 @@ def get_adapter(panel: Panel) -> BasePanelAdapter:
         from app.services.worker_client import (
             WorkerRoutedAdapter,
             lookup_worker_route,
-            register_worker_route,
+            seed_worker_route_from_row,
         )
 
         route = lookup_worker_route(int(wid))
         if route is None:
             # Relationship may be loaded — seed route from ORM worker row
             worker = getattr(panel, "__dict__", {}).get("worker")
-            if worker is not None and getattr(worker, "is_active", False):
-                tok = str((getattr(worker, "meta", None) or {}).get("agent_token") or "")
-                if tok:
-                    register_worker_route(
-                        int(wid),
-                        str(worker.base_url),
-                        tok,
-                        active=True,
-                    )
-                    route = lookup_worker_route(int(wid))
+            if worker is not None and seed_worker_route_from_row(worker):
+                route = lookup_worker_route(int(wid))
         if route is None:
             return local
         base_url, token = route

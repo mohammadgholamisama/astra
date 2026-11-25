@@ -111,8 +111,7 @@ async def _bg_finish_create_provision(username: str, group_ids: list[int]) -> No
     async with _CREATE_PROVISION_BG_SEM:
         try:
             uid = 0
-            panels = None
-            user_row = None
+            panels: list = []
             async with AsyncSessionLocal() as db:
                 user_row = (
                     await db.execute(select(User).where(User.username == username))
@@ -120,19 +119,42 @@ async def _bg_finish_create_provision(username: str, group_ids: list[int]) -> No
                 if user_row is None:
                     return
                 uid = int(user_row.id)
-                panels = await orchestrator.resolve_panels_for_groups(db, group_ids)
+                raw_panels = await orchestrator.resolve_panels_for_groups(
+                    db, group_ids
+                )
+                # CRITICAL: rollback() expires ORM attrs. Touch+expunge while
+                # the session is alive so batch create never hits DetachedInstance.
+                panels = [
+                    (
+                        orchestrator._touch_panel_for_detach(p, db),
+                        dict(cfg or {}),
+                        int(gid or 0),
+                    )
+                    for p, cfg, gid in (raw_panels or [])
+                ]
                 await db.rollback()
-            if panels and user_row is not None:
+            if panels and uid:
                 sdb = AsyncSessionLocal()
                 try:
+                    # Reload user in this session — prior row is detached.
+                    user_row = (
+                        await sdb.execute(select(User).where(User.id == uid))
+                    ).scalar_one_or_none()
+                    if user_row is None:
+                        return
                     n_jobs = max(1, len(panels))
+                    # Enough wall-clock for ≥2 waves of PasarGuard under load.
+                    sem_n = min(48, max(24, n_jobs))
+                    waves = max(1, (n_jobs + sem_n - 1) // sem_n)
+                    create_to = 22.0
+                    overall = min(300.0, max(90.0, waves * create_to + 25.0))
                     await orchestrator.provision_users_batch(
                         sdb,
                         [user_row],
                         panels,
-                        create_timeout=14.0,
-                        concurrency=min(48, max(20, n_jobs)),
-                        overall_timeout=min(180.0, 25.0 + 0.55 * n_jobs),
+                        create_timeout=create_to,
+                        concurrency=sem_n,
+                        overall_timeout=overall,
                     )
                 except Exception:  # noqa: BLE001
                     log.exception(
@@ -152,13 +174,47 @@ async def _bg_finish_create_provision(username: str, group_ids: list[int]) -> No
                 log.debug(
                     "bg create hydrate user=%s failed", username, exc_info=True
                 )
-            # Quick heal — leftover writer already finishes in-flight remotes.
+            # Drain leftovers with real wait — 3s left 80+ pending after create.
             try:
+                pending_n = 0
+                async with AsyncSessionLocal() as sdb:
+                    pending_n = int(
+                        (
+                            await sdb.execute(
+                                select(func.count())
+                                .select_from(PanelAccount)
+                                .where(
+                                    PanelAccount.user_id == uid,
+                                    PanelAccount.status.in_(
+                                        (
+                                            PanelAccountStatus.pending,
+                                            PanelAccountStatus.error,
+                                        )
+                                    ),
+                                )
+                            )
+                        ).scalar()
+                        or 0
+                    )
+                    await sdb.rollback()
+                heal_wait = min(180.0, max(12.0, 2.2 * pending_n + 8.0))
                 await orchestrator.heal_user_coverage_pool_safe(
-                    uid, wait=3.0, include_empty_links=True
+                    uid, wait=heal_wait, include_empty_links=True
                 )
             except Exception:  # noqa: BLE001
                 log.debug("bg create heal user=%s failed", username, exc_info=True)
+            # Brand-new accounts → Hot priority-probe for 15 minutes so
+            # used_traffic moves within 3–5s of first connection.
+            try:
+                from app.services import usage_priority as uprio
+
+                await uprio.enqueue_user_remotes(int(uid), ttl=900.0)
+            except Exception:  # noqa: BLE001
+                log.debug(
+                    "bg create prio-enqueue user=%s failed",
+                    username,
+                    exc_info=True,
+                )
             try:
                 pending_ids: list[int] = []
                 async with AsyncSessionLocal() as sdb:
@@ -706,13 +762,23 @@ async def create_users_bulk(
                     rows = await sdb.execute(
                         select(Panel).where(Panel.id.in_(panel_id_set or [-1]))
                     )
-                    by_id = {int(p.id): p for p in rows.scalars().all()}
+                    by_id = {
+                        int(p.id): orchestrator._touch_panel_for_detach(p, sdb)
+                        for p in rows.scalars().all()
+                    }
                     local_panels = [
                         (by_id[pid], cfg, gid)
                         for pid, cfg, gid in specs
                         if pid in by_id
                         and bool(getattr(by_id[pid], "is_active", True))
                     ]
+                    # Touch users before rollback so batch prepare never Detaches.
+                    for u in bg_users:
+                        _ = (u.id, u.username, u.status, u.data_limit, u.expire)
+                        try:
+                            sdb.expunge(u)
+                        except Exception:  # noqa: BLE001
+                            pass
                     await sdb.rollback()
                 if not local_panels:
                     return
@@ -721,13 +787,22 @@ async def create_users_bulk(
                 # provision_users_batch closes the session after prepare.
                 sdb = AsyncSessionLocal()
                 try:
+                    # Fresh user rows in this session (expunged snaps lack relations).
+                    loaded2 = await sdb.execute(
+                        select(User).where(User.id.in_(uids))
+                    )
+                    bg_users2 = list(loaded2.scalars().all())
+                    create_to = 18.0
+                    sem_n = min(40, max(16, min(n_jobs, 40)))
+                    waves = max(1, (n_jobs + sem_n - 1) // sem_n)
+                    overall = min(480.0, max(90.0, waves * create_to + 30.0))
                     await orchestrator.provision_users_batch(
                         sdb,
-                        bg_users,
+                        bg_users2 or bg_users,
                         local_panels,
-                        create_timeout=9.0,
-                        concurrency=min(32, max(16, min(n_jobs, 32))),
-                        overall_timeout=min(480.0, 25.0 + 0.45 * n_jobs),
+                        create_timeout=create_to,
+                        concurrency=sem_n,
+                        overall_timeout=overall,
                     )
                 finally:
                     try:
@@ -873,6 +948,13 @@ async def modify_user(
             user.on_hold_expire_duration = hold_dur
         else:
             user.status = incoming
+            if incoming == UserStatus.active:
+                try:
+                    from app.services.worker_commands import clear_kill_cooldown
+
+                    clear_kill_cooldown(int(user.id))
+                except Exception:  # noqa: BLE001
+                    pass
     if body.data_limit is not None:
         user.data_limit = body.data_limit
     if body.expire is not None and user.status != UserStatus.on_hold:
@@ -1258,6 +1340,12 @@ async def reset_user_traffic(
     user.used_traffic = 0
     if user.status == UserStatus.limited:
         user.status = UserStatus.active
+        try:
+            from app.services.worker_commands import clear_kill_cooldown
+
+            clear_kill_cooldown(user_id)
+        except Exception:  # noqa: BLE001
+            pass
     acc_result = await db.execute(
         select(PanelAccount).where(PanelAccount.user_id == user_id)
     )
@@ -1745,6 +1833,19 @@ def _soft_timeout_error_sql():
     )
 
 
+def _db_busy_error_sql():
+    """Postgres/pool saturation on master or node — transient, not a panel fault."""
+    msg = PanelAccount.error_message
+    return or_(
+        msg.ilike("%too many clients%"),
+        msg.ilike("%remaining connection slots%"),
+        msg.ilike("%queuepool%"),
+        msg.ilike("%Too many open files%"),
+        msg.ilike("%connection is closed%"),
+        msg.ilike("%PendingRollback%"),
+    )
+
+
 def _error_user_clause(now_ts: int | None = None):
     """Active (not expired) user with a real error on a live panel.
 
@@ -1775,6 +1876,7 @@ def _error_user_clause(now_ts: int | None = None):
                     and_(
                         not_(_capacity_error_sql()),
                         not_(_soft_timeout_error_sql()),
+                        not_(_db_busy_error_sql()),
                     ),
                 ),
             )
@@ -1846,6 +1948,21 @@ async def _users_list_chip_counts(
                           AND p.is_active IS TRUE
                           AND u.status = 'active'
                           AND (u.expire IS NULL OR u.expire <= 0 OR u.expire > :now_ts)
+                          AND (pa.links IS NULL OR pa.links = '[]'::jsonb)
+                          AND COALESCE(pa.error_message, '') <> 'ASTRA_QUOTA_FROZEN'
+                          AND COALESCE(pa.error_message, '') NOT ILIKE '%user limit reached%'
+                          AND COALESCE(pa.error_message, '') NOT ILIKE '%limit reached%'
+                          AND COALESCE(pa.error_message, '') NOT ILIKE '%ظرفیت%'
+                          AND COALESCE(pa.error_message, '') NOT ILIKE '%maximum users%'
+                          AND COALESCE(pa.error_message, '') NOT ILIKE '%too many users%'
+                          AND COALESCE(pa.error_message, '') NOT ILIKE '%timeout%'
+                          AND COALESCE(pa.error_message, '') NOT ILIKE '%timed out%'
+                          AND COALESCE(pa.error_message, '') NOT ILIKE '%waiting for panel response%'
+                          AND COALESCE(pa.error_message, '') NOT ILIKE '%طول کشید%'
+                          AND COALESCE(pa.error_message, '') NOT ILIKE '%تایم%'
+                          AND COALESCE(pa.error_message, '') NOT ILIKE '%too many clients%'
+                          AND COALESCE(pa.error_message, '') NOT ILIKE '%queuepool%'
+                          AND COALESCE(pa.error_message, '') NOT ILIKE '%PendingRollback%'
                       ) AS error_c
                     """
                 ),
@@ -1876,7 +1993,9 @@ async def _users_list_chip_counts(
     if filters:
         q = q.where(*filters)
     row = (await db.execute(q)).one()
-    # Error chip scoped: start from error accounts (indexed), intersect scope.
+    # Error chip scoped: same actionable filter as _error_user_clause.
+    from sqlalchemy import not_
+
     err_q = (
         select(func.count(func.distinct(User.id)))
         .select_from(PanelAccount)
@@ -1886,6 +2005,20 @@ async def _users_list_chip_counts(
             PanelAccount.status == PanelAccountStatus.error,
             Panel.is_active.is_(True),
             active_c,
+            or_(
+                PanelAccount.links.is_(None),
+                PanelAccount.links == [],
+            ),
+            or_(
+                PanelAccount.error_message.is_(None),
+                PanelAccount.error_message == "",
+                and_(
+                    PanelAccount.error_message != "ASTRA_QUOTA_FROZEN",
+                    not_(_capacity_error_sql()),
+                    not_(_soft_timeout_error_sql()),
+                    not_(_db_busy_error_sql()),
+                ),
+            ),
         )
     )
     if needs_group_join:

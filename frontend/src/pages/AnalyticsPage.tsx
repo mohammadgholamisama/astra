@@ -30,18 +30,48 @@ type SearchHit = {
   status: string;
 };
 
+type RangeBlock = {
+  key?: string;
+  label?: string;
+  active_users?: number;
+  eligible_users?: number;
+  usage?: { current: number; previous: number; change_pct: number | null };
+  peak_hour?: number | null;
+  peak_bytes?: number;
+  hour_of_day?: { bytes: number[]; peak_hour: number | null; peak_bytes: number };
+};
+
 type Overview = {
   generated_at: string;
   online_users: number;
-  raw_hour: { current: number; previous: number; change_pct: number | null };
+  raw_hour: {
+    current: number;
+    previous: number;
+    change_pct: number | null;
+    projected?: number;
+    direction?: string;
+  };
   raw_today: number;
+  raw_week?: number;
+  raw_month?: number;
   raw_current?: number;
   raw_pending?: number;
+  eligible_users?: number;
+  active_users?: {
+    day?: number;
+    week?: number;
+    month?: number;
+    all?: number;
+  };
+  range_stats?: Record<string, RangeBlock>;
   hour_of_day: { bytes: number[]; peak_hour: number | null; peak_bytes: number };
-  global_hourly: { hour_ts: number; raw_bytes: number }[];
+  global_hourly: { hour_ts: number; raw_bytes: number; is_current?: boolean }[];
+  global_24h?: { raw_bytes?: number; note?: string };
   top_hour: { username: string; raw_bytes: number }[];
   note?: string;
 };
+
+type OverviewRange = "day" | "week" | "month" | "all";
 
 type UserAnalytics = {
   username: string;
@@ -143,6 +173,7 @@ export default function AnalyticsPage() {
   const [suggestOpen, setSuggestOpen] = useState(false);
   const [freshKey, setFreshKey] = useState(0);
   const [guideOpen, setGuideOpen] = useState(false);
+  const [range, setRange] = useState<OverviewRange>("day");
   const [hodHover, setHodHover] = useState<{ i: number; bytes: number } | null>(
     null
   );
@@ -200,14 +231,38 @@ export default function AnalyticsPage() {
   });
 
   const data = overview.data;
+  const rangeBlock: RangeBlock | null = useMemo(() => {
+    const rs = data?.range_stats?.[range];
+    return rs && typeof rs === "object" ? rs : null;
+  }, [data, range]);
+  const hodBytes = useMemo(() => {
+    const fromRange = rangeBlock?.hour_of_day?.bytes;
+    if (Array.isArray(fromRange) && fromRange.length >= 24) return fromRange;
+    const base = data?.hour_of_day?.bytes;
+    return Array.isArray(base) && base.length ? base : Array(24).fill(0);
+  }, [data, rangeBlock]);
+  const hodPeak =
+    rangeBlock?.hour_of_day?.peak_hour ??
+    rangeBlock?.peak_hour ??
+    data?.hour_of_day?.peak_hour ??
+    null;
+  const hodPeakBytes =
+    rangeBlock?.hour_of_day?.peak_bytes ??
+    rangeBlock?.peak_bytes ??
+    data?.hour_of_day?.peak_bytes ??
+    0;
+  const rangeUsage = Number(rangeBlock?.usage?.current ?? 0);
+  const rangeUsagePrev = Number(rangeBlock?.usage?.previous ?? 0);
+  const rangeActive = Number(
+    rangeBlock?.active_users ?? data?.active_users?.[range] ?? 0
+  );
   const maxHour = useMemo(() => {
     if (!data?.global_hourly?.length) return 1;
-    return Math.max(1, ...data.global_hourly.map((h) => h.raw_bytes));
+    return Math.max(1, ...data.global_hourly.map((h) => Number(h.raw_bytes || 0)));
   }, [data]);
-  const maxHod = useMemo(() => {
-    if (!data?.hour_of_day?.bytes?.length) return 1;
-    return Math.max(1, ...data.hour_of_day.bytes);
-  }, [data]);
+  const maxHod = useMemo(() => Math.max(1, ...hodBytes.map((b) => Number(b || 0))), [
+    hodBytes,
+  ]);
 
   const suggestions = suggestQ.data?.items || [];
   const ua = userQ.data;
@@ -681,12 +736,34 @@ export default function AnalyticsPage() {
         </div>
       ) : data ? (
         <>
-          <div className="an-stat-grid">
+          <div className="panels-test-filters an-range-tabs" role="tablist" aria-label="بازه آمار">
+            {(
+              [
+                ["day", "امروز"],
+                ["week", "این هفته"],
+                ["month", "این ماه"],
+                ["all", "کل"],
+              ] as const
+            ).map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                role="tab"
+                aria-selected={range === key}
+                className={`panels-test-filter${range === key ? " active" : ""}`}
+                onClick={() => setRange(key)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          <div className="an-stat-grid an-stat-grid-5">
             <article className="an-stat">
               <span>
                 <Radio size={13} /> آنلاین الان
               </span>
-              <strong>{toFaDigits(data.online_users)}</strong>
+              <strong>{toFaDigits(Number(data.online_users || 0))}</strong>
               <small>مصرف اخیر روی پنل‌ها</small>
             </article>
             <article className="an-stat">
@@ -696,52 +773,82 @@ export default function AnalyticsPage() {
               <strong>
                 {formatTraffic(Number(data.raw_current || 0))}
               </strong>
-              <small>جمع خام اکانت‌ها</small>
+              <small>جمع اکانت‌ها · با ضریب</small>
             </article>
             <article className="an-stat">
-              <span>این ساعت / امروز</span>
-              <strong>{formatTraffic(data.raw_hour.current)}</strong>
+              <span>مصرف {rangeBlock?.label || "بازه"}</span>
+              <strong>
+                {formatTraffic(
+                  rangeUsage > 0
+                    ? rangeUsage
+                    : range === "day"
+                      ? Number(data.raw_today || 0)
+                      : range === "week"
+                        ? Number(data.raw_week || 0)
+                        : range === "month"
+                          ? Number(data.raw_month || 0)
+                          : Number(data.raw_current || 0)
+                )}
+              </strong>
               <small>
-                امروز {formatTraffic(data.raw_today)}{" "}
-                <ChangePill pct={data.raw_hour.change_pct} />
+                قبل {formatTraffic(rangeUsagePrev)}{" "}
+                <ChangePill pct={rangeBlock?.usage?.change_pct ?? null} />
               </small>
             </article>
             <article className="an-stat">
-              <span>اوج ساعات روز</span>
+              <span>کاربر فعال بازه</span>
+              <strong>{toFaDigits(rangeActive)}</strong>
+              <small>
+                واجدشرایط {toFaDigits(Number(data.eligible_users || 0))}
+              </small>
+            </article>
+            <article className="an-stat">
+              <span>این ساعت</span>
               <strong>
-                {data.hour_of_day.peak_hour != null
-                  ? `ساعت ${toFaDigits(data.hour_of_day.peak_hour)}`
-                  : "—"}
+                {formatTraffic(Number(data.raw_hour?.current || 0))}
               </strong>
-              <small>{formatTraffic(data.hour_of_day.peak_bytes)}</small>
+              <small>
+                قبل {formatTraffic(Number(data.raw_hour?.previous || 0))}{" "}
+                <ChangePill pct={data.raw_hour?.change_pct ?? null} />
+              </small>
             </article>
           </div>
+
+          {data.note ? <p className="muted an-note">{data.note}</p> : null}
 
           <div className="an-grid-2">
             <section className="an-block">
               <div className="an-block-head">
                 <h3>مصرف کل — ۲۴ ساعت</h3>
-                <span className="muted">هاور روی ردیف</span>
+                <span className="muted">
+                  {data.global_24h?.raw_bytes != null
+                    ? `جمع ${formatTraffic(Number(data.global_24h.raw_bytes))}`
+                    : "هاور روی ردیف"}
+                </span>
               </div>
               <div className="an-bars">
-                {data.global_hourly.map((h) => (
-                  <UsageBar
-                    key={h.hour_ts}
-                    label={hourLabelLocal(h.hour_ts)}
-                    value={h.raw_bytes}
-                    max={maxHour}
-                    tip={`${hourLabelLocal(h.hour_ts)} — ${formatTraffic(h.raw_bytes)}`}
-                  />
-                ))}
+                {(data.global_hourly || []).length === 0 ? (
+                  <p className="muted">هنوز باکت ساعتی ثبت نشده</p>
+                ) : (
+                  (data.global_hourly || []).map((h) => (
+                    <UsageBar
+                      key={h.hour_ts}
+                      label={hourLabelLocal(h.hour_ts)}
+                      value={Number(h.raw_bytes || 0)}
+                      max={maxHour}
+                      tip={`${hourLabelLocal(h.hour_ts)} — ${formatTraffic(Number(h.raw_bytes || 0))}${h.is_current ? " · جاری" : ""}`}
+                    />
+                  ))
+                )}
               </div>
             </section>
             <section className="an-block">
               <h3>پرمصرف‌ترین‌ها در این ساعت</h3>
-              {data.top_hour.length === 0 ? (
+              {(data.top_hour || []).length === 0 ? (
                 <p className="muted">هنوز دلتایی ثبت نشده</p>
               ) : (
                 <ul className="an-list">
-                  {data.top_hour.map((u) => (
+                  {(data.top_hour || []).map((u) => (
                     <li key={u.username}>
                       <button
                         type="button"
@@ -750,7 +857,7 @@ export default function AnalyticsPage() {
                       >
                         <b dir="ltr">{u.username}</b>
                       </button>
-                      <span>{formatTraffic(u.raw_bytes)}</span>
+                      <span>{formatTraffic(Number(u.raw_bytes || 0))}</span>
                     </li>
                   ))}
                 </ul>
@@ -760,21 +867,36 @@ export default function AnalyticsPage() {
 
           <section className="an-block">
             <div className="an-block-head">
-              <h3>توزیع مصرف در ساعات روز (۷ روز)</h3>
-              <span className="muted">هاور = جزئیات</span>
+              <h3>
+                توزیع مصرف در ساعات روز
+                {range === "day"
+                  ? " (امروز)"
+                  : range === "week"
+                    ? " (هفته)"
+                    : range === "month"
+                      ? " (ماه)"
+                      : " (کل)"}
+              </h3>
+              <span className="muted">
+                اوج{" "}
+                {hodPeak != null
+                  ? `ساعت ${toFaDigits(hodPeak)} · ${formatTraffic(Number(hodPeakBytes || 0))}`
+                  : "—"}
+              </span>
             </div>
             <div className="an-hod an-hod-live">
-              {data.hour_of_day.bytes.map((b, i) => {
-                const pct = (b / maxHod) * 100;
-                const peak = data.hour_of_day.peak_hour === i;
+              {hodBytes.map((b, i) => {
+                const val = Number(b || 0);
+                const pct = (val / maxHod) * 100;
+                const peak = hodPeak === i;
                 return (
                   <button
                     type="button"
                     key={i}
                     className={`an-hod-col${peak ? " peak" : ""}`}
-                    onMouseEnter={() => setHodHover({ i, bytes: b })}
+                    onMouseEnter={() => setHodHover({ i, bytes: val })}
                     onMouseLeave={() => setHodHover(null)}
-                    onFocus={() => setHodHover({ i, bytes: b })}
+                    onFocus={() => setHodHover({ i, bytes: val })}
                     onBlur={() => setHodHover(null)}
                   >
                     <i style={{ height: `${Math.max(6, pct)}%` }} />

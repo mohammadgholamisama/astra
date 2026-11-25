@@ -24,6 +24,41 @@ _RAW_TOKENS: dict[int, str] = {}  # optional in-memory after create (process lif
 # worker_id → (base_url, token, active) — sync lookup for get_adapter()
 _ROUTE: dict[int, tuple[str, str, bool]] = {}
 
+# One long-lived AsyncClient — reuse TLS/Keep-Alive to remote workers.
+_HTTP: httpx.AsyncClient | None = None
+_HTTP_LOCK = asyncio.Lock()
+
+
+async def _shared_http() -> httpx.AsyncClient:
+    global _HTTP
+    if _HTTP is not None and not _HTTP.is_closed:
+        return _HTTP
+    async with _HTTP_LOCK:
+        if _HTTP is not None and not _HTTP.is_closed:
+            return _HTTP
+        _HTTP = httpx.AsyncClient(
+            # 6s connect / 10s read — one slow tunnel must not stall a 12s batch.
+            timeout=httpx.Timeout(10.0, connect=6.0),
+            verify=False,
+            limits=httpx.Limits(
+                max_connections=40,
+                max_keepalive_connections=20,
+                keepalive_expiry=60.0,
+            ),
+            http2=False,
+        )
+        return _HTTP
+
+
+async def close_shared_http() -> None:
+    global _HTTP
+    if _HTTP is not None:
+        try:
+            await _HTTP.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+        _HTTP = None
+
 
 def register_worker_route(
     worker_id: int, base_url: str, token: str, *, active: bool = True
@@ -49,6 +84,33 @@ def lookup_worker_route(worker_id: int) -> tuple[str, str] | None:
     if not active or not token:
         return None
     return base, token
+
+
+def seed_worker_route_from_row(worker: Any, *, token: str | None = None) -> bool:
+    """Register route from a WorkerNode ORM/namespace row. Returns True if live."""
+    try:
+        wid = int(getattr(worker, "id", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if wid <= 0:
+        return False
+    if not bool(getattr(worker, "is_active", False)):
+        drop_worker_route(wid)
+        return False
+    tok = (token or "").strip()
+    if not tok:
+        tok = str((getattr(worker, "meta", None) or {}).get("agent_token") or "").strip()
+    if not tok:
+        tok = (peek_raw_token(wid) or "").strip()
+    if not tok:
+        return lookup_worker_route(wid) is not None
+    register_worker_route(
+        wid,
+        str(getattr(worker, "base_url", "") or ""),
+        tok,
+        active=True,
+    )
+    return lookup_worker_route(wid) is not None
 
 
 def drop_worker_route(worker_id: int) -> None:
@@ -155,11 +217,12 @@ async def ping_worker(
 ) -> tuple[bool, str]:
     url = normalize_panel_base_url(base_url).rstrip("/") + "/health"
     try:
-        async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
-            res = await client.get(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-            )
+        client = await _shared_http()
+        res = await client.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=timeout,
+        )
         if res.status_code == 200:
             return True, ""
         return False, f"HTTP {res.status_code}"
@@ -183,15 +246,16 @@ async def exec_on_worker(
         "args": args or {},
     }
     try:
-        async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
-            res = await client.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
-                json=body,
-            )
+        client = await _shared_http()
+        res = await client.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=timeout,
+        )
         if res.status_code != 200:
             return AdapterResult(
                 success=False,
@@ -221,15 +285,16 @@ async def push_assignments(
         "panels": panels,
     }
     try:
-        async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
-            res = await client.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
-                json=body,
-            )
+        client = await _shared_http()
+        res = await client.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=timeout,
+        )
         if res.status_code == 200:
             return True, ""
         return False, f"HTTP {res.status_code}: {(res.text or '')[:200]}"
@@ -365,7 +430,13 @@ class WorkerRoutedAdapter:
             "expand_links": bool(expand_links),
             **kwargs,
         }
-        got = await self._via_worker("get_usage", args)
+        # Bound usage hops tightly — worker serves meter_cache in <100ms when fresh.
+        prev_to = self._op_timeout
+        self._op_timeout = min(prev_to, 12.0)
+        try:
+            got = await self._via_worker("get_usage", args)
+        finally:
+            self._op_timeout = prev_to
         if got is not None:
             return got
         try:

@@ -38,14 +38,42 @@ async def analytics_overview(
 
     from app.core.database import AsyncSessionLocal
 
-    cache_path = Path("/tmp/astra_user_analytics_overview.json")
-    ttl = 20.0
+    # Shared path (not PrivateTmp /tmp) + tz key so UI never gets blank/stale wrong zone.
+    cache_dir = Path("/var/lib/astra/cache")
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:  # noqa: BLE001
+        cache_dir = Path("/tmp")
+    # Bucket tz to 30-min slots so Iran (-210) shares one file.
+    tz_key = int(round(int(tz_offset) / 30.0) * 30)
+    cache_path = cache_dir / f"user_analytics_overview_tz{tz_key}.json"
+    legacy = Path("/tmp/astra_user_analytics_overview.json")
+    ttl = 25.0
     now = time.time()
+
+    def _valid_overview(disk: object) -> dict | None:
+        if not isinstance(disk, dict):
+            return None
+        if "raw_hour" not in disk or "hour_of_day" not in disk:
+            return None
+        hod = disk.get("hour_of_day") or {}
+        if not isinstance(hod, dict) or not isinstance(hod.get("bytes"), list):
+            return None
+        # Reject empty poisoned caches that made the UI look dead.
+        if (
+            int(disk.get("online_users") or 0) == 0
+            and int(disk.get("raw_today") or 0) == 0
+            and int(disk.get("raw_current") or 0) == 0
+            and not any(int(x or 0) for x in (hod.get("bytes") or []))
+        ):
+            return None
+        return disk
+
     try:
         if cache_path.is_file() and 0 <= (now - cache_path.stat().st_mtime) < ttl:
-            disk = json.loads(cache_path.read_text(encoding="utf-8"))
-            if isinstance(disk, dict) and "raw_hour" in disk:
-                return disk
+            hit = _valid_overview(json.loads(cache_path.read_text(encoding="utf-8")))
+            if hit is not None:
+                return hit
     except Exception:  # noqa: BLE001
         pass
 
@@ -55,30 +83,53 @@ async def analytics_overview(
                 analytics_svc.build_overview(
                     db, limit_users=limit, tz_offset_min=tz_offset
                 ),
-                timeout=12.0,
+                timeout=22.0,
             )
+        if not isinstance(payload, dict):
+            raise RuntimeError("overview payload not a dict")
+        # Guarantee nested keys the frontend always reads.
+        payload.setdefault(
+            "raw_hour", {"current": 0, "previous": 0, "change_pct": None}
+        )
+        payload.setdefault(
+            "hour_of_day", {"bytes": [0] * 24, "peak_hour": None, "peak_bytes": 0}
+        )
+        payload.setdefault("global_hourly", [])
+        payload.setdefault("top_hour", [])
+        payload.setdefault("online_users", 0)
+        payload.setdefault("raw_today", 0)
+        payload.setdefault("raw_current", 0)
+        payload.setdefault("range_stats", {})
+        payload.setdefault("active_users", {})
         try:
             cache_path.write_text(
                 json.dumps(payload, ensure_ascii=False, default=str),
                 encoding="utf-8",
             )
+            try:
+                legacy.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:  # noqa: BLE001
             pass
         return payload
     except Exception as exc:  # noqa: BLE001
         logger.warning("analytics overview failed/timed out: %s", exc)
-        try:
-            if cache_path.is_file():
-                disk = json.loads(cache_path.read_text(encoding="utf-8"))
-                if isinstance(disk, dict) and "raw_hour" in disk:
-                    disk = dict(disk)
-                    disk["note"] = (
-                        (disk.get("note") or "")
-                        + " · آخرین نمونهٔ کش‌شده (بروزرسانی طول کشید)"
-                    ).strip(" ·")
-                    return disk
-        except Exception:  # noqa: BLE001
-            pass
+        for path in (cache_path, legacy):
+            try:
+                if not path.is_file():
+                    continue
+                disk = _valid_overview(json.loads(path.read_text(encoding="utf-8")))
+                if disk is None:
+                    continue
+                disk = dict(disk)
+                disk["note"] = (
+                    (disk.get("note") or "")
+                    + " · آخرین نمونهٔ کش‌شده (بروزرسانی طول کشید)"
+                ).strip(" ·")
+                return disk
+            except Exception:  # noqa: BLE001
+                continue
         return analytics_svc.empty_user_overview(
             tz_offset_min=tz_offset,
             note="آمار سبک بارگذاری شد — چند ثانیه بعد بروزرسانی کنید",

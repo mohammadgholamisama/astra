@@ -812,6 +812,83 @@ def _migrate_group_order_kind(connection: Connection) -> list[str]:
     return changed
 
 
+def _backfill_preferred_worker_id(connection: Connection) -> list[str]:
+    """Copy worker_id → preferred_worker_id once so affinity sticks after failover."""
+    changed: list[str] = []
+    sp = "astra_pref_worker"
+    try:
+        connection.execute(text(f"SAVEPOINT {sp}"))
+        inspector = inspect(connection)
+        cols = {c["name"] for c in inspector.get_columns("panels")}
+        if "preferred_worker_id" not in cols:
+            connection.execute(text(f"RELEASE SAVEPOINT {sp}"))
+            return changed
+        res = connection.execute(
+            text(
+                """
+                UPDATE panels
+                SET preferred_worker_id = worker_id
+                WHERE preferred_worker_id IS NULL
+                  AND worker_id IS NOT NULL
+                """
+            )
+        )
+        n = int(getattr(res, "rowcount", 0) or 0)
+        connection.execute(text(f"RELEASE SAVEPOINT {sp}"))
+        if n:
+            changed.append(f"panels.preferred_worker_id_backfill:{n}")
+            logger.info("Backfilled panels.preferred_worker_id for %s rows", n)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            connection.execute(text(f"ROLLBACK TO SAVEPOINT {sp}"))
+        except Exception:  # noqa: BLE001
+            pass
+        logger.warning("preferred_worker_id backfill skipped: %s", exc)
+    return changed
+
+
+def _backfill_last_remote_raw(connection: Connection) -> list[str]:
+    """Prime last_remote_raw = used_traffic so the first delta wave does not double-count.
+
+    Idempotent: only rows where last_remote_raw IS NULL are touched. After the
+    high-water pipeline starts, NULL never reappears for live accounts.
+    Uses a SAVEPOINT so a deadlock / long lock never aborts the whole schema txn.
+    """
+    changed: list[str] = []
+    sp = "astra_lrr_backfill"
+    try:
+        connection.execute(text(f"SAVEPOINT {sp}"))
+        inspector = inspect(connection)
+        cols = {c["name"] for c in inspector.get_columns("panel_accounts")}
+        if "last_remote_raw" not in cols:
+            connection.execute(text(f"RELEASE SAVEPOINT {sp}"))
+            return changed
+        # Backfill NULL → used_traffic (existing accumulated meters).
+        res = connection.execute(
+            text(
+                """
+                UPDATE panel_accounts
+                SET last_remote_raw = COALESCE(used_traffic, 0)
+                WHERE last_remote_raw IS NULL
+                """
+            )
+        )
+        n = int(getattr(res, "rowcount", 0) or 0)
+        connection.execute(text(f"RELEASE SAVEPOINT {sp}"))
+        if n:
+            changed.append(f"panel_accounts.last_remote_raw_backfill:{n}")
+            logger.info(
+                "Backfilled panel_accounts.last_remote_raw for %s rows", n
+            )
+    except Exception as exc:  # noqa: BLE001
+        try:
+            connection.execute(text(f"ROLLBACK TO SAVEPOINT {sp}"))
+        except Exception:  # noqa: BLE001
+            pass
+        logger.warning("last_remote_raw backfill skipped: %s", exc)
+    return changed
+
+
 def _ensure_dashboard_perf_indexes(connection: Connection) -> list[str]:
     """Indexes that keep /api/system + users chips from full-scanning 10k+ rows."""
     created: list[str] = []
@@ -835,12 +912,24 @@ def _ensure_dashboard_perf_indexes(connection: Connection) -> list[str]:
             'CREATE INDEX IF NOT EXISTS "ix_panel_accounts_status_panel" '
             'ON "panel_accounts" (status, panel_id)',
         ),
+        (
+            "ix_panel_accounts_panel_remote",
+            'CREATE INDEX IF NOT EXISTS "ix_panel_accounts_panel_remote" '
+            'ON "panel_accounts" (panel_id, remote_username)',
+        ),
     ]
     for name, sql in statements:
+        sp = f"astra_perf_{name[-24:]}".replace("-", "_")
         try:
+            connection.execute(text(f"SAVEPOINT {sp}"))
             connection.execute(text(sql))
+            connection.execute(text(f"RELEASE SAVEPOINT {sp}"))
             created.append(name)
         except Exception as exc:  # noqa: BLE001
+            try:
+                connection.execute(text(f"ROLLBACK TO SAVEPOINT {sp}"))
+            except Exception:  # noqa: BLE001
+                pass
             msg = str(exc).lower()
             if "already exists" in msg or "duplicate" in msg:
                 continue
@@ -858,6 +947,9 @@ def sync_schema_sync(connection: Connection) -> dict[str, Any]:
     # order_kind first with quoted DEFAULT — generic ADD used to emit DEFAULT other (SQL error)
     mig6 = _migrate_group_order_kind(connection)
     added_cols = _add_missing_columns(connection)
+    # After column add: prime high-water mark from existing accumulated raw.
+    mig_lrr = _backfill_last_remote_raw(connection)
+    mig_pref = _backfill_preferred_worker_id(connection)
     mig = _migrate_panel_account_group_unique(connection)
     mig2 = _migrate_config_location_match_host(connection)
     mig3 = _migrate_group_config_hide_match_host(connection)
@@ -868,7 +960,7 @@ def sync_schema_sync(connection: Connection) -> dict[str, Any]:
     return {
         "added_columns": added_cols,
         "added_indexes": added_idx + perf_idx,
-        "migrations": mig6 + mig + mig2 + mig3 + mig4 + mig5,
+        "migrations": mig6 + mig_lrr + mig_pref + mig + mig2 + mig3 + mig4 + mig5,
     }
 
 

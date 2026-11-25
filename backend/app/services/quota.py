@@ -8,13 +8,13 @@ Remote caps (create / modify):
     This stops multi-panel overshoot where every panel had the FULL 10GB.
 
 Usage (what the end-user / admin sees):
-    used_astra = Σ over accounts  (raw_i × coefficient_of_that_account's_group)
+    used_astra = Σ over accounts period-locked weighted bytes:
+      weighted = coeff_anchor_weighted + (raw - coeff_anchor_raw) × applied_coefficient
+    Ingest path also does users.used_traffic += round(raw_delta × live_coeff)
+    so coefficient changes never rewrite historical consumption.
 
 When used_astra >= data_limit → status=limited and ALL remotes are frozen/disabled.
 Astra is the source of truth; remotes are tightened as remaining shrinks.
-
-Coefficient always applies to the full current raw on that account (no legacy
-period lock). Changing coeff 1→3 immediately recounts existing raw × 3.
 """
 
 from __future__ import annotations
@@ -50,15 +50,19 @@ def weighted_bytes(
     anchor_raw: int = 0,
     anchor_weighted: int = 0,
 ) -> int:
-    """Astra-facing usage for one account: raw × current coefficient.
+    """Period-locked Astra usage for one account.
 
-    anchor_* kept for call-site compatibility but ignored — admin expectation is
-    always full raw × live group coefficient.
+    Past bytes stay at the coefficient that was live when they were ingested;
+    only ``(raw - anchor_raw)`` uses the current ``coeff``.
     """
-    _ = (anchor_raw, anchor_weighted)
     c = norm_coeff(coeff)
     r = max(0, int(raw or 0))
-    return int(round(r * c))
+    ar = max(0, int(anchor_raw or 0))
+    aw = max(0, int(anchor_weighted or 0))
+    if ar <= 0 and aw <= 0:
+        return int(round(r * c))
+    delta = max(0, r - ar)
+    return aw + int(round(delta * c))
 
 
 def sum_weighted(parts: list[tuple[int, float, int, int]]) -> int:

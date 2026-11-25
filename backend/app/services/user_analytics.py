@@ -657,6 +657,74 @@ async def _distribute_delta_hours(
             await _bump_hour(db, user_id, h, part, act, peak_bps)
 
 
+async def record_usage_deltas(
+    deltas: dict[int, int],
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Credit known positive usage deltas into the current UTC hour bucket.
+
+    Called from the live usage-report / bulk apply path so «پرمصرف‌ترین‌ها در
+    این ساعت» stays accurate without waiting for the full sample loop.
+    Uses a short isolated session + bulk UPSERT (no shared AsyncSession).
+    """
+    from sqlalchemy import text
+
+    from app.core.database import AsyncSessionLocal, _IS_SQLITE
+
+    items = [(int(uid), int(d)) for uid, d in deltas.items() if int(d) > 0]
+    if not items:
+        return 0
+    now = _as_utc(now) or _utc_now()
+    hour_ts = _hour_ts(now)
+    n = 0
+    async with AsyncSessionLocal() as db:
+        for off in range(0, len(items), 400):
+            chunk = items[off : off + 400]
+            if _IS_SQLITE:
+                for uid, delta in chunk:
+                    await _bump_hour(db, uid, hour_ts, delta, 0, 0.0)
+                    n += 1
+            else:
+                values_sql = ", ".join(
+                    f"({uid}::int, {hour_ts}::bigint, {delta}::bigint)"
+                    for uid, delta in chunk
+                )
+                await db.execute(
+                    text(
+                        f"""
+                        INSERT INTO usage_hour_buckets
+                          (user_id, hour_ts, raw_bytes, active_seconds, sample_count, peak_bps)
+                        SELECT v.user_id, v.hour_ts, v.delta, 0, 1, 0
+                        FROM (VALUES {values_sql}) AS v(user_id, hour_ts, delta)
+                        ON CONFLICT (user_id, hour_ts) DO UPDATE SET
+                          raw_bytes = usage_hour_buckets.raw_bytes + EXCLUDED.raw_bytes,
+                          sample_count = usage_hour_buckets.sample_count + 1
+                        """
+                    )
+                )
+                n += len(chunk)
+            # Keep sample cursors in sync so the next full sample doesn't
+            # double-count these deltas as a giant jump.
+            if not _IS_SQLITE:
+                uid_list = ", ".join(str(uid) for uid, _ in chunk)
+                await db.execute(
+                    text(
+                        f"""
+                        INSERT INTO user_usage_states (user_id, last_raw_total, last_sample_at)
+                        SELECT u.id, coalesce(u.used_traffic, 0), now()
+                        FROM users u
+                        WHERE u.id IN ({uid_list})
+                        ON CONFLICT (user_id) DO UPDATE SET
+                          last_raw_total = EXCLUDED.last_raw_total,
+                          last_sample_at = EXCLUDED.last_sample_at
+                        """
+                    )
+                )
+        await db.commit()
+    return n
+
+
 async def apply_raw_sample(
     db: AsyncSession,
     user_id: int,
@@ -761,7 +829,9 @@ async def rebase_cursors_to_weighted_usage() -> dict[str, int]:
     global _weighted_rebase_done
     if _weighted_rebase_done:
         return {"skipped": 1}
-    from app.core.database import AsyncSessionLocal
+    from sqlalchemy import text
+
+    from app.core.database import AsyncSessionLocal, _IS_SQLITE
 
     async with AsyncSessionLocal() as db:
         live_all = int(
@@ -793,28 +863,63 @@ async def rebase_cursors_to_weighted_usage() -> dict[str, int]:
         day_ts = int(
             now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         )
-        users = (
-            await db.execute(
-                select(User.id, func.coalesce(User.used_traffic, 0))
+        if _IS_SQLITE:
+            users = (
+                await db.execute(
+                    select(User.id, func.coalesce(User.used_traffic, 0))
+                )
+            ).all()
+            n = 0
+            for uid, total in users:
+                state = await _get_or_create_state(db, int(uid))
+                live = int(total or 0)
+                state.last_raw_total = live
+                state.last_sample_at = now
+                state.period_hour_ts = hour_ts
+                state.period_hour_raw = live
+                state.period_day_ts = day_ts
+                state.period_day_raw = live
+                n += 1
+            await db.commit()
+        else:
+            # One bulk upsert — avoids long ORM loops racing other writers.
+            result = await db.execute(
+                text(
+                    """
+                    INSERT INTO user_usage_states (
+                      user_id, last_raw_total, last_sample_at,
+                      period_hour_ts, period_hour_raw,
+                      period_day_ts, period_day_raw
+                    )
+                    SELECT
+                      u.id,
+                      coalesce(u.used_traffic, 0),
+                      now(),
+                      :hour_ts,
+                      coalesce(u.used_traffic, 0),
+                      :day_ts,
+                      coalesce(u.used_traffic, 0)
+                    FROM users u
+                    ON CONFLICT (user_id) DO UPDATE SET
+                      last_raw_total = EXCLUDED.last_raw_total,
+                      last_sample_at = EXCLUDED.last_sample_at,
+                      period_hour_ts = EXCLUDED.period_hour_ts,
+                      period_hour_raw = EXCLUDED.period_hour_raw,
+                      period_day_ts = EXCLUDED.period_day_ts,
+                      period_day_raw = EXCLUDED.period_day_raw
+                    """
+                ),
+                {"hour_ts": int(hour_ts), "day_ts": int(day_ts)},
             )
-        ).all()
-        n = 0
-        for uid, total in users:
-            state = await _get_or_create_state(db, int(uid))
-            live = int(total or 0)
-            state.last_raw_total = live
-            state.last_sample_at = now
-            state.period_hour_ts = hour_ts
-            state.period_hour_raw = live
-            state.period_day_ts = day_ts
-            state.period_day_raw = live
-            n += 1
-            if n % 80 == 0:
-                await db.commit()
+            n = int(result.rowcount or 0)
+            await db.commit()
 
-        # Clear polluted current-hour buckets so «این ساعت» starts clean
+        # Only clear absurd pollution; keep live usage-report hour deltas.
         cleared = await db.execute(
-            delete(UsageHourBucket).where(UsageHourBucket.hour_ts >= hour_ts)
+            delete(UsageHourBucket).where(
+                UsageHourBucket.hour_ts >= hour_ts,
+                UsageHourBucket.raw_bytes >= 5 * 1024 * 1024 * 1024,
+            )
         )
         await db.commit()
         _weighted_rebase_done = True
@@ -906,11 +1011,22 @@ async def sample_all_users_once() -> dict[str, int]:
 
     Uses ``User.used_traffic`` — same counter as the users page
     (Σ raw×coeff, no superseded deleted double-count). No remote I/O.
+
+    Strictly sequential DB access: keyset pages of 1000, one fresh
+    ``AsyncSession`` per page, **never** shared across ``asyncio.gather``.
+    Commit once per page then ``sleep(0.05)`` so usage-report stays unblocked.
     """
     from app.core.database import AsyncSessionLocal
 
     if _sample_lock.locked():
         return {"skipped": 1, "busy": 1}
+    try:
+        from app.core.database import pool_pressure_blocks_background
+
+        if pool_pressure_blocks_background():
+            return {"skipped": 1, "pool_busy": 1}
+    except Exception:  # noqa: BLE001
+        pass
     async with _sample_lock:
         t0 = time.monotonic()
         try:
@@ -918,52 +1034,99 @@ async def sample_all_users_once() -> dict[str, int]:
             if rebase.get("rebased"):
                 logger.info("analytics weighted rebase: %s", rebase)
         except Exception:  # noqa: BLE001
-            logger.exception("analytics weighted rebase failed")
-        # Load ids in a short read txn, then sample in small sessions so we
-        # never sit ``idle in transaction`` across event-loop yields.
-        async with AsyncSessionLocal() as db:
-            rows = (
-                await db.execute(
-                    select(User.id, func.coalesce(User.used_traffic, 0)).where(
-                        User.status.in_(
-                            (
-                                UserStatus.active,
-                                UserStatus.on_hold,
-                                UserStatus.limited,
-                            )
-                        ),
-                        User.used_traffic > 0,
-                    )
-                )
-            ).all()
-            await db.rollback()
-        pairs = [(int(uid), int(total or 0)) for uid, total in rows]
+            logger.warning("analytics weighted rebase failed", exc_info=True)
+
+        batch_size = 1000
+        last_id = 0
         n = 0
-        chunk = 40
-        for i in range(0, len(pairs), chunk):
-            batch = pairs[i : i + chunk]
-            async with AsyncSessionLocal() as db:
-                for uid, total in batch:
-                    try:
-                        async with db.begin_nested():
-                            await apply_raw_sample(db, uid, total)
-                        n += 1
-                    except Exception:  # noqa: BLE001
-                        logger.exception("analytics sample user=%s failed", uid)
-                        try:
-                            await db.rollback()
-                        except Exception:  # noqa: BLE001
-                            pass
+        batches = 0
+        while True:
+            try:
+                from app.core.database import pool_pressure_blocks_background
+
+                if pool_pressure_blocks_background():
+                    logger.info(
+                        "analytics sample pause pool_busy after n=%s batches=%s",
+                        n,
+                        batches,
+                    )
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+            # Short read txn — keyset page only.
+            async with AsyncSessionLocal() as read_db:
+                rows = (
+                    await read_db.execute(
+                        select(User.id, func.coalesce(User.used_traffic, 0))
+                        .where(
+                            User.status.in_(
+                                (
+                                    UserStatus.active,
+                                    UserStatus.on_hold,
+                                    UserStatus.limited,
+                                )
+                            ),
+                            User.used_traffic > 0,
+                            User.id > int(last_id),
+                        )
+                        .order_by(User.id.asc())
+                        .limit(batch_size)
+                    )
+                ).all()
+                await read_db.rollback()
+            if not rows:
+                break
+            pairs = [(int(uid), int(total or 0)) for uid, total in rows]
+            last_id = pairs[-1][0]
+            # Fresh session per 25-row microbatch — never reuse a connection
+            # across commits (asyncpg InternalClientError under pool recycle).
+            # Sequential awaits only — never gather/create_task on a session.
+            micro = 25
+            for off in range(0, len(pairs), micro):
+                chunk = pairs[off : off + micro]
                 try:
-                    await db.commit()
+                    async with AsyncSessionLocal() as batch_db:
+                        for uid, total in chunk:
+                            try:
+                                await apply_raw_sample(batch_db, uid, total)
+                                n += 1
+                            except Exception:  # noqa: BLE001
+                                logger.warning(
+                                    "analytics sample user=%s failed",
+                                    uid,
+                                    exc_info=True,
+                                )
+                                try:
+                                    await batch_db.rollback()
+                                except Exception:  # noqa: BLE001
+                                    pass
+                        try:
+                            await batch_db.commit()
+                        except Exception:  # noqa: BLE001
+                            logger.warning(
+                                "analytics batch commit failed last_id=%s",
+                                last_id,
+                                exc_info=True,
+                            )
+                            try:
+                                await batch_db.rollback()
+                            except Exception:  # noqa: BLE001
+                                pass
                 except Exception:  # noqa: BLE001
-                    try:
-                        await db.rollback()
-                    except Exception:  # noqa: BLE001
-                        pass
-            # Session closed → connection returned before yielding the loop.
-            await asyncio.sleep(0)
-        return {"users": n, "ms": int((time.monotonic() - t0) * 1000)}
+                    logger.warning(
+                        "analytics microbatch failed last_id=%s",
+                        last_id,
+                        exc_info=True,
+                    )
+                await asyncio.sleep(0.05)
+            batches += 1
+            if len(pairs) < batch_size:
+                break
+        return {
+            "users": n,
+            "batches": batches,
+            "ms": int((time.monotonic() - t0) * 1000),
+        }
 
 
 async def prune_analytics(db: AsyncSession) -> dict[str, int]:

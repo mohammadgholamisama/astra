@@ -1,6 +1,6 @@
 [Unit]
-Description=Astra Panel (uvicorn)
-After=network.target
+Description=Astra Panel API (uvicorn)
+After=network.target redis-server.service postgresql.service
 Wants=network-online.target
 
 [Service]
@@ -8,27 +8,21 @@ Type=simple
 User=astra
 Group=astra
 WorkingDirectory=/opt/astra/backend
-# Defaults — overridden by EnvironmentFile when keys exist
 Environment=ASTRA_BIND_HOST=127.0.0.1
 Environment=ASTRA_APP_PORT=2086
-# Spread API across cores (one process used to peg a single core at 100%).
-# Background loops run in only one worker via /tmp/astra-bg.lock.
-# 2 web workers spreads API across cores without 3× DB-pool stampede.
-Environment=ASTRA_WEB_CONCURRENCY=2
 EnvironmentFile=-/opt/astra/.env
+# Pin AFTER EnvironmentFile so .env cannot stampede workers again
+Environment=ASTRA_ROLE=api
+Environment=ASTRA_WEB_CONCURRENCY=3
 Environment=PATH=/opt/astra/backend/.venv/bin:/usr/local/bin:/usr/bin
-# IMPORTANT: systemd supports ${VAR} only — NOT bash ${VAR:-default}
-# limit-concurrency is per-worker; short keepalive cuts CLOSE-WAIT pileups.
-ExecStart=/opt/astra/backend/.venv/bin/uvicorn app.main:app --host ${ASTRA_BIND_HOST} --port ${ASTRA_APP_PORT} --workers ${ASTRA_WEB_CONCURRENCY} --limit-concurrency 80 --timeout-keep-alive 5 --timeout-graceful-shutdown 15
+ExecStart=/opt/astra/backend/.venv/bin/uvicorn app.main:app --host ${ASTRA_BIND_HOST} --port ${ASTRA_APP_PORT} --workers ${ASTRA_WEB_CONCURRENCY} --loop uvloop --http httptools --limit-concurrency 100 --timeout-keep-alive 8 --timeout-graceful-shutdown 15 --no-access-log --log-level warning
 Restart=always
 RestartSec=3
 KillSignal=SIGTERM
 TimeoutStopSec=45
-# ~4 cores max for 3 workers + headroom; leave CPU for sshd/nginx.
-CPUQuota=400%
+CPUQuota=350%
 TasksMax=8192
 OOMPolicy=continue
-# Must be false so astra can sudo astra-helper (SSL / update / nginx) via /etc/sudoers.d/astra
 NoNewPrivileges=false
 PrivateTmp=true
 

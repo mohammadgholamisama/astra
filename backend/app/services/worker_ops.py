@@ -37,7 +37,12 @@ _REPORT_LOCK = asyncio.Lock()
 _REPORT_DIRTY: set[int] = set()
 _REPORT_DIRTY_LOCK = asyncio.Lock()
 _REPORT_STATS = {"queued": 0, "applied": 0, "dropped": 0, "errors": 0, "merged": 0}
-_APPLY_LOCK_PATH = "/tmp/astra-usage-apply.lock"
+# Outside PrivateTmp so all API workers share one flock.
+_APPLY_LOCK_PATH = "/var/lib/astra/usage-apply.lock"
+_PANEL_APPLY_COOLDOWN = float(
+    __import__("os").environ.get("ASTRA_USAGE_APPLY_COOLDOWN", "18") or 18
+)
+_LOCAL_APPLY_TS: dict[int, float] = {}
 
 
 def _report_wake() -> asyncio.Event:
@@ -51,10 +56,12 @@ async def ensure_usage_report_worker() -> None:
     """Start background consumer once (call from lifespan)."""
     global _REPORT_TASK
     if _REPORT_TASK is not None and not _REPORT_TASK.done():
+        await ensure_dirty_recount_worker()
         return
     _REPORT_TASK = asyncio.create_task(
         _usage_report_consumer(), name="worker-usage-report-q"
     )
+    await ensure_dirty_recount_worker()
 
 
 async def enqueue_usage_report(
@@ -64,6 +71,9 @@ async def enqueue_usage_report(
     usage_map: dict[str, int],
     listed: int = 0,
     dt_ms: int | None = None,
+    allow_shrink: bool = False,
+    full_sync: bool = False,
+    mode: str | None = None,
 ) -> dict[str, Any]:
     """Merge meters into per-panel pending map (O(1) accept, deferred apply)."""
     await ensure_usage_report_worker()
@@ -71,15 +81,25 @@ async def enqueue_usage_report(
     async with _REPORT_LOCK:
         row = _REPORT_PENDING.get(pid)
         if row is None:
-            if len(_REPORT_PENDING) >= 40:
-                # Drop an arbitrary oldest panel to keep master responsive.
-                drop_pid = next(iter(_REPORT_PENDING))
+            if len(_REPORT_PENDING) >= 120:
+                # Drop an arbitrary oldest non-priority panel to keep master responsive.
+                drop_pid = next(
+                    (
+                        p
+                        for p, r in _REPORT_PENDING.items()
+                        if not r.get("priority")
+                    ),
+                    next(iter(_REPORT_PENDING)),
+                )
                 _REPORT_PENDING.pop(drop_pid, None)
                 _REPORT_STATS["dropped"] += 1
             row = {
                 "worker_id": int(worker_id),
                 "usage_map": {},
                 "listed": 0,
+                "allow_shrink": False,
+                "full_sync": False,
+                "mode": None,
                 "enqueued_at": time.monotonic(),
             }
             _REPORT_PENDING[pid] = row
@@ -87,13 +107,23 @@ async def enqueue_usage_report(
         else:
             _REPORT_STATS["merged"] += 1
         umap: dict[str, int] = row["usage_map"]
+        shrink = bool(row.get("allow_shrink")) or bool(allow_shrink)
         for k, v in (usage_map or {}).items():
             name = str(k).strip()
             if not name:
                 continue
-            umap[name] = max(int(umap.get(name) or 0), max(0, int(v or 0)))
+            nv = max(0, int(v or 0))
+            # Last write wins so remote resets reach high-water apply intact.
+            umap[name] = nv
+        row["allow_shrink"] = shrink
         row["worker_id"] = int(worker_id)
         row["listed"] = max(int(row.get("listed") or 0), int(listed or 0))
+        row["full_sync"] = bool(row.get("full_sync")) or bool(full_sync)
+        if mode:
+            row["mode"] = str(mode)
+        # Tiny maps = priority-probe; drain them ahead of bulk waves.
+        if len(usage_map or {}) <= 120:
+            row["priority"] = True
         meters_n = len(umap)
         pending_n = len(_REPORT_PENDING)
     _report_wake().set()
@@ -116,17 +146,25 @@ async def _usage_report_consumer() -> None:
             async with _REPORT_LOCK:
                 if not _REPORT_PENDING:
                     break
-                # Prefer largest pending map (finish heavy panels first).
-                pid = max(
-                    _REPORT_PENDING.keys(),
-                    key=lambda p: len(_REPORT_PENDING[p].get("usage_map") or {}),
-                )
+                # Prefer priority-probe (tiny) maps, then largest bulk maps.
+                def _rank(p: int) -> tuple[int, int]:
+                    r = _REPORT_PENDING[p]
+                    n = len(r.get("usage_map") or {})
+                    pri = 1 if r.get("priority") or n <= 120 else 0
+                    return (pri, -n if pri else n)
+
+                pid = max(_REPORT_PENDING.keys(), key=_rank)
                 row = _REPORT_PENDING.pop(pid)
             job = {
                 "panel_id": int(pid),
                 "worker_id": int(row["worker_id"]),
                 "usage_map": row.get("usage_map") or {},
                 "listed": int(row.get("listed") or 0),
+                "allow_shrink": bool(row.get("allow_shrink")),
+                "full_sync": bool(row.get("full_sync")),
+                "mode": row.get("mode"),
+                "priority": bool(row.get("priority"))
+                or len(row.get("usage_map") or {}) <= 120,
             }
             try:
                 if pool_pressure_blocks_background():
@@ -146,8 +184,10 @@ async def _usage_report_consumer() -> None:
 def _try_acquire_apply_lock():
     """Cross-process lock so two uvicorn workers don't apply at once."""
     import fcntl
+    from pathlib import Path
 
     try:
+        Path(_APPLY_LOCK_PATH).parent.mkdir(parents=True, exist_ok=True)
         fd = open(_APPLY_LOCK_PATH, "w", encoding="utf-8")
         fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         return fd
@@ -157,6 +197,73 @@ def _try_acquire_apply_lock():
         return None
 
 
+def _panel_apply_deferred(pid: int, *, force: bool = False) -> bool:
+    """True if another worker applied this panel within the cooldown window."""
+    # Full-sync may shrink meters — shorter cool, never zero (avoids stampede).
+    cool = 6.0 if force else max(8.0, float(_PANEL_APPLY_COOLDOWN))
+    now = time.monotonic()
+    last = float(_LOCAL_APPLY_TS.get(pid, 0.0) or 0.0)
+    if now - last < cool:
+        return True
+    try:
+        from app.core.redis_cache import get_redis
+
+        client = get_redis()
+        if client is not None:
+            # SET NX — first worker wins the window; others coalesce.
+            ok = client.set(
+                f"astra:usage:apply:{int(pid)}",
+                b"1",
+                nx=True,
+                ex=max(3, int(cool)),
+            )
+            if not ok:
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    _LOCAL_APPLY_TS[pid] = now
+    return False
+
+
+def _requeue_usage_job(
+    pid: int,
+    wid: int,
+    usage_map: dict[str, int],
+    *,
+    allow_shrink: bool = False,
+    full_sync: bool = False,
+    mode: str | None = None,
+    priority: bool = False,
+) -> None:
+    """Merge meters back into the pending coalesce map."""
+    # Called under/without lock — take the async lock at call sites when needed.
+    row = _REPORT_PENDING.get(pid) or {
+        "worker_id": wid,
+        "usage_map": {},
+        "listed": 0,
+        "allow_shrink": False,
+        "full_sync": False,
+        "mode": None,
+        "enqueued_at": time.monotonic(),
+    }
+    umap: dict[str, int] = row["usage_map"]
+    shrink = bool(row.get("allow_shrink")) or bool(allow_shrink)
+    for k, v in usage_map.items():
+        name = str(k)
+        nv = max(0, int(v or 0))
+        # Last write wins — high-water apply detects remote resets when got drops.
+        umap[name] = nv
+    row["usage_map"] = umap
+    row["worker_id"] = wid
+    row["allow_shrink"] = shrink
+    row["full_sync"] = bool(row.get("full_sync")) or bool(full_sync)
+    if mode:
+        row["mode"] = str(mode)
+    if priority:
+        row["priority"] = True
+    _REPORT_PENDING[pid] = row
+
+
 async def _apply_usage_report_job(job: dict[str, Any]) -> None:
     from app.core.database import AsyncSessionLocal
     from app.services.panel_usage_bulk import apply_usage_map_to_panel
@@ -164,30 +271,50 @@ async def _apply_usage_report_job(job: dict[str, Any]) -> None:
     pid = int(job["panel_id"])
     wid = int(job["worker_id"])
     usage_map: dict[str, int] = job.get("usage_map") or {}
+    allow_shrink = bool(job.get("allow_shrink"))
+    priority = bool(job.get("priority")) or len(usage_map) <= 120
     if not usage_map:
+        return
+    mode = str(job.get("mode") or "").strip().lower()
+    full_sync = bool(job.get("full_sync"))
+    # Per-panel cooldown — skip for priority-probe (≤120 meters) so /sub stays live.
+    # Cold/full_sync waves use shorter cool so last_sync stamps keep moving.
+    if not priority and _panel_apply_deferred(
+        pid, force=allow_shrink or full_sync or mode == "cold"
+    ):
+        async with _REPORT_LOCK:
+            _requeue_usage_job(
+                pid,
+                wid,
+                usage_map,
+                allow_shrink=allow_shrink,
+                full_sync=full_sync,
+                mode=mode or None,
+                priority=priority,
+            )
+        await asyncio.sleep(1.0)
+        _report_wake().set()
         return
     # Serialize applies across uvicorn workers (shared CPU/DB).
     lock_fd = await asyncio.to_thread(_try_acquire_apply_lock)
     if lock_fd is None:
-        # Another process is applying — re-queue and wait.
         async with _REPORT_LOCK:
-            row = _REPORT_PENDING.get(pid) or {
-                "worker_id": wid,
-                "usage_map": {},
-                "listed": 0,
-                "enqueued_at": time.monotonic(),
-            }
-            umap: dict[str, int] = row["usage_map"]
-            for k, v in usage_map.items():
-                umap[str(k)] = max(int(umap.get(str(k)) or 0), int(v or 0))
-            row["usage_map"] = umap
-            row["worker_id"] = wid
-            _REPORT_PENDING[pid] = row
+            _requeue_usage_job(
+                pid,
+                wid,
+                usage_map,
+                allow_shrink=allow_shrink,
+                full_sync=full_sync,
+                mode=mode or None,
+                priority=priority,
+            )
         await asyncio.sleep(0.8)
         _report_wake().set()
         return
     t0 = time.monotonic()
     dirty: set[int] = set()
+    exhausted: list[int] = []
+    near_limit_uids: list[int] = []
     try:
         async with AsyncSessionLocal() as db:
             panel = (
@@ -195,7 +322,94 @@ async def _apply_usage_report_job(job: dict[str, Any]) -> None:
             ).scalar_one_or_none()
             if panel is None:
                 return
-            dirty = await apply_usage_map_to_panel(db, pid, usage_map)
+            dirty = await apply_usage_map_to_panel(
+                db,
+                pid,
+                usage_map,
+                allow_shrink=allow_shrink,
+            )
+            # Bulk / cold / full_sync waves prove the panel was scanned — stamp
+            # last_sync_at on remaining live remotes so fleet freshness recovers
+            # even when most meters were unchanged (delta-only payloads).
+            # Threshold 80: cache sync-loop posts ~1200; hot probes stay small.
+            bulk_prove = (
+                full_sync
+                or mode == "cold"
+                or len(usage_map) >= 80
+            )
+            if bulk_prove:
+                try:
+                    from datetime import datetime, timedelta, timezone
+
+                    from sqlalchemy import text
+
+                    now_ts = datetime.now(timezone.utc)
+                    cutoff = now_ts - timedelta(minutes=5)
+                    res_stamp = await db.execute(
+                        text(
+                            """
+                            UPDATE panel_accounts
+                            SET last_sync_at = :now
+                            WHERE panel_id = :pid
+                              AND status IN ('active', 'error', 'pending')
+                              AND coalesce(remote_username, '') <> ''
+                              AND (
+                                    last_sync_at IS NULL
+                                 OR last_sync_at < :cutoff
+                              )
+                            """
+                        ),
+                        {
+                            "now": now_ts,
+                            "cutoff": cutoff,
+                            "pid": int(pid),
+                        },
+                    )
+                    try:
+                        stamped = int(getattr(res_stamp, "rowcount", 0) or 0)
+                    except Exception:  # noqa: BLE001
+                        stamped = 0
+                    if stamped:
+                        logger.info(
+                            "bulk last_sync stamp panel=%s rows=%s mode=%s meters=%s",
+                            pid,
+                            stamped,
+                            mode or "-",
+                            len(usage_map),
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "cold last_sync stamp soft-fail panel=%s", pid, exc_info=True
+                    )
+            # Instant quota flip for users whose weighted total just crossed limit.
+            if dirty:
+                from app.models.user import User, UserStatus
+                from app.services.quota import is_quota_exhausted
+
+                urows = (
+                    await db.execute(
+                        select(
+                            User.id,
+                            User.used_traffic,
+                            User.data_limit,
+                            User.status,
+                        ).where(User.id.in_(list(dirty)))
+                    )
+                ).all()
+                for uid, used, lim, st in urows:
+                    used_i = int(used or 0)
+                    lim_i = int(lim or 0)
+                    if st == UserStatus.active and is_quota_exhausted(used_i, lim_i):
+                        user_obj = await db.get(User, int(uid))
+                        if user_obj is not None and user_obj.status == UserStatus.active:
+                            user_obj.status = UserStatus.limited
+                            exhausted.append(int(uid))
+                    elif (
+                        st == UserStatus.active
+                        and lim_i > 0
+                        and used_i >= int(0.85 * lim_i)
+                    ):
+                        near_limit_uids.append(int(uid))
             worker = (
                 await db.execute(select(WorkerNode).where(WorkerNode.id == wid))
             ).scalar_one_or_none()
@@ -204,6 +418,22 @@ async def _apply_usage_report_job(job: dict[str, Any]) -> None:
                 worker.status = "online"
                 worker.last_error = None
             await db.commit()
+        _LOCAL_APPLY_TS[pid] = time.monotonic()
+        # Near-limit + dirty → Hot via ONE bulk session (not N opens).
+        from app.services import usage_priority as uprio
+
+        promote_ids = list(
+            dict.fromkeys(
+                [int(x) for x in near_limit_uids[:80]]
+                + [int(x) for x in list(dirty)[:120]]
+            )
+        )
+        if promote_ids:
+            try:
+                # dirty → 10 min Hot; near-limit share the same bulk enqueue.
+                await uprio.enqueue_users_remotes(promote_ids, ttl=600.0)
+            except Exception:  # noqa: BLE001
+                pass
     finally:
         try:
             import fcntl
@@ -212,6 +442,15 @@ async def _apply_usage_report_job(job: dict[str, Any]) -> None:
             lock_fd.close()
         except Exception:  # noqa: BLE001
             pass
+    # Instant multi-panel cut — Worker KILL_USER + local freeze together.
+    if exhausted:
+        from app.services.orchestrator import kick_freeze_user
+
+        for uid in exhausted[:80]:
+            try:
+                await kick_freeze_user(int(uid), remote_timeout=4.0)
+            except Exception:  # noqa: BLE001
+                pass
     if dirty:
         async with _REPORT_DIRTY_LOCK:
             _REPORT_DIRTY.update(int(x) for x in dirty)
@@ -219,18 +458,83 @@ async def _apply_usage_report_job(job: dict[str, Any]) -> None:
                 keep = list(_REPORT_DIRTY)[:2000]
                 _REPORT_DIRTY.clear()
                 _REPORT_DIRTY.update(keep)
+        _dirty_recount_wake().set()
     _REPORT_STATS["applied"] += 1
     wc.mark_worker_health(wid, True, "")
     async with _REPORT_LOCK:
         pending_n = len(_REPORT_PENDING)
     logger.info(
-        "usage-report applied panel=%s meters=%s dirty=%s dt=%.2fs pending=%s",
+        "usage-report applied panel=%s meters=%s dirty=%s exhausted=%s dt=%.2fs pending=%s",
         pid,
         len(usage_map),
         len(dirty),
+        len(exhausted),
         time.monotonic() - t0,
         pending_n,
     )
+
+
+# ---- batched user.used_traffic recount (every ~10s) ----
+_DIRTY_RECOUNT_TASK: asyncio.Task | None = None
+_DIRTY_RECOUNT_WAKE: asyncio.Event | None = None
+
+
+def _dirty_recount_wake() -> asyncio.Event:
+    global _DIRTY_RECOUNT_WAKE
+    if _DIRTY_RECOUNT_WAKE is None:
+        _DIRTY_RECOUNT_WAKE = asyncio.Event()
+    return _DIRTY_RECOUNT_WAKE
+
+
+async def ensure_dirty_recount_worker() -> None:
+    """Flush dirty user totals in batches so meters stay accurate without stampede."""
+    global _DIRTY_RECOUNT_TASK
+    if _DIRTY_RECOUNT_TASK is not None and not _DIRTY_RECOUNT_TASK.done():
+        return
+    _DIRTY_RECOUNT_TASK = asyncio.create_task(
+        _dirty_recount_consumer(), name="worker-dirty-recount"
+    )
+
+
+async def _dirty_recount_consumer() -> None:
+    from app.services.panel_usage_bulk import recount_users_usage
+
+    wake = _dirty_recount_wake()
+    while True:
+        try:
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                pass
+            wake.clear()
+            ids = await drain_report_dirty_for_recount(limit=250)
+            if not ids:
+                continue
+            t0 = time.monotonic()
+            # Isolated sessions per user — never share one AsyncSession across
+            # concurrent recount work (asyncpg InternalClientError).
+            flipped = await recount_users_usage(ids, concurrency=8)
+            # Instant freeze for users who just hit quota — own sessions.
+            if flipped:
+                from app.services.orchestrator import kick_freeze_user
+
+                for uid in flipped[:40]:
+                    try:
+                        await kick_freeze_user(int(uid), remote_timeout=8.0)
+                    except Exception:  # noqa: BLE001
+                        pass
+            logger.info(
+                "dirty recount n=%s flipped=%s dt=%.2fs left=%s",
+                len(ids),
+                len(flipped),
+                time.monotonic() - t0,
+                len(_REPORT_DIRTY),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("dirty recount failed")
+            await asyncio.sleep(2.0)
 
 
 async def drain_report_dirty_for_recount(limit: int = 400) -> list[int]:
@@ -354,10 +658,25 @@ async def get_worker(db: AsyncSession, worker_id: int) -> WorkerNode | None:
 async def _set_panel_ids(
     db: AsyncSession, worker_id: int, panel_ids: list[int]
 ) -> None:
+    """Assign panels to a worker as both preferred affinity and active lease."""
     want = {int(x) for x in panel_ids}
+    wid = int(worker_id)
+    # Clear preferred+lease for panels this worker no longer owns as preferred.
+    current_pref = (
+        await db.execute(
+            select(Panel.id).where(Panel.preferred_worker_id == wid)
+        )
+    ).scalars().all()
+    drop_pref = [int(i) for i in current_pref if int(i) not in want]
+    if drop_pref:
+        await db.execute(
+            update(Panel)
+            .where(Panel.id.in_(drop_pref))
+            .values(preferred_worker_id=None)
+        )
     current = (
         await db.execute(
-            select(Panel.id).where(Panel.worker_id == int(worker_id))
+            select(Panel.id).where(Panel.worker_id == wid)
         )
     ).scalars().all()
     drop = [int(i) for i in current if int(i) not in want]
@@ -367,7 +686,9 @@ async def _set_panel_ids(
         )
     if want:
         await db.execute(
-            update(Panel).where(Panel.id.in_(want)).values(worker_id=int(worker_id))
+            update(Panel)
+            .where(Panel.id.in_(want))
+            .values(worker_id=wid, preferred_worker_id=wid)
         )
 
 
@@ -680,6 +1001,11 @@ async def delete_worker(db: AsyncSession, worker_id: int) -> None:
     await db.execute(
         update(Panel).where(Panel.worker_id == int(worker_id)).values(worker_id=None)
     )
+    await db.execute(
+        update(Panel)
+        .where(Panel.preferred_worker_id == int(worker_id))
+        .values(preferred_worker_id=None)
+    )
     await db.delete(worker)
     await db.commit()
     wc.drop_worker_route(int(worker_id))
@@ -732,15 +1058,36 @@ async def apply_usage_report(
     worker.last_error = None
     await db.commit()
     wc.mark_worker_health(int(worker.id), True, "")
+    try:
+        from app.services.worker_lease import note_heartbeat, refresh_leases_for_worker
+
+        note_heartbeat(int(worker.id))
+        refresh_leases_for_worker(int(worker.id))
+    except Exception:  # noqa: BLE001
+        pass
     if not usage_map:
         return {"dirty": 0, "listed": 0, "queued": False}
+    # High-water mark handles remote resets; never shrink accumulated raw
+    # just because full_sync reported a lower remote counter.
     qinfo = await enqueue_usage_report(
         worker_id=int(worker.id),
         panel_id=pid,
         usage_map=usage_map,
         listed=int(report.listed or len(usage_map)),
         dt_ms=report.dt_ms,
+        allow_shrink=False,
+        full_sync=bool(getattr(report, "full_sync", False)),
+        mode=getattr(report, "mode", None),
     )
+    # Hot reports from priority-probe must jump the apply queue.
+    try:
+        if str(getattr(report, "mode", None) or "").lower() == "hot":
+            async with _REPORT_LOCK:
+                row = _REPORT_PENDING.get(pid)
+                if row is not None:
+                    row["priority"] = True
+    except Exception:  # noqa: BLE001
+        pass
     return {
         "dirty": 0,
         "listed": len(usage_map),
@@ -762,6 +1109,45 @@ async def touch_heartbeat(
         worker.meta = meta
     await db.commit()
     wc.mark_worker_health(int(worker.id), True, "")
+    try:
+        from app.services.worker_lease import note_heartbeat, refresh_leases_for_worker
+
+        note_heartbeat(int(worker.id))
+        refresh_leases_for_worker(int(worker.id))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def assignment_payload_for_worker(
+    db: AsyncSession, worker: WorkerNode
+) -> dict[str, Any]:
+    """Exact leased panels + tier hints for this worker (zero duplicate work)."""
+    from app.models.panel import PanelType
+    from app.services import usage_tiers as tiers
+
+    panels = []
+    tier_map: dict[str, dict[str, list[str]]] = {}
+    for p in worker.panels or []:
+        if not p.is_active:
+            continue
+        if getattr(p, "type", None) == PanelType.astra:
+            continue
+        # Strict affinity: only panels whose active lease is this worker.
+        if int(getattr(p, "worker_id", 0) or 0) != int(worker.id):
+            continue
+        snap = wc.panel_snapshot(p)
+        panels.append(snap)
+        t = tiers.panel_tier_names(int(p.id))
+        if t["hot"] or t["warm"]:
+            tier_map[str(int(p.id))] = t
+    return {
+        "ok": True,
+        "worker_id": int(worker.id),
+        "interval_sec": 20,
+        "cold_every_sec": 60,
+        "panels": panels,
+        "tiers": tier_map,
+    }
 
 
 async def resolve_worker_route(
@@ -826,39 +1212,74 @@ async def bootstrap_worker_routes(db: AsyncSession) -> int:
     return n
 
 
-async def probe_all_workers(db: AsyncSession) -> dict[str, int]:
-    rows = (await db.execute(select(WorkerNode))).scalars().all()
+async def probe_all_workers(db: AsyncSession | None = None) -> dict[str, int]:
+    """Ping workers without holding a DB session across HTTP awaits.
+
+    Snapshot rows → close → ping → fresh session for status writes. Holding
+    ``db`` across ``ping_worker`` let other bg tasks collide on the same
+    asyncpg connection (InternalClientError).
+    """
+    from app.core.database import AsyncSessionLocal
+
+    # Optional legacy arg ignored when provided — always use isolated sessions.
+    _ = db
+    async with AsyncSessionLocal() as read_db:
+        rows = (await read_db.execute(select(WorkerNode))).scalars().all()
+        snap = [
+            {
+                "id": int(w.id),
+                "base_url": str(w.base_url),
+                "is_active": bool(w.is_active),
+                "token": wc.peek_raw_token(int(w.id))
+                or str((w.meta or {}).get("agent_token") or ""),
+            }
+            for w in rows
+        ]
+        await read_db.rollback()
+
+    results: list[tuple[int, str, str | None]] = []
     online = offline = 0
-    for w in rows:
-        token = wc.peek_raw_token(int(w.id)) or str(
-            (w.meta or {}).get("agent_token") or ""
-        )
+    for w in snap:
+        token = w["token"]
         if token:
             wc.register_worker_route(
-                int(w.id),
-                str(w.base_url),
+                int(w["id"]),
+                str(w["base_url"]),
                 token,
-                active=bool(w.is_active),
+                active=bool(w["is_active"]),
             )
-        if not w.is_active:
+        if not w["is_active"]:
             continue
         if not token:
-            w.status = "unknown"
+            results.append((int(w["id"]), "unknown", "missing token"))
             offline += 1
             continue
-        ok, err = await wc.ping_worker(base_url=w.base_url, token=token)
-        wc.mark_worker_health(int(w.id), ok, err)
+        ok, err = await wc.ping_worker(
+            base_url=str(w["base_url"]), token=token
+        )
+        wc.mark_worker_health(int(w["id"]), ok, err)
         if ok:
-            w.status = "online"
-            w.last_seen_at = datetime.now(timezone.utc)
-            w.last_error = None
+            results.append((int(w["id"]), "online", None))
             online += 1
         else:
-            w.status = "offline"
-            w.last_error = err[:400]
+            results.append((int(w["id"]), "offline", (err or "")[:400]))
             offline += 1
-    await db.commit()
-    return {"online": online, "offline": offline, "total": len(rows)}
+
+    if results:
+        now = datetime.now(timezone.utc)
+        async with AsyncSessionLocal() as write_db:
+            for wid, status, err in results:
+                worker = await write_db.get(WorkerNode, int(wid))
+                if worker is None:
+                    continue
+                worker.status = status
+                if status == "online":
+                    worker.last_seen_at = now
+                    worker.last_error = None
+                elif err:
+                    worker.last_error = err
+            await write_db.commit()
+    return {"online": online, "offline": offline, "total": len(snap)}
 
 
 async def sync_assignments_to_worker(
@@ -897,8 +1318,8 @@ async def sync_assignments_to_worker(
         token=token,
         master_url=master,
         panels=panels,
-        # Full concurrent usage sweep every 2 minutes on the worker.
-        interval_sec=120,
+        # Warm-tier staggered waves (cold full sweep every ~120s on agent).
+        interval_sec=25,
     )
     return ok, err
 

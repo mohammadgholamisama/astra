@@ -222,6 +222,8 @@ export interface Panel {
   category_id?: number | null;
   /** Admin UI order on Panels page (drag-reorder) */
   sort_order?: number;
+  /** Assigned remote worker (ops routed when online) */
+  worker_id?: number | null;
   last_ok_at: string | null;
   created_at: string;
 }
@@ -280,6 +282,7 @@ export interface PanelAccount {
   panel_name?: string | null;
   panel_type?: string | null;
   panel_base_url?: string | null;
+  panel_is_active?: boolean;
   remote_username: string | null;
   status: string;
   links: string[];

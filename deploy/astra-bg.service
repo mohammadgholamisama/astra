@@ -1,0 +1,27 @@
+[Unit]
+Description=Astra Panel background loops (fleet/hot/usage)
+After=network.target redis-server.service postgresql.service astra.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=astra
+Group=astra
+WorkingDirectory=/opt/astra/backend
+Environment=ASTRA_ROLE=bg
+EnvironmentFile=-/opt/astra/.env
+Environment=PATH=/opt/astra/backend/.venv/bin:/usr/local/bin:/usr/bin
+ExecStart=/opt/astra/backend/.venv/bin/python -m app.bg_runner
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=40
+# One process — leave most CPU to API workers
+CPUQuota=150%
+TasksMax=4096
+OOMPolicy=continue
+NoNewPrivileges=false
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

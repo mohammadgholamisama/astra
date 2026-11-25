@@ -47,6 +47,9 @@ class PanelTestOut(BaseModel):
     latency_ms: int | None = None
     grade: str | None = None  # fast | ok | slow | fail
     base_url: str | None = None
+    worker_id: int | None = None
+    worker_name: str | None = None
+    via_worker: bool = False
 
 
 class PanelTestAllStats(BaseModel):

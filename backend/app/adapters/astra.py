@@ -28,11 +28,20 @@ class AstraAdapter(BasePanelAdapter):
             self._panel_id = None
 
     async def _load_panel(self) -> Panel:
+        def _detach(db, p: Panel) -> Panel:
+            # Touch attrs then expunge so callers survive session close/rollback.
+            _ = (p.id, p.type, p.base_url, p.meta, p.is_active, p.name)
+            try:
+                db.expunge(p)
+            except Exception:  # noqa: BLE001
+                pass
+            return p
+
         if self._panel_id:
             async with AsyncSessionLocal() as db:
                 p = await db.get(Panel, self._panel_id)
                 if p and p.type == PanelType.astra:
-                    return p
+                    return _detach(db, p)
         # Fallback: match by base_url + token
         async with AsyncSessionLocal() as db:
             result = await db.execute(
@@ -44,10 +53,10 @@ class AstraAdapter(BasePanelAdapter):
                     tok = str((p.meta or {}).get("node_token") or "")
                     if not self.api_token or tok == (self.api_token or ""):
                         self._panel_id = p.id
-                        return p
+                        return _detach(db, p)
             if len(panels) == 1:
                 self._panel_id = panels[0].id
-                return panels[0]
+                return _detach(db, panels[0])
         raise RuntimeError("پنل Astra پیدا نشد — panel_id در meta لازم است")
 
     async def test_connection(self) -> AdapterResult:
@@ -180,7 +189,10 @@ class AstraAdapter(BasePanelAdapter):
                 if not p:
                     return AdapterResult(success=False, error="panel missing")
                 try:
-                    await node.sync_traffic_from_xray(db, p)
+                    # Coalesced — never rebuild xray on the get_usage hot path.
+                    await node.sync_traffic_from_xray(
+                        db, p, rebuild_on_limit=False
+                    )
                 except Exception:  # noqa: BLE001
                     pass
                 client, links, used = await node.client_usage_and_links(

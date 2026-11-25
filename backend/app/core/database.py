@@ -58,13 +58,15 @@ def _build_engine_kwargs() -> dict[str, Any]:
     pool_size = max(2, int(getattr(settings, "DB_POOL_SIZE", 16) or 16))
     max_overflow = max(0, int(getattr(settings, "DB_MAX_OVERFLOW", 8) or 8))
     pool_timeout = float(getattr(settings, "DB_POOL_TIMEOUT", 5.0) or 5.0)
-    pool_recycle = max(60, int(getattr(settings, "DB_POOL_RECYCLE", 180) or 180))
+    # Recycle before server/proxy idle kills the socket (default 300s).
+    pool_recycle = max(60, int(getattr(settings, "DB_POOL_RECYCLE", 300) or 300))
     kwargs.update(
         {
             "pool_size": pool_size,
             "max_overflow": max_overflow,
             "pool_timeout": pool_timeout,
             "pool_recycle": pool_recycle,
+            "pool_pre_ping": True,  # explicit — drop dead sockets before checkout
             "pool_use_lifo": True,
             "pool_reset_on_return": "rollback",
         }
@@ -76,10 +78,11 @@ def _build_engine_kwargs() -> dict[str, Any]:
             "command_timeout": 45,
             "server_settings": {
                 "statement_timeout": "45000",
-                # Kill leaked idle-in-transaction checkouts fast. Callers must
-                # release_db_txn() before remote HTTP; 8s is the safety net —
-                # longer windows let stuck backends starve the API pool.
-                "idle_in_transaction_session_timeout": "8000",
+                # Safety net for leaked idle-in-transaction checkouts. Keep
+                # well above normal recount/sample txn length — an 8s kill
+                # raced concurrent bg work and poisoned asyncpg checkouts
+                # (BrokenPipe / InternalClientError).
+                "idle_in_transaction_session_timeout": "60000",
             },
         }
     return kwargs
@@ -156,7 +159,11 @@ async def release_db_txn(session: AsyncSession) -> None:
 
     Call this before any slow non-DB await (remote HTTP, sleep, subprocess)
     while still holding a request-scoped session. Read-only → rollback;
-    dirty → commit. ``expire_on_commit=False`` keeps loaded attrs in memory.
+    dirty → commit.
+
+    Note: rollback *expires* ORM instances (even with ``expire_on_commit=False``).
+    Snapshot needed fields or ``expunge`` before calling this if you will use
+    objects after the release.
     """
     try:
         in_txn = bool(session.in_transaction())
@@ -195,7 +202,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         raise
     finally:
         try:
-            if session.in_transaction():
+            if session.is_active and session.in_transaction():
                 await session.rollback()
         except Exception:  # noqa: BLE001
             pass
@@ -285,7 +292,7 @@ def pool_pressure_blocks_fleet() -> bool:
     return bool(cap > 0 and checked >= max(2, cap - 1))
 
 
-async def _terminate_stale_idle_in_txn(*, older_than_sec: float = 12.0) -> int:
+async def _terminate_stale_idle_in_txn(*, older_than_sec: float = 90.0) -> int:
     """Best-effort: kill Postgres backends stuck idle-in-transaction."""
     if _IS_SQLITE:
         return 0
@@ -309,14 +316,15 @@ async def _terminate_stale_idle_in_txn(*, older_than_sec: float = 12.0) -> int:
         return 0
 
 
-async def pool_guardian_loop(interval: float = 8.0) -> None:
-    """Self-heal pool stalls: always reap stuck idle-in-txn; recycle on pressure."""
-    await asyncio.sleep(15)
+async def pool_guardian_loop(interval: float = 20.0) -> None:
+    """Self-heal pool stalls: reap only long-stuck idle-in-txn; never dispose."""
+    await asyncio.sleep(30)
     high_streak = 0
     while True:
         try:
-            # Proactive: do not wait for "high" — idle-in-txn is what freezes UI.
-            killed = await _terminate_stale_idle_in_txn(older_than_sec=8.0)
+            # Only reap truly stuck backends (>90s). Aggressive 8s kills were
+            # racing live recount/sample sessions mid-statement.
+            killed = await _terminate_stale_idle_in_txn(older_than_sec=90.0)
             if killed:
                 logger.warning(
                     "pool guardian reaped %s idle-in-transaction backends", killed
@@ -327,18 +335,12 @@ async def pool_guardian_loop(interval: float = 8.0) -> None:
                 high_streak += 1
                 logger.warning("db pool %s: %s", pressure, st)
                 if pressure == "critical":
-                    await _terminate_stale_idle_in_txn(older_than_sec=3.0)
+                    await _terminate_stale_idle_in_txn(older_than_sec=60.0)
+                # Do NOT dispose/recycle the pool under pressure — that races
+                # checked-out asyncpg connections and causes
+                # InternalClientError: another operation is in progress.
                 if pressure == "critical" or high_streak >= 2:
-                    # Invalidate idle pooled connections only (checked-out keep
-                    # working). Shrinks postgres backends without killing requests.
-                    try:
-                        await engine.dispose(close=False)
-                        logger.error(
-                            "db pool recycled idle connections under pressure: %s",
-                            st,
-                        )
-                    except Exception:  # noqa: BLE001
-                        logger.exception("db pool idle recycle failed")
+                    logger.error("db pool pressure (no dispose): %s", st)
                     high_streak = 0
             else:
                 high_streak = 0

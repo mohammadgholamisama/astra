@@ -84,15 +84,16 @@ def _as_int(raw: object) -> int | None:
 def parse_user_used_traffic(data: dict[str, Any]) -> int:
     """Current-period used bytes (Marzban / PasarGuard / Rebecca).
 
-    Prefer ``used_traffic``. Some PasarGuard list payloads omit/zero the field
-    while ``lifetime_used_traffic`` still reflects real consumption — use
-    lifetime only when the current key is missing (not when it is legitimately 0
-    after a reset).
+    Prefer ``used_traffic``. Some PasarGuard list payloads omit the field
+    while ``lifetime_used_traffic`` still reflects consumption — use lifetime
+    **only when the period key is absent**. If ``used_traffic`` is present and
+    ``0`` (legit reset), never fall through to lifetime (that inflated quotas
+    and falsely exhausted users).
     """
-    has_used_key = "used_traffic" in data
-    used = _as_int(data.get("used_traffic"))
-    if has_used_key and used is not None and used > 0:
-        return used
+    if "used_traffic" in data:
+        used = _as_int(data.get("used_traffic"))
+        if used is not None:
+            return used
     for key in ("current_usage", "total_usage"):
         got = _as_int(data.get(key))
         if got is not None and got > 0:
@@ -110,13 +111,11 @@ def parse_user_used_traffic(data: dict[str, Any]) -> int:
                 return max(0, up + down)
         except (TypeError, ValueError):
             pass
+    # Period counter missing entirely — last-resort fallback only.
     for key in ("lifetime_used_traffic", "total_traffic"):
         got = _as_int(data.get(key))
         if got is not None and got > 0:
             return got
-    # Explicit zero from used_traffic key (reset / unused)
-    if has_used_key and used is not None:
-        return used
     return 0
 
 
@@ -179,7 +178,7 @@ async def fetch_sanaei_usage_map(panel: Panel) -> dict[str, int]:
 
 
 async def fetch_panel_usage_map(
-    panel: Panel, *, max_pages: int = 80, page_size: int = 200
+    panel: Panel, *, max_pages: int = 250, page_size: int = 200
 ) -> dict[str, int]:
     """username → used_traffic bytes via GET /api/users (paginated)."""
     if panel.type not in _BULK_TYPES:
@@ -217,8 +216,16 @@ async def fetch_panel_usage_map(
             except Exception:  # noqa: BLE001
                 break
             users = []
+            total_hint = None
             if isinstance(payload, dict):
                 users = payload.get("users") or payload.get("items") or []
+                for tk in ("total", "total_users", "count"):
+                    if payload.get(tk) is not None:
+                        try:
+                            total_hint = int(payload.get(tk))
+                        except (TypeError, ValueError):
+                            total_hint = None
+                        break
             elif isinstance(payload, list):
                 users = payload
             if not isinstance(users, list) or not users:
@@ -236,9 +243,11 @@ async def fetch_panel_usage_map(
                 if uid is not None and str(uid).strip():
                     kid = str(uid).strip()
                     out[kid] = max(int(out.get(kid) or 0), used)
+            offset += len(users)
             if len(users) < int(page_size):
                 break
-            offset += int(page_size)
+            if total_hint is not None and offset >= int(total_hint):
+                break
             await asyncio.sleep(0.02)
     except Exception as exc:  # noqa: BLE001
         logger.warning("bulk users failed panel=%s: %s", panel.id, exc)
@@ -319,16 +328,107 @@ def _lookup_usage_bytes(
     return None
 
 
+def _high_water_delta(
+    acc: PanelAccount,
+    got: int,
+    *,
+    allow_shrink: bool = False,
+) -> tuple[int, int]:
+    """Return ``(raw_delta, new_accumulated)`` for one remote meter reading.
+
+    ``panel_accounts.used_traffic`` is accumulated Astra raw (survives remote
+    resets). ``last_remote_raw`` tracks the last observed remote counter.
+    """
+    got_i = max(0, int(got or 0))
+    accumulated = int(acc.used_traffic or 0)
+    last = getattr(acc, "last_remote_raw", None)
+    if allow_shrink:
+        # Admin reset path: absolute set, no accumulation.
+        return 0, got_i
+    if last is None:
+        # Not primed yet — adopt remote reading without inventing a delta
+        # (startup backfill normally sets last = used_traffic before this runs).
+        return 0, accumulated
+    last_i = int(last or 0)
+    if got_i >= last_i:
+        raw_delta = got_i - last_i
+    else:
+        # Remote panel reset / wipe — keep prior accumulated, count new from 0.
+        raw_delta = got_i
+    return max(0, int(raw_delta)), accumulated + max(0, int(raw_delta))
+
+
+def _account_lookup_keys(
+    *,
+    astra_username: str,
+    remote_username: str | None,
+    remote_id: str | None,
+    panel_id: int,
+    group_id: int | None,
+) -> list[str]:
+    """All O(1) keys that should resolve to this account."""
+    from app.services.orchestrator import _remote_username_candidates
+
+    keys = _remote_username_candidates(
+        astra_username=astra_username or "",
+        remote_username=remote_username,
+        remote_id=remote_id,
+        uuid=None,
+        panel_id=int(panel_id),
+        group_id=int(group_id) if group_id is not None else None,
+    )
+    out: list[str] = []
+    seen: set[str] = set()
+    for k in keys:
+        low = (k or "").strip().lower()
+        if low and low not in seen:
+            seen.add(low)
+            out.append(low)
+    rid = (remote_id or "").strip()
+    if rid and rid.isdigit() and rid not in seen:
+        out.append(rid)
+    return out
+
+
 def _apply_got_to_account(
-    acc: PanelAccount, got: int, *, now: datetime, dirty: set[int]
-) -> None:
-    prev = int(acc.used_traffic or 0)
-    if got < prev:
-        return
-    if got == prev:
+    acc: PanelAccount,
+    got: int,
+    *,
+    now: datetime,
+    dirty: set[int],
+    allow_shrink: bool = False,
+    coeff: float = 1.0,
+    user_weighted_deltas: dict[int, int] | None = None,
+) -> int:
+    """Apply one remote reading via high-water mark. Returns weighted_delta."""
+    from app.services.orchestrator import _norm_coeff
+
+    got_i = max(0, int(got or 0))
+    raw_delta, new_acc = _high_water_delta(acc, got_i, allow_shrink=allow_shrink)
+    c = _norm_coeff(
+        getattr(acc, "applied_coefficient", None)
+        if getattr(acc, "applied_coefficient", None) is not None
+        else coeff
+    )
+    if getattr(acc, "applied_coefficient", None) is None:
+        acc.applied_coefficient = c
+
+    if allow_shrink:
+        acc.used_traffic = got_i
+        acc.last_remote_raw = got_i
+        acc.coeff_anchor_raw = 0
+        acc.coeff_anchor_weighted = 0
         acc.last_sync_at = now
-        return
-    acc.used_traffic = got
+        dirty.add(int(acc.user_id))
+        return 0
+
+    if raw_delta == 0 and int(getattr(acc, "last_remote_raw", None) or -1) == got_i:
+        acc.last_sync_at = now
+        return 0
+
+    weighted_delta = int(round(raw_delta * c)) if raw_delta else 0
+    acc.used_traffic = int(new_acc)
+    acc.last_remote_raw = got_i
     acc.last_sync_at = now
     if (acc.error_message or "") == QUOTA_FROZEN_MARK:
         acc.error_message = None
@@ -336,62 +436,310 @@ def _apply_got_to_account(
         acc.status = PanelAccountStatus.active
         if (acc.error_message or "") != QUOTA_FROZEN_MARK:
             acc.error_message = None
-    dirty.add(int(acc.user_id))
+    # Pending rows that already hold a real meter are live — finish activation.
+    if (
+        acc.status == PanelAccountStatus.pending
+        and int(acc.used_traffic or 0) > 0
+    ):
+        acc.status = PanelAccountStatus.active
+        if (acc.error_message or "") != QUOTA_FROZEN_MARK:
+            acc.error_message = None
+    if raw_delta > 0 or weighted_delta > 0:
+        dirty.add(int(acc.user_id))
+        if user_weighted_deltas is not None and weighted_delta:
+            uid = int(acc.user_id)
+            user_weighted_deltas[uid] = (
+                int(user_weighted_deltas.get(uid, 0)) + weighted_delta
+            )
+    return weighted_delta
 
 
 async def apply_usage_map_to_panel(
-    db: AsyncSession, panel_id: int, usage_map: dict[str, int]
+    db: AsyncSession,
+    panel_id: int,
+    usage_map: dict[str, int],
+    *,
+    allow_shrink: bool = False,
 ) -> set[int]:
-    """Write raw counters onto panel_accounts. Returns dirty user ids."""
+    """High-water delta apply + period-locked user increment. Returns dirty ids.
+
+    Builds an O(1) lookup of remote_username / aliases → account, then for each
+    meter computes ``raw_delta`` against ``last_remote_raw`` and atomically
+    increments ``users.used_traffic`` by ``round(raw_delta × coeff)``.
+    """
     if not usage_map:
         return set()
-    usage_exact, usage_lower, alias_idx = _build_usage_indexes(usage_map)
-    # Skip expired/disabled users — no background usage work for dead subs.
-    result = await db.execute(
-        select(PanelAccount, User.username)
-        .join(User, User.id == PanelAccount.user_id)
-        .where(
-            PanelAccount.panel_id == int(panel_id),
-            PanelAccount.status.in_(
-                (
-                    PanelAccountStatus.active,
-                    PanelAccountStatus.error,
-                )
-            ),
-            User.status.in_(
-                (
-                    UserStatus.active,
-                    UserStatus.on_hold,
-                    UserStatus.limited,
-                )
-            ),
+    usage_exact = {
+        str(k).strip(): max(0, int(v or 0))
+        for k, v in usage_map.items()
+        if str(k).strip()
+    }
+    if not usage_exact:
+        return set()
+
+    name_keys = list(usage_exact.keys())
+    base_names: set[str] = set()
+    for n in name_keys:
+        base_names.add(n)
+        low = n.lower()
+        for sep in ("_g", "_p"):
+            idx = low.rfind(sep)
+            if idx > 0 and low[idx + 2 :].isdigit():
+                base_names.add(n[:idx])
+                break
+    from sqlalchemy import or_
+
+    # Pending-with-usage must receive the same remote meter (provision lag).
+    status_ok = PanelAccount.status.in_(
+        (
+            PanelAccountStatus.active,
+            PanelAccountStatus.error,
+            PanelAccountStatus.pending,
         )
     )
-    rows = list(result.all())
-    now = datetime.now(timezone.utc)
-    dirty: set[int] = set()
-    matched = 0
-    for i, (acc, astra_uname) in enumerate(rows):
-        got_i = _lookup_usage_bytes(
-            usage_exact,
-            usage_lower,
-            alias_idx,
+    user_ok = User.status.in_(
+        (UserStatus.active, UserStatus.on_hold, UserStatus.limited)
+    )
+    if len(name_keys) <= 4000 and name_keys:
+        rows: list = []
+        chunk_sz = 900
+        keys = list(dict.fromkeys(name_keys + list(base_names)))
+        for off in range(0, len(keys), chunk_sz):
+            chunk = keys[off : off + chunk_sz]
+            result = await db.execute(
+                select(PanelAccount, User.username)
+                .join(User, User.id == PanelAccount.user_id)
+                .where(
+                    PanelAccount.panel_id == int(panel_id),
+                    status_ok,
+                    user_ok,
+                    or_(
+                        PanelAccount.remote_username.in_(chunk),
+                        User.username.in_(chunk),
+                    ),
+                )
+            )
+            rows.extend(result.all())
+        seen: set[int] = set()
+        uniq = []
+        for acc, uname in rows:
+            aid = int(acc.id)
+            if aid in seen:
+                continue
+            seen.add(aid)
+            uniq.append((acc, uname))
+        rows = uniq
+    else:
+        result = await db.execute(
+            select(PanelAccount, User.username)
+            .join(User, User.id == PanelAccount.user_id)
+            .where(
+                PanelAccount.panel_id == int(panel_id),
+                status_ok,
+                user_ok,
+            )
+        )
+        rows = list(result.all())
+
+    # Live group coefficients for this panel (period-lock on change).
+    from app.services.orchestrator import (
+        _norm_coeff,
+        apply_coefficient_period,
+        coefficient_from_config,
+    )
+
+    coeff_by_group: dict[int, float] = {}
+    try:
+        from app.models.group import GroupPanel
+
+        gp_rows = (
+            await db.execute(
+                select(GroupPanel).where(GroupPanel.panel_id == int(panel_id))
+            )
+        ).scalars().all()
+        for link in gp_rows:
+            cfg = link.config if isinstance(link.config, dict) else {}
+            coeff_by_group[int(link.group_id)] = _norm_coeff(
+                coefficient_from_config(cfg)
+            )
+    except Exception:  # noqa: BLE001
+        coeff_by_group = {}
+
+    # O(1) lookup: normalized remote key → PanelAccount
+    lookup: dict[str, PanelAccount] = {}
+    for acc, astra_uname in rows:
+        gid = int(acc.group_id) if getattr(acc, "group_id", None) is not None else None
+        live_c = coeff_by_group.get(gid, 1.0) if gid is not None else 1.0
+        apply_coefficient_period(acc, live_c)
+        for key in _account_lookup_keys(
             astra_username=str(astra_uname or ""),
             remote_username=(acc.remote_username or "").strip() or None,
             remote_id=str(acc.remote_id).strip()
             if acc.remote_id and not str(acc.remote_id).startswith("{")
             else None,
             panel_id=int(panel_id),
-            group_id=int(acc.group_id) if getattr(acc, "group_id", None) is not None else None,
-        )
-        if got_i is None:
+            group_id=gid,
+        ):
+            # Prefer the account that already owns this exact remote_username.
+            if key not in lookup:
+                lookup[key] = acc
+            else:
+                existing = lookup[key]
+                rem = (acc.remote_username or "").strip().lower()
+                if rem == key:
+                    lookup[key] = acc
+                elif (existing.remote_username or "").strip().lower() != key:
+                    lookup[key] = acc
+
+    now = datetime.now(timezone.utc)
+    dirty: set[int] = set()
+    user_weighted: dict[int, int] = {}
+    # (account_id, new_used, last_remote_raw)
+    bulk_rows: list[tuple[int, int, int]] = []
+    # Matched but unchanged — still stamp last_sync_at for fleet freshness.
+    sync_touch_ids: list[int] = []
+    matched = 0
+    seen_acc: set[int] = set()
+
+    # Index siblings sharing the same remote on this panel so one meter
+    # updates every group row (weighted path dedupes; freshness needs all).
+    siblings_by_remote: dict[str, list[PanelAccount]] = {}
+    for acc, _uname in rows:
+        rem = (acc.remote_username or "").strip().lower()
+        if rem:
+            siblings_by_remote.setdefault(rem, []).append(acc)
+
+    for i, (name, got_raw) in enumerate(usage_exact.items()):
+        acc = lookup.get(name.lower()) or lookup.get(name)
+        if acc is None:
             continue
-        matched += 1
-        _apply_got_to_account(acc, int(got_i), now=now, dirty=dirty)
-        # Yield so create/delete/API stay responsive during huge panel maps.
-        if i and i % 250 == 0:
+        aid = int(acc.id)
+        if aid in seen_acc:
+            # Same account matched under multiple meter keys — keep max got.
+            # Re-apply with the larger reading only.
+            prev_got = int(getattr(acc, "last_remote_raw", None) or 0)
+            if int(got_raw) <= prev_got and not allow_shrink:
+                continue
+        targets = [acc]
+        rem_key = (acc.remote_username or "").strip().lower() or name.lower()
+        for sib in siblings_by_remote.get(rem_key, []):
+            if int(sib.id) != aid:
+                targets.append(sib)
+        got = int(got_raw)
+        for tgt in targets:
+            tid = int(tgt.id)
+            if tid in seen_acc and tid != aid:
+                # Already processed via another meter key this wave.
+                continue
+            seen_acc.add(tid)
+            matched += 1
+            c = _norm_coeff(getattr(tgt, "applied_coefficient", None) or 1.0)
+            before_used = int(tgt.used_traffic or 0)
+            before_last = getattr(tgt, "last_remote_raw", None)
+            _apply_got_to_account(
+                tgt,
+                got,
+                now=now,
+                dirty=dirty,
+                allow_shrink=allow_shrink,
+                coeff=c,
+                user_weighted_deltas=user_weighted,
+            )
+            if allow_shrink or int(tgt.used_traffic or 0) != before_used or (
+                getattr(tgt, "last_remote_raw", None) != before_last
+            ):
+                bulk_rows.append(
+                    (
+                        tid,
+                        int(tgt.used_traffic or 0),
+                        int(tgt.last_remote_raw or 0),
+                    )
+                )
+            else:
+                sync_touch_ids.append(tid)
+        if i and i % 500 == 0:
             await asyncio.sleep(0)
-    if rows and matched < max(1, len(rows) // 4):
+
+    if bulk_rows:
+        from sqlalchemy import text
+
+        for off in range(0, len(bulk_rows), 800):
+            chunk = bulk_rows[off : off + 800]
+            values_sql = ", ".join(
+                f"({aid}::int, {used}::bigint, {last}::bigint)"
+                for aid, used, last in chunk
+            )
+            await db.execute(
+                text(
+                    f"""
+                    UPDATE panel_accounts AS pa
+                    SET used_traffic = v.used,
+                        last_remote_raw = v.last,
+                        last_sync_at = :now,
+                        error_message = CASE
+                            WHEN pa.error_message = :frozen THEN NULL
+                            ELSE pa.error_message
+                        END,
+                        status = CASE
+                            WHEN pa.status = 'error' THEN 'active'
+                            WHEN pa.status = 'pending' AND v.used > 0 THEN 'active'
+                            ELSE pa.status
+                        END
+                    FROM (VALUES {values_sql}) AS v(id, used, last)
+                    WHERE pa.id = v.id
+                    """
+                ),
+                {"now": now, "frozen": QUOTA_FROZEN_MARK},
+            )
+
+    if sync_touch_ids:
+        from sqlalchemy import text
+
+        uniq_touch = sorted({int(x) for x in sync_touch_ids})
+        for off in range(0, len(uniq_touch), 900):
+            chunk = uniq_touch[off : off + 900]
+            ids_sql = ", ".join(str(i) for i in chunk)
+            await db.execute(
+                text(
+                    f"""
+                    UPDATE panel_accounts
+                    SET last_sync_at = :now
+                    WHERE id IN ({ids_sql})
+                    """
+                ),
+                {"now": now},
+            )
+
+    # Atomically bump users.used_traffic by period-locked weighted deltas.
+    if user_weighted and not allow_shrink:
+        from sqlalchemy import text
+
+        items = [(uid, int(d)) for uid, d in user_weighted.items() if int(d) > 0]
+        for off in range(0, len(items), 500):
+            chunk = items[off : off + 500]
+            values_sql = ", ".join(
+                f"({uid}::int, {delta}::bigint)" for uid, delta in chunk
+            )
+            await db.execute(
+                text(
+                    f"""
+                    UPDATE users AS u
+                    SET used_traffic = u.used_traffic + v.delta
+                    FROM (VALUES {values_sql}) AS v(id, delta)
+                    WHERE u.id = v.id
+                    """
+                )
+            )
+        # Feed analytics hour buckets from the same known deltas (isolated txn).
+        if items:
+            try:
+                from app.services import user_analytics as ua
+
+                await ua.record_usage_deltas(dict(items))
+            except Exception:  # noqa: BLE001
+                logger.debug("analytics delta record failed", exc_info=True)
+
+    if rows and matched < max(1, len(rows) // 4) and len(usage_exact) > 20:
         logger.warning(
             "bulk match sparse panel=%s accounts=%s matched=%s map=%s dirty=%s",
             panel_id,
@@ -562,91 +910,116 @@ async def heal_zero_accounts_via_get_usage(
     return dirty
 
 
-async def recount_users_usage(user_ids: list[int], *, concurrency: int = 6) -> list[int]:
-    """Recompute weighted used_traffic + enforce quota. Returns flipped user ids."""
+async def _load_user_for_recount(
+    db, uid: int
+) -> tuple[User, list[PanelAccount]] | tuple[None, list[PanelAccount]]:
+    """Load one user + accounts for recount — sequential queries only.
+
+    Never uses sibling/nested ``selectinload`` (asyncpg forbids concurrent ops
+    on one connection). Panels are attached via ``set_committed_value`` so
+    commit/flush cannot trigger a lazy load race.
+    """
+    from sqlalchemy.orm.attributes import set_committed_value
+
+    user = (
+        await db.execute(select(User).where(User.id == int(uid)))
+    ).scalar_one_or_none()
+    if user is None:
+        return None, []
+    accounts = list(
+        (
+            await db.execute(
+                select(PanelAccount).where(PanelAccount.user_id == int(uid))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if accounts:
+        panel_ids = list({int(a.panel_id) for a in accounts if a.panel_id})
+        panels_by_id: dict[int, Panel] = {}
+        if panel_ids:
+            prow = (
+                await db.execute(select(Panel).where(Panel.id.in_(panel_ids)))
+            ).scalars().all()
+            panels_by_id = {int(p.id): p for p in prow}
+        for acc in accounts:
+            panel = panels_by_id.get(int(acc.panel_id))
+            if panel is not None:
+                set_committed_value(acc, "panel", panel)
+    set_committed_value(user, "panel_accounts", accounts)
+    return user, accounts
+
+
+async def _recount_one_user(uid: int) -> int | None:
+    """Isolated-session recount for one user. Returns flipped user_id or None."""
     from app.services.orchestrator import (
         activate_on_hold_if_used,
         enforce_user_quota,
         recount_user_used_traffic,
     )
 
+    last_exc: BaseException | None = None
+    for attempt in range(2):
+        try:
+            async with AsyncSessionLocal() as db:
+                user, accounts = await _load_user_for_recount(db, uid)
+                if user is None:
+                    return None
+                if user.status not in (
+                    UserStatus.active,
+                    UserStatus.on_hold,
+                    UserStatus.limited,
+                ):
+                    return None
+                exp = int(getattr(user, "expire", 0) or 0)
+                if exp > 0 and exp <= int(time.time()):
+                    return None
+                await recount_user_used_traffic(db, user, accounts)
+                activated = await activate_on_hold_if_used(db, user)
+                changed = bool(activated) or await enforce_user_quota(db, user)
+                await db.commit()
+                if user.status in (
+                    UserStatus.limited,
+                    UserStatus.expired,
+                    UserStatus.disabled,
+                ):
+                    return int(user.id)
+                if changed:
+                    return int(user.id)
+                return None
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt == 0:
+                await asyncio.sleep(0.2)
+                continue
+            logger.warning(
+                "recount failed user_id=%s", uid, exc_info=last_exc
+            )
+            return None
+    return None
+
+
+async def recount_users_usage(user_ids: list[int], *, concurrency: int = 8) -> list[int]:
+    """Recompute weighted used_traffic + enforce quota. Returns flipped user ids.
+
+    Always sequential on one session path via ``_recount_one_user`` (each user
+    opens its own ``AsyncSessionLocal``). Concurrent gather on shared/pooled
+    checkouts previously caused asyncpg InternalClientError under load; the
+    ``concurrency`` / Sem(8) knob is retained for callers but capped to 1.
+    """
     ids = list(dict.fromkeys(int(x) for x in user_ids if x))
     if not ids:
         return []
-    sem = asyncio.Semaphore(max(1, concurrency))
     flipped: list[int] = []
-
-    async def _one(uid: int) -> None:
-        async with sem:
-            try:
-                async with AsyncSessionLocal() as db:
-                    result = await db.execute(
-                        select(User)
-                        .where(User.id == uid)
-                        .options(
-                            selectinload(User.panel_accounts).selectinload(
-                                PanelAccount.panel
-                            ),
-                            selectinload(User.groups),
-                        )
-                    )
-                    user = result.scalar_one_or_none()
-                    if user is None:
-                        return
-                    if user.status not in (
-                        UserStatus.active,
-                        UserStatus.on_hold,
-                        UserStatus.limited,
-                    ):
-                        return
-                    # Wall-clock expired: flip once via quota, don't re-pull forever.
-                    exp = int(getattr(user, "expire", 0) or 0)
-                    if exp > 0 and exp <= int(time.time()):
-                        return
-                    await recount_user_used_traffic(db, user)
-                    activated = await activate_on_hold_if_used(db, user)
-                    changed = bool(activated) or await enforce_user_quota(db, user)
-                    await db.commit()
-                    if changed or user.status in (
-                        UserStatus.limited,
-                        UserStatus.expired,
-                        UserStatus.disabled,
-                    ):
-                        if user.status in (
-                            UserStatus.limited,
-                            UserStatus.expired,
-                            UserStatus.disabled,
-                        ):
-                            flipped.append(int(user.id))
-                        elif changed:
-                            flipped.append(int(user.id))
-            except Exception:  # noqa: BLE001
-                logger.warning("recount failed user_id=%s", uid, exc_info=True)
-                try:
-                    async with AsyncSessionLocal() as db2:
-                        result2 = await db2.execute(
-                            select(User)
-                            .where(User.id == uid)
-                            .options(
-                                selectinload(User.panel_accounts).selectinload(
-                                    PanelAccount.panel
-                                ),
-                                selectinload(User.groups),
-                            )
-                        )
-                        user2 = result2.scalar_one_or_none()
-                        if user2 is None:
-                            return
-                        await recount_user_used_traffic(db2, user2)
-                        await activate_on_hold_if_used(db2, user2)
-                        await enforce_user_quota(db2, user2)
-                        await db2.commit()
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "recount retry failed user_id=%s", uid, exc_info=True
-                    )
-
-    await asyncio.gather(*[_one(uid) for uid in ids])
+    # Force sequential — isolated sessions under gather still raced the
+    # asyncpg pool (dispose / idle-in-txn terminate / selectinload).
+    _ = concurrency  # API compat; do not gather
+    for uid in ids:
+        got = await _recount_one_user(uid)
+        if got is not None:
+            flipped.append(got)
+        await asyncio.sleep(0)
     return list(dict.fromkeys(flipped))
 
 
@@ -1158,7 +1531,7 @@ async def run_fleet_usage_cycle(*, rotate_only: bool = False) -> dict[str, int]:
         )
         if report_dirty:
             flipped_rep = await recount_users_usage(
-                report_dirty, concurrency=3
+                report_dirty, concurrency=4
             )
             stats["flipped"] += len(list(dict.fromkeys(flipped_rep)))
             stats["report_dirty"] = len(report_dirty)
@@ -1170,7 +1543,7 @@ async def run_fleet_usage_cycle(*, rotate_only: bool = False) -> dict[str, int]:
         # the usage-report queue on the single event-loop core.
         lag = await recount_lagging_users(
             limit=500 if full_panels else 280,
-            concurrency=3,
+            concurrency=4,
         )
         stats["lagging"] = int(lag.get("users") or 0)
         stats["flipped"] += int(lag.get("flipped") or 0)
@@ -1230,12 +1603,116 @@ async def find_exhausted_user_ids(*, limit: int = 200) -> list[int]:
         return [int(x) for (x,) in result.all()]
 
 
-async def find_raw_over_limit_user_ids(*, limit: int = 400) -> list[int]:
-    """Active users where Σ *live* panel raw meters already exceed data_limit.
+async def find_unfrozen_blocked_user_ids(*, limit: int = 500) -> list[int]:
+    """limited/expired users that still have live remotes needing KILL_USER.
 
-    Deleted meters are excluded (migrations inflate totals). Lagging
-    ``users.used_traffic`` after live meters pass the limit means remotes
-    stay online until recount+enforce flips them.
+    Matches accounts still ``active``/``error`` without the quota-frozen mark —
+    these keep downloading after Astra already flipped status.
+    """
+    from sqlalchemy import text
+
+    mark = str(QUOTA_FROZEN_MARK)
+    async with AsyncSessionLocal() as db:
+        rows = (
+            await db.execute(
+                text(
+                    """
+                    SELECT DISTINCT u.id
+                    FROM users u
+                    JOIN panel_accounts pa ON pa.user_id = u.id
+                    WHERE u.status IN ('limited', 'expired', 'disabled')
+                      AND pa.status IN ('active', 'error')
+                      AND (
+                        pa.error_message IS NULL
+                        OR pa.error_message = ''
+                        OR pa.error_message <> :mark
+                      )
+                    ORDER BY u.id DESC
+                    LIMIT :lim
+                    """
+                ),
+                {"lim": max(1, int(limit)), "mark": mark},
+            )
+        ).all()
+    return [int(r[0]) for r in rows]
+
+
+async def heal_exhausted_and_unfrozen(*, limit: int = 400) -> dict[str, int]:
+    """Flip active-over-quota users and KILL every blocked user with live remotes.
+
+    Never KILL from a pre-recount candidate list — after weighted recount a
+    user may no longer be limited (inflated ``users.used_traffic``). Only
+    freeze users still ``limited``/``expired``/``disabled``.
+    """
+    from app.services.orchestrator import (
+        enforce_user_quota,
+        kick_freeze_user,
+        recount_user_used_traffic,
+    )
+
+    exhausted = await find_exhausted_user_ids(limit=limit)
+    flipped = 0
+    still_blocked: list[int] = []
+    for uid in exhausted:
+        try:
+            async with AsyncSessionLocal() as db:
+                user, accounts = await _load_user_for_recount(db, int(uid))
+                if user is None:
+                    continue
+                # Shrink allowed: candidates came from stored used>=limit which
+                # may be inflated vs Σ panel meters.
+                await recount_user_used_traffic(
+                    db, user, accounts, allow_shrink=True
+                )
+                if await enforce_user_quota(db, user):
+                    flipped += 1
+                await db.commit()
+                if user.status in (
+                    UserStatus.limited,
+                    UserStatus.expired,
+                    UserStatus.disabled,
+                ):
+                    still_blocked.append(int(uid))
+        except Exception:  # noqa: BLE001
+            logger.warning("heal flip user_id=%s failed", uid, exc_info=True)
+
+    unfrozen = await find_unfrozen_blocked_user_ids(limit=limit)
+    kill_ids = list(dict.fromkeys([*still_blocked, *unfrozen]))
+    from app.services.worker_commands import enqueue_kill_user
+
+    for uid in kill_ids:
+        try:
+            # Await enqueue so ASTRA_QUOTA_FROZEN is stamped before we return
+            # (kick_freeze alone schedules a task and heal would re-select them).
+            await enqueue_kill_user(int(uid), force=True)
+            await kick_freeze_user(int(uid), remote_timeout=8.0, force=True)
+        except Exception:  # noqa: BLE001
+            logger.debug("heal kill user_id=%s failed", uid, exc_info=True)
+        await asyncio.sleep(0.02)
+    logger.info(
+        "heal_exhausted flipped=%s exhausted=%s still_blocked=%s unfrozen=%s kill=%s",
+        flipped,
+        len(exhausted),
+        len(still_blocked),
+        len(unfrozen),
+        len(kill_ids),
+    )
+    return {
+        "flipped": flipped,
+        "exhausted": len(exhausted),
+        "unfrozen": len(unfrozen),
+        "kill": len(kill_ids),
+        "still_blocked": len(still_blocked),
+    }
+
+
+async def find_raw_over_limit_user_ids(*, limit: int = 400) -> list[int]:
+    """Active users where Σ *live* panel *weighted* meters already exceed data_limit.
+
+    Uses ``raw × applied_coefficient`` (not raw alone) so high-coeff panels do
+    not false-trigger, and coeff&lt;1 panels are not ignored. Deleted meters are
+    excluded. Lagging ``users.used_traffic`` after live meters pass the limit
+    means remotes stay online until recount+enforce flips them.
     """
     from sqlalchemy import text
 
@@ -1252,9 +1729,17 @@ async def find_raw_over_limit_user_ids(*, limit: int = 400) -> list[int]:
                     WHERE u.status = 'active'
                       AND u.data_limit > 0
                     GROUP BY u.id, u.data_limit, u.used_traffic
-                    HAVING coalesce(sum(pa.used_traffic), 0) >= u.data_limit
+                    HAVING coalesce(sum(
+                             (coalesce(pa.used_traffic, 0)::numeric
+                              * coalesce(pa.applied_coefficient, 1.0))::bigint
+                           ), 0) >= u.data_limit
                        AND coalesce(u.used_traffic, 0) < u.data_limit
-                    ORDER BY (coalesce(sum(pa.used_traffic), 0) - coalesce(u.used_traffic, 0)) DESC
+                    ORDER BY (
+                      coalesce(sum(
+                        (coalesce(pa.used_traffic, 0)::numeric
+                         * coalesce(pa.applied_coefficient, 1.0))::bigint
+                      ), 0) - coalesce(u.used_traffic, 0)
+                    ) DESC
                     LIMIT :lim
                     """
                 ),
@@ -1268,8 +1753,6 @@ async def recount_and_flip_exhausted(
     *, limit: int = 500, concurrency: int = 6
 ) -> dict[str, int]:
     """Recount lagging / raw-over users, flip quota, return flip counts."""
-    from sqlalchemy.orm import selectinload
-
     from app.services.orchestrator import (
         enforce_user_quota,
         recount_user_used_traffic,
@@ -1286,44 +1769,56 @@ async def recount_and_flip_exhausted(
     # Anyone still active with used >= limit after recount
     exhausted = await find_exhausted_user_ids(limit=limit)
     extra = 0
+    confirmed: list[int] = []
     for uid in exhausted:
         try:
             async with AsyncSessionLocal() as db:
-                user = (
-                    await db.execute(
-                        select(User)
-                        .where(User.id == int(uid))
-                        .options(
-                            selectinload(User.panel_accounts).selectinload(
-                                PanelAccount.panel
-                            ),
-                            selectinload(User.groups),
-                        )
-                    )
-                ).scalar_one_or_none()
+                user, accounts = await _load_user_for_recount(db, int(uid))
                 if user is None:
                     continue
-                await recount_user_used_traffic(db, user)
+                await recount_user_used_traffic(
+                    db, user, accounts, allow_shrink=True
+                )
                 if await enforce_user_quota(db, user):
                     extra += 1
                 await db.commit()
+                if user.status in (
+                    UserStatus.limited,
+                    UserStatus.expired,
+                    UserStatus.disabled,
+                ):
+                    confirmed.append(int(uid))
         except Exception:  # noqa: BLE001
             logger.debug(
                 "recount_and_flip user_id=%s failed", uid, exc_info=True
             )
+    # Immediate multi-panel cut only for users still blocked after recount.
+    try:
+        from app.services.orchestrator import kick_freeze_user
+
+        for uid in confirmed[:120]:
+            try:
+                await kick_freeze_user(int(uid), remote_timeout=6.0)
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
     logger.info(
-        "recount_and_flip lag=%s raw_over=%s flipped=%s extra=%s exhausted=%s",
+        "recount_and_flip lag=%s raw_over=%s flipped=%s extra=%s "
+        "exhausted=%s confirmed=%s",
         len(lag_ids),
         len(raw_ids),
         flipped,
         extra,
         len(exhausted),
+        len(confirmed),
     )
     return {
         "lagging": len(lag_ids),
         "raw_over": len(raw_ids),
         "flipped": flipped + extra,
         "exhausted": len(exhausted),
+        "confirmed": len(confirmed),
     }
 
 
@@ -1435,6 +1930,219 @@ async def find_false_limited_user_ids(*, limit: int = 200) -> list[int]:
             {"lim": max(1, int(limit))},
         )
         return [int(x) for (x,) in result.all()]
+
+
+async def find_inflated_limited_user_ids(*, limit: int = 200) -> list[int]:
+    """limited users whose stored used ≫ Σ weighted meters and still under limit.
+
+    Kept for callers that only want false-limited reactivation candidates.
+    """
+    return await find_inflated_used_user_ids(
+        limit=limit, statuses=("limited",), only_under_limit=True
+    )
+
+
+async def find_inflated_used_user_ids(
+    *,
+    limit: int = 500,
+    statuses: tuple[str, ...] = ("active", "limited", "on_hold"),
+    only_under_limit: bool = False,
+    gap_bytes: int = 50 * 1024 * 1024,
+) -> list[int]:
+    """Users whose ``users.used_traffic`` exceeds Σ(panel raw × coeff) by ``gap``.
+
+    Covers lifetime-parse inflation and double delta bumps — including cases
+    where weighted is still above ``data_limit`` (shrink the number, keep
+    limited) and near-zero meter victims (shrink → often reactivate).
+    """
+    from sqlalchemy import text
+
+    lim = max(1, min(10000, int(limit)))
+    gap = max(0, int(gap_bytes))
+    st = tuple(str(s) for s in statuses if s) or ("active", "limited", "on_hold")
+    st_sql = ", ".join(f"'{s}'" for s in st)
+    under = (
+        "AND coalesce(sum("
+        "(coalesce(pa.used_traffic, 0)::numeric "
+        "* coalesce(pa.applied_coefficient, 1.0))::bigint"
+        "), 0) < u.data_limit"
+        if only_under_limit
+        else ""
+    )
+    async with AsyncSessionLocal() as db:
+        rows = (
+            await db.execute(
+                text(
+                    f"""
+                    SELECT u.id
+                    FROM users u
+                    LEFT JOIN panel_accounts pa ON pa.user_id = u.id
+                    WHERE u.status IN ({st_sql})
+                      AND u.data_limit > 0
+                    GROUP BY u.id, u.used_traffic, u.data_limit
+                    HAVING u.used_traffic > coalesce(sum(
+                             (coalesce(pa.used_traffic, 0)::numeric
+                              * coalesce(pa.applied_coefficient, 1.0))::bigint
+                           ), 0) + :gap
+                    {under}
+                    ORDER BY (
+                      u.used_traffic - coalesce(sum(
+                        (coalesce(pa.used_traffic, 0)::numeric
+                         * coalesce(pa.applied_coefficient, 1.0))::bigint
+                      ), 0)
+                    ) DESC
+                    LIMIT :lim
+                    """
+                ),
+                {"lim": lim, "gap": gap},
+            )
+        ).all()
+    return [int(r[0]) for r in rows]
+
+
+def _accounts_synced_enough_for_shrink(
+    accounts: list, *, max_age_sec: float = 7200.0
+) -> bool:
+    """True when live meters look fresh enough to safely shrink user.used_traffic."""
+    from datetime import datetime, timezone
+
+    from app.models.user import PanelAccountStatus
+
+    now = datetime.now(timezone.utc)
+    live = [
+        a
+        for a in accounts
+        if a.status
+        in (
+            PanelAccountStatus.active,
+            PanelAccountStatus.error,
+            PanelAccountStatus.pending,
+        )
+        and int(getattr(a, "used_traffic", 0) or 0) >= 0
+        and (
+            a.status != PanelAccountStatus.pending
+            or int(getattr(a, "used_traffic", 0) or 0) > 0
+        )
+    ]
+    if not live:
+        return False
+    fresh = 0
+    for a in live:
+        ts = getattr(a, "last_sync_at", None)
+        if ts is None:
+            continue
+        if getattr(ts, "tzinfo", None) is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if (now - ts).total_seconds() <= max_age_sec:
+            fresh += 1
+    # Require a majority of live rows synced within the window.
+    return fresh >= max(1, (len(live) + 1) // 2)
+
+
+async def activate_pending_with_usage(*, limit: int = 2000) -> dict[str, int]:
+    """Promote pending accounts that already hold real traffic to active.
+
+    Provision lag left meters on ``pending`` rows (~654GB fleet-wide). Weighted
+    usage now counts them, and this pass finishes migration so UI/status match.
+    """
+    from sqlalchemy import text
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                UPDATE panel_accounts
+                SET status = 'active',
+                    error_message = CASE
+                        WHEN error_message = :frozen THEN NULL
+                        ELSE error_message
+                    END
+                WHERE id IN (
+                    SELECT pa.id FROM panel_accounts pa
+                    JOIN panels p ON p.id = pa.panel_id AND p.is_active IS TRUE
+                    WHERE pa.status = 'pending'
+                      AND COALESCE(pa.used_traffic, 0) > 0
+                    ORDER BY pa.used_traffic DESC
+                    LIMIT :lim
+                )
+                RETURNING id
+                """
+            ),
+            {"lim": max(1, int(limit)), "frozen": QUOTA_FROZEN_MARK},
+        )
+        rows = result.fetchall()
+        await db.commit()
+    n = len(rows)
+    if n:
+        logger.info("activate_pending_with_usage promoted=%s", n)
+    return {"promoted": n}
+
+
+async def reconcile_inflated_used_traffic(
+    *, limit: int = 500, gap_bytes: int = 50 * 1024 * 1024
+) -> dict[str, int]:
+    """Shrink inflated ``users.used_traffic`` to deduped Σ weighted meters.
+
+    Only shrinks when a majority of the user's live/pending-with-usage rows
+    have ``last_sync_at`` within 2h (avoids wiping totals while remotes are
+    stale). Deduped recount removes multi-group remote double-counts.
+    """
+    from app.services.orchestrator import (
+        enforce_user_quota,
+        recount_user_used_traffic,
+    )
+
+    ids = await find_inflated_used_user_ids(limit=limit, gap_bytes=gap_bytes)
+    shrunk = 0
+    reactivated = 0
+    skipped_stale = 0
+    for uid in ids:
+        try:
+            async with AsyncSessionLocal() as db:
+                user, accounts = await _load_user_for_recount(db, int(uid))
+                if user is None:
+                    continue
+                if not _accounts_synced_enough_for_shrink(accounts):
+                    skipped_stale += 1
+                    continue
+                before = int(user.used_traffic or 0)
+                after = await recount_user_used_traffic(
+                    db, user, accounts, allow_shrink=True
+                )
+                changed = await enforce_user_quota(db, user)
+                if user.status == UserStatus.active:
+                    for acc in accounts:
+                        if (acc.error_message or "") == QUOTA_FROZEN_MARK:
+                            acc.error_message = None
+                    try:
+                        from app.services.worker_commands import clear_kill_cooldown
+
+                        clear_kill_cooldown(int(uid))
+                    except Exception:  # noqa: BLE001
+                        pass
+                await db.commit()
+                if after < before:
+                    shrunk += 1
+                if changed and user.status == UserStatus.active:
+                    reactivated += 1
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "reconcile inflated user_id=%s failed", uid, exc_info=True
+            )
+        await asyncio.sleep(0)
+    logger.info(
+        "reconcile_inflated candidates=%s shrunk=%s reactivated=%s skipped_stale=%s",
+        len(ids),
+        shrunk,
+        reactivated,
+        skipped_stale,
+    )
+    return {
+        "candidates": len(ids),
+        "shrunk": shrunk,
+        "reactivated": reactivated,
+        "skipped_stale": skipped_stale,
+    }
 
 
 async def find_active_needing_unfreeze_ids(*, limit: int = 80) -> list[int]:

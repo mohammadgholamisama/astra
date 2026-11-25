@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -36,6 +36,14 @@ logger = logging.getLogger("astra.node")
 _REBUILD_TASKS: dict[int, asyncio.Task] = {}
 _REBUILD_META: dict[int, dict[str, Any]] = {}
 _REBUILD_SEM = asyncio.Semaphore(1)
+
+# Coalesce statsquery+ORM sync — get_usage/hydrate used to reload 7k clients
+# per panel on every /sub and peg both uvicorn workers at 100%.
+_SYNC_LOCKS: dict[int, asyncio.Lock] = {}
+_SYNC_LAST: dict[int, float] = {}
+_SYNC_MIN_INTERVAL = float(
+    os.environ.get("ASTRA_XRAY_SYNC_SECONDS", "25") or 25
+)
 
 DEFAULT_XRAY_DIR = Path(os.environ.get("ASTRA_XRAY_DIR", "/opt/astra/xray"))
 # CF orange-cloud: Xray on loopback; nginx terminates TLS on CF HTTPS ports.
@@ -381,21 +389,68 @@ async def sync_nginx_ws_upstreams(db: AsyncSession) -> Path | None:
         if not panels:
             lines.append("# (no Astra panels yet)")
             lines.append("")
-        NGINX_WS_INCLUDE.write_text("\n".join(lines), encoding="utf-8")
+        new_body = "\n".join(lines)
+        try:
+            old_body = NGINX_WS_INCLUDE.read_text(encoding="utf-8")
+        except OSError:
+            old_body = ""
+        if old_body == new_body:
+            # Config already matches — skip write + reload (was 1+/sec under heal).
+            await db.flush()
+            return NGINX_WS_INCLUDE
+        NGINX_WS_INCLUDE.write_text(new_body, encoding="utf-8")
     except OSError as exc:
         logger.warning("nginx ws include write failed: %s", exc)
         return None
     await db.flush()
     # Never await sudo/nginx while the caller still holds this DB transaction —
     # that was flooding «connection is closed» / PendingRollback under load.
-    try:
-        asyncio.get_running_loop().create_task(
-            _reload_nginx_helper_bg(),
-            name="astra-nginx-reload",
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("nginx reload schedule: %s", exc)
+    _schedule_nginx_reload()
     return NGINX_WS_INCLUDE
+
+
+# Coalesce helper reloads — provision/heal used to fire sudo reload-nginx
+# more than once per second and peg both workers + nginx workers.
+_NGINX_RELOAD_TASK: asyncio.Task | None = None
+_NGINX_RELOAD_PENDING = False
+_NGINX_RELOAD_MIN_INTERVAL = float(
+    os.environ.get("ASTRA_NGINX_RELOAD_SECONDS", "8") or 8
+)
+_NGINX_RELOAD_LAST = 0.0
+
+
+def _schedule_nginx_reload() -> None:
+    """Debounce nginx reload to at most ~1 per ASTRA_NGINX_RELOAD_SECONDS."""
+    global _NGINX_RELOAD_TASK, _NGINX_RELOAD_PENDING
+    _NGINX_RELOAD_PENDING = True
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = _NGINX_RELOAD_TASK
+    if task is not None and not task.done():
+        return
+
+    async def _run() -> None:
+        global _NGINX_RELOAD_TASK, _NGINX_RELOAD_PENDING, _NGINX_RELOAD_LAST
+        try:
+            while _NGINX_RELOAD_PENDING:
+                _NGINX_RELOAD_PENDING = False
+                min_iv = max(2.0, float(_NGINX_RELOAD_MIN_INTERVAL))
+                wait = min_iv - (time.monotonic() - float(_NGINX_RELOAD_LAST or 0.0))
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                if _NGINX_RELOAD_PENDING:
+                    # More writes arrived while waiting — loop once more.
+                    continue
+                await _reload_nginx_helper_bg()
+                _NGINX_RELOAD_LAST = time.monotonic()
+        finally:
+            _NGINX_RELOAD_TASK = None
+            if _NGINX_RELOAD_PENDING:
+                _schedule_nginx_reload()
+
+    _NGINX_RELOAD_TASK = loop.create_task(_run(), name="astra-nginx-reload")
 
 
 async def _reload_nginx_helper_bg() -> None:
@@ -635,6 +690,38 @@ async def ping_outbounds_batch(
     return [r for r, _, _ in probed]
 
 
+def _outbound_ping_snap(row: AstraOutbound) -> Any:
+    """Plain namespace for protocol_ping after DB rollback/expunge.
+
+    ``release_db_txn`` rollbacks expire ORM instances even with
+    ``expire_on_commit=False`` — never pass live AstraOutbound across that.
+    """
+    from types import SimpleNamespace
+
+    parsed = row.parsed
+    if isinstance(parsed, dict):
+        parsed = dict(parsed)
+    elif parsed is None:
+        parsed = {}
+    else:
+        try:
+            parsed = dict(parsed)
+        except Exception:  # noqa: BLE001
+            parsed = {}
+    return SimpleNamespace(
+        id=int(row.id or 0),
+        uri=str(row.uri or ""),
+        protocol=str(row.protocol or "vless"),
+        host=str(row.host or ""),
+        port=int(row.port or 0),
+        parsed=parsed,
+        is_enabled=bool(row.is_enabled),
+        last_ping_ok=row.last_ping_ok,
+        last_ping_ms=row.last_ping_ms,
+        last_ping_at=row.last_ping_at,
+    )
+
+
 async def probe_panel_outbounds_health(
     panel_id: int,
     *,
@@ -644,7 +731,7 @@ async def probe_panel_outbounds_health(
 ) -> dict[str, Any]:
     """Pool-safe outbound health for panel Test / test-all.
 
-    Load enabled rows → release DB → protocol ping → short writeback.
+    Load enabled rows → snapshot → release DB → protocol ping → short writeback.
     When ``prefer_cache_sec`` > 0 and every enabled outbound was pinged
     recently, reuse that result (fast test-all without false قطع from
     stampede Xray pings).
@@ -652,6 +739,7 @@ async def probe_panel_outbounds_health(
     from app.core.database import AsyncSessionLocal, release_db_txn
 
     pid = int(panel_id)
+    snap: list[Any] = []
     async with AsyncSessionLocal() as db:
         rows = list(
             (
@@ -667,21 +755,8 @@ async def probe_panel_outbounds_health(
             .scalars()
             .all()
         )
-        # Detach fields needed after session close.
-        snap: list[AstraOutbound] = list(rows)
-        for r in snap:
-            _ = (
-                r.id,
-                r.uri,
-                r.protocol,
-                r.host,
-                r.port,
-                r.parsed,
-                r.is_enabled,
-                r.last_ping_ok,
-                r.last_ping_ms,
-                r.last_ping_at,
-            )
+        # Copy into detached namespaces BEFORE rollback expires ORM state.
+        snap = [_outbound_ping_snap(r) for r in rows]
         await release_db_txn(db)
 
     if not snap:
@@ -715,7 +790,7 @@ async def probe_panel_outbounds_health(
     sem = asyncio.Semaphore(max(1, min(4, int(concurrency))))
     to = max(2.0, float(ping_timeout))
 
-    async def _one(r: AstraOutbound) -> tuple[int, bool, int | None]:
+    async def _one(r: Any) -> tuple[int, bool, int | None]:
         async with sem:
             ok, ms = await protocol_ping(r, timeout=to)
             return int(r.id), bool(ok), ms
@@ -724,13 +799,21 @@ async def probe_panel_outbounds_health(
     results: list[tuple[int, bool, int | None]] = []
     for item in probed:
         if isinstance(item, Exception):
+            logger.debug(
+                "probe_panel_outbounds_health ping soft-fail panel=%s: %s",
+                pid,
+                item,
+            )
             continue
         results.append(item)
 
     # If a ping blew up under load, fall back to last known ok for that row
     # instead of inventing a hard قطع.
     by_prev = {
-        int(r.id): (bool(r.last_ping_ok) if r.last_ping_ok is not None else None, r.last_ping_ms)
+        int(r.id): (
+            bool(r.last_ping_ok) if r.last_ping_ok is not None else None,
+            r.last_ping_ms,
+        )
         for r in snap
     }
     merged: list[tuple[int, bool, int | None]] = []
@@ -842,12 +925,12 @@ async def reconcile_outbounds_health_released(
         if not rows:
             return {"pinged": 0, "changed": 0, "ok": 0}
         before = {int(r.id): r.last_ping_ok for r in rows}
-        # Snapshot ORM state needed for protocol_ping after session closes
-        snap = list(rows)
+        # Detached namespaces — session_scope exit / rollback expires ORM rows.
+        snap = [_outbound_ping_snap(r) for r in rows]
 
     sem = asyncio.Semaphore(max(1, min(8, int(concurrency))))
 
-    async def _probe(r: AstraOutbound) -> tuple[int, bool, int | None]:
+    async def _probe(r: Any) -> tuple[int, bool, int | None]:
         async with sem:
             ok, ms = await protocol_ping(r)
             return int(r.id), ok, ms
@@ -1113,7 +1196,80 @@ async def upsert_client(
     rebuild: bool = True,
     sync_nginx: bool = True,
 ) -> AstraNodeClient:
+    """Insert-or-update client. Postgres uses atomic ON CONFLICT (no race)."""
     email = (email or "").strip()
+    new_uuid = (uuid or "").strip() or str(uuid_lib.uuid4())
+    data_limit_i = int(data_limit or 0)
+    expire_i = int(expire or 0)
+    limit_ip_i = int(limit_ip or 0)
+    enable_b = bool(enable)
+    needs_xray = False
+
+    # Prefer atomic upsert on Postgres — SELECT+INSERT races across uvicorn
+    # workers were flooding UniqueViolationError / Tracebacks (CPU).
+    use_pg = False
+    try:
+        bind = db.get_bind()
+        use_pg = (getattr(getattr(bind, "dialect", None), "name", "") or "") == "postgresql"
+    except Exception:  # noqa: BLE001
+        use_pg = "asyncpg" in (os.environ.get("DATABASE_URL") or "")
+    if use_pg:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        prev = (
+            await db.execute(
+                select(
+                    AstraNodeClient.uuid, AstraNodeClient.enable
+                ).where(
+                    AstraNodeClient.panel_id == panel.id,
+                    AstraNodeClient.email == email,
+                )
+            )
+        ).one_or_none()
+        if prev is None:
+            needs_xray = True
+            uuid_val = new_uuid
+        else:
+            prev_uuid, prev_enable = prev[0], prev[1]
+            uuid_val = str(uuid) if uuid else str(prev_uuid or new_uuid)
+            if uuid and str(uuid) != str(prev_uuid or ""):
+                needs_xray = True
+            if bool(prev_enable) != enable_b:
+                needs_xray = True
+
+        stmt = pg_insert(AstraNodeClient).values(
+            panel_id=int(panel.id),
+            email=email,
+            uuid=uuid_val,
+            enable=enable_b,
+            data_limit=data_limit_i,
+            expire=expire_i,
+            limit_ip=limit_ip_i,
+        )
+        # Keep existing uuid on conflict unless caller explicitly changed it.
+        set_cols = {
+            "enable": enable_b,
+            "data_limit": data_limit_i,
+            "expire": expire_i,
+            "limit_ip": limit_ip_i,
+            "updated_at": func.now(),
+        }
+        if uuid:
+            set_cols["uuid"] = str(uuid)
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_astra_node_panel_email",
+            set_=set_cols,
+        )
+        await db.execute(stmt)
+        await db.flush()
+        row = await get_client(db, int(panel.id), email)
+        if row is not None:
+            if rebuild and needs_xray:
+                schedule_rebuild_xray(
+                    int(panel.id), sync_nginx=sync_nginx, delay=1.2
+                )
+            return row
+
     result = await db.execute(
         select(AstraNodeClient).where(
             AstraNodeClient.panel_id == panel.id,
@@ -1123,30 +1279,47 @@ async def upsert_client(
     row = result.scalar_one_or_none()
     # Xray config only embeds uuid/enable — data_limit/expire live in DB only.
     # Skip expensive xray/nginx reload when quota fields alone change.
-    needs_xray = False
     if row is None:
         row = AstraNodeClient(
             panel_id=panel.id,
             email=email,
-            uuid=uuid or str(uuid_lib.uuid4()),
-            enable=enable,
-            data_limit=int(data_limit or 0),
-            expire=int(expire or 0),
-            limit_ip=int(limit_ip or 0),
+            uuid=new_uuid,
+            enable=enable_b,
+            data_limit=data_limit_i,
+            expire=expire_i,
+            limit_ip=limit_ip_i,
         )
         db.add(row)
         needs_xray = True
+        try:
+            await db.flush()
+        except Exception:
+            # Concurrent insert won the race — load winner.
+            await db.rollback()
+            row = await get_client(db, int(panel.id), email)
+            if row is None:
+                raise
+            needs_xray = bool(row.enable) != enable_b or (
+                uuid and str(uuid) != str(row.uuid or "")
+            )
+            row.enable = enable_b
+            row.data_limit = data_limit_i
+            row.expire = expire_i
+            row.limit_ip = limit_ip_i
+            if uuid:
+                row.uuid = str(uuid)
+            await db.flush()
     else:
         if uuid and str(uuid) != str(row.uuid or ""):
             row.uuid = uuid
             needs_xray = True
-        if bool(row.enable) != bool(enable):
+        if bool(row.enable) != enable_b:
             needs_xray = True
-        row.enable = bool(enable)
-        row.data_limit = int(data_limit or 0)
-        row.expire = int(expire or 0)
-        row.limit_ip = int(limit_ip or 0)
-    await db.flush()
+        row.enable = enable_b
+        row.data_limit = data_limit_i
+        row.expire = expire_i
+        row.limit_ip = limit_ip_i
+        await db.flush()
     if rebuild and needs_xray:
         # Debounce: dozens of modify_user in a wave must not each rewrite xray.
         schedule_rebuild_xray(
@@ -1570,13 +1743,44 @@ async def ensure_all_astra_xray_running(*, limit: int = 64) -> dict[str, int]:
                 .limit(max(1, int(limit)))
             )
         ).scalars().all()
-        panels = list(rows)
-        await db.rollback()
+        panels: list[Panel] = []
+        for panel in rows:
+            # Eager-load every attr heal/node_health touches BEFORE the
+            # session closes — rollback() would otherwise DetachedInstanceError
+            # at panel_xray_dir / node_health (astra_node.py:~1724).
+            _ = (
+                int(panel.id),
+                getattr(panel, "name", None),
+                getattr(panel, "type", None),
+                getattr(panel, "base_url", None),
+                getattr(panel, "is_active", True),
+                dict(getattr(panel, "meta", None) or {}),
+            )
+            try:
+                db.expunge(panel)
+            except Exception:  # noqa: BLE001
+                try:
+                    from sqlalchemy.orm import make_transient
+
+                    make_transient(panel)
+                except Exception:  # noqa: BLE001
+                    pass
+            panels.append(panel)
+        # Do not rollback after expunge — that re-expires remaining instances.
 
     # At most a few restarts per heal tick — never stampede systemd.
     max_starts = 3
     for panel in panels:
-        xdir = panel_xray_dir(panel)
+        try:
+            xdir = panel_xray_dir(panel)
+        except Exception:  # noqa: BLE001
+            failed += 1
+            logger.warning(
+                "ensure xray panel_xray_dir failed panel=%s",
+                getattr(panel, "id", "?"),
+                exc_info=True,
+            )
+            continue
         cfg = xdir / "config.json"
         if not cfg.is_file():
             missing += 1
@@ -1872,27 +2076,25 @@ async def _push_client_usage_to_accounts(
         return 0
     from app.models.user import PanelAccount
 
+    emails = [e for e in by_email.keys() if e]
+    if not emails:
+        return 0
+    # Only touch accounts for emails that actually moved — never SELECT *
+    # across 7k rows on every stats tick.
     accounts = (
         await db.execute(
-            select(PanelAccount)
-            .where(PanelAccount.panel_id == panel_id)
-            .options(selectinload(PanelAccount.user))
+            select(PanelAccount).where(
+                PanelAccount.panel_id == panel_id,
+                PanelAccount.remote_username.in_(emails),
+            )
         )
     ).scalars().all()
     n = 0
     for acc in accounts:
         email = (acc.remote_username or "").strip()
-        uname = ""
-        user = acc.__dict__.get("user")
-        if user is not None:
-            uname = (getattr(user, "username", None) or "").strip()
-        got: int | None = None
-        if email and email in by_email:
-            got = int(by_email[email])
-        elif uname and uname in by_email:
-            got = int(by_email[uname])
-        if got is None:
+        if not email or email not in by_email:
             continue
+        got = int(by_email[email])
         prev = int(acc.used_traffic or 0)
         if got != prev:
             acc.used_traffic = got
@@ -1906,12 +2108,47 @@ async def sync_traffic_from_xray(
     *,
     timeout: float = 8.0,
     rebuild_on_limit: bool = True,
+    force: bool = False,
 ) -> int:
     """Pull per-email uplink+downlink from Xray StatsService and accumulate usage.
 
     ``rebuild_on_limit=False`` skips config rebuild (analytics fast path) so a
     quota flip cannot stall the stats API for minutes.
+
+    Coalesced per panel: concurrent get_usage/hydrate calls share one sync and
+    skip if a fresh sync finished within ``ASTRA_XRAY_SYNC_SECONDS`` (default 25).
+    Only clients with live counters (or enabled+capped) are loaded — not all 7k.
     """
+    try:
+        pid = int(panel.id)
+    except (TypeError, ValueError):
+        return 0
+    min_iv = max(5.0, float(_SYNC_MIN_INTERVAL))
+    now = time.monotonic()
+    if not force and (now - float(_SYNC_LAST.get(pid, 0.0) or 0.0)) < min_iv:
+        return 0
+    lock = _SYNC_LOCKS.setdefault(pid, asyncio.Lock())
+    async with lock:
+        now = time.monotonic()
+        if not force and (now - float(_SYNC_LAST.get(pid, 0.0) or 0.0)) < min_iv:
+            return 0
+        updated = await _sync_traffic_from_xray_unlocked(
+            db,
+            panel,
+            timeout=timeout,
+            rebuild_on_limit=rebuild_on_limit,
+        )
+        _SYNC_LAST[pid] = time.monotonic()
+        return updated
+
+
+async def _sync_traffic_from_xray_unlocked(
+    db: AsyncSession,
+    panel: Panel,
+    *,
+    timeout: float = 8.0,
+    rebuild_on_limit: bool = True,
+) -> int:
     api_port = int((panel.meta or {}).get("xray_api_port") or (10085 + int(panel.id)))
     xray_bin = os.environ.get("ASTRA_XRAY_BIN", "/usr/local/bin/xray")
     if not Path(xray_bin).is_file():
@@ -1952,14 +2189,31 @@ async def sync_traffic_from_xray(
 
     totals = _parse_xray_user_traffic(text)
     inbound_live = _parse_xray_inbound_astra(text)
+    if not totals and int(inbound_live or 0) <= 0:
+        return 0
     updated = 0
     need_rebuild = False
-    clients = (
-        await db.execute(
-            select(AstraNodeClient).where(AstraNodeClient.panel_id == panel.id)
+    email_keys = list(totals.keys())
+    # Hot path: only rows that can move this tick (live counters or capped).
+    if email_keys:
+        client_q = select(AstraNodeClient).where(
+            AstraNodeClient.panel_id == panel.id,
+            or_(
+                AstraNodeClient.email.in_(email_keys),
+                and_(
+                    AstraNodeClient.enable.is_(True),
+                    AstraNodeClient.data_limit > 0,
+                ),
+            ),
         )
-    ).scalars().all()
-    by_email: dict[str, int] = {}
+    else:
+        client_q = select(AstraNodeClient).where(
+            AstraNodeClient.panel_id == panel.id,
+            AstraNodeClient.enable.is_(True),
+            AstraNodeClient.data_limit > 0,
+        )
+    clients = (await db.execute(client_q)).scalars().all()
+    changed_push: dict[str, int] = {}
     for c in clients:
         if c.email in totals:
             added = _apply_xray_counter_delta(c, int(totals[c.email]))
@@ -1973,15 +2227,17 @@ async def sync_traffic_from_xray(
                     int(c.used_down or 0),
                     c.stats_counter,
                 )
+                changed_push[c.email] = int(c.used_down or 0) + int(c.used_up or 0)
         used = int(c.used_down or 0) + int(c.used_up or 0)
-        by_email[c.email] = used
         if int(c.data_limit or 0) > 0 and used >= int(c.data_limit) and c.enable:
             c.enable = False
             need_rebuild = True
             updated += 1
-    # Mirror cumulatives → PanelAccount so «مصرف پنل‌ها» stays accurate
+            changed_push[c.email] = used
+    # Mirror only rows that moved this tick
     try:
-        await _push_client_usage_to_accounts(db, panel.id, by_email)
+        if changed_push:
+            await _push_client_usage_to_accounts(db, panel.id, changed_push)
     except Exception:  # noqa: BLE001
         logger.debug("push client usage to accounts failed", exc_info=True)
     # Panel-level inbound meter (survives missing per-user stats)

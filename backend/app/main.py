@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, ORJSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy import select
@@ -57,7 +57,18 @@ from app.services.config_orders import refresh_cache as refresh_config_orders
 from app.services.site_settings import refresh_cache as refresh_site_settings
 
 settings = get_settings()
-logging.basicConfig(level=logging.INFO)
+# Quieter default — access log off at uvicorn; hush httpx/uvicorn access spam.
+_log_level = (getattr(settings, "LOG_LEVEL", None) or "WARNING").upper()
+try:
+    logging.basicConfig(level=getattr(logging, _log_level, logging.WARNING))
+except Exception:  # noqa: BLE001
+    logging.basicConfig(level=logging.WARNING)
+logging.getLogger("astra").setLevel(logging.INFO)
+logging.getLogger("astra.worker").setLevel(logging.INFO)
+logging.getLogger("astra.node").setLevel(logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 logger = logging.getLogger("astra")
 
 
@@ -202,12 +213,17 @@ async def _auto_retry_errors_loop() -> None:
 
 
 async def _astra_xray_heal_loop() -> None:
-    """Keep astra-xray@N up — calm cadence; never stampede systemctl/D-Bus."""
+    """Keep astra-xray@N up — calm cadence; never stampede systemctl/D-Bus.
+
+    ``ensure_all_astra_xray_running`` opens its own isolated
+    ``AsyncSessionLocal`` (never shares a session with analytics / usage-report).
+    """
     from app.services import astra_node as node
 
     await asyncio.sleep(90)
     while True:
         try:
+            # Isolated helper — own short session inside; exceptions stay here.
             stats = await node.ensure_all_astra_xray_running(limit=40)
             if stats.get("started") or stats.get("failed"):
                 logging.getLogger("astra").info(
@@ -545,12 +561,77 @@ async def _hot_usage_loop() -> None:
                 worker_ok = False
             ids = ids[:4] if (under_pressure or worker_ok) else ids[:10]
             if ids:
-                sem = asyncio.Semaphore(1)
+                # Never share a session across concurrent pulls. Each task opens
+                # one isolated AsyncSessionLocal under Sem(8) — no nested
+                # pool_safe checkout while that session is open.
+                sem = asyncio.Semaphore(8)
 
                 async def _one(uid: int) -> None:
                     async with sem:
                         try:
-                            await recount_user_usage_pool_safe(int(uid))
+                            from sqlalchemy.orm.attributes import (
+                                set_committed_value as _scv,
+                            )
+
+                            from app.models.panel import Panel as _Panel
+                            from app.models.user import (
+                                PanelAccount as _PA,
+                                User as _User,
+                            )
+                            from app.services.orchestrator import (
+                                activate_on_hold_if_used as _act,
+                                enforce_user_quota as _enq,
+                                recount_user_used_traffic as _rct,
+                            )
+
+                            async with AsyncSessionLocal() as local_db:
+                                user = (
+                                    await local_db.execute(
+                                        select(_User).where(
+                                            _User.id == int(uid)
+                                        )
+                                    )
+                                ).scalar_one_or_none()
+                                if user is None:
+                                    return
+                                accounts = list(
+                                    (
+                                        await local_db.execute(
+                                            select(_PA).where(
+                                                _PA.user_id == int(uid)
+                                            )
+                                        )
+                                    )
+                                    .scalars()
+                                    .all()
+                                )
+                                if accounts:
+                                    pids = list(
+                                        {
+                                            int(a.panel_id)
+                                            for a in accounts
+                                            if a.panel_id
+                                        }
+                                    )
+                                    by_id: dict[int, _Panel] = {}
+                                    if pids:
+                                        for p in (
+                                            await local_db.execute(
+                                                select(_Panel).where(
+                                                    _Panel.id.in_(pids)
+                                                )
+                                            )
+                                        ).scalars().all():
+                                            by_id[int(p.id)] = p
+                                    for acc in accounts:
+                                        panel = by_id.get(int(acc.panel_id))
+                                        if panel is not None:
+                                            _scv(acc, "panel", panel)
+                                _scv(user, "panel_accounts", accounts)
+                                await _rct(local_db, user, accounts)
+                                await _act(local_db, user)
+                                await _enq(local_db, user)
+                                await local_db.commit()
                             if worker_ok or under_pressure:
                                 return
                             await asyncio.wait_for(
@@ -605,7 +686,7 @@ async def _priority_usage_loop() -> None:
     """Dedicated lane for live consumers — never deferred by fleet/pool pressure.
 
     After check-usage / successful pull, users stay in the priority set ~5 min.
-    This loop alone must keep their meters within ~30–45s of remote panels.
+    When a Worker owns remote meters, only recount from DB (no per-user HTTP).
     """
     import time as _time
 
@@ -619,10 +700,20 @@ async def _priority_usage_loop() -> None:
     while True:
         t0 = _time.monotonic()
         try:
+            worker_ok = False
+            try:
+                from app.services.worker_client import any_worker_healthy
+
+                worker_ok = bool(any_worker_healthy())
+            except Exception:  # noqa: BLE001
+                worker_ok = False
             ids = list(take_live_usage_priority(360.0, 6))[:4]
             if ids:
                 for uid in ids:
                     try:
+                        if worker_ok:
+                            await recount_user_usage_pool_safe(int(uid))
+                            continue
                         await asyncio.wait_for(
                             refresh_usage_pool_safe(
                                 int(uid), force=True, quick=True
@@ -641,8 +732,9 @@ async def _priority_usage_loop() -> None:
                             exc_info=True,
                         )
                 logger.info(
-                    "priority usage: pulled=%s dt=%.1fs",
+                    "priority usage: pulled=%s worker=%s dt=%.1fs",
                     len(ids),
+                    int(worker_ok),
                     _time.monotonic() - t0,
                 )
         except asyncio.CancelledError:
@@ -676,22 +768,28 @@ async def _worker_probe_loop() -> None:
 
 
 async def _analytics_sample_loop() -> None:
-    """Cadenced analytics snapshot; live Astra sync stays light."""
+    """Cadenced analytics snapshot; live Astra sync stays light.
+
+    Live usage-report deltas already feed hour buckets via
+    ``user_analytics.record_usage_deltas``. This loop is a backup sampler +
+    panel refresh — keep it frequent but never hold ``background_db_sem``
+    across the whole user scan (that starved the pool for minutes).
+    """
     from app.core.database import AsyncSessionLocal, background_db_sem
     from app.services import panel_analytics as panel_analytics_svc
     from app.services import user_analytics as analytics_svc
 
-    await asyncio.sleep(20)
+    await asyncio.sleep(15)
     cycle = 0
     while True:
         try:
-            sem = background_db_sem()
-            await sem.acquire()
-            try:
-                stats = await analytics_svc.sample_all_users_once()
-                panel_stats = await panel_analytics_svc.sample_all_panels_once()
-                # Every ~3 minutes: live Xray sync so hour columns track consumption
-                if cycle % 3 == 0:
+            stats = await analytics_svc.sample_all_users_once()
+            panel_stats = await panel_analytics_svc.sample_all_panels_once()
+            # Every ~2 minutes: live Xray sync so hour columns track consumption
+            if cycle % 2 == 0:
+                sem = background_db_sem()
+                await sem.acquire()
+                try:
                     live = await panel_analytics_svc.refresh_panel_analytics_fast(
                         tz_offset_min=0,
                         budget_s=5.5,
@@ -704,12 +802,12 @@ async def _analytics_sample_loop() -> None:
                         live_stats.get("ms"),
                         live_stats.get("error"),
                     )
-            finally:
-                sem.release()
+                finally:
+                    sem.release()
             cycle += 1
-            if cycle == 1 or cycle % 30 == 0:
+            if cycle == 1 or cycle % 10 == 0:
                 logger.info("analytics sample: users=%s panels=%s", stats, panel_stats)
-            if cycle % 120 == 0:
+            if cycle % 60 == 0:
                 async with AsyncSessionLocal() as db:
                     pruned = await analytics_svc.prune_analytics(db)
                     ppruned = await panel_analytics_svc.prune_panel_analytics(db)
@@ -721,7 +819,7 @@ async def _analytics_sample_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("analytics sample loop failed")
-        await asyncio.sleep(300)
+        await asyncio.sleep(60)
 
 
 def _resolve_frontend_dist() -> Path | None:
@@ -772,6 +870,12 @@ async def lifespan(_app: FastAPI):
                 )
             # Coalesced usage-report consumer (merges chunks per panel).
             await ensure_usage_report_worker()
+            if run_bg:
+                from app.services.worker_lease import ensure_lease_loop
+                from app.services.usage_tiers import ensure_tier_loop
+
+                await ensure_lease_loop()
+                await ensure_tier_loop()
         except Exception:  # noqa: BLE001
             logging.getLogger("astra.worker").warning(
                 "worker route bootstrap failed", exc_info=True
@@ -944,6 +1048,7 @@ app = FastAPI(
     version="1.0.0",
     description="Multi-source V2Ray panel with PasarGuard-compatible API",
     lifespan=lifespan,
+    default_response_class=ORJSONResponse,
 )
 
 _SUB_HOST_LANDING = """<!DOCTYPE html>
