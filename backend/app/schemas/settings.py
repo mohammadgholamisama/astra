@@ -54,3 +54,24 @@ class SslIssueResponse(BaseModel):
     message: str
     domain: str = ""
     target: str = ""
+
+
+class SubEdgeStatus(BaseModel):
+    ok: bool = True
+    mode: str = "cloudflare"
+    tunnel_active: bool = False
+    tunnel_enabled: bool = False
+    watch_enabled: bool = False
+    edge_host: str = ""
+    edge: dict = Field(default_factory=dict)
+    sub_base_url: str = ""
+    sub_hostname: str = ""
+    panel_base_url: str = ""
+    panel_ip_hint: str = ""
+    cf_instructions: list[str] = Field(default_factory=list)
+    message: str = ""
+    notes: list[str] = Field(default_factory=list)
+
+
+class SubEdgeUpdate(BaseModel):
+    enabled: bool = Field(description="True = Iran tunnel on; False = Cloudflare / tunnel off")

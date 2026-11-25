@@ -13,9 +13,12 @@ from app.schemas.settings import (
     SiteSettingsUpdate,
     SslIssueRequest,
     SslIssueResponse,
+    SubEdgeStatus,
+    SubEdgeUpdate,
 )
 from app.services import site_settings as site_svc
 from app.services import ssl_ops
+from app.services import sub_edge as sub_edge_svc
 
 router = APIRouter(tags=["Settings"])
 
@@ -128,3 +131,24 @@ async def issue_ssl_api(
             detail={"code": "SSL_FAILED", "message": str(exc)},
         ) from exc
     return SslIssueResponse(**result)
+
+
+@router.get("/api/admin/settings/sub-edge", response_model=SubEdgeStatus)
+async def get_sub_edge_api(
+    db: AsyncSession = Depends(get_db),
+    _admin: Admin = Depends(get_session_admin_only),
+):
+    await site_svc.ensure_loaded(db)
+    data = sub_edge_svc.status_snapshot()
+    data.setdefault("ok", True)
+    return SubEdgeStatus(**data)
+
+
+@router.post("/api/admin/settings/sub-edge", response_model=SubEdgeStatus)
+async def set_sub_edge_api(
+    body: SubEdgeUpdate,
+    db: AsyncSession = Depends(get_db),
+    _admin: Admin = Depends(get_session_admin_only),
+):
+    data = await sub_edge_svc.set_mode(db, enabled=bool(body.enabled))
+    return SubEdgeStatus(**data)

@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  Cable,
   Check,
   KeyRound,
   Link2,
@@ -53,6 +54,23 @@ function previewStatusLine(template: string): string {
     return STATUS_SAMPLE_VARS[key.toLowerCase()] ?? "";
   });
 }
+
+type SubEdgeStatus = {
+  ok: boolean;
+  mode: "cloudflare" | "iran_tunnel" | string;
+  tunnel_active: boolean;
+  tunnel_enabled: boolean;
+  watch_enabled: boolean;
+  edge_host: string;
+  edge: { reachable?: boolean; host?: string; port?: number; latency_ms?: number; error?: string };
+  sub_base_url: string;
+  sub_hostname: string;
+  panel_base_url: string;
+  panel_ip_hint: string;
+  cf_instructions: string[];
+  message?: string;
+  notes?: string[];
+};
 
 type SiteSettings = {
   sub_base_url: string;
@@ -303,6 +321,38 @@ export default function SettingsPage() {
   const { data, isLoading, error } = useQuery({
     queryKey: ["site-settings"],
     queryFn: () => api<SiteSettings>("/api/admin/settings"),
+  });
+
+  const {
+    data: subEdge,
+    isLoading: subEdgeLoading,
+    refetch: refetchSubEdge,
+  } = useQuery({
+    queryKey: ["sub-edge"],
+    queryFn: () => api<SubEdgeStatus>("/api/admin/settings/sub-edge"),
+    refetchInterval: 20000,
+  });
+
+  const toggleSubEdge = useMutation({
+    mutationFn: (enabled: boolean) =>
+      api<SubEdgeStatus>("/api/admin/settings/sub-edge", {
+        method: "POST",
+        body: JSON.stringify({ enabled }),
+      }),
+    onSuccess: (res) => {
+      qc.setQueryData(["sub-edge"], res);
+      setMsg({
+        type: res.ok ? "ok" : "err",
+        text: res.message || (res.mode === "iran_tunnel" ? "تانل ایران" : "حالت کلادفلر"),
+      });
+    },
+    onError: (e: Error) => {
+      const ae = e as ApiError;
+      setMsg({
+        type: "err",
+        text: ae.message || e.message || "خطا در تغییر تانل ساب",
+      });
+    },
   });
 
   const { data: apiKeys = [], isLoading: keysLoading } = useQuery({
@@ -675,6 +725,98 @@ export default function SettingsPage() {
                 بازگشت به پیش‌فرض
               </button>
             </div>
+          </div>
+
+
+          <div className="settings-card settings-card-wide">
+            <header className="settings-card-head">
+              <Cable size={20} />
+              <div>
+                <h2>تونل ساب ایران</h2>
+                <p>
+                  اگر سرور ایران خاموش است تانل را خاموش کنید و DNS ساب را از
+                  Cloudflare به همین پنل ببرید. بعد از روشن شدن ایران، تانل را
+                  دوباره فعال کنید.
+                </p>
+              </div>
+            </header>
+
+            {subEdgeLoading && !subEdge ? (
+              <p className="field-hint">در حال خواندن وضعیت تانل…</p>
+            ) : (
+              <div className="settings-stack" style={{ gap: 12 }}>
+                <div className="field-hint" dir="rtl">
+                  حالت:{" "}
+                  <strong>
+                    {subEdge?.mode === "iran_tunnel"
+                      ? "تانل ایران"
+                      : "کلادفلر / بدون تانل"}
+                  </strong>
+                  {" · "}
+                  سرویس تانل:{" "}
+                  <strong dir="ltr">
+                    {subEdge?.tunnel_active ? "active" : "off"}
+                  </strong>
+                  {" · "}
+                  edge{" "}
+                  <code dir="ltr">{subEdge?.edge_host || "—"}</code>:{" "}
+                  <strong>
+                    {subEdge?.edge?.reachable ? "TCP OK" : "unreachable"}
+                  </strong>
+                </div>
+
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                  <button
+                    type="button"
+                    className="btn ghost sm"
+                    disabled={
+                      toggleSubEdge.isPending || subEdge?.mode === "cloudflare"
+                    }
+                    onClick={() => {
+                      setMsg(null);
+                      toggleSubEdge.mutate(false);
+                    }}
+                  >
+                    خاموش کردن تانل
+                  </button>
+                  <button
+                    type="button"
+                    className="btn toolbar-primary sm"
+                    disabled={
+                      toggleSubEdge.isPending ||
+                      subEdge?.mode === "iran_tunnel"
+                    }
+                    onClick={() => {
+                      setMsg(null);
+                      toggleSubEdge.mutate(true);
+                    }}
+                  >
+                    روشن کردن تانل ایران
+                  </button>
+                  <button
+                    type="button"
+                    className="btn ghost sm"
+                    disabled={toggleSubEdge.isPending}
+                    onClick={() => refetchSubEdge()}
+                  >
+                    بروزرسانی وضعیت
+                  </button>
+                </div>
+
+                {!!subEdge?.cf_instructions?.length && (
+                  <ol className="field-hint" style={{ margin: 0, paddingInlineStart: 18 }}>
+                    {subEdge.cf_instructions.map((line) => (
+                      <li key={line}>{line}</li>
+                    ))}
+                  </ol>
+                )}
+                {!!subEdge?.notes?.length && (
+                  <p className="field-hint" dir="ltr">
+                    {subEdge.notes.join(" | ")}
+                  </p>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="settings-card settings-card-wide settings-status-line">

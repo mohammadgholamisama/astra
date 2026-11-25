@@ -32,6 +32,8 @@ KEY_PROMO_CONFIG_TEXT_2 = "promo_config_text_2"
 # First sub line (status remark) template + group label
 KEY_STATUS_LINE_TEMPLATE = "status_line_template"
 KEY_STATUS_PANEL_LABEL = "status_panel_label"
+# Iran edge reverse-tunnel vs Cloudflare direct for public sub
+KEY_SUB_EDGE_MODE = "sub_edge_mode"
 
 _ALLOWED_KEYS = frozenset(
     {
@@ -47,6 +49,7 @@ _ALLOWED_KEYS = frozenset(
         KEY_PROMO_CONFIG_TEXT_2,
         KEY_STATUS_LINE_TEMPLATE,
         KEY_STATUS_PANEL_LABEL,
+        KEY_SUB_EDGE_MODE,
     }
 )
 

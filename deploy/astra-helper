@@ -1136,6 +1136,45 @@ PY
   echo "astra-helper: admin login set to user=${new_user} (API login OK)"
 }
 
+cmd_sub_edge() {
+  need_root
+  local action="${1:-}"
+  local unit=astra-sub-rtunnel
+  local timer=astra-sub-rtunnel-watch.timer
+  local svc=astra-sub-rtunnel-watch.service
+  case "$action" in
+    off|disable|cloudflare)
+      systemctl stop "$svc" 2>/dev/null || true
+      systemctl stop "$timer" 2>/dev/null || true
+      systemctl disable "$timer" 2>/dev/null || true
+      systemctl stop "$unit" 2>/dev/null || true
+      systemctl disable "$unit" 2>/dev/null || true
+      echo "sub-edge: tunnel disabled"
+      systemctl is-active "$unit" 2>/dev/null || true
+      systemctl is-enabled "$unit" 2>/dev/null || true
+      ;;
+    on|enable|iran|tunnel)
+      systemctl enable "$unit" 2>/dev/null || true
+      systemctl enable "$timer" 2>/dev/null || true
+      systemctl reset-failed "$unit" 2>/dev/null || true
+      systemctl restart "$unit"
+      systemctl start "$timer" 2>/dev/null || true
+      sleep 2
+      echo "sub-edge: tunnel enable requested"
+      systemctl is-active "$unit" 2>/dev/null || true
+      systemctl is-enabled "$unit" 2>/dev/null || true
+      ;;
+    status)
+      echo "unit=$(systemctl is-active "$unit" 2>/dev/null || true)"
+      echo "enabled=$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+      echo "watch=$(systemctl is-enabled "$timer" 2>/dev/null || true)"
+      ;;
+    *)
+      die "usage: sub-edge on|off|status"
+      ;;
+  esac
+}
+
 usage() {
   cat <<EOF
 Usage: astra-helper <command> [args]
@@ -1154,6 +1193,7 @@ Commands:
   apply-update                 # pull latest; keeps .env + data/
   install-ping-hub             # build/restart astra-ping-hub only
   uninstall [--purge]          # remove Astra from server (other apps safe)
+  sub-edge <on|off|status>     # Iran reverse tunnel for public sub
 EOF
 }
 
@@ -1177,6 +1217,7 @@ main() {
       bash "${ASTRA_ROOT}/deploy/ping-hub-install.sh"
       ;;
     uninstall)     cmd_uninstall "${1:-}" ;;
+    sub-edge)      cmd_sub_edge "${1:-}" ;;
     ""|-h|--help)  usage ;;
     *)             die "unknown command: $cmd" ;;
 esac
