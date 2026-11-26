@@ -58,7 +58,7 @@ import {
   usagePercent,
 } from "../lib/format";
 
-type FilterKey = "all" | "active" | "error" | "expired";
+type FilterKey = "all" | "active" | "error" | "expired" | "limited";
 
 const PAGE_SIZE = 10;
 
@@ -651,7 +651,7 @@ export default function UsersPage() {
 
   const [searchDebounced, setSearchDebounced] = useState(search);
   useEffect(() => {
-    const t = window.setTimeout(() => setSearchDebounced(search), 280);
+    const t = window.setTimeout(() => setSearchDebounced(search), 180);
     return () => window.clearTimeout(t);
   }, [search]);
 
@@ -688,6 +688,7 @@ export default function UsersPage() {
     active: number;
     error: number;
     expired: number;
+    limited: number;
   };
 
   type UsersListPayload = {
@@ -745,7 +746,11 @@ export default function UsersPage() {
     refetchInterval: 45_000,
     refetchOnMount: true,
     refetchOnWindowFocus: false,
-    placeholderData: (prev) => prev,
+    // While typing a search, don't keep the previous board page as placeholder
+    // (it looked like the list "vanished" mid-type). Page flips can reuse.
+    placeholderData: searchDebounced.trim()
+      ? undefined
+      : (prev) => prev,
   });
 
   // Phase 2 — panel accounts for cards (merge into the same cache).
@@ -780,7 +785,7 @@ export default function UsersPage() {
     refetchOnWindowFocus: false,
   });
 
-  // Phase 3 — chip totals (all/active/error/expired) after list is visible.
+  // Phase 3 — chip totals (all/active/error/expired/limited) after list is visible.
   const {
     data: chipCounts,
     isFetching: countsFetching,
@@ -797,7 +802,6 @@ export default function UsersPage() {
         { timeoutMs: 30_000 }
       );
     },
-    enabled: !searchDebounced.trim(),
     staleTime: 30_000,
     refetchInterval: 60_000,
     refetchOnWindowFocus: false,
@@ -1821,15 +1825,13 @@ export default function UsersPage() {
   };
 
   const counts = chipCounts ?? data?.counts;
-  const countsReady = Boolean(chipCounts) || Boolean(searchDebounced.trim());
+  const countsReady = Boolean(chipCounts);
   const stats = useMemo(() => {
     const now = Math.floor(Date.now() / 1000);
     let expiringSoon = 0;
     let usedSum = 0;
-    let limited = 0;
     for (const u of users) {
       usedSum += Number(u.used_traffic) || 0;
-      if ((Number(u.data_limit) || 0) > 0) limited += 1;
       const exp = Number(u.expire) || 0;
       if (exp > now && exp - now <= 7 * 86400) expiringSoon += 1;
     }
@@ -1838,9 +1840,9 @@ export default function UsersPage() {
       active: counts?.active ?? 0,
       withError: counts?.error ?? 0,
       expired: counts?.expired ?? 0,
+      limited: counts?.limited ?? 0,
       expiringSoon,
       usedSum,
-      limited,
       loaded: users.length,
     };
   }, [users, totalUsers, counts]);
@@ -1870,6 +1872,11 @@ export default function UsersPage() {
   }[] = [
     { key: "all", label: "همه", count: countsReady ? stats.total : null },
     { key: "active", label: "فعال", count: countsReady ? stats.active : null },
+    {
+      key: "limited",
+      label: "اتمام حجم",
+      count: countsReady ? stats.limited : null,
+    },
     { key: "error", label: "خطا", count: countsReady ? stats.withError : null },
     {
       key: "expired",

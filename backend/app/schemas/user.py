@@ -91,6 +91,7 @@ class UsersListCounts(BaseModel):
     active: int = 0
     error: int = 0
     expired: int = 0
+    limited: int = 0
 
 
 class UsersListResponse(BaseModel):

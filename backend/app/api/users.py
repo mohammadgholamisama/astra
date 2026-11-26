@@ -2011,24 +2011,32 @@ async def retry_all_errors(
     )
 
 
-def _exact_username_term(search: str | None) -> str | None:
-    """Bot lookups pass a full username (telegram id / phone). Use btree index."""
-    term = (search or "").strip()
-    if not term or len(term) < 2:
-        return None
-    if any(ch in term for ch in ("%", "_", " ", "*", "?")):
-        return None
-    if not all(c.isalnum() or c in "._-@" for c in term):
-        return None
-    return term
+def _like_escape(term: str) -> str:
+    """Escape ``%`` / ``_`` / ``\\`` so user input is literal in ILIKE."""
+    return (
+        (term or "")
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
 
 
 def _username_search_filter(search: str):
-    exact = _exact_username_term(search)
-    if exact is not None:
-        # Case-insensitive exact — still sargable via username index + lower.
-        return or_(User.username == exact, User.username.ilike(exact))
-    return User.username.ilike(f"%{(search or '').strip()}%")
+    """Typeahead search: username prefix + display_name contains.
+
+    Previously any clean 2+ char term forced *exact* username equality, so
+    typing ``Fa`` → ``Fas`` → ``Fast`` emptied the list until the full name
+    was entered. Prefix match restores progressive search and stays index-friendly.
+    """
+    term = (search or "").strip()
+    if not term:
+        return User.id.is_not(None)
+    esc = _like_escape(term)
+    clauses = [User.username.ilike(f"{esc}%", escape="\\")]
+    # Also match display name once the query is meaningful.
+    if len(term) >= 2:
+        clauses.append(User.display_name.ilike(f"%{esc}%", escape="\\"))
+    return or_(*clauses)
 
 
 def _user_list_scope(
@@ -2063,6 +2071,18 @@ def _active_user_clause(now_ts: int):
     """Match UI: status=active and not time-expired."""
     return and_(
         User.status == UserStatus.active,
+        or_(
+            User.expire.is_(None),
+            User.expire <= 0,
+            User.expire > int(now_ts),
+        ),
+    )
+
+
+def _limited_user_clause(now_ts: int):
+    """Match UI chip «اتمام حجم»: status=limited and not time-expired."""
+    return and_(
+        User.status == UserStatus.limited,
         or_(
             User.expire.is_(None),
             User.expire <= 0,
@@ -2203,6 +2223,10 @@ async def _users_list_chip_counts(
                          WHERE status = 'expired'
                             OR (expire IS NOT NULL AND expire > 0 AND expire <= :now_ts)
                       ) AS expired_c,
+                      (SELECT count(*) FROM users
+                         WHERE status = 'limited'
+                           AND (expire IS NULL OR expire <= 0 OR expire > :now_ts)
+                      ) AS limited_c,
                       (SELECT count(DISTINCT pa.user_id)
                          FROM panel_accounts pa
                          JOIN panels p ON p.id = pa.panel_id
@@ -2236,11 +2260,13 @@ async def _users_list_chip_counts(
             all=int(row[0] or 0),
             active=int(row[1] or 0),
             expired=int(row[2] or 0),
-            error=int(row[3] or 0),
+            limited=int(row[3] or 0),
+            error=int(row[4] or 0),
         )
 
     active_c = _active_user_clause(now_ts)
     expired_c = _expired_user_clause(now_ts)
+    limited_c = _limited_user_clause(now_ts)
     id_count = (
         func.count(func.distinct(User.id)) if needs_group_join else func.count()
     )
@@ -2248,6 +2274,7 @@ async def _users_list_chip_counts(
         id_count,
         id_count.filter(active_c),
         id_count.filter(expired_c),
+        id_count.filter(limited_c),
     )
     if needs_group_join:
         q = q.join(UserGroup, UserGroup.user_id == User.id)
@@ -2294,6 +2321,7 @@ async def _users_list_chip_counts(
         active=int(row[1] or 0),
         error=err_n,
         expired=int(row[2] or 0),
+        limited=int(row[3] or 0),
     )
 
 
@@ -2329,8 +2357,8 @@ async def list_users(
     group_id: int | None = Query(None, ge=1),
     filter: str | None = Query(
         None,
-        pattern="^(all|active|error|expired)$",
-        description="Chip filter across all pages: all|active|error|expired",
+        pattern="^(all|active|error|expired|limited)$",
+        description="Chip filter across all pages: all|active|error|expired|limited",
     ),
     refresh: bool = Query(
         False,
@@ -2382,16 +2410,12 @@ async def _list_users_impl(
 ):
     now_ts = int(time.time())
     status_filter = (filter or "all").strip().lower()
-    if status_filter not in ("all", "active", "error", "expired"):
+    if status_filter not in ("all", "active", "error", "expired", "limited"):
         status_filter = "all"
     is_search = bool((search or "").strip())
-    exact_term = _exact_username_term(search) if is_search else None
-    # Bot stampede often uses limit=100 search — keep payload tiny.
-    if is_search:
-        if exact_term is not None:
-            limit = min(limit, 5)
-        elif limit > 20:
-            limit = 20
+    # Cap search page size — prefix typeahead can match many rows.
+    if is_search and limit > 40:
+        limit = 40
 
     base_filters, needs_group_join, group_filter = _user_list_scope(
         search=search, group_id=group_id
@@ -2402,6 +2426,7 @@ async def _list_users_impl(
     expired_c = _expired_user_clause(now_ts)
     active_c = _active_user_clause(now_ts)
     error_c = _error_user_clause(now_ts)
+    limited_c = _limited_user_clause(now_ts)
 
     status_extra = None
     if status_filter == "active":
@@ -2410,6 +2435,8 @@ async def _list_users_impl(
         status_extra = error_c
     elif status_filter == "expired":
         status_extra = expired_c
+    elif status_filter == "limited":
+        status_extra = limited_c
 
     # details=true always loads panel status (board + search). Search used to
     # force lean-only and left cards stuck at ۰/N after bulk provision finished.
@@ -2489,6 +2516,8 @@ async def _list_users_impl(
                 total = counts.error
             elif status_filter == "expired":
                 total = counts.expired
+            elif status_filter == "limited":
+                total = counts.limited
             else:
                 total = await _count_users(
                     db, search=search, group_id=group_id, extra=status_extra
