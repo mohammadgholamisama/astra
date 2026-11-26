@@ -121,18 +121,20 @@ def _panel_public_ip_hint() -> str:
 def cloudflare_instructions(*, enabling_tunnel: bool) -> list[str]:
     sub_host = site_svc.extract_hostname(site_svc.get_sub_base_url()) or "sub.vokqem.ir"
     panel_host = site_svc.extract_hostname(site_svc.get_panel_base_url()) or "p.vokqem.ir"
+    panel_ip = _panel_public_ip_hint()
     if enabling_tunnel:
         return [
-            f"Cloudflare → DNS: رکورد A برای {sub_host} = {EDGE_HOST}",
-            "Proxy status: DNS only (ابر خاکستری)",
-            "سرور ایران را روشن کنید، بعد دکمه «روشن کردن تانل ایران» را بزنید",
+            "ترتیب بدون قطعی: اول تانل را از همین صفحه روشن کنید (پنل همیشه روی سرور خارج سرو می‌دهد)",
+            f"بعد Cloudflare → DNS: A برای {sub_host} = {EDGE_HOST}",
+            "Proxy status: DNS only (ابر خاکستری) — پروکسی خاموش",
+            "تا TTL قدیمی، کاربرانی که هنوز IP خارج را دارند مستقیم به پنل وصل می‌مانند",
         ]
     return [
-        f"Cloudflare → DNS: رکورد {sub_host} را مثل {panel_host} به {_panel_public_ip_hint()} بدهید",
+        "ترتیب بدون قطعی: اول DNS را عوض کنید، بعد تانل را خاموش کنید",
+        f"Cloudflare → DNS: A برای {sub_host} = {panel_ip} (مثل {panel_host})",
         "Proxy status: Proxied (ابر نارنجی) — مثل دامنه پنل",
-        "SSL/TLS: Full (اگر Full strict خطا داد موقتاً Full)",
-        f"بعد از سبز شدن DNS، در تنظیمات → SSL دامنه ساب ({sub_host}) گواهی بگیرید",
-        "لینک ساب کاربران همان sub.… می‌ماند؛ فقط DNS عوض می‌شود",
+        "۱–۲ دقیقه صبر کنید تا ترافیک به سرور خارج برگردد، بعد «خاموش کردن تانل» را بزنید",
+        "SSL/TLS: Full؛ لینک ساب کاربران همان می‌ماند — فقط مسیر DNS عوض می‌شود",
     ]
 
 
@@ -164,8 +166,23 @@ def status_snapshot() -> dict[str, Any]:
     }
 
 
+def _wait_tunnel_active(*, seconds: float = 12.0) -> bool:
+    """Poll systemd until reverse tunnel is active (or timeout)."""
+    deadline = time.time() + max(2.0, seconds)
+    while time.time() < deadline:
+        if _systemctl_is("active", TUNNEL_UNIT) == "active":
+            return True
+        time.sleep(0.7)
+    return _systemctl_is("active", TUNNEL_UNIT) == "active"
+
+
 async def set_mode(db: AsyncSession, *, enabled: bool) -> dict[str, Any]:
-    """enabled=True → iran tunnel; False → cloudflare (tunnel off)."""
+    """enabled=True → iran tunnel; False → cloudflare (tunnel off).
+
+    Panel :2086 always keeps serving. Toggle only starts/stops the reverse
+    SSH to the Iran edge — zero local downtime. DNS switch order is in
+    cf_instructions (tunnel on first / DNS off first).
+    """
     await site_svc.ensure_loaded(db)
     notes: list[str] = []
 
@@ -176,15 +193,16 @@ async def set_mode(db: AsyncSession, *, enabled: bool) -> dict[str, Any]:
             notes.append((err or out or "sub-edge on failed").strip()[:300])
         elif out.strip():
             notes.append(out.strip()[:300])
+        active = _wait_tunnel_active(seconds=14.0)
         mode = MODE_IRAN_TUNNEL
         await site_svc._upsert_key(db, KEY_SUB_EDGE_MODE, mode)  # noqa: SLF001
         await db.commit()
         await site_svc.refresh_cache(db)
         snap = status_snapshot()
-        snap["ok"] = bool(snap.get("tunnel_active"))
+        snap["ok"] = bool(snap.get("tunnel_active") or active)
         snap["message"] = (
-            "تانل ایران روشن شد"
-            if snap.get("tunnel_active")
+            "تانل ایران روشن شد — حالا DNS ساب را به IP ایران بدهید (DNS only)"
+            if snap.get("ok")
             else "تانل روشن نشد — سرور ایران / SSH را چک کنید"
         )
         if not edge.get("reachable"):
@@ -208,7 +226,9 @@ async def set_mode(db: AsyncSession, *, enabled: bool) -> dict[str, Any]:
     await site_svc.refresh_cache(db)
     snap = status_snapshot()
     snap["ok"] = not bool(snap.get("tunnel_active"))
-    snap["message"] = "تانل ایران خاموش شد — DNS ساب را در Cloudflare به پنل ببرید"
+    snap["message"] = (
+        "تانل ایران خاموش شد — اگر هنوز DNS روی ایران است، فوراً به IP خارج ببرید"
+    )
     snap["notes"] = notes
     snap["cf_instructions"] = cloudflare_instructions(enabling_tunnel=False)
     return snap

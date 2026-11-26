@@ -976,9 +976,9 @@ export default function SettingsPage() {
               <div>
                 <h2>تونل ساب ایران</h2>
                 <p>
-                  اگر سرور ایران خاموش است تانل را خاموش کنید و DNS ساب را از
-                  Cloudflare به همین پنل ببرید. بعد از روشن شدن ایران، تانل را
-                  دوباره فعال کنید.
+                  پنل همیشه روی سرور خارج سرو می‌دهد. تانل فقط مسیر ایران را باز
+                  می‌کند. روشن: اول تانل، بعد DNS به IP ایران (DNS only). خاموش:
+                  اول DNS به IP خارج، بعد تانل.
                 </p>
               </div>
             </header>
@@ -1005,6 +1005,13 @@ export default function SettingsPage() {
                   <strong>
                     {subEdge?.edge?.reachable ? "TCP OK" : "unreachable"}
                   </strong>
+                  {subEdge?.panel_ip_hint ? (
+                    <>
+                      {" · "}
+                      پنل{" "}
+                      <code dir="ltr">{subEdge.panel_ip_hint}</code>
+                    </>
+                  ) : null}
                 </div>
 
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
@@ -1012,7 +1019,9 @@ export default function SettingsPage() {
                     type="button"
                     className="btn ghost sm"
                     disabled={
-                      toggleSubEdge.isPending || subEdge?.mode === "cloudflare"
+                      toggleSubEdge.isPending ||
+                      (!subEdge?.tunnel_active &&
+                        subEdge?.mode === "cloudflare")
                     }
                     onClick={() => {
                       setMsg(null);
@@ -1026,14 +1035,17 @@ export default function SettingsPage() {
                     className="btn toolbar-primary sm"
                     disabled={
                       toggleSubEdge.isPending ||
-                      subEdge?.mode === "iran_tunnel"
+                      (subEdge?.mode === "iran_tunnel" &&
+                        !!subEdge?.tunnel_active)
                     }
                     onClick={() => {
                       setMsg(null);
                       toggleSubEdge.mutate(true);
                     }}
                   >
-                    روشن کردن تانل ایران
+                    {subEdge?.mode === "iran_tunnel" && !subEdge?.tunnel_active
+                      ? "تلاش مجدد روشن کردن"
+                      : "روشن کردن تانل ایران"}
                   </button>
                   <button
                     type="button"
