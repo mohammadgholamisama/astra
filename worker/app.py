@@ -502,11 +502,27 @@ async def exec_op(body: ExecBody, _auth: None = Depends(_require_token)):
                         async with gsem:
                             res = await _live_get_usage()
                 except Exception as exc:  # noqa: BLE001
+                    # Never raise into ASGI — SSL/timeout on one panel must not
+                    # 500 the /v1/exec path or starve sibling meters.
                     if pid and uname and _is_404_err(exc):
                         _usage_404_mark(pid, uname)
                     if pid and _is_5xx_err(exc):
                         _circuit_fail(pid)
-                    raise
+                    from types import SimpleNamespace
+
+                    res = SimpleNamespace(
+                        success=False,
+                        error=f"get_usage failed: {exc}"[:240],
+                        used_traffic=0,
+                        remote_username=uname,
+                        remote_id=rid,
+                        links=[],
+                        raw=None,
+                        remote_status=None,
+                        remote_expire=None,
+                        online_at=None,
+                        uuid=None,
+                    )
                 if pid and uname and _result_is_404(res):
                     _usage_404_mark(pid, uname)
                 elif pid and _result_is_5xx(res):
@@ -539,6 +555,28 @@ async def exec_op(body: ExecBody, _auth: None = Depends(_require_token)):
         else:
             raise HTTPException(status_code=400, detail=f"unknown op: {op}")
         return _result_json(res)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # Soft-fail any leftover adapter crash so master gets JSON, not ASGI 500.
+        logger.warning("exec_op soft-fail op=%s: %s", op, exc)
+        from types import SimpleNamespace
+
+        return _result_json(
+            SimpleNamespace(
+                success=False,
+                error=f"exec failed: {exc}"[:300],
+                used_traffic=0,
+                remote_username=None,
+                remote_id=None,
+                links=[],
+                raw=None,
+                remote_status=None,
+                remote_expire=None,
+                online_at=None,
+                uuid=None,
+            )
+        )
     finally:
         close = getattr(adapter, "close", None)
         if callable(close):

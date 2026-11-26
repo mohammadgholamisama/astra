@@ -207,7 +207,10 @@ class SanaeiAdapter(BasePanelAdapter):
 
         # Prefer Bearer when token exists
         if self._token():
-            resp = await client.request(method, path, headers=headers, cookies=cookies, **kwargs)
+            try:
+                resp = await client.request(method, path, headers=headers, cookies=cookies, **kwargs)
+            except Exception as exc:  # noqa: BLE001 — SSL/reset on flaky 3x-ui
+                raise RuntimeError(f"sanaei request failed: {exc}") from exc
             if resp.status_code in (200, 201) or (
                 resp.status_code < 400 and resp.headers.get("content-type", "").startswith("application/json")
             ):
@@ -222,16 +225,25 @@ class SanaeiAdapter(BasePanelAdapter):
                 except Exception:
                     return resp
                 headers = self._auth_headers(with_bearer=True)
-                return await client.request(
-                    method, path, headers=headers, cookies=self._cookies, **kwargs
-                )
+                try:
+                    return await client.request(
+                        method, path, headers=headers, cookies=self._cookies, **kwargs
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    raise RuntimeError(f"sanaei request failed: {exc}") from exc
             return resp
 
         # Token-less: session only
         if not self._session_ok:
-            await self._cookie_login()
+            try:
+                await self._cookie_login()
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(f"sanaei login failed: {exc}") from exc
         headers = self._auth_headers(with_bearer=False)
-        return await client.request(method, path, headers=headers, cookies=self._cookies, **kwargs)
+        try:
+            return await client.request(method, path, headers=headers, cookies=self._cookies, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"sanaei request failed: {exc}") from exc
 
     def _client_payload(self, payload: UserPayload) -> dict[str, Any]:
         email = payload.username
