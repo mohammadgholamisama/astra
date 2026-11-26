@@ -1683,12 +1683,19 @@ async def heal_exhausted_and_unfrozen(*, limit: int = 400) -> dict[str, int]:
     Never KILL from a pre-recount candidate list — after weighted recount a
     user may no longer be limited (inflated ``users.used_traffic``). Only
     freeze users still ``limited``/``expired``/``disabled``.
+
+    Critical: do NOT fan out N ``kick_freeze_user`` create_tasks — that
+    stampedes AsyncSession QueuePool and every freeze fails (remotes stay
+    live while DB never gets ASTRA_QUOTA_FROZEN). Pattern:
+      1) enqueue KILL_USER to workers (fast, no DB hold)
+      2) await one bounded ``_freeze_quota_users`` wave for local panels
     """
     from app.services.orchestrator import (
+        _freeze_quota_users,
         enforce_user_quota,
-        kick_freeze_user,
         recount_user_used_traffic,
     )
+    from app.services.worker_commands import clear_kill_cooldown, enqueue_kill_user
 
     exhausted = await find_exhausted_user_ids(limit=limit)
     flipped = 0
@@ -1718,23 +1725,58 @@ async def heal_exhausted_and_unfrozen(*, limit: int = 400) -> dict[str, int]:
 
     unfrozen = await find_unfrozen_blocked_user_ids(limit=limit)
     kill_ids = list(dict.fromkeys([*still_blocked, *unfrozen]))
-    from app.services.worker_commands import enqueue_kill_user
 
+    enqueued = 0
     for uid in kill_ids:
         try:
             # force=True bypasses 180s cooldown so a prior failed cut retries.
-            # kick_freeze also enqueues KILL_USER + local sync_modify.
-            await kick_freeze_user(int(uid), remote_timeout=14.0, force=True)
+            clear_kill_cooldown(int(uid))
+            res = await enqueue_kill_user(int(uid), force=True)
+            if res.get("ok"):
+                enqueued += 1
         except Exception:  # noqa: BLE001
-            logger.debug("heal kill user_id=%s failed", uid, exc_info=True)
-        await asyncio.sleep(0.05)
+            logger.debug("heal kill enqueue user_id=%s failed", uid, exc_info=True)
+        await asyncio.sleep(0.02)
+
+    # Bounded awaited local freeze — chews ~24 users/cycle so the durable
+    # loop drains the fleet without drowning the session pool.
+    freeze_batch = kill_ids[:24]
+    freeze_ok = 0
+    freeze_fail = 0
+    if freeze_batch:
+        try:
+            freeze_ok, freeze_fail = await _freeze_quota_users(
+                freeze_batch,
+                remote_timeout=14.0,
+                concurrency=3,
+                wall=100.0,
+                thorough=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "heal awaited freeze failed n=%s",
+                len(freeze_batch),
+                exc_info=True,
+            )
+
+    left = 0
+    try:
+        left = len(await find_unfrozen_blocked_user_ids(limit=limit))
+    except Exception:  # noqa: BLE001
+        left = -1
+
     logger.info(
-        "heal_exhausted flipped=%s exhausted=%s still_blocked=%s unfrozen=%s kill=%s",
+        "heal_exhausted flipped=%s exhausted=%s still_blocked=%s unfrozen=%s "
+        "kill=%s enqueued=%s freeze_ok=%s freeze_fail=%s left=%s",
         flipped,
         len(exhausted),
         len(still_blocked),
         len(unfrozen),
         len(kill_ids),
+        enqueued,
+        freeze_ok,
+        freeze_fail,
+        left,
     )
     return {
         "flipped": flipped,
@@ -1742,6 +1784,10 @@ async def heal_exhausted_and_unfrozen(*, limit: int = 400) -> dict[str, int]:
         "unfrozen": len(unfrozen),
         "kill": len(kill_ids),
         "still_blocked": len(still_blocked),
+        "enqueued": enqueued,
+        "freeze_ok": int(freeze_ok or 0),
+        "freeze_fail": int(freeze_fail or 0),
+        "unfrozen_left": left,
     }
 
 

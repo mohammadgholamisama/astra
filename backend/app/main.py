@@ -300,13 +300,22 @@ async def _exhausted_remote_kill_loop() -> None:
         killed = 0
         try:
             stats = await bulk_usage.heal_exhausted_and_unfrozen(limit=200)
-            killed = int(stats.get("kill") or 0) + int(stats.get("flipped") or 0)
-            if killed:
+            killed = (
+                int(stats.get("kill") or 0)
+                + int(stats.get("flipped") or 0)
+                + int(stats.get("freeze_ok") or 0)
+            )
+            if killed or int(stats.get("unfrozen_left") or 0) > 0:
                 logger.warning(
-                    "exhausted-kill loop flipped=%s kill=%s unfrozen=%s",
+                    "exhausted-kill loop flipped=%s kill=%s enqueued=%s "
+                    "freeze_ok=%s freeze_fail=%s unfrozen=%s left=%s",
                     stats.get("flipped"),
                     stats.get("kill"),
+                    stats.get("enqueued"),
+                    stats.get("freeze_ok"),
+                    stats.get("freeze_fail"),
                     stats.get("unfrozen"),
+                    stats.get("unfrozen_left"),
                 )
         except asyncio.CancelledError:
             raise
