@@ -352,6 +352,11 @@ def _high_water_delta(
     last_i = int(last or 0)
     if got_i >= last_i:
         raw_delta = got_i - last_i
+    elif got_i == 0 and last_i > 0:
+        # Transient zero (disabled snapshot / API blip). Collapsing the
+        # watermark to 0 made the next real reading re-add the full counter
+        # (seen as exact N× inflation, e.g. 20.5GB × 16 → 328GB).
+        return 0, accumulated
     else:
         # Remote panel reset / wipe — keep prior accumulated, count new from 0.
         raw_delta = got_i
@@ -420,6 +425,12 @@ def _apply_got_to_account(
         acc.coeff_anchor_weighted = 0
         acc.last_sync_at = now
         dirty.add(int(acc.user_id))
+        return 0
+
+    last_i = int(getattr(acc, "last_remote_raw", None) or 0)
+    # Zero blip: do not move last_remote_raw down to 0 (see _high_water_delta).
+    if got_i == 0 and last_i > 0:
+        acc.last_sync_at = now
         return 0
 
     if raw_delta == 0 and int(getattr(acc, "last_remote_raw", None) or -1) == got_i:
