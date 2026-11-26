@@ -110,13 +110,35 @@ def _redis_key(worker_id: int) -> str:
     return f"astra:wcmd:{int(worker_id)}"
 
 
+def _is_same_kill(cmd: dict[str, Any], user_id: int) -> bool:
+    try:
+        return (
+            str(cmd.get("op") or "") == "KILL_USER"
+            and int(cmd.get("user_id") or 0) == int(user_id)
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def enqueue_command(worker_id: int, cmd: dict[str, Any]) -> str:
-    """Push a command for a worker. Returns command id."""
+    """Push a command for a worker. Returns command id.
+
+    KILL_USER is deduped per user_id (replace older pending) and pushed to the
+    head so fresh quota cuts are not buried under heal storms. Redis LTRIM used
+    to drop the oldest waiting kills — including brand-new over-limit users.
+    """
     wid = int(worker_id)
     cid = str(cmd.get("id") or uuid.uuid4().hex[:16])
     payload = dict(cmd)
     payload["id"] = cid
     payload["enqueued_at"] = time.time()
+    op = str(payload.get("op") or "")
+    kill_uid = 0
+    if op == "KILL_USER":
+        try:
+            kill_uid = int(payload.get("user_id") or 0)
+        except Exception:  # noqa: BLE001
+            kill_uid = 0
     raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     pushed = False
     try:
@@ -125,17 +147,55 @@ def enqueue_command(worker_id: int, cmd: dict[str, Any]) -> str:
         r = get_redis()
         if r is not None:
             key = _redis_key(wid)
-            r.lpush(key, raw)
-            r.ltrim(key, 0, 499)
-            r.expire(key, 300)
-            pushed = True
+            if kill_uid:
+                # Drop older pending KILL_USER for same user (exact JSON differs
+                # by id — scan + rewrite kept list).
+                try:
+                    existing = r.lrange(key, 0, 499) or []
+                    kept: list[Any] = []
+                    for item in existing:
+                        try:
+                            if isinstance(item, (bytes, bytearray)):
+                                obj = json.loads(item.decode("utf-8"))
+                            else:
+                                obj = json.loads(str(item))
+                            if _is_same_kill(obj, kill_uid):
+                                continue
+                            kept.append(item)
+                        except Exception:  # noqa: BLE001
+                            kept.append(item)
+                    pipe = r.pipeline()
+                    pipe.delete(key)
+                    # Newest kill at head; survivors keep relative order.
+                    pipe.lpush(key, raw)
+                    if kept:
+                        # re-append old items after the new head
+                        pipe.rpush(key, *kept)
+                    pipe.ltrim(key, 0, 399)
+                    pipe.expire(key, 300)
+                    pipe.execute()
+                    pushed = True
+                except Exception:  # noqa: BLE001
+                    r.lpush(key, raw)
+                    r.ltrim(key, 0, 399)
+                    r.expire(key, 300)
+                    pushed = True
+            else:
+                r.lpush(key, raw)
+                r.ltrim(key, 0, 399)
+                r.expire(key, 300)
+                pushed = True
     except Exception:  # noqa: BLE001
         pass
     # Always mirror in-process for local long-poll wakeups.
     q = _QUEUES.setdefault(wid, [])
-    q.append(payload)
-    if len(q) > 500:
-        del q[:-400]
+    if kill_uid:
+        q[:] = [c for c in q if not _is_same_kill(c, kill_uid)]
+        q.insert(0, payload)
+    else:
+        q.append(payload)
+    if len(q) > 400:
+        del q[400:]
     _event(wid).set()
     if not pushed:
         logger.debug("cmd queued in-memory only worker=%s op=%s", wid, payload.get("op"))
@@ -166,9 +226,10 @@ async def take_commands(
             if remaining <= 0:
                 break
             try:
-                # BRPOP blocks up to 1s so we can return early if timeout small.
+                # BLPOP = head first so freshly LPUSH'd KILL_USER cuts win over
+                # stale heal backlog (BRPOP buried new over-limit users for minutes).
                 item = await asyncio.to_thread(
-                    r.brpop, key, max(1, min(1, int(remaining)))
+                    r.blpop, key, max(1, min(1, int(remaining)))
                 )
             except Exception:  # noqa: BLE001
                 item = None
@@ -191,10 +252,10 @@ async def take_commands(
                     out.append(json.loads(str(raw)))
             except Exception:  # noqa: BLE001
                 continue
-            # Non-blocking drain of remaining without waiting.
+            # Non-blocking drain of remaining without waiting (head-first).
             while len(out) < lim:
                 try:
-                    nxt = r.rpop(key)
+                    nxt = r.lpop(key)
                 except Exception:  # noqa: BLE001
                     break
                 if not nxt:
@@ -354,8 +415,8 @@ async def enqueue_kill_user(
             except Exception:  # noqa: BLE001
                 pass
 
-    # Optimistic freeze mark on ALL live accounts for this user so heal/watch
-    # stop re-queueing while Worker/local freeze finish the hard cut.
+    # Optimistic freeze mark + strip share links so /sub cannot keep serving
+    # live configs while Worker/local freeze finish the hard cut.
     try:
         from sqlalchemy import update
 
@@ -370,10 +431,15 @@ async def enqueue_kill_user(
                         (
                             PanelAccountStatus.active,
                             PanelAccountStatus.error,
+                            PanelAccountStatus.pending,
                         )
                     )
                 )
-                .values(error_message=QUOTA_FROZEN_MARK)
+                .values(
+                    error_message=QUOTA_FROZEN_MARK,
+                    links=[],
+                    links_by_group=None,
+                )
             )
             await db2.commit()
     except Exception:  # noqa: BLE001

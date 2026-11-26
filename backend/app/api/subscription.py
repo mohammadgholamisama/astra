@@ -643,9 +643,16 @@ async def _bg_usage_pull(user_id: int) -> None:
                     if st == UserStatus.limited:
                         try:
                             from app.services.orchestrator import kick_freeze_user
+                            from app.services.worker_commands import (
+                                kill_on_cooldown,
+                            )
 
+                            # Re-cut when cooldown elapsed — earlier kills may
+                            # have been trimmed from the Redis command queue.
                             await kick_freeze_user(
-                                int(user_id), remote_timeout=8.0
+                                int(user_id),
+                                remote_timeout=8.0,
+                                force=not kill_on_cooldown(int(user_id)),
                             )
                         except Exception:  # noqa: BLE001
                             pass

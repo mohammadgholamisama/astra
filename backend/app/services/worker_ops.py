@@ -391,9 +391,18 @@ async def _apply_usage_report_job(job: dict[str, Any]) -> None:
                     )
             # Instant quota flip for users whose weighted total just crossed limit.
             if dirty:
-                from app.models.user import User, UserStatus
+                from app.models.user import (
+                    PanelAccount as PA,
+                    PanelAccountStatus,
+                    User,
+                    UserStatus,
+                )
                 from app.services.quota import is_quota_exhausted
 
+                # apply_usage_map bumps users.used_traffic via raw SQL — expire
+                # the identity map so this SELECT sees the post-delta totals
+                # (stale ORM values were skipping exhausted flips).
+                db.expire_all()
                 urows = (
                     await db.execute(
                         select(
@@ -411,6 +420,17 @@ async def _apply_usage_report_job(job: dict[str, Any]) -> None:
                         user_obj = await db.get(User, int(uid))
                         if user_obj is not None and user_obj.status == UserStatus.active:
                             user_obj.status = UserStatus.limited
+                            # Drop share links immediately so /sub cannot keep
+                            # serving cached configs while KILL is in flight.
+                            try:
+                                await db.execute(
+                                    update(PA)
+                                    .where(PA.user_id == int(uid))
+                                    .where(PA.status != PanelAccountStatus.deleted)
+                                    .values(links=[], links_by_group=None)
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
                             exhausted.append(int(uid))
                     elif (
                         st == UserStatus.active
@@ -525,10 +545,16 @@ async def _dirty_recount_consumer() -> None:
             # Instant freeze for users who just hit quota — own sessions.
             if flipped:
                 from app.services.orchestrator import kick_freeze_user
+                from app.services.worker_commands import kill_on_cooldown
 
                 for uid in flipped[:40]:
                     try:
-                        await kick_freeze_user(int(uid), remote_timeout=8.0)
+                        # Fresh flips must cut even if a prior soft kick set TTL.
+                        await kick_freeze_user(
+                            int(uid),
+                            remote_timeout=8.0,
+                            force=not kill_on_cooldown(int(uid)),
+                        )
                     except Exception:  # noqa: BLE001
                         pass
             logger.info(

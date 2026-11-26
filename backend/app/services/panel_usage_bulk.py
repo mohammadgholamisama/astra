@@ -430,11 +430,11 @@ def _apply_got_to_account(
     acc.used_traffic = int(new_acc)
     acc.last_remote_raw = got_i
     acc.last_sync_at = now
-    if (acc.error_message or "") == QUOTA_FROZEN_MARK:
-        acc.error_message = None
+    # Keep ASTRA_QUOTA_FROZEN sticky — clearing it on every meter tick made
+    # heal re-enqueue KILL_USER forever and trimmed newer kills out of Redis.
     if acc.status == PanelAccountStatus.error:
-        acc.status = PanelAccountStatus.active
         if (acc.error_message or "") != QUOTA_FROZEN_MARK:
+            acc.status = PanelAccountStatus.active
             acc.error_message = None
     # Pending rows that already hold a real meter are live — finish activation.
     if (
@@ -687,11 +687,10 @@ async def apply_usage_map_to_panel(
                     SET used_traffic = v.used,
                         last_remote_raw = v.last,
                         last_sync_at = :now,
-                        error_message = CASE
-                            WHEN pa.error_message = :frozen THEN NULL
-                            ELSE pa.error_message
-                        END,
                         status = CASE
+                            -- Keep ASTRA_QUOTA_FROZEN sticky (do not revive error
+                            -- rows that are mid-kill); only promote pending→active.
+                            WHEN pa.error_message = :frozen THEN pa.status
                             WHEN pa.status = 'error' THEN 'active'
                             WHEN pa.status = 'pending' AND v.used > 0 THEN 'active'
                             ELSE pa.status
@@ -1693,10 +1692,16 @@ async def heal_exhausted_and_unfrozen(*, limit: int = 400) -> dict[str, int]:
 
     for uid in kill_ids:
         try:
+            # Respect kill cooldown — force=True was flooding Redis (500-cap
+            # LTRIM dropped waiting fresh over-limit kills for minutes).
+            from app.services.worker_commands import kill_on_cooldown
+
+            if kill_on_cooldown(int(uid)):
+                continue
             # Await enqueue so ASTRA_QUOTA_FROZEN is stamped before we return
             # (kick_freeze alone schedules a task and heal would re-select them).
-            await enqueue_kill_user(int(uid), force=True)
-            await kick_freeze_user(int(uid), remote_timeout=8.0, force=True)
+            await enqueue_kill_user(int(uid), force=False)
+            await kick_freeze_user(int(uid), remote_timeout=8.0, force=False)
         except Exception:  # noqa: BLE001
             logger.debug("heal kill user_id=%s failed", uid, exc_info=True)
         await asyncio.sleep(0.02)
