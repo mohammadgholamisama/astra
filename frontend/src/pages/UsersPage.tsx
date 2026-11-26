@@ -2231,25 +2231,21 @@ export default function UsersPage() {
                     <strong>{pct == null ? "∞" : `${toFaDigits(pct)}٪`}</strong>
                   </div>
                   <div
-                    className="user-bar"
+                    className={`user-bar ${barTone}${pct != null && pct > 0 ? " has-use" : ""}`}
                     role="progressbar"
                     aria-valuemin={0}
                     aria-valuemax={100}
                     aria-valuenow={pct == null ? undefined : pct}
                     title={pct == null ? undefined : `${pct}%`}
-                  >
-                    <span
-                      className={`user-bar-fill ${barTone}${pct != null && pct > 0 ? " has-use" : ""}`}
-                      style={
-                        {
-                          ["--bar-pct"]:
-                            pct == null
-                              ? "0%"
-                              : `${Math.min(100, Math.max(0, pct))}%`,
-                        } as CSSProperties
-                      }
-                    />
-                  </div>
+                    style={
+                      {
+                        ["--bar-pct"]:
+                          pct == null
+                            ? "0%"
+                            : `${Math.min(100, Math.max(0, pct))}%`,
+                      } as CSSProperties
+                    }
+                  />
                   <div className="user-card-usage-remain">
                     {remain != null
                       ? `باقی‌مانده: ${formatTraffic(remain, { empty: "۰" })}`
