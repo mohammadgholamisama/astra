@@ -8515,6 +8515,110 @@ async def recount_user_usage_pool_safe(user_id: int) -> int:
     return -1
 
 
+async def reconcile_user_usage_if_inflated(
+    user_id: int,
+    *,
+    gap_bytes: int = 50 * 1024 * 1024,
+) -> int | None:
+    """If ``users.used_traffic`` ≫ Σ live weighted meters, shrink + re-quota.
+
+    Returns the corrected total, or ``None`` when no shrink was needed / safe.
+    Used by admin «چک مصرف» so false اتمام حجم is not sticky.
+    """
+    from app.core.database import AsyncSessionLocal
+    from app.services.panel_usage_bulk import QUOTA_FROZEN_MARK
+
+    uid = int(user_id)
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(User)
+            .where(User.id == uid)
+            .options(
+                selectinload(User.panel_accounts).selectinload(PanelAccount.panel),
+                selectinload(User.groups),
+            )
+        )
+        user = result.scalar_one_or_none()
+        if user is None:
+            return None
+        accounts = list(user.panel_accounts or [])
+        coeffs = await account_coefficients_for_user(db, user, accounts)
+        truth = int(await _weighted_total(accounts, coeffs))
+        stored = int(user.used_traffic or 0)
+        if stored <= truth + max(0, int(gap_bytes)):
+            return None
+        before_status = user.status
+        after = await recount_user_used_traffic(
+            db, user, accounts, allow_shrink=True
+        )
+        changed = await enforce_user_quota(db, user)
+        if user.status == UserStatus.active:
+            for acc in accounts:
+                if (acc.error_message or "") == QUOTA_FROZEN_MARK:
+                    acc.error_message = None
+            try:
+                from app.services.worker_commands import clear_kill_cooldown
+
+                clear_kill_cooldown(uid)
+            except Exception:  # noqa: BLE001
+                pass
+        await db.commit()
+        logger.info(
+            "reconcile_user_usage_if_inflated user_id=%s %s→%s status=%s→%s",
+            uid,
+            stored,
+            after,
+            getattr(before_status, "value", before_status),
+            getattr(user.status, "value", user.status),
+        )
+        # limited→active: remotes must be re-enabled
+        if changed and user.status == UserStatus.active:
+
+            async def _unfreeze() -> None:
+                from app.core.database import AsyncSessionLocal as _SL
+
+                try:
+                    async with _SL() as sdb:
+                        u2 = (
+                            await sdb.execute(
+                                select(User)
+                                .where(User.id == uid)
+                                .options(
+                                    selectinload(User.panel_accounts).selectinload(
+                                        PanelAccount.panel
+                                    ),
+                                    selectinload(User.groups),
+                                )
+                            )
+                        ).scalar_one_or_none()
+                        if u2 is None:
+                            return
+                        await sync_modify_user(
+                            sdb,
+                            u2,
+                            skip_nginx_sync=True,
+                            freeze_fast=False,
+                            remote_timeout=14,
+                        )
+                        await sdb.commit()
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "unfreeze after inflate reconcile failed user_id=%s",
+                        uid,
+                        exc_info=True,
+                    )
+
+            try:
+                asyncio.create_task(_unfreeze())
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "schedule unfreeze after inflate reconcile failed user_id=%s",
+                    uid,
+                    exc_info=True,
+                )
+        return int(after)
+
+
 async def recount_users_used_traffic_batch(
     db: AsyncSession,
     users: list[User],

@@ -1439,12 +1439,26 @@ async def check_user_usage(
             },
         ) from exc
 
+    # Admin «چک مصرف»: if users.used_traffic is inflated vs live panel meters
+    # (e.g. 2× double-count), shrink to truth and re-enforce quota. Normal
+    # refresh is monotonic on purpose — this path must correct false اتمام حجم.
+    shrunk = False
+    try:
+        fixed = await orchestrator.reconcile_user_usage_if_inflated(uid)
+        if fixed is not None:
+            after = int(fixed)
+            shrunk = True
+    except Exception:  # noqa: BLE001
+        pass
+
     user = await load_user(db, username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     used_after = int(user.used_traffic or 0)
-    if after >= 0:
+    if after >= 0 and not shrunk:
         used_after = max(used_after, int(after))
+    elif after >= 0 and shrunk:
+        used_after = int(after)
 
     panels_out: list[UserCheckUsagePanel] = []
     synced = 0
@@ -1476,7 +1490,12 @@ async def check_user_usage(
 
     dt_ms = int((time.monotonic() - t0) * 1000)
     delta = used_after - used_before
-    if delta > 0:
+    if shrunk and delta < 0:
+        msg = (
+            f"مصرف اصلاح شد (تورم متر): {used_before} → {used_after} بایت "
+            f"({synced}/{len(panels_out)} پنل)"
+        )
+    elif delta > 0:
         msg = (
             f"مصرف به‌روز شد: {used_before} → {used_after} بایت "
             f"(+{delta}) از {len(panels_out)} اکانت"
