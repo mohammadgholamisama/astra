@@ -21,6 +21,7 @@ from app.schemas.user import (
     UserCheckUsagePanel,
     UserCheckUsageResponse,
     UserCreate,
+    UserFixSubBlocker,
     UserFixSubResponse,
     UserFromTemplate,
     UserModify,
@@ -1753,6 +1754,132 @@ def _share_gap_stats(user: User) -> tuple[int, int]:
     return len(uniq), gaps
 
 
+def _looks_capacity_err(msg: str | None) -> bool:
+    m = (msg or "").lower()
+    if not m:
+        return False
+    if "user limit reached" in m or "limit reached" in m:
+        return True
+    if "maximum users" in m or "too many users" in m:
+        return True
+    if "ظرفیت" in (msg or "") and ("پر" in (msg or "") or "گروه" in (msg or "")):
+        return True
+    return False
+
+
+def _looks_timeout_err(msg: str | None) -> bool:
+    m = (msg or "").lower()
+    return bool(
+        m
+        and (
+            "timeout" in m
+            or "timed out" in m
+            or "waiting for panel response" in m
+            or "طول کشید" in (msg or "")
+        )
+    )
+
+
+async def _stamp_fix_sub_blockers(db: AsyncSession, user: User) -> list[dict]:
+    """Mark remaining empty-link accounts with a concrete reason for the errors UI.
+
+    Silent ``active`` + empty links hid Out122-class failures from «خطاها».
+    """
+    from app.adapters.http_utils import is_share_link
+    from app.models.panel import PanelType
+    from app.schemas.user import UserFixSubBlocker
+    from app.services import astra_node as astra_node_svc
+
+    blockers: list[dict] = []
+    touched = 0
+    # Cache outbound checks per panel
+    outbound_cache: dict[int, tuple[str, str]] = {}
+
+    for a in user.panel_accounts or []:
+        st = getattr(a.status, "value", a.status)
+        if st not in ("active", "pending", "error"):
+            continue
+        if getattr(a, "panel", None) is not None and not getattr(
+            a.panel, "is_active", True
+        ):
+            continue
+        links = [
+            str(x)
+            for x in (a.links or [])
+            if x and is_share_link(str(x))
+        ]
+        if links:
+            continue
+
+        panel = getattr(a, "panel", None)
+        pname = (panel.name if panel else None) or f"پنل #{a.panel_id}"
+        prev = (a.error_message or "").strip()
+        kind = "empty"
+        reason = prev
+
+        if _looks_capacity_err(prev):
+            kind = "capacity"
+            reason = prev
+        elif _looks_timeout_err(prev):
+            kind = "timeout"
+            reason = prev
+        elif panel is not None and panel.type == PanelType.astra:
+            pid = int(panel.id)
+            if pid not in outbound_cache:
+                try:
+                    outs = await astra_node_svc.list_outbounds(db, pid)
+                except Exception:  # noqa: BLE001
+                    outs = []
+                enabled = [o for o in outs if getattr(o, "is_enabled", False)]
+                if not outs:
+                    outbound_cache[pid] = (
+                        "no_outbound",
+                        f"پنل {pname}: اوتباندی تعریف نشده — لینک ساخته نمی‌شود",
+                    )
+                elif not enabled:
+                    host = getattr(outs[0], "host", None) or "?"
+                    outbound_cache[pid] = (
+                        "outbound_disabled",
+                        f"پنل {pname}: اوتباند خاموش است "
+                        f"(host={host}، پینگ ناموفق/غیرفعال) — لینک ساخته نمی‌شود",
+                    )
+                else:
+                    outbound_cache[pid] = (
+                        "empty",
+                        f"پنل {pname}: کلاینت هست ولی لینک share خالی ماند",
+                    )
+            kind, reason = outbound_cache[pid]
+        elif prev:
+            kind = "error"
+            reason = prev
+        else:
+            reason = f"پنل {pname}: بدون لینک — ساخت/hydrate ناموفق بود"
+
+        if a.status != PanelAccountStatus.error or (a.error_message or "") != reason:
+            a.status = PanelAccountStatus.error
+            a.error_message = reason
+            touched += 1
+
+        blockers.append(
+            UserFixSubBlocker(
+                panel_id=int(a.panel_id),
+                panel_name=pname,
+                kind=kind,
+                reason=reason,
+            ).model_dump()
+        )
+
+    if touched:
+        try:
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+    return blockers
+
+
 @router.post("/api/user/{username}/fix-sub", response_model=UserFixSubResponse)
 async def fix_user_subscription(
     username: str,
@@ -1763,9 +1890,11 @@ async def fix_user_subscription(
 
     Retries error/empty accounts, recreates missing group×panel slots, hydrates
     share links, and clears the /sub feed cache — so the next app Update is full.
+    Remaining gaps are stamped with a concrete panel reason for «خطاها».
     """
     from app.adapters.http_utils import is_share_link
     from app.api.subscription import invalidate_user_feed_cache
+    from app.schemas.user import UserFixSubBlocker
 
     user = await load_user(db, username)
     if not user:
@@ -1839,6 +1968,12 @@ async def fix_user_subscription(
         raise HTTPException(status_code=404, detail="User not found")
     after_share, after_gaps = _share_gap_stats(user)
 
+    blockers_raw = await _stamp_fix_sub_blockers(db, user)
+    # Reload so response carries stamped errors into the UI errors modal.
+    user = await load_user(db, username) or user
+    after_share, after_gaps = _share_gap_stats(user)
+    blockers = [UserFixSubBlocker(**b) for b in blockers_raw]
+
     if after_gaps <= 0 and after_share >= before_share:
         if after_share > before_share:
             msg = (
@@ -1846,6 +1981,30 @@ async def fix_user_subscription(
             )
         else:
             msg = f"لیست کامل است ({after_share} کانفیگ یکتا)"
+    elif blockers:
+        # Name the first few panels so admin sees the real cause immediately.
+        parts: list[str] = []
+        for b in blockers[:4]:
+            label = b.panel_name or f"#{b.panel_id}"
+            if b.kind == "capacity":
+                parts.append(f"{label} (ظرفیت پر)")
+            elif b.kind == "outbound_disabled":
+                parts.append(f"{label} (اوتباند خاموش)")
+            elif b.kind == "no_outbound":
+                parts.append(f"{label} (بدون اوتباند)")
+            elif b.kind == "timeout":
+                parts.append(f"{label} (تایم‌اوت)")
+            else:
+                parts.append(label)
+        extra = f" و {len(blockers) - 4} مورد دیگر" if len(blockers) > 4 else ""
+        if after_share > before_share:
+            msg = (
+                f"بهبود {before_share}→{after_share}؛ هنوز گیر: "
+                + "، ".join(parts)
+                + extra
+            )
+        else:
+            msg = "تکمیل نشد — " + "، ".join(parts) + extra
     elif after_share > before_share:
         msg = (
             f"بهبود یافت: {before_share} → {after_share} کانفیگ "
@@ -1855,7 +2014,7 @@ async def fix_user_subscription(
         msg = f"بخشی درست شد — {after_gaps} پنل هنوز لینک ندارد"
     else:
         msg = (
-            "تغییر محسوسی نبود؛ پنل‌های قطع/پر ممکن است جلوی ساخت را گرفته باشند"
+            "تغییر محسوسی نبود؛ جزئیات را در خطاهای همین کاربر ببینید"
         )
 
     return UserFixSubResponse(
@@ -1868,6 +2027,7 @@ async def fix_user_subscription(
         healed=healed_n,
         hydrated=hydrated_n,
         message=msg,
+        blockers=blockers,
         user=to_user_response(user),
     )
 

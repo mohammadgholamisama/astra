@@ -167,6 +167,15 @@ class UserRetryErrorsResponse(BaseModel):
     message: str = ""
 
 
+class UserFixSubBlocker(BaseModel):
+    """One panel that still blocks a full subscription after fix-sub."""
+
+    panel_id: int
+    panel_name: str | None = None
+    kind: str = "empty"  # capacity | outbound_disabled | no_outbound | timeout | error | empty
+    reason: str = ""
+
+
 class UserFixSubResponse(BaseModel):
     """One-user heal: retry errors, fill missing panels, hydrate share links."""
 
@@ -179,6 +188,7 @@ class UserFixSubResponse(BaseModel):
     healed: int = 0
     hydrated: int = 0
     message: str = ""
+    blockers: list[UserFixSubBlocker] = []
     user: UserResponse | None = None
 
 

@@ -95,12 +95,15 @@ function isDbBusyAccountError(msg?: string | null) {
   );
 }
 
+function isOutboundDisabledError(msg?: string | null) {
+  const m = msg || "";
+  return m.includes("اوتباند خاموش") || m.includes("اوتباندی تعریف نشده");
+}
+
 function isNoiseAccountError(msg?: string | null) {
-  return (
-    isCapacityAccountError(msg) ||
-    isSoftTimeoutAccountError(msg) ||
-    isDbBusyAccountError(msg)
-  );
+  // Capacity / timeout / outbound-off must stay visible in «خطاها» —
+  // admins need to see which panel is full or cut. Only DB storms are noise.
+  return isDbBusyAccountError(msg);
 }
 
 function isActionableAccountError(
@@ -1184,6 +1187,13 @@ export default function UsersPage() {
     onError: (e: Error) => setActionMsg({ type: "err", text: e.message }),
   });
 
+  type FixSubBlocker = {
+    panel_id: number;
+    panel_name?: string | null;
+    kind: string;
+    reason: string;
+  };
+
   type FixSubResult = {
     username: string;
     before_share: number;
@@ -1194,6 +1204,8 @@ export default function UsersPage() {
     healed: number;
     hydrated: number;
     message: string;
+    blockers?: FixSubBlocker[];
+    user?: User | null;
   };
 
   const fixSub = useMutation({
@@ -1204,11 +1216,17 @@ export default function UsersPage() {
       }),
     onSuccess: (r) => {
       qc.invalidateQueries({ queryKey: ["users"] });
-      setErrorsUser(null);
+      const stuck = (r.blockers && r.blockers.length > 0) || r.after_gaps > 0;
       setActionMsg({
-        type: r.after_gaps > 0 && r.after_share <= r.before_share ? "err" : "ok",
+        type: stuck ? "err" : "ok",
         text: r.message || "تکمیل کانفیگ‌ها انجام شد",
       });
+      // Open errors modal with stamped panel reasons (capacity / outbound off).
+      if (stuck && r.user) {
+        setErrorsUser(r.user);
+      } else {
+        setErrorsUser(null);
+      }
     },
     onError: (e: Error) =>
       setActionMsg({ type: "err", text: e.message || "تکمیل کانفیگ‌ها ناموفق بود" }),
@@ -4393,13 +4411,20 @@ export default function UsersPage() {
                 {errorAccounts.map((a) => {
                   const capacity = isCapacityAccountError(a.error_message);
                   const softTimeout = isSoftTimeoutAccountError(a.error_message);
-                  const soft = capacity || softTimeout;
+                  const outboundOff = isOutboundDisabledError(a.error_message);
+                  const soft = capacity || softTimeout || outboundOff;
                   return (
                   <div key={a.id || a.panel_id} className="user-err-item">
                     <div className="user-err-head">
                       <strong>{a.panel_name || `پنل #${a.panel_id}`}</strong>
                       <span className={`badge ${soft ? "warn" : "err"}`}>
-                        {capacity ? "ظرفیت پر" : softTimeout ? "کند / تایم‌اوت" : "خطا"}
+                        {capacity
+                          ? "ظرفیت پر"
+                          : outboundOff
+                            ? "اوتباند خاموش"
+                            : softTimeout
+                              ? "کند / تایم‌اوت"
+                              : "خطا"}
                       </span>
                       {a.panel_type && <span className="badge muted">{a.panel_type}</span>}
                     </div>
