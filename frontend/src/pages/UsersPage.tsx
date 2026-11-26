@@ -211,6 +211,8 @@ type PanelUsageRow = {
   configs: number;
   /** Removed from sub/group but usage still counts toward Astra quota */
   banked: boolean;
+  /** Synthetic row: users.used_traffic − Σ visible meters */
+  residual?: boolean;
 };
 
 type GroupUsageRow = {
@@ -224,7 +226,12 @@ type GroupUsageRow = {
   coefficients: number[];
   /** Group no longer on user — usage kept from deleted remotes */
   banked: boolean;
+  /** Synthetic row: users.used_traffic − Σ group rows */
+  residual?: boolean;
 };
+
+/** Bytes above this between Astra total and Σ rows count as unexplained gap. */
+const USAGE_RESIDUAL_MIN = 1024 * 1024;
 
 type UsageMode = "panels" | "groups";
 
@@ -312,7 +319,11 @@ function remoteKey(panelId: number, name: string | null | undefined): string | n
 function liveRemoteKeys(accounts: User["panel_accounts"]): Set<string> {
   const keys = new Set<string>();
   for (const a of accounts || []) {
-    if (a.status !== "active" && a.status !== "error") continue;
+    const counts =
+      a.status === "active" ||
+      a.status === "error" ||
+      (a.status === "pending" && (Number(a.used_traffic) || 0) > 0);
+    if (!counts) continue;
     for (const raw of [a.remote_username]) {
       const k = remoteKey(a.panel_id, raw);
       if (k) keys.add(k);
@@ -353,7 +364,11 @@ function panelUsageRows(u: User, groups: Group[]): PanelUsageRow[] {
 
   for (const a of accounts) {
     const banked = a.status === "deleted";
-    if (!banked && a.status !== "active" && a.status !== "error") continue;
+    const pendingMeter =
+      a.status === "pending" && (Number(a.used_traffic) || 0) > 0;
+    if (!banked && a.status !== "active" && a.status !== "error" && !pendingMeter) {
+      continue;
+    }
 
     let raw = Number(a.used_traffic) || 0;
     if (banked) {
@@ -387,7 +402,7 @@ function panelUsageRows(u: User, groups: Group[]): PanelUsageRow[] {
     const row: PanelUsageRow = {
       key: `${a.id}-${a.panel_id}-${a.group_id ?? "x"}-${banked ? "b" : "l"}`,
       panelId: a.panel_id,
-      name: banked ? `${baseName} · بانکی` : baseName,
+      name: banked ? `${baseName} · ریمو شده` : baseName,
       raw,
       coefficient,
       weighted,
@@ -422,7 +437,11 @@ function panelUsageRows(u: User, groups: Group[]): PanelUsageRow[] {
 function groupUsageRows(u: User, groups: Group[]): GroupUsageRow[] {
   const want = new Set(u.group_ids || []);
   const accounts = (u.panel_accounts || []).filter(
-    (a) => a.status === "active" || a.status === "error" || a.status === "deleted",
+    (a) =>
+      a.status === "active" ||
+      a.status === "error" ||
+      a.status === "deleted" ||
+      (a.status === "pending" && (Number(a.used_traffic) || 0) > 0),
   );
   const liveKeys = liveRemoteKeys(u.panel_accounts || []);
   const byGroup = new Map<number, User["panel_accounts"]>();
@@ -493,7 +512,7 @@ function groupUsageRows(u: User, groups: Group[]): GroupUsageRow[] {
     }
     rows.push({
       groupId: g.id,
-      name: bankedOnly ? `${g.name} · بانکی` : g.name,
+      name: bankedOnly ? `${g.name} · ریمو شده` : g.name,
       raw: rawSum,
       weighted,
       panels,
@@ -542,7 +561,7 @@ function groupUsageRows(u: User, groups: Group[]): GroupUsageRow[] {
       if (rawSum > 0 || weighted > 0) {
         rows.push({
           groupId: gid,
-          name: `گروه #${gid} · بانکی`,
+          name: `گروه #${gid} · ریمو شده`,
           raw: rawSum,
           weighted,
           panels,
@@ -1564,14 +1583,49 @@ export default function UsersPage() {
     }
   }
 
-  const usageRows = useMemo(
-    () => (usageUser ? panelUsageRows(usageUser, groups) : []),
-    [usageUser, groups]
-  );
-  const groupUsage = useMemo(
-    () => (usageUser ? groupUsageRows(usageUser, groups) : []),
-    [usageUser, groups]
-  );
+  const usageRows = useMemo(() => {
+    if (!usageUser) return [] as PanelUsageRow[];
+    const rows = panelUsageRows(usageUser, groups);
+    const astra = Number(usageUser.used_traffic) || 0;
+    const sum = rows.reduce((s, r) => s + r.weighted, 0);
+    const gap = astra - sum;
+    if (gap >= USAGE_RESIDUAL_MIN) {
+      rows.push({
+        key: "residual-astra-gap",
+        panelId: -1,
+        name: "اختلاف متر (بدون ردیف پنل)",
+        raw: gap,
+        coefficient: 1,
+        weighted: gap,
+        remoteLimit: 0,
+        configs: 0,
+        banked: true,
+        residual: true,
+      });
+    }
+    return rows;
+  }, [usageUser, groups]);
+  const groupUsage = useMemo(() => {
+    if (!usageUser) return [] as GroupUsageRow[];
+    const rows = groupUsageRows(usageUser, groups);
+    const astra = Number(usageUser.used_traffic) || 0;
+    const sum = rows.reduce((s, r) => s + r.weighted, 0);
+    const gap = astra - sum;
+    if (gap >= USAGE_RESIDUAL_MIN) {
+      rows.push({
+        groupId: -1,
+        name: "اختلاف متر (بدون ردیف گروه)",
+        raw: gap,
+        weighted: gap,
+        panels: 0,
+        configs: 0,
+        coefficients: [1],
+        banked: true,
+        residual: true,
+      });
+    }
+    return rows;
+  }, [usageUser, groups]);
   const usageTotalWeighted = useMemo(
     () => usageRows.reduce((s, r) => s + r.weighted, 0),
     [usageRows]
@@ -4023,13 +4077,12 @@ export default function UsersPage() {
             {usageMode === "panels" ? (
               <>
                 <p className="usage-modal-hint">
-                  مصرف کل = جمع (خام هر پنل × ضریب نهایی). حذف پنل/گروه از ساب آمار مصرف را پاک
-                  نمی‌کند — ردیف‌های «بانکی» همان حجم قبلی‌اند. با رسیدن به سقف خرید، وضعیت «اتمام
-                  حجم» می‌شود و کانفیگ روی پنل اصلی هم خاموش می‌شود.
+                  مصرف کل باید با جمع ردیف‌های زیر یکی باشد. پنل/گروه حذف‌شده با برچسب «ریمو شده»
+                  می‌ماند تا سقف کم نشود. اگر «اختلاف متر» دیدی، با چک مصرف اصلاح می‌شود.
                 </p>
 
                 <div className="usage-modal-total">
-                  <span>مصرف کل (با ضریب)</span>
+                  <span>مصرف کل Astra</span>
                   <strong>
                     {formatTraffic(usageUser.used_traffic || usageTotalWeighted, {
                       empty: "۰",
@@ -4037,10 +4090,14 @@ export default function UsersPage() {
                     <small> / {formatDataLimit(usageUser.data_limit)}</small>
                   </strong>
                 </div>
+                <div className="usage-modal-total usage-modal-total--sub">
+                  <span>جمع ردیف‌های پنل</span>
+                  <strong>{formatTraffic(usageTotalWeighted, { empty: "۰" })}</strong>
+                </div>
 
                 {usageRows.length === 0 ? (
                   <p className="muted" style={{ textAlign: "center", padding: "20px 0" }}>
-                    پنل یا مصرف بانکی برای این کاربر نیست
+                    پنل یا مصرف ریمو‌شده برای این کاربر نیست
                   </p>
                 ) : (
                   <div className="usage-panel-list">
@@ -4053,7 +4110,7 @@ export default function UsersPage() {
                       return (
                         <div
                           key={row.key}
-                          className={`usage-panel-row${row.banked ? " usage-panel-row--banked" : ""}`}
+                          className={`usage-panel-row${row.banked ? " usage-panel-row--banked" : ""}${row.residual ? " usage-panel-row--residual" : ""}`}
                         >
                           <div className="usage-panel-head">
                             <strong>{row.name}</strong>
@@ -4064,9 +4121,13 @@ export default function UsersPage() {
                           </div>
                           <div className="usage-panel-meta">
                             <span>خام: {formatTraffic(row.raw, { empty: "۰" })}</span>
-                            <span>ضریب ×{toFaDigits(formatCoeff(row.coefficient))}</span>
-                            {row.banked ? (
-                              <span>از ساب حذف شده · در سقف حجم می‌ماند</span>
+                            {!row.residual ? (
+                              <span>ضریب ×{toFaDigits(formatCoeff(row.coefficient))}</span>
+                            ) : null}
+                            {row.residual ? (
+                              <span>در هیچ پنل زنده‌ای نیست — معمولاً تورم متر</span>
+                            ) : row.banked ? (
+                              <span>ریمو شده · مصرف در سقف می‌ماند</span>
                             ) : (
                               <span>
                                 روی پنل:{" "}
@@ -4075,9 +4136,13 @@ export default function UsersPage() {
                                   : "نامحدود"}
                               </span>
                             )}
-                            <span>
-                              {row.banked ? "بدون کانفیگ" : `${toFaDigits(row.configs)} کانفیگ`}
-                            </span>
+                            {!row.residual ? (
+                              <span>
+                                {row.banked
+                                  ? "بدون کانفیگ"
+                                  : `${toFaDigits(row.configs)} کانفیگ`}
+                              </span>
+                            ) : null}
                             <span>{toFaDigits(share)}٪ از کل</span>
                           </div>
                         </div>
@@ -4089,18 +4154,22 @@ export default function UsersPage() {
             ) : (
               <>
                 <p className="usage-modal-hint">
-                  فقط گروه‌های همین کاربر (یا مصرف بانکی همان گروه‌ها بعد از حذف). مصرف = جمع (خام ×
-                  ضریب). گروه حذف‌شده با برچسب «بانکی» می‌ماند تا سقف حجم کم نشود.
+                  فقط گروه‌های همین کاربر. گروه/پنل حذف‌شده = «ریمو شده» با مقدار مصرف‌شده.
+                  جمع ردیف‌ها باید با مصرف کل یکی باشد؛ اختلاف جدا ردیف می‌شود.
                 </p>
 
                 <div className="usage-modal-total">
                   <span>مصرف کل Astra</span>
                   <strong>
-                    {formatTraffic(usageUser.used_traffic || usageTotalWeighted, {
+                    {formatTraffic(usageUser.used_traffic || groupUsageTotal, {
                       empty: "۰",
                     })}
                     <small> / {formatDataLimit(usageUser.data_limit)}</small>
                   </strong>
+                </div>
+                <div className="usage-modal-total usage-modal-total--sub">
+                  <span>جمع ردیف‌های گروه</span>
+                  <strong>{formatTraffic(groupUsageTotal, { empty: "۰" })}</strong>
                 </div>
 
                 {groupUsage.length === 0 ? (
@@ -4111,15 +4180,13 @@ export default function UsersPage() {
                   <div className="usage-panel-list">
                     {groupUsage.map((row) => {
                       const width = Math.min(100, (row.weighted / groupUsageMax) * 100);
+                      const astraTotal =
+                        Number(usageUser.used_traffic) || groupUsageTotal;
                       const shareOfAstra =
-                        (Number(usageUser.used_traffic) || usageTotalWeighted) > 0
+                        astraTotal > 0
                           ? Math.min(
                               100,
-                              Math.round(
-                                (row.weighted /
-                                  (Number(usageUser.used_traffic) || usageTotalWeighted)) *
-                                  100
-                              )
+                              Math.round((row.weighted / astraTotal) * 100)
                             )
                           : 0;
                       const shareOfGroups =
@@ -4134,8 +4201,8 @@ export default function UsersPage() {
                             : row.coefficients.map(formatCoeff).join(" / ");
                       return (
                         <div
-                          key={`${row.groupId}-${row.banked ? "b" : "l"}`}
-                          className={`usage-panel-row${row.banked ? " usage-panel-row--banked" : ""}`}
+                          key={`${row.groupId}-${row.banked ? "b" : "l"}-${row.residual ? "r" : "n"}`}
+                          className={`usage-panel-row${row.banked ? " usage-panel-row--banked" : ""}${row.residual ? " usage-panel-row--residual" : ""}`}
                         >
                           <div className="usage-panel-head">
                             <strong>{row.name}</strong>
@@ -4146,14 +4213,20 @@ export default function UsersPage() {
                           </div>
                           <div className="usage-panel-meta">
                             <span>خام: {formatTraffic(row.raw, { empty: "۰" })}</span>
-                            <span>ضریب ×{toFaDigits(coeffLabel)}</span>
-                            <span>{toFaDigits(row.panels)} پنل</span>
+                            {!row.residual ? (
+                              <span>ضریب ×{toFaDigits(coeffLabel)}</span>
+                            ) : null}
+                            {!row.residual ? (
+                              <span>{toFaDigits(row.panels)} پنل</span>
+                            ) : null}
                             <span>
-                              {row.banked
-                                ? "از ساب حذف شده"
-                                : `${toFaDigits(row.configs)} کانفیگ`}
+                              {row.residual
+                                ? "در هیچ گروه زنده‌ای نیست — معمولاً تورم متر"
+                                : row.banked
+                                  ? "ریمو شده · مصرف در سقف می‌ماند"
+                                  : `${toFaDigits(row.configs)} کانفیگ`}
                             </span>
-                            <span>{toFaDigits(shareOfGroups)}٪ از گروه‌ها</span>
+                            <span>{toFaDigits(shareOfGroups)}٪ از ردیف‌ها</span>
                             <span>{toFaDigits(shareOfAstra)}٪ نسبت به کل</span>
                           </div>
                         </div>

@@ -5721,6 +5721,23 @@ th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
   font-weight: 600;
   font-size: 0.85em;
 }
+.usage-modal-total--sub {
+  margin-top: -8px;
+  margin-bottom: 14px;
+  padding: 8px 14px;
+  background: transparent;
+  border-style: dashed;
+}
+.usage-modal-total--sub strong {
+  font-size: 0.95rem;
+  font-weight: 650;
+}
+.usage-panel-row--residual .usage-panel-head strong {
+  color: color-mix(in srgb, #c45c26 80%, var(--text));
+}
+.usage-panel-row--residual .usage-panel-bar i {
+  background: color-mix(in srgb, #c45c26 70%, var(--accent));
+}
 .usage-panel-list {
   display: flex;
   flex-direction: column;
