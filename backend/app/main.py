@@ -213,79 +213,52 @@ async def _auto_retry_errors_loop() -> None:
 
 
 async def _drain_recent_pending_provisions() -> None:
-    """Finish pending creates that lost in-flight tasks (boot + periodic).
+    """Finish pending/error creates — no age cutoff, partial users first.
 
-    Bounded concurrency — never stampede the DB pool with thousands of tasks.
-    Runs on ``astra-bg`` (and any process that holds the bg role).
+    One broken panel used to cancel sibling creates; sticky pending then sat
+    forever because the old drain only looked at 48h. This loop is the
+    durable backfill for ۱۱/۲۶-style cards.
     """
-    await asyncio.sleep(20)
-    from sqlalchemy import text
-
-    from app.core.database import AsyncSessionLocal
-    from app.services.orchestrator import _provision_account_now
-
-    async def _wave(limit: int = 120) -> int:
-        async with AsyncSessionLocal() as db:
-            rows = await db.execute(
-                text(
-                    """
-                    SELECT pa.id
-                    FROM panel_accounts pa
-                    JOIN users u ON u.id = pa.user_id
-                    WHERE pa.status IN ('pending', 'error')
-                      AND u.created_at > now() - interval '48 hours'
-                    ORDER BY pa.id DESC
-                    LIMIT :lim
-                    """
-                ),
-                {"lim": int(limit)},
-            )
-            ids = [int(r[0]) for r in rows.all() if r[0]]
-            await db.rollback()
-        if not ids:
-            return 0
-        sem = asyncio.Semaphore(8)
-        ok = 0
-
-        async def _one(aid: int) -> None:
-            nonlocal ok
-            async with sem:
-                try:
-                    if await _provision_account_now(aid):
-                        ok += 1
-                except Exception:  # noqa: BLE001
-                    logger.debug(
-                        "pending drain aid=%s failed", aid, exc_info=True
-                    )
-
-        await asyncio.gather(*(_one(i) for i in ids))
-        logger.info("pending provision drain n=%s ok=%s", len(ids), ok)
-        return len(ids)
+    await asyncio.sleep(12)
+    from app.services.orchestrator import drain_pending_panel_accounts
 
     try:
-        await _wave(160)
+        boot = await drain_pending_panel_accounts(
+            limit_accounts=800, prefer_partial_users=True
+        )
+        logger.info(
+            "boot pending provision drain queued=%s ok_now=%s",
+            boot.get("queued"),
+            boot.get("ok_now"),
+        )
     except Exception:  # noqa: BLE001
         logger.exception("boot pending provision drain failed")
     while True:
         try:
-            await asyncio.sleep(45)
-            n = await _wave(120)
+            await asyncio.sleep(12)
+            stats = await drain_pending_panel_accounts(
+                limit_accounts=700, prefer_partial_users=True
+            )
+            n = int(stats.get("queued") or 0)
             if n == 0:
-                await asyncio.sleep(120)
+                await asyncio.sleep(60)
+            elif n >= 300:
+                # Backlog still huge — keep chewing with short pause.
+                await asyncio.sleep(4)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("periodic pending provision drain failed")
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)
 
 
 async def _empty_user_coverage_heal_loop() -> None:
-    """Never leave recent users stuck at ۰/۰ پنل or empty /sub.
+    """Never leave users stuck at ۰/۰ or partial ۱۱/۲۶ پنل / empty /sub.
 
     Independent of AUTO_RETRY_ERRORS — create/bulk bg tasks can die on
     worker restart; this loop on ``astra-bg`` is the durable guarantee.
     """
-    await asyncio.sleep(35)
+    await asyncio.sleep(25)
     from app.services.orchestrator import (
         heal_recent_empty_users,
         heal_users_missing_panel_accounts,
@@ -296,22 +269,21 @@ async def _empty_user_coverage_heal_loop() -> None:
         try:
             healed += int(
                 await heal_recent_empty_users(
-                    limit_users=25, max_age_hours=72.0
+                    limit_users=40, max_age_hours=168.0
                 )
                 or 0
             )
-            if healed < 10:
-                healed += int(
-                    await heal_users_missing_panel_accounts(limit_users=12)
-                    or 0
-                )
+            healed += int(
+                await heal_users_missing_panel_accounts(limit_users=40)
+                or 0
+            )
             if healed:
                 logger.info("coverage heal loop healed=%s", healed)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("empty-user coverage heal loop failed")
-        await asyncio.sleep(30 if healed else 75)
+        await asyncio.sleep(18 if healed else 45)
 
 
 async def _astra_xray_heal_loop() -> None:

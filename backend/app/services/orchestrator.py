@@ -926,8 +926,9 @@ async def provision_user_on_panels(
 
     ``fast=True`` (create-user HTTP path): all targets start together (high
     concurrency). Per-panel timeout is generous enough for PasarGuard; overall
-    budget scales with waves so a healthy-but-slow panel is not falsely marked
-    error. Budget-cancelled rows stay ``pending`` for auto-heal (not fake errors).
+    budget scales with waves. When the budget expires we never cancel sibling
+    creates — unfinished slots stay ``pending`` and finish via leftover apply
+    + durable drain (so one slow/broken panel cannot leave ۱۱/۲۶ forever).
 
     ``skip_astra_rebuild=True``: leave Xray/nginx rebuild to the caller (e.g. one
     rebuild per panel after a whole group resync wave).
@@ -1176,16 +1177,21 @@ async def provision_user_on_panels(
         create_timeout,
         fast,
     )
-    done, pending = await asyncio.wait(tasks, timeout=budget)
-    for t in pending:
-        t.cancel()
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
+    # Never cancel sibling creates when the wave budget expires. A slow/broken
+    # panel used to starve later slots (cancel → sticky pending → ۱۱/۲۶ پنل).
+    # Keep unfinished tasks running and apply their results in background —
+    # same durable path as provision_users_batch leftovers.
+    done, _unfinished = await asyncio.wait(tasks, timeout=budget)
+    leftover: list[tuple[int, asyncio.Task]] = []
+    leftover_uids: set[int] = {int(user.id)} if getattr(user, "id", None) else set()
 
     results: list[AdapterResult] = []
-    for t in tasks:
-        if t in pending or t.cancelled():
+    for (account, _panel, _payload, _gid), t in zip(jobs, tasks):
+        if t not in done or t.cancelled() or not t.done():
             results.append(_fail_result(_PROVISION_BUDGET_SOFT))
+            aid = int(getattr(account, "id", 0) or 0)
+            if aid and not t.done():
+                leftover.append((aid, t))
             continue
         try:
             results.append(t.result())
@@ -1259,6 +1265,20 @@ async def provision_user_on_panels(
         await db.commit()
     except Exception:  # noqa: BLE001
         pass
+
+    if leftover:
+        try:
+            asyncio.create_task(
+                _finish_leftover_provision(leftover, leftover_uids),
+                name=f"astra-prov-leftover-{int(getattr(user, 'id', 0) or 0)}",
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "schedule leftover provision user=%s n=%s failed",
+                getattr(user, "username", "?"),
+                len(leftover),
+                exc_info=True,
+            )
 
     # One Xray+nginx rebuild per Astra panel touched in this provision wave.
     # Callers that batch many users (group resync) pass skip_astra_rebuild and
@@ -1811,13 +1831,12 @@ _account_prov_sem: asyncio.Semaphore | None = None
 def _get_account_prov_sem() -> asyncio.Semaphore:
     """Cap concurrent creates — pool-safe sessions (open → HTTP → close).
 
-    Was 4/10 — leftovers after a large create (100+ slots) drained too slowly
-    and stayed pending for tens of minutes. 24 keeps fan-out high without
-    saturating the asyncpg pool.
+    Was 4/10 then 24 — 80k+ sticky pending after cancel-on-budget meant the
+    drain never caught up. 40 keeps fan-out high without saturating asyncpg.
     """
     global _account_prov_sem
     if _account_prov_sem is None:
-        _account_prov_sem = asyncio.Semaphore(24)
+        _account_prov_sem = asyncio.Semaphore(64)
     return _account_prov_sem
 
 
@@ -1890,9 +1909,19 @@ async def _provision_account_now(account_id: int) -> bool:
                     return False
                 if acc.status == PanelAccountStatus.active and (acc.links or []):
                     return True
+                # Intentional freeze marks — never re-create as live remotes.
+                if (acc.error_message or "").startswith("ASTRA_QUOTA_FROZEN"):
+                    return False
                 user = acc.user
                 panel = acc.panel
                 uid = int(acc.user_id)
+                if user is not None and user.status in (
+                    UserStatus.limited,
+                    UserStatus.expired,
+                    UserStatus.disabled,
+                ):
+                    # Sale over — leave freeze path; don't mint new remotes.
+                    return False
                 if user is None or panel is None or not bool(
                     getattr(panel, "is_active", True)
                 ):
@@ -1901,6 +1930,14 @@ async def _provision_account_now(account_id: int) -> bool:
                     await db.commit()
                     invalidate_user_feed_cache(uid)
                     return False
+                try:
+                    from app.core.panel_circuit import panel_circuit_open
+
+                    if panel_circuit_open(int(panel.id)):
+                        # Fail-fast: leave pending for a later wave when circuit cools.
+                        return False
+                except Exception:  # noqa: BLE001
+                    pass
                 cfg: dict = {}
                 gid = int(getattr(acc, "group_id", 0) or 0)
                 if gid:
@@ -1968,10 +2005,11 @@ async def _provision_account_now(account_id: int) -> bool:
             adapter = get_adapter(panel)
             # PasarGuard under worker load often needs >18s; short timeouts
             # left dozens of pending rows after create.
+            # Drain/heal path: fail faster on dead panels so siblings advance.
             panel_timeout = (
-                28.0
+                22.0
                 if getattr(panel, "type", None) == PanelType.astra
-                else 24.0
+                else 14.0
             )
             try:
                 # Heal/edit: modify every known name first — never mint _p* twins
@@ -2481,9 +2519,9 @@ async def heal_user_coverage(
     panels = await resolve_panels_for_groups(db, gids)
     if not panels:
         return 0
-    # Queue remotes; keep wait short so request/bg sessions are not IIT for long.
-    # Actual creates run in their own pool-safe sessions.
-    await provision_users_now(db, [user], panels, wait=min(float(wait), 3.0))
+    # Queue remotes in pool-safe tasks. Allow a real wait so healthy panels
+    # finish in-wave; leftovers keep running (no sibling cancel).
+    await provision_users_now(db, [user], panels, wait=min(float(wait), 45.0))
     try:
         await hydrate_share_links_pool_safe(int(user.id))
     except Exception:  # noqa: BLE001
@@ -2825,48 +2863,170 @@ async def heal_recent_empty_users(
     return n
 
 
+async def drain_pending_panel_accounts(
+    *,
+    limit_accounts: int = 400,
+    prefer_partial_users: bool = True,
+) -> dict[str, int]:
+    """Fire creates for pending/error rows — no age filter, partial users first.
+
+    One panel failure must never leave siblings stuck forever; this drain is
+    the durable guarantee that every sticky pending slot gets another try.
+    Tasks keep running after this returns (start_account_provisions).
+    """
+    from sqlalchemy import text
+
+    from app.core.database import AsyncSessionLocal
+
+    lim = max(20, min(2000, int(limit_accounts)))
+    ids: list[int] = []
+    try:
+        async with AsyncSessionLocal() as db:
+            # Only live sale users — limited/expired stay freeze-only.
+            # Skip intentional ASTRA_QUOTA_FROZEN marks (not create failures).
+            # Alternate ASC/DESC each minute so one sticky panel id range
+            # cannot starve the rest of the backlog forever.
+            order_sql = (
+                "pa.id ASC" if (int(time.time()) // 60) % 2 else "pa.id DESC"
+            )
+            if prefer_partial_users:
+                rows = await db.execute(
+                    text(
+                        f"""
+                        SELECT pa.id
+                        FROM panel_accounts pa
+                        JOIN users u ON u.id = pa.user_id
+                        JOIN panels p ON p.id = pa.panel_id
+                        WHERE pa.status IN ('pending', 'error')
+                          AND u.status IN ('active', 'on_hold')
+                          AND p.is_active IS TRUE
+                          AND coalesce(pa.error_message, '') NOT LIKE 'ASTRA_QUOTA_FROZEN%'
+                          AND EXISTS (
+                            SELECT 1 FROM panel_accounts a2
+                            WHERE a2.user_id = pa.user_id
+                              AND a2.status = 'active'
+                          )
+                        ORDER BY {order_sql}
+                        LIMIT :lim
+                        """
+                    ),
+                    {"lim": lim},
+                )
+                ids = [int(r[0]) for r in rows.all() if r[0]]
+            if len(ids) < lim:
+                # Second pass: empties / leftover errors (exclude already queued).
+                have = set(ids)
+                rows = await db.execute(
+                    text(
+                        f"""
+                        SELECT pa.id
+                        FROM panel_accounts pa
+                        JOIN users u ON u.id = pa.user_id
+                        JOIN panels p ON p.id = pa.panel_id
+                        WHERE pa.status IN ('pending', 'error')
+                          AND u.status IN ('active', 'on_hold')
+                          AND p.is_active IS TRUE
+                          AND coalesce(pa.error_message, '') NOT LIKE 'ASTRA_QUOTA_FROZEN%'
+                        ORDER BY {order_sql}
+                        LIMIT :lim
+                        """
+                    ),
+                    {"lim": lim + len(have)},
+                )
+                for r in rows.all():
+                    if not r[0]:
+                        continue
+                    aid = int(r[0])
+                    if aid in have:
+                        continue
+                    ids.append(aid)
+                    if len(ids) >= lim:
+                        break
+            await db.rollback()
+    except Exception:  # noqa: BLE001
+        logger.exception("drain_pending_panel_accounts select failed")
+        return {"queued": 0, "ok_now": 0}
+
+    if not ids:
+        return {"queued": 0, "ok_now": 0}
+
+    tasks = start_account_provisions(ids)
+    # Short wait — tasks keep running after return; don't stall the bg loop.
+    done, _pending = await asyncio.wait(tasks, timeout=8.0)
+    ok_now = 0
+    for t in done:
+        try:
+            if t.result():
+                ok_now += 1
+        except Exception:  # noqa: BLE001
+            pass
+    logger.info(
+        "drain_pending_panel_accounts queued=%s done_now=%s ok_now=%s",
+        len(ids),
+        len(done),
+        ok_now,
+    )
+    return {"queued": len(ids), "ok_now": ok_now}
+
+
 async def heal_users_missing_panel_accounts(*, limit_users: int = 20) -> int:
     """Heal users with zero OR partial panel coverage (missing group×panel slots).
 
     One short DB session per user — never holds a connection across HTTP.
     Never deletes accounts/users; only provisions missing slots + hydrates links.
     """
+    from sqlalchemy import text
+
     from app.core.database import AsyncSessionLocal, background_db_sem
 
     # Prefer the hard empty-remote safety net first (۰/۰ cards).
     n = 0
     try:
         n += await heal_recent_empty_users(
-            limit_users=max(5, min(20, int(limit_users))),
-            max_age_hours=72.0,
+            limit_users=max(5, min(40, int(limit_users))),
+            max_age_hours=168.0,
         )
     except Exception:  # noqa: BLE001
         logger.debug("heal_recent_empty_users via coverage skipped", exc_info=True)
 
+    # Fast path: drain sticky pending/error slots fleet-wide (partial first).
+    try:
+        drained = await drain_pending_panel_accounts(
+            limit_accounts=max(120, int(limit_users) * 40),
+            prefer_partial_users=True,
+        )
+        if int(drained.get("queued") or 0) > 0:
+            n += 1
+    except Exception:  # noqa: BLE001
+        logger.debug("drain_pending via coverage skipped", exc_info=True)
+
     try:
         async with AsyncSessionLocal() as db:
-            result = await db.execute(
-                select(User.id)
-                .join(UserGroup, UserGroup.user_id == User.id)
-                .where(
-                    User.status.in_(
-                        (
-                            UserStatus.active,
-                            UserStatus.on_hold,
-                            UserStatus.limited,
-                            UserStatus.expired,
-                        )
-                    )
-                )
-                .distinct()
-                .order_by(User.id.desc())
-                .limit(max(40, int(limit_users) * 4))
+            # Incomplete users: fewer active rows than total non-deleted rows.
+            rows = await db.execute(
+                text(
+                    """
+                    SELECT u.id
+                    FROM users u
+                    JOIN panel_accounts pa ON pa.user_id = u.id
+                    WHERE u.status IN ('active', 'on_hold', 'limited', 'expired')
+                      AND pa.status <> 'deleted'
+                    GROUP BY u.id
+                    HAVING count(*) FILTER (WHERE pa.status = 'active') < count(*)
+                    ORDER BY
+                      (count(*) FILTER (WHERE pa.status = 'active') > 0) DESC,
+                      u.id DESC
+                    LIMIT :lim
+                    """
+                ),
+                {"lim": max(60, int(limit_users) * 5)},
             )
-            candidate_ids = [int(r[0]) for r in result.all() if r[0]]
+            candidate_ids = [int(r[0]) for r in rows.all() if r[0]]
+            await db.rollback()
 
         sem = background_db_sem()
         for uid in candidate_ids:
-            if n >= max(1, int(limit_users)):
+            if n >= max(1, int(limit_users) * 2):
                 break
             async with sem:
                 try:
@@ -2906,7 +3066,7 @@ async def heal_users_missing_panel_accounts(*, limit_users: int = 20) -> int:
                             needs_hydrate = bool(empty)
                     if needs_heal:
                         healed = await heal_user_coverage_pool_safe(
-                            int(uid), wait=10.0, include_empty_links=True
+                            int(uid), wait=18.0, include_empty_links=True
                         )
                         if healed:
                             n += 1
