@@ -1,32 +1,32 @@
-"""Category + usage-cost aware sub order.
+"""Category + quality-aware sub order.
 
-Layout (every config participates — ping only affects rank inside a slot):
+Layout (every config participates — ping only ranks inside a slot):
   1) up to 20 مستقیم — sorted by usage_cost↑ then quality
-  2) تانل — ascending usage_cost, up to 35 per cost, within a
-     fixed tunnel budget so gaming always fits before leftover
-     (budget = SUB_MAX − 20 − 9 = 70 → e.g. گیگ ۵ سپس گیگ ۷)
+  2) up to 50 تانل — sorted by usage_cost↑ then quality
   3) up to 9 گیمینگ — sorted by usage_cost↑ then quality
-  4) leftover by cost then quality (extra of above + other)
+  4) up to 20 leftover — best remaining (extra of above + other),
+     quality-first (test scores when present)
 
-Category comes ONLY from group.order_kind set by admin — never from
-config remark / label text. Missing ping does NOT eject a config from
-its slot (it just sorts after scored peers in the same tier).
+Missing buckets shrink cleanly: 5 direct + only tunnels → 5 + 50 + 0 + 20.
+Category comes ONLY from group.order_kind — never from remark text.
 """
 
 from __future__ import annotations
 
-from itertools import groupby
 from typing import Any, Callable, TypeVar
 
 T = TypeVar("T")
 
 DIRECT_SLOT = 20
-TUNNEL_PER_COST = 35
+TUNNEL_SLOT = 50
 GAMING_SLOT = 9
+LEFTOVER_SLOT = 20
 # Hard cap for normal user subscription feed (probe/app gets uncapped)
-SUB_MAX_CONFIGS = 99
-# Tunnel window before gaming so 20 + 70 + 9 = 99
-TUNNEL_BUDGET = SUB_MAX_CONFIGS - DIRECT_SLOT - GAMING_SLOT  # 70
+SUB_MAX_CONFIGS = DIRECT_SLOT + TUNNEL_SLOT + GAMING_SLOT + LEFTOVER_SLOT  # 99
+
+# Back-compat aliases (older callers / tests)
+TUNNEL_PER_COST = TUNNEL_SLOT
+TUNNEL_BUDGET = TUNNEL_SLOT
 
 ORDER_KINDS = ("direct", "tunnel", "gaming", "other")
 
@@ -54,7 +54,6 @@ def normalize_order_kind(raw: str | None) -> str:
     t = " ".join(str(raw or "").split()).strip().lower()
     if t in _KIND_ALIASES:
         return _KIND_ALIASES[t]
-    # tolerate mixed case canonical
     low = t.lower()
     if low in ORDER_KINDS:
         return low
@@ -91,15 +90,30 @@ def arrange_by_category_slots(
     category_of: Callable[[T], Any] | None = None,
     cost_of: Callable[[T], Any] | None = None,
     direct_slot: int = DIRECT_SLOT,
-    tunnel_per_cost: int = TUNNEL_PER_COST,
+    tunnel_slot: int = TUNNEL_SLOT,
     gaming_slot: int = GAMING_SLOT,
-    tunnel_budget: int | None = TUNNEL_BUDGET,
+    leftover_slot: int = LEFTOVER_SLOT,
+    # Deprecated kwargs kept so old call sites don't break
+    tunnel_per_cost: int | None = None,
+    tunnel_budget: int | None = None,
 ) -> list[T]:
-    """Sort items into category/cost slots then leftover by quality.
+    """Sort items into category slots then leftover by quality.
 
     ``category_of`` must return group.order_kind (or alias). Labels are ignored.
-    Every item enters its order_kind bucket — no separate «unscored» exile.
+    Empty buckets simply contribute zero rows — never steal from another kind.
     """
+    # Honor legacy tunnel_budget/tunnel_per_cost if a caller still passes them
+    # without tunnel_slot — treat as a flat tunnel window size.
+    if tunnel_slot == TUNNEL_SLOT and tunnel_budget is not None:
+        try:
+            tunnel_slot = max(0, int(tunnel_budget))
+        except (TypeError, ValueError):
+            pass
+    elif tunnel_slot == TUNNEL_SLOT and tunnel_per_cost is not None:
+        try:
+            tunnel_slot = max(0, int(tunnel_per_cost))
+        except (TypeError, ValueError):
+            pass
 
     def _num(call: Callable[[T], Any] | None, it: T, default: float = 0.0) -> float:
         if call is None:
@@ -157,13 +171,11 @@ def arrange_by_category_slots(
         stab = _num(stability_of, it, default=-1.0)
         has_stab = 0 if stab >= 0 else 1
         stab_key = -stab if stab >= 0 else 0.0
-        # Uptime: missing/new → 100 (no penalty); higher better
         up = _num(uptime_of, it, default=-1.0)
         up_key = -(up if up >= 0 else 100.0)
         jit = _num(jitter_of, it, default=-1.0)
         jit_key = jit if jit >= 0 else 1e18
         has_metric = 0 if (dl > 0 or ul > 0 or (0 <= loss < 100) or stab >= 0 or up >= 0) else 1
-        # Stability → uptime → jitter → ping → upload → download → packet → devices
         return (
             has_score,
             has_metric,
@@ -195,46 +207,30 @@ def arrange_by_category_slots(
     picked: set[int] = set()
     head: list[T] = []
 
-    # 1) مستقیم — up to N, cheapest cost first then fastest
+    # 1) مستقیم — up to N
     for it in buckets["direct"][: max(0, int(direct_slot))]:
         head.append(it)
         picked.add(id(it))
 
-    # 2) تانل — each usage_cost tier ≤ tunnel_per_cost, total ≤ tunnel_budget
-    budget = (
-        10**9
-        if tunnel_budget is None
-        else max(0, int(tunnel_budget))
-    )
-    tunnel_taken = 0
-    tunnel = buckets["tunnel"]
-    for _cost_val, group in groupby(tunnel, key=_cost):
-        if tunnel_taken >= budget:
-            break
-        tier = list(group)
-        taken = 0
-        for it in tier:
-            if tunnel_taken >= budget:
-                break
-            if taken >= int(tunnel_per_cost):
-                break
-            if id(it) in picked:
-                continue
-            head.append(it)
-            picked.add(id(it))
-            taken += 1
-            tunnel_taken += 1
+    # 2) تانل — up to N (cost↑ then quality; no per-cost hard split)
+    for it in buckets["tunnel"][: max(0, int(tunnel_slot))]:
+        if id(it) in picked:
+            continue
+        head.append(it)
+        picked.add(id(it))
 
-    # 3) گیمینگ — up to N (always before leftover / extra tunnel tiers)
+    # 3) گیمینگ — up to N
     for it in buckets["gaming"][: max(0, int(gaming_slot))]:
         if id(it) in picked:
             continue
         head.append(it)
         picked.add(id(it))
 
+    # 4) leftover — best remaining, capped so feed stays 20+50+9+20
     leftover = [it for it in items if id(it) not in picked]
     leftover.sort(key=segment_key)
-    return head + leftover
+    lim = max(0, int(leftover_slot))
+    return head + leftover[:lim]
 
 
 def arrange_rank_dicts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -305,7 +301,7 @@ def arrange_subscription_rows(
     """Order one user's sub feed by group.order_kind slots.
 
     Layout is fixed whether or not AstraPing has scores:
-      20 direct → tunnel (≤35/cost, budget 70) → 9 gaming → leftover
+      20 direct → 50 tunnel → 9 gaming → 20 leftover (best remaining)
 
     ``ping_rank_of`` only ranks *inside* a slot (lower positive = better).
     Missing / non-positive rank → still stays in its order_kind slot.
@@ -323,12 +319,10 @@ def arrange_subscription_rows(
             v = float(ping_rank_of(row))
         except (TypeError, ValueError):
             return -1.0
-        # Non-positive / huge sentinel = unscored (slot still filled)
         if v <= 0 or v >= 10**6:
             return -1.0
         return v
 
-    # Stamp canonical order_kind so remarks / debug see the same bucket
     for row in rows:
         row["order_kind"] = _kind(row)
 

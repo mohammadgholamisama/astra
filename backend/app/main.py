@@ -287,6 +287,34 @@ async def _empty_user_coverage_heal_loop() -> None:
         await asyncio.sleep(12 if healed else 25)
 
 
+async def _exhausted_remote_kill_loop() -> None:
+    """Never leave limited/expired users with live remotes after اتمام حجم.
+
+    Independent of /sub traffic — chews unfrozen-blocked until every account
+    is cut. Force bypasses kill cooldown so a prior failed wave retries.
+    """
+    await asyncio.sleep(20)
+    from app.services import panel_usage_bulk as bulk_usage
+
+    while True:
+        killed = 0
+        try:
+            stats = await bulk_usage.heal_exhausted_and_unfrozen(limit=200)
+            killed = int(stats.get("kill") or 0) + int(stats.get("flipped") or 0)
+            if killed:
+                logger.warning(
+                    "exhausted-kill loop flipped=%s kill=%s unfrozen=%s",
+                    stats.get("flipped"),
+                    stats.get("kill"),
+                    stats.get("unfrozen"),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("exhausted-kill loop failed")
+        await asyncio.sleep(8 if killed else 20)
+
+
 async def _astra_xray_heal_loop() -> None:
     """Keep astra-xray@N up — calm cadence; never stampede systemctl/D-Bus.
 
@@ -1055,6 +1083,12 @@ async def lifespan(_app: FastAPI):
             asyncio.create_task(
                 _empty_user_coverage_heal_loop(),
                 name="astra-empty-coverage-heal",
+            )
+        )
+        bg_tasks.append(
+            asyncio.create_task(
+                _exhausted_remote_kill_loop(),
+                name="astra-exhausted-kill",
             )
         )
     logger.info(

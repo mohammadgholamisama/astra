@@ -3,7 +3,9 @@
 from app.services.ping_category_order import (
     DIRECT_SLOT,
     GAMING_SLOT,
+    LEFTOVER_SLOT,
     SUB_MAX_CONFIGS,
+    TUNNEL_SLOT,
     arrange_subscription_rows,
 )
 
@@ -24,19 +26,23 @@ def test_slots_without_any_ping():
         + [_row("tunnel", i, cost=5) for i in range(40)]
         + [_row("tunnel", 100 + i, cost=7) for i in range(40)]
         + [_row("gaming", i) for i in range(12)]
-        + [_row("other", i) for i in range(5)]
+        + [_row("other", i) for i in range(25)]
     )
-    # No ping ranks at all
     out = arrange_subscription_rows(rows, ping_rank_of=lambda _r: 10**6)
     head = out[:SUB_MAX_CONFIGS]
+    assert len(head) == SUB_MAX_CONFIGS
     assert [r["order_kind"] for r in head[:DIRECT_SLOT]] == ["direct"] * DIRECT_SLOT
-    # Next: tunnels only (cost 5 then 7), no direct leakage
-    mid = head[DIRECT_SLOT : DIRECT_SLOT + 70]
+    mid = head[DIRECT_SLOT : DIRECT_SLOT + TUNNEL_SLOT]
+    assert len(mid) == TUNNEL_SLOT
     assert all(r["order_kind"] == "tunnel" for r in mid)
-    assert all(r["usage_cost"] == 5 for r in mid[:35])
-    assert all(r["usage_cost"] == 7 for r in mid[35:70])
-    g = head[DIRECT_SLOT + 70 : DIRECT_SLOT + 70 + GAMING_SLOT]
+    assert all(r["usage_cost"] == 5 for r in mid[:40])
+    assert all(r["usage_cost"] == 7 for r in mid[40:50])
+    g = head[
+        DIRECT_SLOT + TUNNEL_SLOT : DIRECT_SLOT + TUNNEL_SLOT + GAMING_SLOT
+    ]
     assert [r["order_kind"] for r in g] == ["gaming"] * GAMING_SLOT
+    leftover = head[-LEFTOVER_SLOT:]
+    assert len(leftover) == LEFTOVER_SLOT
 
 
 def test_persian_alias_normalized():

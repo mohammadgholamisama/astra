@@ -7496,8 +7496,8 @@ async def collect_links_detailed(
             pass
 
     # Dedupe by endpoint fingerprint, then arrange THIS user's inventory by
-    # group.order_kind (20 direct → tunnel budget → 9 gaming). Ping/app scores
-    # only reorder inside a slot — never move a config across buckets.
+    # group.order_kind (20 direct → 50 tunnel → 9 gaming → 20 leftover).
+    # Ping/app scores only reorder inside a slot — never move across buckets.
     from app.services.config_locations import (
         extract_link_client_id,
         extract_link_endpoint,
@@ -10542,11 +10542,14 @@ async def kick_freeze_user(
             except Exception:  # noqa: BLE001
                 logger.debug("kill-user enqueue failed user=%s", uid, exc_info=True)
             # Local / non-leased panels + backup path for worker remotes.
+            # Thorough (not freeze_fast): one short miss must not leave live
+            # configs after اتمام حجم — retry until accounts are marked frozen.
             await _freeze_quota_users(
                 [uid],
-                remote_timeout=min(float(remote_timeout), 8.0),
-                concurrency=2,
-                wall=25.0,
+                remote_timeout=max(float(remote_timeout), 14.0),
+                concurrency=4,
+                wall=60.0,
+                thorough=True,
             )
         except Exception:  # noqa: BLE001
             logger.debug("kick freeze failed user_id=%s", uid, exc_info=True)
@@ -10565,20 +10568,21 @@ async def _freeze_quota_users(
     remote_timeout: float = 8.0,
     concurrency: int = 2,
     wall: float = 45.0,
+    thorough: bool = False,
 ) -> tuple[int, int]:
     """Disable every remote config for exhausted users (PasarGuard /disabled first).
 
-    Concurrency stays tiny so freeze HTTP cannot pin the whole DB pool
-    (each sync_modify held a checkout for the full remote round-trip).
+    ``thorough=True`` (kill /sub / heal): multi-attempt sync_modify + second
+    pass for accounts still missing ASTRA_QUOTA_FROZEN. Fast wave uses
+    freeze_fast for bulk quota-watch; never leave live remotes after اتمام حجم.
     """
     from app.core.database import AsyncSessionLocal
+    from app.services.panel_usage_bulk import QUOTA_FROZEN_MARK
     from app.services.users import load_user
 
     ids = list(dict.fromkeys(int(x) for x in user_ids if x))
     if not ids:
         return 0, 0
-    # Allow enough parallel freezes to cut multi-panel users quickly without
-    # saturating the DB pool (each _one opens its own short sessions).
     sem = asyncio.Semaphore(max(1, min(int(concurrency), 8)))
     ok_n = 0
     fail_n = 0
@@ -10613,16 +10617,66 @@ async def _freeze_quota_users(
                 await sync_modify_user(
                     db,
                     user,
-                    remote_timeout=max(float(remote_timeout), 8.0),
+                    remote_timeout=max(
+                        float(remote_timeout), 14.0 if thorough else 8.0
+                    ),
                     skip_nginx_sync=True,
-                    # Fast path: disable remotes in parallel waves — freeze_fast=False
-                    # left limited users with live configs for minutes.
-                    freeze_fast=True,
+                    # Thorough cut: 3 attempts per remote. Fast wave for
+                    # bulk watch still uses freeze_fast.
+                    freeze_fast=not thorough,
                 )
-                # sync_modify may close the session on freeze — do not touch it.
+                try:
+                    await db.commit()
+                except Exception:  # noqa: BLE001
+                    try:
+                        await db.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            if not thorough:
                 return True
 
-    # Cap concurrency higher for exhaust storms (was hard-capped at 2).
+            # Second pass: anything still without FROZEN mark → force again.
+            async with AsyncSessionLocal() as db:
+                user = await load_user(db, uname)
+                if user is None:
+                    return True
+                if user.status not in (
+                    UserStatus.limited,
+                    UserStatus.expired,
+                    UserStatus.disabled,
+                ):
+                    return True
+                leftover = [
+                    a
+                    for a in (user.panel_accounts or [])
+                    if a.status
+                    in (
+                        PanelAccountStatus.active,
+                        PanelAccountStatus.error,
+                        PanelAccountStatus.pending,
+                    )
+                    and not (a.error_message or "").startswith(QUOTA_FROZEN_MARK)
+                ]
+                if not leftover:
+                    return True
+                await sync_modify_user(
+                    db,
+                    user,
+                    remote_timeout=max(float(remote_timeout), 18.0),
+                    skip_nginx_sync=True,
+                    freeze_fast=False,
+                    only_panel_ids={int(a.panel_id) for a in leftover},
+                )
+                try:
+                    await db.commit()
+                except Exception:  # noqa: BLE001
+                    try:
+                        await db.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+                return True
+
     tasks = [asyncio.create_task(_one(uid)) for uid in ids]
     done, pending = await asyncio.wait(tasks, timeout=wall)
     for t in pending:

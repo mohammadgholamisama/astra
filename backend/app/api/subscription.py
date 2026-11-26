@@ -525,7 +525,9 @@ async def _bg_sub_maintain(user_id: int, *, force: bool = False) -> None:
                         await db.commit()
                         from app.services.orchestrator import kick_freeze_user
 
-                        await kick_freeze_user(int(user_id), remote_timeout=10.0)
+                        await kick_freeze_user(
+                            int(user_id), remote_timeout=14.0, force=True
+                        )
                         invalidate_user_feed_cache(int(user_id))
                     elif changed:
                         await db.commit()
@@ -643,16 +645,13 @@ async def _bg_usage_pull(user_id: int) -> None:
                     if st == UserStatus.limited:
                         try:
                             from app.services.orchestrator import kick_freeze_user
-                            from app.services.worker_commands import (
-                                kill_on_cooldown,
-                            )
 
-                            # Re-cut when cooldown elapsed — earlier kills may
-                            # have been trimmed from the Redis command queue.
+                            # Always force-cut on /sub for limited — cooldown
+                            # must never leave live remotes after اتمام حجم.
                             await kick_freeze_user(
                                 int(user_id),
-                                remote_timeout=8.0,
-                                force=not kill_on_cooldown(int(user_id)),
+                                remote_timeout=14.0,
+                                force=True,
                             )
                         except Exception:  # noqa: BLE001
                             pass
@@ -2498,7 +2497,9 @@ async def _serve_subscription_db(
             try:
                 from app.services.orchestrator import kick_freeze_user
 
-                await kick_freeze_user(int(user.id), remote_timeout=10.0)
+                await kick_freeze_user(
+                    int(user.id), remote_timeout=14.0, force=True
+                )
             except Exception:  # noqa: BLE001
                 pass
             if curated:
