@@ -2006,6 +2006,9 @@ async def find_inflated_used_user_ids(
     gap = max(0, int(gap_bytes))
     st = tuple(str(s) for s in statuses if s) or ("active", "limited", "on_hold")
     st_sql = ", ".join(f"'{s}'" for s in st)
+    # Include pending (provision lag meters) — same live set as _weighted_total.
+    # Excluding pending caused ~580 false «inflated» flags while used already
+    # matched truth; reconcile then no-op'd and the bug looked permanent.
     under = (
         "AND coalesce(sum("
         "(coalesce(pa.used_traffic, 0)::numeric "
@@ -2022,7 +2025,7 @@ async def find_inflated_used_user_ids(
                     SELECT u.id
                     FROM users u
                     LEFT JOIN panel_accounts pa ON pa.user_id = u.id
-                      AND pa.status IN ('active', 'error')
+                      AND pa.status IN ('active', 'error', 'pending')
                     WHERE u.status IN ({st_sql})
                     GROUP BY u.id, u.used_traffic, u.data_limit
                     HAVING u.used_traffic::numeric > coalesce(sum(
@@ -2046,9 +2049,13 @@ async def find_inflated_used_user_ids(
 
 
 def _accounts_synced_enough_for_shrink(
-    accounts: list, *, max_age_sec: float = 7200.0
+    accounts: list, *, max_age_sec: float = 86400.0
 ) -> bool:
-    """True when live meters look fresh enough to safely shrink user.used_traffic."""
+    """True when live meters look trustworthy enough to shrink user.used_traffic.
+
+    Accept either a recent ``last_sync_at`` (≤24h) or a consistent
+    ``used_traffic ≈ last_remote_raw`` watermark (panel meter already grounded).
+    """
     from datetime import datetime, timezone
 
     from app.models.user import PanelAccountStatus
@@ -2074,13 +2081,21 @@ def _accounts_synced_enough_for_shrink(
     fresh = 0
     for a in live:
         ts = getattr(a, "last_sync_at", None)
-        if ts is None:
-            continue
-        if getattr(ts, "tzinfo", None) is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        if (now - ts).total_seconds() <= max_age_sec:
+        if ts is not None:
+            if getattr(ts, "tzinfo", None) is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if (now - ts).total_seconds() <= max_age_sec:
+                fresh += 1
+                continue
+        used = int(getattr(a, "used_traffic", 0) or 0)
+        raw = int(getattr(a, "last_remote_raw", 0) or 0)
+        # Grounded meter: stored matches last remote sample (or both zero).
+        if used == 0 and raw == 0:
             fresh += 1
-    # Require a majority of live rows synced within the window.
+            continue
+        if raw > 0 and abs(used - raw) <= max(1024 * 1024, int(raw * 0.02)):
+            fresh += 1
+    # Require a majority of live rows synced / grounded.
     return fresh >= max(1, (len(live) + 1) // 2)
 
 
@@ -2320,10 +2335,20 @@ async def reconcile_inflated_used_traffic(
                 user, accounts = await _load_user_for_recount(db, int(uid))
                 if user is None:
                     continue
-                if not _accounts_synced_enough_for_shrink(accounts):
+                before = int(user.used_traffic or 0)
+                # Authority = stored weighted formula (pending+anchors), not the
+                # coarse SQL scan. Skip phantoms that find_inflated still tags.
+                from app.services.orchestrator import _weighted_total_from_stored
+
+                truth_quick = int(_weighted_total_from_stored(accounts))
+                if before <= truth_quick + int(gap_bytes):
+                    continue
+                synced = _accounts_synced_enough_for_shrink(accounts)
+                # ≥500MB sticky inflate: shrink even if sync stamps are old —
+                # panel meters already in DB are the source of truth.
+                if not synced and (before - truth_quick) < 500 * 1024 * 1024:
                     skipped_stale += 1
                     continue
-                before = int(user.used_traffic or 0)
                 after = await recount_user_used_traffic(
                     db, user, accounts, allow_shrink=True
                 )

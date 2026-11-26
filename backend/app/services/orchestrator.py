@@ -472,6 +472,11 @@ def account_weighted_usage(account: PanelAccount, coeff: float) -> int:
     )
 
 
+# After a live remote pull, if stored used is this far above Σ weighted meters,
+# treat it as sticky inflate (not a real banked peak) and shrink.
+_INFLATE_AUTO_SHRINK_GAP = 50 * 1024 * 1024
+
+
 def _assign_user_used_traffic(
     user: User, total: int, *, allow_shrink: bool = False
 ) -> int:
@@ -479,7 +484,7 @@ def _assign_user_used_traffic(
 
     By default usage is monotonic: removing a panel/config must never refund
     volume the user already burned. Pass ``allow_shrink=True`` only for
-    intentional admin resets.
+    intentional admin resets / inflate reconcile.
     """
     new = max(0, int(total or 0))
     if allow_shrink:
@@ -490,6 +495,29 @@ def _assign_user_used_traffic(
         return cur
     user.used_traffic = new
     return new
+
+
+def _assign_usage_after_meter_update(
+    user: User, total: int, *, live_pull: bool = False
+) -> int:
+    """Assign weighted total; auto-shrink sticky inflate after live pulls.
+
+    Normal path stays monotonic. When ``live_pull`` just refreshed panel meters
+    and ``users.used_traffic`` is still ≫ Σ(raw×coeff) by ≥50MB, shrink — that
+    is the false «اتمام حجم» / 2× meter class, not a deleted-panel bank.
+    """
+    truth = max(0, int(total or 0))
+    stored = int(user.used_traffic or 0)
+    if live_pull and stored > truth + _INFLATE_AUTO_SHRINK_GAP:
+        logger.info(
+            "auto-shrink inflated usage user=%s stored=%s truth=%s gap=%s",
+            getattr(user, "username", "?"),
+            stored,
+            truth,
+            stored - truth,
+        )
+        return _assign_user_used_traffic(user, truth, allow_shrink=True)
+    return _assign_user_used_traffic(user, truth)
 
 
 def apply_coefficient_period(account: PanelAccount, new_coeff: float) -> bool:
@@ -9309,7 +9337,7 @@ async def refresh_usage(
     # Refresh coeffs in case new accounts appeared (should not, but cheap)
     account_coeffs = await account_coefficients_for_user(db, user, accounts)
     total = await _weighted_total(accounts, account_coeffs)
-    total = _assign_user_used_traffic(user, total)
+    total = _assign_usage_after_meter_update(user, total, live_pull=True)
     await db.flush()
     return total
 
@@ -9749,9 +9777,17 @@ async def _refresh_usage_pool_safe_inner(
                     db, user, accounts
                 )
                 total = await _weighted_total(accounts, account_coeffs)
-                total = _assign_user_used_traffic(user, total)
+                total = _assign_usage_after_meter_update(
+                    user, total, live_pull=True
+                )
                 activated = await activate_on_hold_if_used(db, user)
                 changed = bool(activated) or await enforce_user_quota(db, user)
+                if user.status == UserStatus.active:
+                    from app.services.panel_usage_bulk import QUOTA_FROZEN_MARK
+
+                    for acc in accounts:
+                        if (acc.error_message or "") == QUOTA_FROZEN_MARK:
+                            acc.error_message = None
                 await db.commit()
                 try:
                     mark_live_usage_priority(int(user_id))
@@ -9784,6 +9820,52 @@ async def _refresh_usage_pool_safe_inner(
                     except Exception:  # noqa: BLE001
                         logger.warning(
                             "schedule freeze after quota flip failed user=%s",
+                            username,
+                            exc_info=True,
+                        )
+                elif changed and user.status == UserStatus.active:
+                    # Auto-shrink may flip limited→active — remount remotes.
+                    try:
+                        uid_i = int(user_id)
+
+                        async def _unfreeze_after_shrink() -> None:
+                            from app.core.database import AsyncSessionLocal as _SL
+
+                            try:
+                                async with _SL() as sdb:
+                                    u2 = (
+                                        await sdb.execute(
+                                            select(User)
+                                            .where(User.id == uid_i)
+                                            .options(
+                                                selectinload(
+                                                    User.panel_accounts
+                                                ).selectinload(PanelAccount.panel),
+                                                selectinload(User.groups),
+                                            )
+                                        )
+                                    ).scalar_one_or_none()
+                                    if u2 is None or u2.status != UserStatus.active:
+                                        return
+                                    await sync_modify_user(
+                                        sdb,
+                                        u2,
+                                        skip_nginx_sync=True,
+                                        freeze_fast=False,
+                                        remote_timeout=14,
+                                    )
+                                    await sdb.commit()
+                            except Exception:  # noqa: BLE001
+                                logger.warning(
+                                    "unfreeze after shrink failed user_id=%s",
+                                    uid_i,
+                                    exc_info=True,
+                                )
+
+                        asyncio.create_task(_unfreeze_after_shrink())
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "schedule unfreeze after shrink failed user=%s",
                             username,
                             exc_info=True,
                         )
@@ -10637,7 +10719,9 @@ async def run_quota_watch_cycle() -> dict[str, int]:
     except Exception:  # noqa: BLE001
         logger.warning("quota-watch pending activate failed", exc_info=True)
     try:
-        recon = await bulk_usage.reconcile_inflated_used_traffic(limit=400)
+        recon = await bulk_usage.reconcile_inflated_used_traffic(
+            limit=1200, gap_bytes=30 * 1024 * 1024
+        )
         stats["flipped"] += int(recon.get("reactivated") or 0)
         if int(recon.get("shrunk") or 0):
             logger.info(
