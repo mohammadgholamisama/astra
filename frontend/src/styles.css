@@ -13312,6 +13312,35 @@ html[dir="rtl"] .configs-switch input:checked + .configs-switch-track::after,
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.worker-panel-hint {
+  margin: 0 0 8px;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+.worker-panel-row.taken {
+  background: color-mix(in srgb, #c9a227 10%, transparent);
+}
+.worker-panel-row.moving {
+  outline: 1px dashed color-mix(in srgb, #2a9d8f 55%, transparent);
+}
+.worker-panel-owner {
+  margin-inline-start: auto;
+  flex-shrink: 0;
+  max-width: 42%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: #a67c00;
+  background: color-mix(in srgb, #c9a227 18%, transparent);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+.worker-panel-owner.moving-badge {
+  color: #1b6b63;
+  background: color-mix(in srgb, #2a9d8f 18%, transparent);
+}
 .worker-panel-type {
   flex-shrink: 0;
   font-size: 0.72rem;

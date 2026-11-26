@@ -143,17 +143,39 @@ async def assign_panels_api(
     db: AsyncSession = Depends(get_db),
     _admin: Admin = Depends(get_session_admin_only),
 ):
+    """Exclusive panel assign — selecting a panel here removes it from other workers."""
+    from sqlalchemy import select as sa_select
+
+    from app.models.panel import Panel
+
+    want = {int(x) for x in (body.panel_ids or [])}
+    # Capture previous owners so we can re-sync agents that lose panels.
+    prev_owners: set[int] = set()
+    if want:
+        rows = (
+            await db.execute(
+                sa_select(Panel.worker_id, Panel.preferred_worker_id).where(
+                    Panel.id.in_(list(want))
+                )
+            )
+        ).all()
+        for wid, pref in rows:
+            if wid and int(wid) != int(worker_id):
+                prev_owners.add(int(wid))
+            if pref and int(pref) != int(worker_id):
+                prev_owners.add(int(pref))
     try:
         out = await ops.update_worker(
             db, worker_id, WorkerUpdate(panel_ids=list(body.panel_ids))
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail="Worker not found") from exc
-    # Best-effort push assignment to the agent
-    try:
-        await ops.sync_assignments_to_worker(db, worker_id)
-    except Exception:  # noqa: BLE001
-        pass
+    # Push to this worker + any workers that just lost panels.
+    for wid in {int(worker_id), *prev_owners}:
+        try:
+            await ops.sync_assignments_to_worker(db, wid)
+        except Exception:  # noqa: BLE001
+            pass
     return out
 
 

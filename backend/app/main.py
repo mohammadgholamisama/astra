@@ -23,6 +23,7 @@ from app.api import (
     config_orders,
     group_configs,
     groups,
+    integration as integration_api,
     panels,
     settings as settings_api,
     subscription,
@@ -1103,12 +1104,38 @@ async def lifespan(_app: FastAPI):
         await dispose_engine()
 
 
+_OPENAPI_DESC = """
+پنل Astra — مدیریت کاربران، گروه‌ها، پنل‌ها و ورکرها.
+
+## احراز هویت API
+هدر `X-Api-Key: pg_key_…` (از تنظیمات → کلیدهای API) یا Bearer JWT.
+
+## Integration · گروه‌ها
+- `GET /api/v1/groups` — استعلام همه گروه‌ها
+- `GET /api/v1/groups/{id}` — استعلام یک گروه
+- `POST /api/v1/groups` — افزودن گروه
+- `PUT /api/v1/groups/{id}` — ویرایش گروه
+- `DELETE /api/v1/groups/{id}` — حذف گروه
+
+## Integration · رتبه و تست پنل در ساب
+- `GET /api/v1/panels/sub-status` — برای هر پنل: نتیجه تست پینگ و رتبه کانفیگ‌ها در `/sub`
+- `GET /api/v1/panels/{id}/sub-status` — همان برای یک پنل
+""".strip()
+
 app = FastAPI(
     title=f"{settings.PANEL_NAME} Panel",
     version="1.0.0",
-    description="Multi-source V2Ray panel with PasarGuard-compatible API",
+    description=_OPENAPI_DESC,
     lifespan=lifespan,
     default_response_class=ORJSONResponse,
+    openapi_tags=[
+        {
+            "name": "Integration · API خارجی",
+            "description": "گروه‌ها (CRUD) و وضعیت تست/رتبه پنل در لینک ساب — با X-Api-Key",
+        },
+        {"name": "Workers", "description": "ورکرها و تخصیص انحصاری پنل‌ها"},
+        {"name": "Groups", "description": "گروه‌های فروش (UI ادمین)"},
+    ],
 )
 
 _SUB_HOST_LANDING = """<!DOCTYPE html>
@@ -1171,6 +1198,7 @@ app.add_middleware(SubHostGuardMiddleware)
 app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(groups.router)
+app.include_router(integration_api.router)
 app.include_router(group_configs.router)
 app.include_router(panels.router)
 app.include_router(astra_outbounds.router)

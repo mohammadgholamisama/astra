@@ -140,16 +140,23 @@ type WorkerProbeResult = {
 
 type PanelBrief = { id: number; name: string; type: string; is_active: boolean };
 
+type PanelOwner = { id: number; name: string };
+
 function WorkerPanelPicker({
   panels,
   selected,
   onChange,
   disabled,
+  currentWorkerId,
+  ownership,
 }: {
   panels: PanelBrief[];
   selected: number[];
   onChange: (ids: number[]) => void;
   disabled?: boolean;
+  /** When set, panels owned by other workers show as taken (exclusive). */
+  currentWorkerId?: number | null;
+  ownership?: Record<number, PanelOwner>;
 }) {
   const [q, setQ] = useState("");
   const selectedSet = useMemo(() => new Set(selected), [selected]);
@@ -163,6 +170,13 @@ function WorkerPanelPicker({
       const aOn = selectedSet.has(a.id) ? 0 : 1;
       const bOn = selectedSet.has(b.id) ? 0 : 1;
       if (aOn !== bOn) return aOn - bOn;
+      const aOther =
+        ownership?.[a.id] && ownership[a.id].id !== currentWorkerId ? 1 : 2;
+      const bOther =
+        ownership?.[b.id] && ownership[b.id].id !== currentWorkerId ? 1 : 2;
+      if (!selectedSet.has(a.id) && !selectedSet.has(b.id) && aOther !== bOther) {
+        return aOther - bOther;
+      }
       return a.name.localeCompare(b.name, "fa");
     });
     if (!needle) return list;
@@ -170,13 +184,21 @@ function WorkerPanelPicker({
       (p) =>
         p.name.toLowerCase().includes(needle) ||
         p.type.toLowerCase().includes(needle) ||
-        String(p.id).includes(needle)
+        String(p.id).includes(needle) ||
+        (ownership?.[p.id]?.name || "").toLowerCase().includes(needle)
     );
-  }, [activePanels, q, selectedSet]);
+  }, [activePanels, q, selectedSet, ownership, currentWorkerId]);
   const allIds = filtered.map((p) => p.id);
   const allOn =
     allIds.length > 0 && allIds.every((id) => selectedSet.has(id));
   const selectedPanels = activePanels.filter((p) => selectedSet.has(p.id));
+  const takenElsewhere = useMemo(() => {
+    if (!ownership || !currentWorkerId) return 0;
+    return activePanels.filter((p) => {
+      const o = ownership[p.id];
+      return o && o.id !== currentWorkerId && !selectedSet.has(p.id);
+    }).length;
+  }, [activePanels, ownership, currentWorkerId, selectedSet]);
 
   function toggle(id: number) {
     if (selectedSet.has(id)) onChange(selected.filter((x) => x !== id));
@@ -192,7 +214,7 @@ function WorkerPanelPicker({
             type="search"
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            placeholder="جستجوی نام یا نوع پنل…"
+            placeholder="جستجوی نام، نوع یا ورکر…"
             disabled={disabled}
             autoComplete="off"
           />
@@ -224,9 +246,19 @@ function WorkerPanelPicker({
           )}
           <span className="worker-panel-count">
             {toFaDigits(selected.length)} از {toFaDigits(activePanels.length)}
+            {takenElsewhere > 0
+              ? ` · ${toFaDigits(takenElsewhere)} روی ورکر دیگر`
+              : ""}
           </span>
         </div>
       </div>
+
+      {currentWorkerId != null && (
+        <p className="worker-panel-hint muted">
+          هر پنل فقط روی یک ورکر است. اگر پنلی روی ورکر دیگر باشد، با انتخاب اینجا
+          از آنجا برداشته می‌شود.
+        </p>
+      )}
 
       {selectedPanels.length > 0 && (
         <div className="worker-panel-selected" aria-label="پنل‌های انتخاب‌شده">
@@ -252,11 +284,35 @@ function WorkerPanelPicker({
         ) : (
           filtered.map((p) => {
             const on = selectedSet.has(p.id);
+            const owner = ownership?.[p.id];
+            const other =
+              owner &&
+              currentWorkerId != null &&
+              owner.id !== currentWorkerId &&
+              !on
+                ? owner
+                : null;
+            const moving =
+              owner &&
+              currentWorkerId != null &&
+              owner.id !== currentWorkerId &&
+              on
+                ? owner
+                : null;
             return (
               <label
                 key={p.id}
                 role="listitem"
-                className={`worker-panel-row${on ? " on" : ""}${disabled ? " is-disabled" : ""}`}
+                className={`worker-panel-row${on ? " on" : ""}${
+                  other ? " taken" : ""
+                }${moving ? " moving" : ""}${disabled ? " is-disabled" : ""}`}
+                title={
+                  other
+                    ? `الان روی «${other.name}» — با انتخاب به این ورکر منتقل می‌شود`
+                    : moving
+                      ? `با ذخیره از «${moving.name}» برداشته می‌شود`
+                      : undefined
+                }
               >
                 <input
                   type="checkbox"
@@ -273,6 +329,16 @@ function WorkerPanelPicker({
                     {p.type}
                   </span>
                 </span>
+                {other ? (
+                  <span className="worker-panel-owner">
+                    روی {other.name}
+                  </span>
+                ) : null}
+                {moving ? (
+                  <span className="worker-panel-owner moving-badge">
+                    انتقال از {moving.name}
+                  </span>
+                ) : null}
               </label>
             );
           })
@@ -393,6 +459,16 @@ export default function SettingsPage() {
     queryKey: ["panels-brief"],
     queryFn: () => api<PanelBrief[]>("/api/admin/panels"),
   });
+
+  const panelOwnership = useMemo(() => {
+    const map: Record<number, PanelOwner> = {};
+    for (const w of workers) {
+      for (const pid of w.panel_ids || []) {
+        map[pid] = { id: w.id, name: w.name };
+      }
+    }
+    return map;
+  }, [workers]);
 
   const createWorker = useMutation({
     mutationFn: () =>
@@ -1905,6 +1981,7 @@ export default function SettingsPage() {
                   selected={workerPanelIds}
                   onChange={setWorkerPanelIds}
                   disabled={createWorker.isPending}
+                  ownership={panelOwnership}
                 />
               </div>
               {createWorker.isPending && (
@@ -2176,7 +2253,7 @@ export default function SettingsPage() {
                 <div>
                   <h3>تخصیص پنل — {assignWorker.name}</h3>
                   <p className="modal-sub">
-                    درخواست‌های این پنل‌ها به Worker می‌رود؛ قطعی = همین سرور
+                    تخصیص انحصاری — پنل انتخاب‌شده از ورکر دیگر برداشته می‌شود
                   </p>
                 </div>
               </div>
@@ -2195,6 +2272,8 @@ export default function SettingsPage() {
                 selected={workerPanelIds}
                 onChange={setWorkerPanelIds}
                 disabled={saveAssign.isPending}
+                currentWorkerId={assignWorker.id}
+                ownership={panelOwnership}
               />
             </div>
             {saveAssign.isError && (

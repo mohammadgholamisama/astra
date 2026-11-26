@@ -27,7 +27,7 @@ from app.schemas.group import (
 from app.services.group_configs import sample_username_for_group
 from app.services.link_remark import normalize_notices
 
-router = APIRouter(tags=["Group"])
+router = APIRouter(tags=["Groups"])
 logger = logging.getLogger(__name__)
 
 
