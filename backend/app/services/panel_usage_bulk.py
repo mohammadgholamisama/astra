@@ -328,39 +328,54 @@ def _lookup_usage_bytes(
     return None
 
 
+# Ignore "used=0 / tiny" API snapshots that used to collapse last_remote_raw
+# and re-add the full counter on the next good reading (exact N× inflation).
+_METER_BLIP_MAX = 1 * 1024 * 1024  # 1 MiB
+_METER_JITTER_KEEP = 0.95  # drops within 5% of watermark = jitter, not reset
+
+
 def _high_water_delta(
     acc: PanelAccount,
     got: int,
     *,
     allow_shrink: bool = False,
-) -> tuple[int, int]:
-    """Return ``(raw_delta, new_accumulated)`` for one remote meter reading.
+) -> tuple[int, int, bool]:
+    """Return ``(raw_delta, new_accumulated, touch_last)``.
 
     ``panel_accounts.used_traffic`` is accumulated Astra raw (survives remote
     resets). ``last_remote_raw`` tracks the last observed remote counter.
+
+    ``touch_last=False`` means the reading is a blip — keep the watermark.
     """
     got_i = max(0, int(got or 0))
     accumulated = int(acc.used_traffic or 0)
     last = getattr(acc, "last_remote_raw", None)
     if allow_shrink:
         # Admin reset path: absolute set, no accumulation.
-        return 0, got_i
+        return 0, got_i, True
     if last is None:
-        # Not primed yet — adopt remote reading without inventing a delta
+        # Not primed yet — stamp watermark without inventing a delta
         # (startup backfill normally sets last = used_traffic before this runs).
-        return 0, accumulated
+        return 0, accumulated, True
     last_i = int(last or 0)
     if got_i >= last_i:
         raw_delta = got_i - last_i
-    elif got_i == 0 and last_i > 0:
-        # Transient zero (disabled snapshot / API blip). Collapsing the
-        # watermark to 0 made the next real reading re-add the full counter
-        # (seen as exact N× inflation, e.g. 20.5GB × 16 → 328GB).
-        return 0, accumulated
-    else:
-        # Remote panel reset / wipe — keep prior accumulated, count new from 0.
-        raw_delta = got_i
-    return max(0, int(raw_delta)), accumulated + max(0, int(raw_delta))
+        return max(0, int(raw_delta)), accumulated + max(0, int(raw_delta)), True
+
+    # --- got < last: blip vs real remote reset ---
+    # Zero / near-zero while watermark is healthy: NEVER collapse last_remote_raw.
+    # Real resets are detected when usage climbs again from a non-trivial value
+    # below the old watermark (got > blip ceiling).
+    if last_i > 0 and (
+        got_i == 0
+        or (got_i <= _METER_BLIP_MAX and last_i > _METER_BLIP_MAX * 4)
+        or got_i >= int(last_i * _METER_JITTER_KEEP)
+    ):
+        return 0, accumulated, False
+
+    # Confirmed remote wipe / period reset — keep prior accumulated, count new.
+    raw_delta = got_i
+    return max(0, int(raw_delta)), accumulated + max(0, int(raw_delta)), True
 
 
 def _account_lookup_keys(
@@ -409,7 +424,9 @@ def _apply_got_to_account(
     from app.services.orchestrator import _norm_coeff
 
     got_i = max(0, int(got or 0))
-    raw_delta, new_acc = _high_water_delta(acc, got_i, allow_shrink=allow_shrink)
+    raw_delta, new_acc, touch_last = _high_water_delta(
+        acc, got_i, allow_shrink=allow_shrink
+    )
     c = _norm_coeff(
         getattr(acc, "applied_coefficient", None)
         if getattr(acc, "applied_coefficient", None) is not None
@@ -427,9 +444,8 @@ def _apply_got_to_account(
         dirty.add(int(acc.user_id))
         return 0
 
-    last_i = int(getattr(acc, "last_remote_raw", None) or 0)
-    # Zero blip: do not move last_remote_raw down to 0 (see _high_water_delta).
-    if got_i == 0 and last_i > 0:
+    # Blip / jitter: refresh sync stamp only — never lower the watermark.
+    if not touch_last:
         acc.last_sync_at = now
         return 0
 
@@ -648,7 +664,7 @@ async def apply_usage_map_to_panel(
             if int(sib.id) != aid:
                 targets.append(sib)
         got = int(got_raw)
-        for tgt in targets:
+        for ti, tgt in enumerate(targets):
             tid = int(tgt.id)
             if tid in seen_acc and tid != aid:
                 # Already processed via another meter key this wave.
@@ -658,6 +674,8 @@ async def apply_usage_map_to_panel(
             c = _norm_coeff(getattr(tgt, "applied_coefficient", None) or 1.0)
             before_used = int(tgt.used_traffic or 0)
             before_last = getattr(tgt, "last_remote_raw", None)
+            # Sibling rows share one remote counter — sync their raw watermark,
+            # but bump users.used_traffic only once (primary match).
             _apply_got_to_account(
                 tgt,
                 got,
@@ -665,7 +683,7 @@ async def apply_usage_map_to_panel(
                 dirty=dirty,
                 allow_shrink=allow_shrink,
                 coeff=c,
-                user_weighted_deltas=user_weighted,
+                user_weighted_deltas=user_weighted if ti == 0 else None,
             )
             if allow_shrink or int(tgt.used_traffic or 0) != before_used or (
                 getattr(tgt, "last_remote_raw", None) != before_last
@@ -2105,23 +2123,196 @@ async def activate_pending_with_usage(*, limit: int = 2000) -> dict[str, int]:
     return {"promoted": n}
 
 
+def is_nx_inflated_meter(accumulated: int, last_remote: int | None) -> bool:
+    """True when accumulated raw looks like false watermark re-adds.
+
+    Classic zero-blip bug: ``last_remote_raw`` stays on the current cycle while
+    ``used_traffic`` is re-added on every 0→N blip (exact 2×/3×/… or extreme
+    ratios like 100×+ that cannot be real panel resets).
+    """
+    last_i = int(last_remote or 0)
+    acc_i = int(accumulated or 0)
+    if last_i <= 0 or acc_i < last_i * 2:
+        return False
+    ratio = acc_i / float(last_i)
+    # Extreme multiples are virtually always false re-adds (hundreds of
+    # identical panel resets of the same watermark do not happen in practice).
+    if ratio >= 8.0 and last_i >= 10 * 1024 * 1024:  # ≥10MB watermark
+        return True
+    if last_i < 50 * 1024 * 1024:  # near-integer path needs ≥50MB
+        return False
+    k = int(round(ratio))
+    if k < 2:
+        return False
+    return abs(ratio - k) <= 0.10
+
+
+async def clamp_nx_inflated_panel_accounts(
+    *, limit: int = 20000
+) -> dict[str, Any]:
+    """Clamp panel_accounts hit by N× watermark re-add; return affected user ids.
+
+    Sets ``used_traffic = last_remote_raw`` when the ratio is a near-integer ≥2.
+    Fast SQL filter first; Python confirms the integer-multiple heuristic.
+    """
+    from sqlalchemy import text
+
+    lim = max(1, min(100000, int(limit)))
+    async with AsyncSessionLocal() as db:
+        rows = (
+            await db.execute(
+                text(
+                    """
+                    SELECT id, user_id, used_traffic, last_remote_raw
+                    FROM panel_accounts
+                    WHERE status IN ('active', 'error', 'pending')
+                      AND last_remote_raw IS NOT NULL
+                      AND last_remote_raw > :min_last
+                      AND used_traffic > last_remote_raw * 2
+                    ORDER BY used_traffic DESC
+                    LIMIT :lim
+                    """
+                ),
+                # 10MB floor so extreme-ratio victims with small watermarks
+                # (e.g. 0.5GB last × 1500) are still selected for Python check.
+                {"min_last": 10 * 1024 * 1024, "lim": lim},
+            )
+        ).mappings().all()
+
+        clamped = 0
+        user_ids: set[int] = set()
+        for r in rows:
+            acc = int(r["used_traffic"] or 0)
+            last = int(r["last_remote_raw"] or 0)
+            if not is_nx_inflated_meter(acc, last):
+                continue
+            await db.execute(
+                text(
+                    """
+                    UPDATE panel_accounts
+                    SET used_traffic = :last,
+                        coeff_anchor_raw = 0,
+                        coeff_anchor_weighted = 0
+                    WHERE id = :id
+                    """
+                ),
+                {"last": last, "id": int(r["id"])},
+            )
+            clamped += 1
+            user_ids.add(int(r["user_id"]))
+        await db.commit()
+    if clamped:
+        logger.warning(
+            "clamp_nx_inflated accounts=%s users=%s", clamped, len(user_ids)
+        )
+    return {"clamped": clamped, "user_ids": sorted(user_ids)}
+
+
+async def heal_nx_meter_inflation(*, limit: int = 20000) -> dict[str, int]:
+    """Clamp N×-inflated panel meters, recount victims, unfreeze if under quota."""
+    from app.services.orchestrator import (
+        enforce_user_quota,
+        recount_user_used_traffic,
+    )
+    from sqlalchemy import text
+
+    summary = await clamp_nx_inflated_panel_accounts(limit=limit)
+    user_ids = list(summary.get("user_ids") or [])
+    shrunk = 0
+    reactivated = 0
+    for uid in user_ids:
+        try:
+            async with AsyncSessionLocal() as db:
+                user, accounts = await _load_user_for_recount(db, int(uid))
+                if user is None:
+                    continue
+                before = int(user.used_traffic or 0)
+                # Clear sticky freeze so remotes can revive after recount.
+                await db.execute(
+                    text(
+                        """
+                        UPDATE panel_accounts
+                        SET error_message = NULL,
+                            status = CASE
+                              WHEN status = 'error' THEN 'active'
+                              ELSE status
+                            END
+                        WHERE user_id = :uid
+                          AND error_message = :mark
+                        """
+                    ),
+                    {"uid": int(uid), "mark": QUOTA_FROZEN_MARK},
+                )
+                after = await recount_user_used_traffic(
+                    db, user, accounts, allow_shrink=True
+                )
+                if after < before:
+                    shrunk += 1
+                changed = await enforce_user_quota(db, user)
+                if user.status == UserStatus.active:
+                    for acc in accounts:
+                        if (acc.error_message or "") == QUOTA_FROZEN_MARK:
+                            acc.error_message = None
+                    try:
+                        from app.services.worker_commands import clear_kill_cooldown
+
+                        clear_kill_cooldown(int(uid))
+                    except Exception:  # noqa: BLE001
+                        pass
+                await db.commit()
+                if changed and user.status == UserStatus.active:
+                    reactivated += 1
+                elif (
+                    user.status == UserStatus.limited
+                    and int(user.data_limit or 0) > 0
+                    and int(user.used_traffic or 0) < int(user.data_limit or 0)
+                ):
+                    user.status = UserStatus.active
+                    await db.commit()
+                    reactivated += 1
+        except Exception:  # noqa: BLE001
+            logger.warning("heal_nx user_id=%s failed", uid, exc_info=True)
+        await asyncio.sleep(0)
+    out = {
+        "clamped": int(summary.get("clamped") or 0),
+        "users": len(user_ids),
+        "shrunk": shrunk,
+        "reactivated": reactivated,
+    }
+    if out["clamped"] or out["users"]:
+        logger.warning(
+            "heal_nx_meter_inflation clamped=%s users=%s shrunk=%s reactivated=%s",
+            out["clamped"],
+            out["users"],
+            out["shrunk"],
+            out["reactivated"],
+        )
+    return out
+
+
 async def reconcile_inflated_used_traffic(
     *, limit: int = 500, gap_bytes: int = 50 * 1024 * 1024
 ) -> dict[str, int]:
     """Shrink inflated ``users.used_traffic`` to deduped Σ weighted meters.
 
-    Only shrinks when a majority of the user's live/pending-with-usage rows
-    have ``last_sync_at`` within 2h (avoids wiping totals while remotes are
-    stale). Deduped recount removes multi-group remote double-counts.
+    First heals panel-level N× watermark re-adds, then shrinks user totals when
+    a majority of live meters look fresh (≤2h). Deduped recount removes
+    multi-group remote double-counts.
     """
     from app.services.orchestrator import (
         enforce_user_quota,
         recount_user_used_traffic,
     )
 
+    nx = {"clamped": 0, "users": 0, "shrunk": 0, "reactivated": 0}
+    try:
+        nx = await heal_nx_meter_inflation(limit=max(2000, int(limit) * 20))
+    except Exception:  # noqa: BLE001
+        logger.warning("heal_nx_meter_inflation failed", exc_info=True)
+
     ids = await find_inflated_used_user_ids(limit=limit, gap_bytes=gap_bytes)
-    shrunk = 0
-    reactivated = 0
+    shrunk = int(nx.get("shrunk") or 0)
+    reactivated = int(nx.get("reactivated") or 0)
     skipped_stale = 0
     for uid in ids:
         try:
@@ -2158,13 +2349,18 @@ async def reconcile_inflated_used_traffic(
             )
         await asyncio.sleep(0)
     logger.info(
-        "reconcile_inflated candidates=%s shrunk=%s reactivated=%s skipped_stale=%s",
+        "reconcile_inflated nx_clamped=%s nx_users=%s candidates=%s "
+        "shrunk=%s reactivated=%s skipped_stale=%s",
+        int(nx.get("clamped") or 0),
+        int(nx.get("users") or 0),
         len(ids),
         shrunk,
         reactivated,
         skipped_stale,
     )
     return {
+        "nx_clamped": int(nx.get("clamped") or 0),
+        "nx_users": int(nx.get("users") or 0),
         "candidates": len(ids),
         "shrunk": shrunk,
         "reactivated": reactivated,
