@@ -12,9 +12,12 @@ from app.core.database import get_db
 from app.models.admin import Admin
 from app.schemas.workers import (
     WorkerAssignPanels,
+    WorkerBulkCreate,
+    WorkerBulkCreateResponse,
     WorkerCreate,
     WorkerHeartbeatIn,
     WorkerOut,
+    WorkerProbeResult,
     WorkerReinstall,
     WorkerUpdate,
     WorkerUsageReport,
@@ -46,6 +49,38 @@ async def create_worker_api(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "WORKER_INVALID", "message": str(exc)},
         ) from exc
+
+
+@router.post("/api/admin/workers/bulk", response_model=WorkerBulkCreateResponse)
+async def create_workers_bulk_api(
+    body: WorkerBulkCreate,
+    db: AsyncSession = Depends(get_db),
+    _admin: Admin = Depends(get_session_admin_only),
+):
+    """Create several workers at once (parallel auto-install) + optional balance."""
+    try:
+        return await ops.create_workers_bulk(db, body)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "WORKER_BULK_INVALID", "message": str(exc)},
+        ) from exc
+
+
+@router.post("/api/admin/workers/balance-panels")
+async def balance_panels_api(
+    db: AsyncSession = Depends(get_db),
+    _admin: Admin = Depends(get_session_admin_only),
+):
+    """Evenly redistribute active non-Astra panels across active workers."""
+    try:
+        balanced = await ops.balance_panels_across_workers(db)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "WORKER_BALANCE", "message": str(exc)},
+        ) from exc
+    return {"ok": True, "balanced": balanced}
 
 
 @router.post("/api/admin/workers/{worker_id}/reinstall", response_model=WorkerOut)
@@ -134,22 +169,17 @@ async def rotate_token_api(
         raise HTTPException(status_code=404, detail="Worker not found") from exc
 
 
-@router.post("/api/admin/workers/{worker_id}/probe")
+@router.post("/api/admin/workers/{worker_id}/probe", response_model=WorkerProbeResult)
 async def probe_worker_api(
     worker_id: int,
     db: AsyncSession = Depends(get_db),
     _admin: Admin = Depends(get_session_admin_only),
 ):
-    w = await ops.get_worker(db, worker_id)
-    if w is None:
-        raise HTTPException(status_code=404, detail="Worker not found")
-    stats = await ops.probe_all_workers(db)
-    fresh = await ops.get_worker(db, worker_id)
-    return {
-        "ok": True,
-        "worker": ops.to_out(fresh) if fresh else None,
-        "fleet": stats,
-    }
+    """Accurate agent + SSH TCP probe — returns the real reason if offline."""
+    try:
+        return await ops.probe_one_worker(db, worker_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Worker not found") from exc
 
 
 @router.post("/api/admin/workers/{worker_id}/sync")

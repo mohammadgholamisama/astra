@@ -6,6 +6,7 @@ import {
   KeyRound,
   Link2,
   Megaphone,
+  Pencil,
   Plus,
   RotateCcw,
   Save,
@@ -121,6 +122,20 @@ type WorkerNode = {
   install_ok?: boolean | null;
   install_log?: string | null;
   message?: string | null;
+};
+
+type WorkerProbeResult = {
+  ok: boolean;
+  worker_id: number;
+  name: string;
+  status: string;
+  agent_ok: boolean;
+  agent_error?: string | null;
+  agent_latency_ms?: number | null;
+  ssh_tcp_ok?: boolean | null;
+  last_error?: string | null;
+  message: string;
+  worker?: WorkerNode | null;
 };
 
 type PanelBrief = { id: number; name: string; type: string; is_active: boolean };
@@ -317,6 +332,14 @@ export default function SettingsPage() {
   const [assignWorker, setAssignWorker] = useState<WorkerNode | null>(null);
   const [reinstallWorker, setReinstallWorker] = useState<WorkerNode | null>(null);
   const [reinstallPass, setReinstallPass] = useState("");
+  const [editWorker, setEditWorker] = useState<WorkerNode | null>(null);
+  const [editWorkerName, setEditWorkerName] = useState("");
+  const [bulkWorkerOpen, setBulkWorkerOpen] = useState(false);
+  const [bulkWorkerText, setBulkWorkerText] = useState("");
+  const [workerActionMsg, setWorkerActionMsg] = useState<{
+    type: "ok" | "err";
+    text: string;
+  } | null>(null);
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["site-settings"],
@@ -438,8 +461,113 @@ export default function SettingsPage() {
 
   const probeWorker = useMutation({
     mutationFn: (id: number) =>
-      api(`/api/admin/workers/${id}/probe`, { method: "POST" }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["workers"] }),
+      api<WorkerProbeResult>(`/api/admin/workers/${id}/probe`, {
+        method: "POST",
+        timeoutMs: 30_000,
+      }),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["workers"] });
+      setWorkerActionMsg({
+        type: res.ok ? "ok" : "err",
+        text: res.message || (res.ok ? "آنلاین" : "قطع"),
+      });
+    },
+    onError: (e) => {
+      setWorkerActionMsg({
+        type: "err",
+        text: e instanceof Error ? e.message : "تست ناموفق",
+      });
+    },
+  });
+
+  const renameWorker = useMutation({
+    mutationFn: ({ id, name }: { id: number; name: string }) =>
+      api<WorkerNode>(`/api/admin/workers/${id}`, {
+        method: "PUT",
+        body: JSON.stringify({ name }),
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["workers"] });
+      setEditWorker(null);
+      setEditWorkerName("");
+      setWorkerActionMsg({ type: "ok", text: "نام ورکر ذخیره شد" });
+    },
+    onError: (e) => {
+      setWorkerActionMsg({
+        type: "err",
+        text: e instanceof Error ? e.message : "تغییر نام ناموفق",
+      });
+    },
+  });
+
+  const bulkCreateWorkers = useMutation({
+    mutationFn: (workers: {
+      name: string;
+      ssh_host: string;
+      ssh_user: string;
+      ssh_password: string;
+      ssh_port?: number;
+      listen_port?: number;
+    }[]) =>
+      api<{
+        created: WorkerNode[];
+        failed: { name: string; ssh_host: string; message: string }[];
+        message: string;
+      }>("/api/admin/workers/bulk", {
+        method: "POST",
+        timeoutMs: 120_000,
+        body: JSON.stringify({
+          workers,
+          auto_install: true,
+          balance_panels: true,
+        }),
+      }),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["workers"] });
+      setBulkWorkerOpen(false);
+      setBulkWorkerText("");
+      const failN = res.failed?.length || 0;
+      setWorkerActionMsg({
+        type: failN ? "err" : "ok",
+        text:
+          res.message ||
+          `${toFaDigits(res.created?.length || 0)} ورکر · ${toFaDigits(failN)} خطا`,
+      });
+      if (res.created?.[0]) setCreatedWorker(res.created[0]);
+    },
+    onError: (e) => {
+      setWorkerActionMsg({
+        type: "err",
+        text: e instanceof Error ? e.message : "ساخت گروهی ناموفق",
+      });
+    },
+  });
+
+  const balanceWorkers = useMutation({
+    mutationFn: () =>
+      api<{ ok: boolean; balanced: Record<string, number[]> }>(
+        "/api/admin/workers/balance-panels",
+        { method: "POST", timeoutMs: 60_000 }
+      ),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["workers"] });
+      const n = Object.values(res.balanced || {}).reduce(
+        (a, ids) => a + (ids?.length || 0),
+        0
+      );
+      setWorkerActionMsg({
+        type: "ok",
+        text: `پنل‌ها تقسیم شد — ${toFaDigits(n)} پنل روی ${toFaDigits(
+          Object.keys(res.balanced || {}).length
+        )} ورکر`,
+      });
+    },
+    onError: (e) => {
+      setWorkerActionMsg({
+        type: "err",
+        text: e instanceof Error ? e.message : "تقسیم پنل ناموفق",
+      });
+    },
   });
 
   const saveAssign = useMutation({
@@ -453,6 +581,44 @@ export default function SettingsPage() {
       setAssignWorker(null);
     },
   });
+
+  function parseBulkWorkerLines(raw: string) {
+    const out: {
+      name: string;
+      ssh_host: string;
+      ssh_user: string;
+      ssh_password: string;
+    }[] = [];
+    for (const line of raw.split(/\r?\n/)) {
+      const t = line.trim();
+      if (!t || t.startsWith("#")) continue;
+      const parts = t.split(/[|\t,]+/).map((x) => x.trim()).filter(Boolean);
+      // name|ip|user|pass  OR  name|ip|pass  OR  ip|pass
+      if (parts.length >= 4) {
+        out.push({
+          name: parts[0],
+          ssh_host: parts[1],
+          ssh_user: parts[2] || "root",
+          ssh_password: parts[3],
+        });
+      } else if (parts.length === 3) {
+        out.push({
+          name: parts[0],
+          ssh_host: parts[1],
+          ssh_user: "root",
+          ssh_password: parts[2],
+        });
+      } else if (parts.length === 2) {
+        out.push({
+          name: `Worker-${parts[0]}`,
+          ssh_host: parts[0],
+          ssh_user: "root",
+          ssh_password: parts[1],
+        });
+      }
+    }
+    return out;
+  }
 
   const createKey = useMutation({
     mutationFn: () =>
@@ -1137,6 +1303,22 @@ export default function SettingsPage() {
               <span className="muted">{toFaDigits(workers.length)} سرور</span>
               <button
                 type="button"
+                className="btn ghost sm"
+                disabled={balanceWorkers.isPending || workers.length < 2}
+                onClick={() => balanceWorkers.mutate()}
+                title="تقسیم یکنواخت پنل‌ها بین ورکرها"
+              >
+                {balanceWorkers.isPending ? "…" : "تقسیم پنل‌ها"}
+              </button>
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() => setBulkWorkerOpen(true)}
+              >
+                چندتایی
+              </button>
+              <button
+                type="button"
                 className="btn toolbar-primary"
                 onClick={() => setWorkerOpen(true)}
               >
@@ -1144,6 +1326,15 @@ export default function SettingsPage() {
                 افزودن سرور
               </button>
             </div>
+
+            {workerActionMsg ? (
+              <p
+                className={workerActionMsg.type === "ok" ? "ok" : "error"}
+                style={{ margin: "0 0 12px" }}
+              >
+                {workerActionMsg.text}
+              </p>
+            ) : null}
 
             {workersLoading ? (
               <p className="muted">در حال بارگذاری…</p>
@@ -1161,6 +1352,7 @@ export default function SettingsPage() {
                         <b>{w.name}</b>
                         <span className="groups-row-desc" dir="ltr">
                           {w.base_url}
+                          {w.ssh_host ? ` · ssh ${w.ssh_user || "root"}@${w.ssh_host}` : ""}
                         </span>
                       </div>
                       <div className="groups-row-meta">
@@ -1186,14 +1378,37 @@ export default function SettingsPage() {
                           <span className="badge err">غیرفعال</span>
                         ) : null}
                       </div>
+                      {w.last_error ? (
+                        <p
+                          className="muted"
+                          style={{ margin: "6px 0 0", fontSize: 12, lineHeight: 1.45 }}
+                          dir="auto"
+                          title={w.last_error}
+                        >
+                          {w.last_error}
+                        </p>
+                      ) : null}
                     </div>
                     <div className="groups-row-actions">
                       <button
                         type="button"
                         className="btn ghost sm"
+                        disabled={probeWorker.isPending}
                         onClick={() => probeWorker.mutate(w.id)}
+                        title="تست دقیق agent و پورت SSH"
                       >
-                        تست
+                        {probeWorker.isPending ? "…" : "تست"}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn ghost sm"
+                        onClick={() => {
+                          setEditWorker(w);
+                          setEditWorkerName(w.name);
+                        }}
+                        title="ویرایش نام"
+                      >
+                        <Pencil size={14} />
                       </button>
                       <button
                         type="button"
@@ -1781,6 +1996,163 @@ export default function SettingsPage() {
                 onClick={() => reinstallMut.mutate()}
               >
                 {reinstallMut.isPending ? "…" : "نصب مجدد"}
+              </button>
+            </footer>
+          </div>
+        </div>
+      )}
+
+      {editWorker && (
+        <div
+          className="modal-backdrop"
+          onClick={() => !renameWorker.isPending && setEditWorker(null)}
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <header className="modal-head">
+              <div>
+                <h3>ویرایش نام ورکر</h3>
+                <p className="modal-sub" dir="ltr">
+                  {editWorker.ssh_host || editWorker.base_url}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setEditWorker(null)}
+                aria-label="بستن"
+              >
+                ×
+              </button>
+            </header>
+            <div className="field">
+              <label>نام نمایشی</label>
+              <input
+                required
+                minLength={2}
+                value={editWorkerName}
+                onChange={(e) => setEditWorkerName(e.target.value)}
+                disabled={renameWorker.isPending}
+              />
+            </div>
+            {renameWorker.isError && (
+              <p className="error">{(renameWorker.error as Error).message}</p>
+            )}
+            <footer className="modal-foot">
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={renameWorker.isPending}
+                onClick={() => setEditWorker(null)}
+              >
+                انصراف
+              </button>
+              <button
+                type="button"
+                className="btn"
+                disabled={
+                  renameWorker.isPending || editWorkerName.trim().length < 2
+                }
+                onClick={() =>
+                  renameWorker.mutate({
+                    id: editWorker.id,
+                    name: editWorkerName.trim(),
+                  })
+                }
+              >
+                {renameWorker.isPending ? "…" : "ذخیره"}
+              </button>
+            </footer>
+          </div>
+        </div>
+      )}
+
+      {bulkWorkerOpen && (
+        <div
+          className="modal-backdrop"
+          onClick={() =>
+            !bulkCreateWorkers.isPending && setBulkWorkerOpen(false)
+          }
+        >
+          <div
+            className="modal worker-modal"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <header className="modal-head worker-modal-head">
+              <div className="worker-modal-title">
+                <span className="worker-modal-icon" aria-hidden>
+                  <Server size={20} />
+                </span>
+                <div>
+                  <h3>افزودن چند Worker</h3>
+                  <p className="modal-sub">
+                    هر خط یک سرور — بعد از نصب، پنل‌ها خودکار تقسیم می‌شوند
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setBulkWorkerOpen(false)}
+                aria-label="بستن"
+              >
+                ×
+              </button>
+            </header>
+            <div className="field">
+              <label>لیست سرورها</label>
+              <textarea
+                dir="ltr"
+                rows={8}
+                value={bulkWorkerText}
+                onChange={(e) => setBulkWorkerText(e.target.value)}
+                disabled={bulkCreateWorkers.isPending}
+                placeholder={
+                  "DE-Hetzner-P4|78.18.14.169|root|password\n" +
+                  "FI-Hetzner-P4T|5.222.24.95|root|password\n" +
+                  "FI-HostVDS|185.179.153.78|password"
+                }
+                style={{ fontFamily: "ui-monospace, monospace", width: "100%" }}
+              />
+              <p className="field-hint">
+                فرمت: <code>نام|IP|یوزر|رمز</code> یا{" "}
+                <code>نام|IP|رمز</code> یا <code>IP|رمز</code>
+              </p>
+            </div>
+            {bulkCreateWorkers.isPending && (
+              <p className="worker-modal-pending">
+                در حال ساخت و نصب… نصب هر سرور ممکن است چند دقیقه طول بکشد
+              </p>
+            )}
+            {bulkCreateWorkers.isError && (
+              <p className="error">
+                {(bulkCreateWorkers.error as Error).message}
+              </p>
+            )}
+            <footer className="modal-foot">
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={bulkCreateWorkers.isPending}
+                onClick={() => setBulkWorkerOpen(false)}
+              >
+                انصراف
+              </button>
+              <button
+                type="button"
+                className="btn"
+                disabled={
+                  bulkCreateWorkers.isPending ||
+                  parseBulkWorkerLines(bulkWorkerText).length < 1
+                }
+                onClick={() =>
+                  bulkCreateWorkers.mutate(parseBulkWorkerLines(bulkWorkerText))
+                }
+              >
+                {bulkCreateWorkers.isPending
+                  ? "در حال نصب…"
+                  : `ساخت ${toFaDigits(
+                      parseBulkWorkerLines(bulkWorkerText).length
+                    )} ورکر`}
               </button>
             </footer>
           </div>

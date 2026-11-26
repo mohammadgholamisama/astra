@@ -149,6 +149,103 @@ async def ssh_install_worker(
     )
 
 
+async def ssh_probe(
+    *,
+    host: str,
+    username: str = "root",
+    password: str = "",
+    ssh_port: int = 22,
+    timeout: float = 20.0,
+) -> tuple[bool, str]:
+    """TCP + password SSH check with a clear Persian/English error.
+
+    Does not install anything — used by admin «تست» and preflight before install.
+    """
+    host = _sanitize_host(host)
+    user = (username or "root").strip() or "root"
+    if not host:
+        return False, "آدرس/IP خالی است"
+    # Fast TCP first — avoids long ssh hangs on dead hosts.
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, int(ssh_port)),
+            timeout=min(8.0, max(2.0, timeout / 2)),
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:  # noqa: BLE001
+            pass
+        del reader
+    except Exception as exc:  # noqa: BLE001
+        return False, f"پورت SSH ({ssh_port}) بسته/unreachable: {exc}"[:220]
+
+    if not (password or "").strip():
+        return True, f"TCP:{ssh_port} باز است — رمز برای تست کامل لازم است"
+
+    await ensure_sshpass_installed()
+    cmd = [
+        "sshpass",
+        "-e",
+        "ssh",
+        "-4",
+        "-p",
+        str(int(ssh_port)),
+        "-o",
+        "PreferredAuthentications=password",
+        "-o",
+        "PubkeyAuthentication=no",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ConnectTimeout=12",
+        "-o",
+        "NumberOfPasswordPrompts=1",
+        "-o",
+        "BatchMode=no",
+        f"{user}@{host}",
+        "echo ASTRA_SSH_OK; hostname; uptime -p 2>/dev/null || uptime",
+    ]
+    env = dict(**{k: v for k, v in __import__("os").environ.items()})
+    env["SSHPASS"] = password
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=env,
+        )
+        out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except FileNotFoundError:
+        return False, "sshpass روی مستر نصب نیست"
+    except asyncio.TimeoutError:
+        return False, f"تایم‌اوت SSH بعد از {int(timeout)}s"
+    log = (out_b or b"").decode("utf-8", "replace")
+    if password and password in log:
+        log = log.replace(password, "***")
+    low = log.lower()
+    if proc.returncode == 0 and "ASTRA_SSH_OK" in log:
+        host_line = next(
+            (
+                ln.strip()
+                for ln in log.splitlines()
+                if ln.strip() and "ASTRA_SSH_OK" not in ln
+            ),
+            "",
+        )
+        return True, (f"SSH OK — {host_line}" if host_line else "SSH OK")[:240]
+    if "password change required" in low or "password has expired" in low:
+        return (
+            False,
+            "رمز SSH منقضی شده — باید عوض شود (Password change required)",
+        )
+    if "permission denied" in low or "authentication failed" in low:
+        return False, "یوزر/رمز SSH اشتباه است (Authentication failed)"
+    if "connection refused" in low:
+        return False, "SSH Connection refused"
+    return False, (log.strip() or f"ssh exit={proc.returncode}")[-280:]
+
+
 async def ensure_sshpass_installed() -> bool:
     """Best-effort: install sshpass on the master if missing."""
     which = await asyncio.create_subprocess_exec(

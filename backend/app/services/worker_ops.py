@@ -17,9 +17,13 @@ from app.core.config import get_settings
 from app.models.panel import Panel
 from app.models.worker import WorkerNode
 from app.schemas.workers import (
+    WorkerBulkCreate,
+    WorkerBulkCreateResponse,
+    WorkerBulkFail,
     WorkerCreate,
     WorkerOut,
     WorkerPanelBrief,
+    WorkerProbeResult,
     WorkerUpdate,
     WorkerUsageReport,
 )
@@ -756,6 +760,35 @@ async def create_worker(db: AsyncSession, body: WorkerCreate) -> WorkerOut:
             install_ok = False
             install_log = message
         else:
+            # Preflight SSH so UI sees a clear error instead of fake «قطع».
+            from app.services.worker_install import ssh_probe
+
+            ssh_ok, ssh_detail = await ssh_probe(
+                host=host,
+                username=user,
+                password=body.ssh_password,
+                ssh_port=int(body.ssh_port or 22),
+            )
+            if not ssh_ok:
+                worker.status = "offline"
+                worker.last_error = ssh_detail[:400]
+                meta = dict(worker.meta or {})
+                meta["install_ok"] = False
+                meta["install_log"] = ssh_detail[:2000]
+                meta["installing"] = False
+                worker.meta = meta
+                await db.commit()
+                fresh = await get_worker(db, wid)
+                assert fresh is not None
+                return to_out(
+                    fresh,
+                    token=token,
+                    include_install=True,
+                    install_ok=False,
+                    install_log=ssh_detail,
+                    message=f"SSH ناموفق — {ssh_detail}",
+                )
+
             import asyncio
 
             pwd = body.ssh_password
@@ -787,6 +820,7 @@ async def create_worker(db: AsyncSession, body: WorkerCreate) -> WorkerOut:
                         meta = dict(wrow.meta or {})
                         meta["install_log"] = (result.log or "")[-3500:]
                         meta["install_ok"] = bool(result.ok)
+                        meta["installing"] = False
                         wrow.meta = meta
                         if result.ok:
                             wrow.status = "online"
@@ -826,6 +860,7 @@ async def create_worker(db: AsyncSession, body: WorkerCreate) -> WorkerOut:
                                 wrow.last_error = "auto-install crashed"
                                 meta = dict(wrow.meta or {})
                                 meta["install_ok"] = False
+                                meta["installing"] = False
                                 wrow.meta = meta
                                 await s3.commit()
                     except Exception:  # noqa: BLE001
@@ -1216,6 +1251,119 @@ async def bootstrap_worker_routes(db: AsyncSession) -> int:
     return n
 
 
+async def probe_one_worker(
+    db: AsyncSession,
+    worker_id: int,
+    *,
+    ssh_password: str | None = None,
+    ssh_port: int | None = None,
+) -> WorkerProbeResult:
+    """Accurate single-worker probe: agent /health + optional SSH check.
+
+    Updates ``status`` / ``last_error`` so UI never shows stale «قطع» when the
+    agent is fine, and surfaces the real reason when it is not.
+    """
+    from app.services.worker_install import ssh_probe
+
+    worker = await get_worker(db, worker_id)
+    if worker is None:
+        raise LookupError("worker not found")
+
+    token = wc.peek_raw_token(int(worker.id)) or str(
+        (worker.meta or {}).get("agent_token") or ""
+    )
+    agent_ok = False
+    agent_err: str | None = None
+    latency_ms: int | None = None
+    if not worker.is_active:
+        agent_err = "Worker غیرفعال است"
+    elif not token:
+        agent_err = "توکن Worker موجود نیست — نصب مجدد یا Rotate"
+    else:
+        wc.register_worker_route(
+            int(worker.id),
+            str(worker.base_url),
+            token,
+            active=True,
+        )
+        t0 = time.monotonic()
+        agent_ok, raw_err = await wc.ping_worker(
+            base_url=str(worker.base_url), token=token, timeout=6.0
+        )
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        if not agent_ok:
+            agent_err = (raw_err or "agent unreachable")[:400]
+        wc.mark_worker_health(int(worker.id), agent_ok, agent_err)
+
+    ssh_tcp_ok: bool | None = None
+    ssh_ok: bool | None = None
+    ssh_err: str | None = None
+    host = (worker.ssh_host or "").strip()
+    if host:
+        try:
+            port = int(ssh_port or 22)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=5.0
+            )
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+            del reader
+            ssh_tcp_ok = True
+        except Exception as exc:  # noqa: BLE001
+            ssh_tcp_ok = False
+            ssh_err = f"SSH TCP بسته: {exc}"[:220]
+        if ssh_tcp_ok and (ssh_password or "").strip():
+            ssh_ok, ssh_detail = await ssh_probe(
+                host=host,
+                username=(worker.ssh_user or "root"),
+                password=ssh_password or "",
+                ssh_port=int(ssh_port or 22),
+            )
+            if not ssh_ok:
+                ssh_err = ssh_detail
+            else:
+                ssh_err = None
+
+    if agent_ok:
+        status = "online"
+        worker.status = status
+        worker.last_seen_at = datetime.now(timezone.utc)
+        worker.last_error = None
+        msg = f"آنلاین — agent سالم ({latency_ms or 0}ms)"
+    else:
+        status = "offline" if worker.is_active else "unknown"
+        worker.status = status
+        detail = agent_err or "agent down"
+        if ssh_tcp_ok is True and not agent_ok:
+            detail = f"{detail} · SSH پورت باز است (agent نصب/اجرا نشده؟)"
+        if ssh_err and ssh_tcp_ok is False:
+            detail = f"{detail} · {ssh_err}"
+        elif ssh_err and ssh_ok is False:
+            detail = f"{detail} · {ssh_err}"
+        worker.last_error = detail[:400]
+        msg = f"قطع — {detail}"
+    await db.commit()
+    fresh = await get_worker(db, worker_id)
+    return WorkerProbeResult(
+        ok=bool(agent_ok),
+        worker_id=int(worker_id),
+        name=str(worker.name),
+        status=status,
+        agent_ok=bool(agent_ok),
+        agent_error=agent_err,
+        agent_latency_ms=latency_ms,
+        ssh_tcp_ok=ssh_tcp_ok,
+        ssh_ok=ssh_ok,
+        ssh_error=ssh_err,
+        last_error=(fresh.last_error if fresh else worker.last_error),
+        message=msg[:400],
+        worker=to_out(fresh) if fresh else None,
+    )
+
+
 async def probe_all_workers(db: AsyncSession | None = None) -> dict[str, int]:
     """Ping workers without holding a DB session across HTTP awaits.
 
@@ -1284,6 +1432,188 @@ async def probe_all_workers(db: AsyncSession | None = None) -> dict[str, int]:
                     worker.last_error = err
             await write_db.commit()
     return {"online": online, "offline": offline, "total": len(snap)}
+
+
+async def balance_panels_across_workers(
+    db: AsyncSession,
+    *,
+    worker_ids: list[int] | None = None,
+) -> dict[str, list[int]]:
+    """Evenly distribute active non-Astra panels across workers.
+
+    Prefers name affinity (Panel(N)-Direct/Tunnel → same bucket when possible)
+    then round-robin fill so load stays even.
+    """
+    from app.models.panel import PanelType
+
+    q = (
+        select(WorkerNode)
+        .where(WorkerNode.is_active.is_(True))
+        .options(selectinload(WorkerNode.panels))
+        .order_by(WorkerNode.id.asc())
+    )
+    workers = list((await db.execute(q)).scalars().unique().all())
+    if worker_ids:
+        want = {int(x) for x in worker_ids}
+        workers = [w for w in workers if int(w.id) in want]
+    if not workers:
+        return {}
+
+    panels = list(
+        (
+            await db.execute(
+                select(Panel)
+                .where(
+                    Panel.is_active.is_(True),
+                    Panel.type != PanelType.astra,
+                )
+                .order_by(Panel.id.asc())
+            )
+        ).scalars().all()
+    )
+    if not panels:
+        return {str(w.name): [] for w in workers}
+
+    # Clear then reassign for a clean exclusive mapping.
+    await db.execute(
+        update(Panel)
+        .where(Panel.id.in_([int(p.id) for p in panels]))
+        .values(worker_id=None)
+    )
+
+    buckets: dict[int, list[int]] = {int(w.id): [] for w in workers}
+    cap = max(1, (len(panels) + len(workers) - 1) // len(workers) + 1)
+
+    def _kind(text: str) -> str:
+        t = (text or "").lower()
+        if "tunnel" in t or "تونل" in t or "تانل" in t:
+            return "tunnel"
+        if "direct" in t or "مستقیم" in t:
+            return "direct"
+        return "other"
+
+    def _panel_num(text: str) -> int | None:
+        import re
+
+        m = re.search(r"panel\s*\(\s*(\d+)\s*\)", (text or "").lower())
+        if m:
+            return int(m.group(1))
+        m = re.search(r"(?:^|[^0-9])p(\d+)(?:[^0-9]|$)", (text or "").lower())
+        return int(m.group(1)) if m else None
+
+    remaining = list(panels)
+    # Pass 1: same panel number + same kind (Direct/Tunnel) as worker name.
+    kept: list[Panel] = []
+    for p in remaining:
+        pname = p.name or ""
+        pnum = _panel_num(pname)
+        pkind = _kind(pname)
+        best = None
+        for w in workers:
+            if len(buckets[int(w.id)]) >= cap:
+                continue
+            wname = w.name or ""
+            wnum = _panel_num(wname)
+            wkind = _kind(wname)
+            if pnum is not None and wnum == pnum and pkind == wkind and pkind != "other":
+                best = w
+                break
+        if best is not None:
+            buckets[int(best.id)].append(int(p.id))
+        else:
+            kept.append(p)
+    remaining = kept
+
+    # Pass 2: same panel number (any kind).
+    kept = []
+    for p in remaining:
+        pnum = _panel_num(p.name or "")
+        best = None
+        for w in workers:
+            if len(buckets[int(w.id)]) >= cap:
+                continue
+            if pnum is not None and _panel_num(w.name or "") == pnum:
+                best = w
+                break
+        if best is not None:
+            buckets[int(best.id)].append(int(p.id))
+        else:
+            kept.append(p)
+    remaining = kept
+
+    # Pass 3: round-robin leftovers onto lightest workers.
+    for p in remaining:
+        order = sorted(workers, key=lambda ww: len(buckets[int(ww.id)]))
+        buckets[int(order[0].id)].append(int(p.id))
+
+    out: dict[str, list[int]] = {}
+    for w in workers:
+        ids = buckets[int(w.id)]
+        await _set_panel_ids(db, int(w.id), ids)
+        out[str(w.name)] = ids
+    await db.commit()
+
+    # Push assignments best-effort (online agents pick up; offline failover stays local).
+    for w in workers:
+        try:
+            await sync_assignments_to_worker(db, int(w.id))
+        except Exception:  # noqa: BLE001
+            logger.debug("balance sync soft-fail worker=%s", w.id, exc_info=True)
+    return out
+
+
+async def create_workers_bulk(
+    db: AsyncSession, body: WorkerBulkCreate
+) -> WorkerBulkCreateResponse:
+    """Create many workers (install in bg each), optionally balance panels."""
+    created: list[WorkerOut] = []
+    failed: list[WorkerBulkFail] = []
+    for item in body.workers:
+        try:
+            one = WorkerCreate(
+                name=item.name,
+                ssh_host=item.ssh_host,
+                ssh_user=item.ssh_user,
+                ssh_password=item.ssh_password,
+                ssh_port=item.ssh_port,
+                listen_port=item.listen_port,
+                panel_ids=[],
+                auto_install=bool(body.auto_install),
+            )
+            out = await create_worker(db, one)
+            created.append(out)
+        except Exception as exc:  # noqa: BLE001
+            failed.append(
+                WorkerBulkFail(
+                    name=item.name,
+                    ssh_host=item.ssh_host,
+                    message=str(exc)[:300],
+                )
+            )
+    balanced: dict[str, list[int]] = {}
+    if body.balance_panels and created:
+        try:
+            # Include pre-existing active workers so load spreads fleet-wide.
+            balanced = await balance_panels_across_workers(db)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("bulk balance failed")
+            failed.append(
+                WorkerBulkFail(
+                    name="balance",
+                    message=f"توزیع پنل ناموفق: {exc}"[:300],
+                )
+            )
+    msg_parts = [f"{len(created)} ورکر ساخته شد"]
+    if failed:
+        msg_parts.append(f"{len(failed)} ناموفق")
+    if balanced:
+        msg_parts.append("پنل‌ها تقسیم شدند")
+    return WorkerBulkCreateResponse(
+        created=created,
+        failed=failed,
+        balanced=balanced,
+        message=" — ".join(msg_parts),
+    )
 
 
 async def sync_assignments_to_worker(
