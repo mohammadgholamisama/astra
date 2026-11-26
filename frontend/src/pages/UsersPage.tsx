@@ -1,4 +1,11 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import {
+  CSSProperties,
+  FormEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
@@ -2231,14 +2238,16 @@ export default function UsersPage() {
                     aria-valuenow={pct == null ? undefined : pct}
                     title={pct == null ? undefined : `${pct}%`}
                   >
-                    <div
+                    <span
                       className={`user-bar-fill ${barTone}${pct != null && pct > 0 ? " has-use" : ""}`}
-                      style={{
-                        width:
-                          pct == null
-                            ? "0%"
-                            : `${Math.min(100, Math.max(0, pct))}%`,
-                      }}
+                      style={
+                        {
+                          ["--bar-pct"]:
+                            pct == null
+                              ? "0%"
+                              : `${Math.min(100, Math.max(0, pct))}%`,
+                        } as CSSProperties
+                      }
                     />
                   </div>
                   <div className="user-card-usage-remain">
