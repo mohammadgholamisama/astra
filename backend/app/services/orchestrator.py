@@ -2997,6 +2997,164 @@ async def drain_pending_panel_accounts(
     return {"queued": len(ids), "ok_now": ok_now}
 
 
+async def find_incomplete_coverage_user_ids(*, limit: int = 200) -> list[int]:
+    """Users whose groups need more distinct active panels than they have rows.
+
+    Critical: prior heal SQL only found sticky pending/error among *existing*
+    rows. Users stuck at ۲۱/۳۲ with no missing-row pending never got selected,
+    so coverage heal looked idle while thousands of slots stayed empty forever.
+    """
+    from sqlalchemy import text
+
+    from app.core.database import AsyncSessionLocal
+
+    lim = max(1, min(5000, int(limit)))
+    async with AsyncSessionLocal() as db:
+        rows = await db.execute(
+            text(
+                """
+                SELECT u.id
+                FROM users u
+                WHERE u.status IN ('active', 'on_hold')
+                  AND (
+                    SELECT count(DISTINCT gp.panel_id)
+                    FROM user_groups ug
+                    JOIN group_panels gp ON gp.group_id = ug.group_id
+                    JOIN panels p ON p.id = gp.panel_id AND p.is_active IS TRUE
+                    WHERE ug.user_id = u.id
+                  ) > (
+                    SELECT count(DISTINCT pa.panel_id)
+                    FROM panel_accounts pa
+                    JOIN panels p2 ON p2.id = pa.panel_id AND p2.is_active IS TRUE
+                    WHERE pa.user_id = u.id
+                      AND pa.status IN ('active', 'error', 'pending')
+                  )
+                ORDER BY (
+                  (
+                    SELECT count(DISTINCT gp.panel_id)
+                    FROM user_groups ug
+                    JOIN group_panels gp ON gp.group_id = ug.group_id
+                    JOIN panels p ON p.id = gp.panel_id AND p.is_active IS TRUE
+                    WHERE ug.user_id = u.id
+                  ) - (
+                    SELECT count(DISTINCT pa.panel_id)
+                    FROM panel_accounts pa
+                    JOIN panels p2 ON p2.id = pa.panel_id AND p2.is_active IS TRUE
+                    WHERE pa.user_id = u.id
+                      AND pa.status IN ('active', 'error', 'pending')
+                  )
+                ) DESC,
+                u.id DESC
+                LIMIT :lim
+                """
+            ),
+            {"lim": lim},
+        )
+        ids = [int(r[0]) for r in rows.all() if r[0]]
+        await db.rollback()
+    return ids
+
+
+async def seed_missing_coverage_pendings(*, limit_slots: int = 4000) -> int:
+    """Insert/revive pending PanelAccount rows for missing group×panel slots.
+
+    Without this, drain_pending has nothing to chew — missing panels never
+    appear as pending, so workers never create them. Deleted twins must be
+    revived (unique uq_user_panel_group) instead of inserted again.
+    """
+    from sqlalchemy import text
+
+    from app.core.database import AsyncSessionLocal
+
+    lim = max(50, min(20000, int(limit_slots)))
+    revived = 0
+    inserted = 0
+    async with AsyncSessionLocal() as db:
+        # 1) Revive deleted rows that still match needed group×panel slots.
+        rev = await db.execute(
+            text(
+                """
+                UPDATE panel_accounts pa
+                SET status = 'pending',
+                    links = '[]'::json,
+                    links_by_group = '{}'::json,
+                    error_message = NULL,
+                    remote_username = NULL,
+                    remote_id = NULL,
+                    uuid = NULL
+                WHERE pa.id IN (
+                  SELECT pa2.id
+                  FROM panel_accounts pa2
+                  JOIN users u ON u.id = pa2.user_id
+                    AND u.status IN ('active', 'on_hold')
+                  JOIN panels p ON p.id = pa2.panel_id AND p.is_active IS TRUE
+                  WHERE pa2.status = 'deleted'
+                    AND EXISTS (
+                      SELECT 1 FROM user_groups ug
+                      JOIN group_panels gp ON gp.group_id = ug.group_id
+                      WHERE ug.user_id = pa2.user_id
+                        AND gp.panel_id = pa2.panel_id
+                        AND coalesce(gp.group_id, 0) = coalesce(pa2.group_id, 0)
+                    )
+                  ORDER BY pa2.id DESC
+                  LIMIT :lim
+                )
+                RETURNING pa.id
+                """
+            ),
+            {"lim": lim},
+        )
+        revived = len([r for r in rev.all() if r[0]])
+
+        # 2) Insert only when no row exists at all for that unique key.
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO panel_accounts (
+                  user_id, panel_id, group_id, status,
+                  links, links_by_group,
+                  used_traffic, coeff_anchor_raw, coeff_anchor_weighted
+                )
+                SELECT
+                  ug.user_id,
+                  gp.panel_id,
+                  gp.group_id,
+                  'pending',
+                  '[]'::json,
+                  '{}'::json,
+                  0,
+                  0,
+                  0
+                FROM user_groups ug
+                JOIN users u ON u.id = ug.user_id
+                  AND u.status IN ('active', 'on_hold')
+                JOIN group_panels gp ON gp.group_id = ug.group_id
+                JOIN panels p ON p.id = gp.panel_id AND p.is_active IS TRUE
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM panel_accounts pa
+                  WHERE pa.user_id = ug.user_id
+                    AND pa.panel_id = gp.panel_id
+                    AND coalesce(pa.group_id, 0) = coalesce(gp.group_id, 0)
+                )
+                ORDER BY ug.user_id DESC, gp.panel_id
+                LIMIT :lim
+                RETURNING id
+                """
+            ),
+            {"lim": lim},
+        )
+        inserted = len([r for r in result.all() if r[0]])
+        await db.commit()
+    total = revived + inserted
+    if total:
+        logger.warning(
+            "seed_missing_coverage_pendings revived=%s inserted=%s",
+            revived,
+            inserted,
+        )
+    return total
+
+
 async def heal_users_missing_panel_accounts(*, limit_users: int = 20) -> int:
     """Heal users with zero OR partial panel coverage (missing group×panel slots).
 
@@ -3017,10 +3175,22 @@ async def heal_users_missing_panel_accounts(*, limit_users: int = 20) -> int:
     except Exception:  # noqa: BLE001
         logger.debug("heal_recent_empty_users via coverage skipped", exc_info=True)
 
+    # Seed missing slots as pending so workers/drain can create remotes.
+    try:
+        # Cap seed waves — huge inserts + parallel creates stampeded QueuePool
+        # and delayed freeze/kill for exhausted users.
+        seeded = await seed_missing_coverage_pendings(
+            limit_slots=max(200, min(1500, int(limit_users) * 20))
+        )
+        if seeded:
+            n += 1
+    except Exception:  # noqa: BLE001
+        logger.warning("seed_missing_coverage_pendings failed", exc_info=True)
+
     # Fast path: drain sticky pending/error slots fleet-wide (partial first).
     try:
         drained = await drain_pending_panel_accounts(
-            limit_accounts=max(120, int(limit_users) * 40),
+            limit_accounts=max(400, int(limit_users) * 60),
             prefer_partial_users=True,
         )
         if int(drained.get("queued") or 0) > 0:
@@ -3029,15 +3199,19 @@ async def heal_users_missing_panel_accounts(*, limit_users: int = 20) -> int:
         logger.debug("drain_pending via coverage skipped", exc_info=True)
 
     try:
+        # True incomplete (missing panel rows), worst gaps first.
+        candidate_ids = await find_incomplete_coverage_user_ids(
+            limit=max(80, int(limit_users) * 8)
+        )
+        # Also sticky pending/error among existing rows (old path).
         async with AsyncSessionLocal() as db:
-            # Incomplete users: fewer active rows than total non-deleted rows.
             rows = await db.execute(
                 text(
                     """
                     SELECT u.id
                     FROM users u
                     JOIN panel_accounts pa ON pa.user_id = u.id
-                    WHERE u.status IN ('active', 'on_hold', 'limited', 'expired')
+                    WHERE u.status IN ('active', 'on_hold')
                       AND pa.status <> 'deleted'
                     GROUP BY u.id
                     HAVING count(*) FILTER (WHERE pa.status = 'active') < count(*)
@@ -3047,14 +3221,17 @@ async def heal_users_missing_panel_accounts(*, limit_users: int = 20) -> int:
                     LIMIT :lim
                     """
                 ),
-                {"lim": max(60, int(limit_users) * 5)},
+                {"lim": max(40, int(limit_users) * 4)},
             )
-            candidate_ids = [int(r[0]) for r in rows.all() if r[0]]
+            for r in rows.all():
+                if r[0] and int(r[0]) not in candidate_ids:
+                    candidate_ids.append(int(r[0]))
             await db.rollback()
 
         sem = background_db_sem()
+        cap = max(8, int(limit_users) * 3)
         for uid in candidate_ids:
-            if n >= max(1, int(limit_users) * 2):
+            if n >= cap:
                 break
             async with sem:
                 try:
@@ -3094,16 +3271,32 @@ async def heal_users_missing_panel_accounts(*, limit_users: int = 20) -> int:
                             needs_hydrate = bool(empty)
                     if needs_heal:
                         healed = await heal_user_coverage_pool_safe(
-                            int(uid), wait=18.0, include_empty_links=True
+                            int(uid), wait=22.0, include_empty_links=True
                         )
                         if healed:
                             n += 1
+                            try:
+                                from app.api.subscription import (
+                                    invalidate_user_feed_cache,
+                                )
+
+                                invalidate_user_feed_cache(int(uid))
+                            except Exception:  # noqa: BLE001
+                                pass
                     elif needs_hydrate:
                         got = await asyncio.wait_for(
                             hydrate_share_links_pool_safe(int(uid)), timeout=14.0
                         )
                         if got:
                             n += 1
+                            try:
+                                from app.api.subscription import (
+                                    invalidate_user_feed_cache,
+                                )
+
+                                invalidate_user_feed_cache(int(uid))
+                            except Exception:  # noqa: BLE001
+                                pass
                 except Exception:  # noqa: BLE001
                     logger.debug(
                         "heal missing coverage user_id=%s skipped",
@@ -9978,7 +10171,7 @@ async def enforce_user_quota(db: AsyncSession, user: User) -> bool:
                 # Yield so the caller's ``await db.commit()`` lands first —
                 # enqueue_kill_user refuses non-limited users.
                 await asyncio.sleep(0.15)
-                await kick_freeze_user(u, remote_timeout=8.0, force=True)
+                await kick_freeze_user(u, remote_timeout=14.0, force=True)
 
             asyncio.create_task(
                 _kill_after_commit(), name=f"astra-kill-{uid}"
@@ -10549,7 +10742,7 @@ async def run_quota_watch_cycle() -> dict[str, int]:
 
     t0 = time.monotonic()
     try:
-        await heal_users_missing_panel_accounts(limit_users=3)
+        await heal_users_missing_panel_accounts(limit_users=40)
     except Exception:  # noqa: BLE001
         logger.debug("quota-watch missing-account heal skipped", exc_info=True)
 
@@ -10707,6 +10900,20 @@ async def run_quota_watch_cycle() -> dict[str, int]:
                 stats["freeze_fail"] += fail_n
     except Exception:  # noqa: BLE001
         logger.warning("quota-watch recount/flip catchup failed", exc_info=True)
+
+    # --- Phase 2c: limited/expired with remotes still enabled → force KILL ---
+    try:
+        cut = await bulk_usage.heal_exhausted_and_unfrozen(limit=250)
+        if int(cut.get("kill") or 0) or int(cut.get("flipped") or 0):
+            stats["flipped"] += int(cut.get("flipped") or 0)
+            logger.warning(
+                "quota-watch exhausted-unfrozen flipped=%s kill=%s unfrozen=%s",
+                cut.get("flipped"),
+                cut.get("kill"),
+                cut.get("unfrozen"),
+            )
+    except Exception:  # noqa: BLE001
+        logger.warning("quota-watch exhausted-unfrozen heal failed", exc_info=True)
 
     # --- Phase 3a0: pending meters with traffic → active, then shrink inflated used ---
     try:

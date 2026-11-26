@@ -269,10 +269,11 @@ async def _empty_user_coverage_heal_loop() -> None:
         try:
             healed += int(
                 await heal_recent_empty_users(
-                    limit_users=40, max_age_hours=168.0
+                    limit_users=60, max_age_hours=168.0
                 )
                 or 0
             )
+            # Steady chew — avoid pool stampede that blocked freeze/kill.
             healed += int(
                 await heal_users_missing_panel_accounts(limit_users=40)
                 or 0
@@ -283,7 +284,7 @@ async def _empty_user_coverage_heal_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("empty-user coverage heal loop failed")
-        await asyncio.sleep(18 if healed else 45)
+        await asyncio.sleep(12 if healed else 25)
 
 
 async def _astra_xray_heal_loop() -> None:

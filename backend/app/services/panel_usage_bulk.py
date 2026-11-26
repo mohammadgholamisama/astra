@@ -1645,8 +1645,9 @@ async def find_exhausted_user_ids(*, limit: int = 200) -> list[int]:
 async def find_unfrozen_blocked_user_ids(*, limit: int = 500) -> list[int]:
     """limited/expired users that still have live remotes needing KILL_USER.
 
-    Matches accounts still ``active``/``error`` without the quota-frozen mark —
-    these keep downloading after Astra already flipped status.
+    Matches accounts still ``active``/``error``/``pending`` without the
+    quota-frozen mark — pending create-lag remotes used to be invisible here
+    and kept downloading after Astra already flipped status.
     """
     from sqlalchemy import text
 
@@ -1660,7 +1661,7 @@ async def find_unfrozen_blocked_user_ids(*, limit: int = 500) -> list[int]:
                     FROM users u
                     JOIN panel_accounts pa ON pa.user_id = u.id
                     WHERE u.status IN ('limited', 'expired', 'disabled')
-                      AND pa.status IN ('active', 'error')
+                      AND pa.status IN ('active', 'error', 'pending')
                       AND (
                         pa.error_message IS NULL
                         OR pa.error_message = ''
@@ -1721,19 +1722,12 @@ async def heal_exhausted_and_unfrozen(*, limit: int = 400) -> dict[str, int]:
 
     for uid in kill_ids:
         try:
-            # Respect kill cooldown — force=True was flooding Redis (500-cap
-            # LTRIM dropped waiting fresh over-limit kills for minutes).
-            from app.services.worker_commands import kill_on_cooldown
-
-            if kill_on_cooldown(int(uid)):
-                continue
-            # Await enqueue so ASTRA_QUOTA_FROZEN is stamped before we return
-            # (kick_freeze alone schedules a task and heal would re-select them).
-            await enqueue_kill_user(int(uid), force=False)
-            await kick_freeze_user(int(uid), remote_timeout=8.0, force=False)
+            # force=True bypasses 180s cooldown so a prior failed cut retries.
+            # kick_freeze also enqueues KILL_USER + local sync_modify.
+            await kick_freeze_user(int(uid), remote_timeout=14.0, force=True)
         except Exception:  # noqa: BLE001
             logger.debug("heal kill user_id=%s failed", uid, exc_info=True)
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.05)
     logger.info(
         "heal_exhausted flipped=%s exhausted=%s still_blocked=%s unfrozen=%s kill=%s",
         flipped,

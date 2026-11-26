@@ -362,13 +362,16 @@ async def enqueue_kill_user(
                 set_committed_value(acc, "panel", panel)
 
         for acc in accounts:
+            # pending + error too — create lag left live remotes that never got
+            # status=active, and kill used to skip them so configs stayed on.
             if acc.status not in (
                 PanelAccountStatus.active,
                 PanelAccountStatus.error,
+                PanelAccountStatus.pending,
             ):
                 continue
             panel = panels_by_id.get(int(acc.panel_id))
-            if panel is None:
+            if panel is None or not getattr(panel, "is_active", True):
                 continue
             panel_ids_all.append(int(panel.id))
             wid = getattr(panel, "worker_id", None)
@@ -377,8 +380,12 @@ async def enqueue_kill_user(
 
                 wid = lease_worker_for_panel(int(acc.panel_id))
             name = (acc.remote_username or "").strip() or str(acc.remote_id or "")
-            if not name or name.startswith("{"):
+            uuid = (acc.uuid or "").strip()
+            # Sanaei/some hosts identify by uuid only — never skip those.
+            if (not name or name.startswith("{")) and not uuid:
                 continue
+            if not name:
+                name = uuid
             if not wid:
                 local_panel_ids.append(int(panel.id))
                 continue
@@ -387,6 +394,7 @@ async def enqueue_kill_user(
                     "panel_id": int(acc.panel_id),
                     "remote_username": name,
                     "remote_id": str(acc.remote_id or "") or None,
+                    "uuid": uuid or None,
                     "account_id": int(acc.id),
                     "used_traffic": int(acc.used_traffic or 0),
                     "panel": wc.panel_snapshot(panel),
@@ -415,12 +423,12 @@ async def enqueue_kill_user(
             except Exception:  # noqa: BLE001
                 pass
 
-    # Optimistic freeze mark + strip share links so /sub cannot keep serving
-    # live configs while Worker/local freeze finish the hard cut.
+    # Strip share links immediately so /sub stops handing configs out.
+    # Do NOT stamp ASTRA_QUOTA_FROZEN here — that lied "frozen" while Worker
+    # queues lagged, blocked 180s cooldown retries, and left remotes enabled
+    # (testmmdddddd-class leak). Mark is set only after sync_modify succeeds.
     try:
         from sqlalchemy import update
-
-        from app.services.panel_usage_bulk import QUOTA_FROZEN_MARK
 
         async with AsyncSessionLocal() as db2:
             await db2.execute(
@@ -436,7 +444,6 @@ async def enqueue_kill_user(
                     )
                 )
                 .values(
-                    error_message=QUOTA_FROZEN_MARK,
                     links=[],
                     links_by_group=None,
                 )
@@ -444,7 +451,7 @@ async def enqueue_kill_user(
             await db2.commit()
     except Exception:  # noqa: BLE001
         logger.debug(
-            "freeze-mark after kill dispatch failed user=%s",
+            "link-strip after kill dispatch failed user=%s",
             uid,
             exc_info=True,
         )
