@@ -93,19 +93,45 @@ class AstraAdapter(BasePanelAdapter):
             health["outbounds"] = ob
             enabled = int(ob.get("enabled") or 0)
             ok_n = int(ob.get("ok") or 0)
+            bad_n = int(ob.get("bad") or 0)
+            disabled_n = int(ob.get("disabled") or 0)
+            bad_names = list(ob.get("bad_names") or [])
+            disabled_names = list(ob.get("disabled_names") or [])
+            names_off = node._format_outbound_names(disabled_names)
+            names_bad = node._format_outbound_names(bad_names)
             if enabled <= 0:
+                if disabled_n > 0 and names_off:
+                    return AdapterResult(
+                        success=False,
+                        error=f"اوتباند خاموش است: {names_off}",
+                        raw=health,
+                    )
                 return AdapterResult(
                     success=False,
                     error="اوتباند فعالی روی این نود نیست",
                     raw=health,
                 )
             if ok_n <= 0:
-                bad = int(ob.get("bad") or 0)
+                if names_bad:
+                    return AdapterResult(
+                        success=False,
+                        error=f"اوتباند قطع است (پینگ ناموفق): {names_bad}",
+                        raw=health,
+                    )
                 return AdapterResult(
                     success=False,
-                    error=f"اوتباند قطع است ({bad}/{enabled})",
+                    error=f"اوتباند قطع است ({bad_n}/{enabled})",
                     raw=health,
                 )
+            # Partial: still «وصل» but warn which hops are down/off so the
+            # panels toast/test-all list shows the live outbound names.
+            warn_bits: list[str] = []
+            if names_bad:
+                warn_bits.append(f"قطع: {names_bad}")
+            if names_off:
+                warn_bits.append(f"خاموش: {names_off}")
+            if warn_bits:
+                health["outbound_warning"] = " · ".join(warn_bits)
             return AdapterResult(
                 success=True,
                 raw=health,

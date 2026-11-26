@@ -148,6 +148,7 @@ async def _live_test_panel(
 
     t0 = _time.monotonic()
     last_err = "اتصال ناموفق"
+    last_raw: dict = {}
     panel_type = getattr(panel, "type", None)
     is_astra = panel_type == PanelType.astra or str(
         getattr(panel_type, "value", panel_type) or ""
@@ -220,6 +221,8 @@ async def _live_test_panel(
         last_err = (
             (result.error if result else None) or last_err or "اتصال ناموفق"
         ).strip()
+        if result is not None and isinstance(result.raw, dict):
+            last_raw = dict(result.raw)
         if _is_hard_auth_fail(last_err):
             break
         if attempt + 1 < tries:
@@ -228,7 +231,8 @@ async def _live_test_panel(
     ms = int((_time.monotonic() - t0) * 1000)
     # Clarify path: browser OK ≠ Astra server can reach the panel
     low = last_err.lower()
-    if any(
+    # Keep Astra outbound-cut messages clean (already name the hop).
+    if "اوتباند" not in last_err and any(
         x in low
         for x in (
             "timeout",
@@ -256,7 +260,7 @@ async def _live_test_panel(
         "error": last_err,
         "latency_ms": ms,
         "via_worker": via_worker,
-        "raw": {},
+        "raw": last_raw,
     }
 
 

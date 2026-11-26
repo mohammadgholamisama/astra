@@ -690,6 +690,21 @@ async def ping_outbounds_batch(
     return [r for r, _, _ in probed]
 
 
+def outbound_display_name(row: Any) -> str:
+    """Human label for UI/errors — always the live remark (falls back to host:port)."""
+    remark = str(getattr(row, "remark", None) or "").strip()
+    if remark:
+        return remark
+    host = str(getattr(row, "host", None) or "").strip()
+    port = getattr(row, "port", None)
+    if host and port:
+        return f"{host}:{port}"
+    if host:
+        return host
+    rid = getattr(row, "id", None)
+    return f"outbound-{rid}" if rid else "outbound"
+
+
 def _outbound_ping_snap(row: AstraOutbound) -> Any:
     """Plain namespace for protocol_ping after DB rollback/expunge.
 
@@ -714,12 +729,22 @@ def _outbound_ping_snap(row: AstraOutbound) -> Any:
         protocol=str(row.protocol or "vless"),
         host=str(row.host or ""),
         port=int(row.port or 0),
+        remark=str(row.remark or ""),
         parsed=parsed,
         is_enabled=bool(row.is_enabled),
         last_ping_ok=row.last_ping_ok,
         last_ping_ms=row.last_ping_ms,
         last_ping_at=row.last_ping_at,
     )
+
+
+def _format_outbound_names(names: list[str], *, limit: int = 4) -> str:
+    clean = [f"«{n}»" for n in names if n]
+    if not clean:
+        return ""
+    if len(clean) <= limit:
+        return "، ".join(clean)
+    return "، ".join(clean[:limit]) + f" و {len(clean) - limit} مورد دیگر"
 
 
 async def probe_panel_outbounds_health(
@@ -731,36 +756,49 @@ async def probe_panel_outbounds_health(
 ) -> dict[str, Any]:
     """Pool-safe outbound health for panel Test / test-all.
 
-    Load enabled rows → snapshot → release DB → protocol ping → short writeback.
-    When ``prefer_cache_sec`` > 0 and every enabled outbound was pinged
-    recently, reuse that result (fast test-all without false قطع from
-    stampede Xray pings).
+    Loads ALL outbounds (enabled + disabled). Pings enabled ones. Returns live
+    remark names so the panels page / user errors show the current outbound
+    label (not a stale panel nickname).
     """
     from app.core.database import AsyncSessionLocal, release_db_txn
 
     pid = int(panel_id)
     snap: list[Any] = []
+    disabled_snap: list[Any] = []
     async with AsyncSessionLocal() as db:
         rows = list(
             (
                 await db.execute(
                     select(AstraOutbound)
-                    .where(
-                        AstraOutbound.panel_id == pid,
-                        AstraOutbound.is_enabled.is_(True),
-                    )
+                    .where(AstraOutbound.panel_id == pid)
                     .order_by(AstraOutbound.sort_order.asc(), AstraOutbound.id.asc())
                 )
             )
             .scalars()
             .all()
         )
-        # Copy into detached namespaces BEFORE rollback expires ORM state.
-        snap = [_outbound_ping_snap(r) for r in rows]
+        for r in rows:
+            snap_row = _outbound_ping_snap(r)
+            if snap_row.is_enabled:
+                snap.append(snap_row)
+            else:
+                disabled_snap.append(snap_row)
         await release_db_txn(db)
 
+    disabled_names = [outbound_display_name(r) for r in disabled_snap]
+    empty = {
+        "enabled": 0,
+        "ok": 0,
+        "bad": 0,
+        "disabled": len(disabled_snap),
+        "pinged": 0,
+        "cached": False,
+        "ok_names": [],
+        "bad_names": [],
+        "disabled_names": disabled_names,
+    }
     if not snap:
-        return {"enabled": 0, "ok": 0, "bad": 0, "pinged": 0, "cached": False}
+        return empty
 
     cache_sec = max(0.0, float(prefer_cache_sec or 0.0))
     if cache_sec > 0:
@@ -777,14 +815,18 @@ async def probe_panel_outbounds_health(
                 fresh = False
                 break
         if fresh:
-            ok_n = sum(1 for r in snap if r.last_ping_ok is True)
-            bad_n = sum(1 for r in snap if r.last_ping_ok is not True)
+            ok_rows = [r for r in snap if r.last_ping_ok is True]
+            bad_rows = [r for r in snap if r.last_ping_ok is not True]
             return {
                 "enabled": len(snap),
-                "ok": ok_n,
-                "bad": bad_n,
+                "ok": len(ok_rows),
+                "bad": len(bad_rows),
+                "disabled": len(disabled_snap),
                 "pinged": 0,
                 "cached": True,
+                "ok_names": [outbound_display_name(r) for r in ok_rows],
+                "bad_names": [outbound_display_name(r) for r in bad_rows],
+                "disabled_names": disabled_names,
             }
 
     sem = asyncio.Semaphore(max(1, min(4, int(concurrency))))
@@ -830,8 +872,19 @@ async def probe_panel_outbounds_health(
         else:
             merged.append((rid, False, None))
 
-    ok_n = sum(1 for _, ok, _ in merged if ok)
-    bad_n = sum(1 for _, ok, _ in merged if not ok)
+    by_merged = {oid: (ok, ms) for oid, ok, ms in merged}
+    ok_names = [
+        outbound_display_name(r)
+        for r in snap
+        if by_merged.get(int(r.id), (False, None))[0]
+    ]
+    bad_names = [
+        outbound_display_name(r)
+        for r in snap
+        if not by_merged.get(int(r.id), (False, None))[0]
+    ]
+    ok_n = len(ok_names)
+    bad_n = len(bad_names)
     now = datetime.now(timezone.utc)
     try:
         async with AsyncSessionLocal() as db:
@@ -865,8 +918,12 @@ async def probe_panel_outbounds_health(
         "enabled": len(snap),
         "ok": ok_n,
         "bad": bad_n,
+        "disabled": len(disabled_snap),
         "pinged": len(results),
         "cached": False,
+        "ok_names": ok_names,
+        "bad_names": bad_names,
+        "disabled_names": disabled_names,
     }
 
 
@@ -1079,9 +1136,14 @@ async def share_links_by_email(db: AsyncSession, panel: Panel) -> dict[str, list
 
 
 async def refresh_panel_account_links(db: AsyncSession, panel: Panel) -> int:
-    """Rewrite PanelAccount.links after public_host / port / outbound changes."""
+    """Rewrite PanelAccount.links after public_host / port / outbound changes.
+
+    When links come back, clear stale «اوتباند …» error stamps. Do NOT
+    fleet-stamp every empty-link row here — that deadlocks under load; naming
+    of cut outbounds is done on fix-sub / panel Test instead.
+    """
     from app.api.subscription import invalidate_user_feed_cache
-    from app.models.user import PanelAccount, User
+    from app.models.user import PanelAccount, PanelAccountStatus
 
     by_email = await share_links_by_email(db, panel)
     accounts = (
@@ -1106,6 +1168,11 @@ async def refresh_panel_account_links(db: AsyncSession, panel: Panel) -> int:
         if prev != fresh:
             acc.links = fresh
             acc.links_by_group = None
+            # Recovered links clear the outbound-cut stamp.
+            if (acc.error_message or "").startswith("اوتباند"):
+                acc.error_message = None
+                if acc.status == PanelAccountStatus.error:
+                    acc.status = PanelAccountStatus.active
             updated += 1
             uids.append(int(acc.user_id))
     if updated:

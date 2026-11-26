@@ -97,7 +97,13 @@ function isDbBusyAccountError(msg?: string | null) {
 
 function isOutboundDisabledError(msg?: string | null) {
   const m = msg || "";
-  return m.includes("اوتباند خاموش") || m.includes("اوتباندی تعریف نشده");
+  return (
+    m.includes("اوتباند") &&
+    (m.includes("خاموش") ||
+      m.includes("قطع است") ||
+      m.includes("تعریف نشده") ||
+      m.includes("پینگ ناموفق"))
+  );
 }
 
 function isNoiseAccountError(msg?: string | null) {

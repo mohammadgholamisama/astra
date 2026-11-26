@@ -1831,22 +1831,50 @@ async def _stamp_fix_sub_blockers(db: AsyncSession, user: User) -> list[dict]:
                 except Exception:  # noqa: BLE001
                     outs = []
                 enabled = [o for o in outs if getattr(o, "is_enabled", False)]
+                disabled = [o for o in outs if not getattr(o, "is_enabled", False)]
+                dead_enabled = [
+                    o
+                    for o in enabled
+                    if getattr(o, "last_ping_ok", None) is False
+                ]
                 if not outs:
                     outbound_cache[pid] = (
                         "no_outbound",
-                        f"پنل {pname}: اوتباندی تعریف نشده — لینک ساخته نمی‌شود",
+                        f"اوتباندی روی پنل «{pname}» تعریف نشده — لینک ساخته نمی‌شود",
                     )
                 elif not enabled:
-                    host = getattr(outs[0], "host", None) or "?"
+                    labels = [
+                        astra_node_svc.outbound_display_name(o) for o in disabled
+                    ]
+                    named = astra_node_svc._format_outbound_names(labels)
+                    host = getattr(disabled[0], "host", None) or "?"
+                    port = getattr(disabled[0], "port", None) or "?"
                     outbound_cache[pid] = (
                         "outbound_disabled",
-                        f"پنل {pname}: اوتباند خاموش است "
-                        f"(host={host}، پینگ ناموفق/غیرفعال) — لینک ساخته نمی‌شود",
+                        (
+                            f"اوتباند {named} خاموش است"
+                            f" ({host}:{port}) — لینک ساخته نمی‌شود"
+                            if named
+                            else f"اوتباند پنل «{pname}» خاموش است — لینک ساخته نمی‌شود"
+                        ),
+                    )
+                elif dead_enabled and len(dead_enabled) == len(enabled):
+                    labels = [
+                        astra_node_svc.outbound_display_name(o) for o in dead_enabled
+                    ]
+                    named = astra_node_svc._format_outbound_names(labels)
+                    outbound_cache[pid] = (
+                        "outbound_disabled",
+                        (
+                            f"اوتباند {named} قطع است (پینگ ناموفق) — لینک ساخته نمی‌شود"
+                            if named
+                            else f"اوتباند پنل «{pname}» قطع است — لینک ساخته نمی‌شود"
+                        ),
                     )
                 else:
                     outbound_cache[pid] = (
                         "empty",
-                        f"پنل {pname}: کلاینت هست ولی لینک share خالی ماند",
+                        f"پنل «{pname}»: کلاینت هست ولی لینک share خالی ماند",
                     )
             kind, reason = outbound_cache[pid]
         elif prev:

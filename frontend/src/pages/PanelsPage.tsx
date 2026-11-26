@@ -904,6 +904,31 @@ export default function PanelsPage() {
     return "ok";
   }
 
+  function outboundHintFromRaw(raw: Record<string, unknown> | undefined | null): string {
+    if (!raw || typeof raw !== "object") return "";
+    const warn = typeof raw.outbound_warning === "string" ? raw.outbound_warning.trim() : "";
+    if (warn) return ` · ${warn}`;
+    const ob = raw.outbounds as
+      | {
+          bad_names?: string[];
+          disabled_names?: string[];
+          ok?: number;
+          enabled?: number;
+          bad?: number;
+          disabled?: number;
+        }
+      | undefined;
+    if (!ob || typeof ob !== "object") return "";
+    const bits: string[] = [];
+    const bad = Array.isArray(ob.bad_names) ? ob.bad_names.filter(Boolean) : [];
+    const off = Array.isArray(ob.disabled_names)
+      ? ob.disabled_names.filter(Boolean)
+      : [];
+    if (bad.length) bits.push(`قطع: ${bad.slice(0, 3).map((n) => `«${n}»`).join("، ")}`);
+    if (off.length) bits.push(`خاموش: ${off.slice(0, 3).map((n) => `«${n}»`).join("، ")}`);
+    return bits.length ? ` · ${bits.join(" · ")}` : "";
+  }
+
   const test = useMutation({
     mutationFn: (id: number) =>
       api<{
@@ -913,6 +938,7 @@ export default function PanelsPage() {
         worker_id?: number | null;
         worker_name?: string | null;
         via_worker?: boolean;
+        raw?: Record<string, unknown>;
       }>(`/api/admin/panels/${id}/test`, {
         method: "POST",
         timeoutMs: 28_000,
@@ -942,12 +968,13 @@ export default function PanelsPage() {
             ? ` · ورکر «${wName}»`
             : ` · ورکر «${wName}» (نود مستر)`
           : "";
+      const obHint = outboundHintFromRaw(res.raw);
       showTestToast(
         !!res.success,
         res.success
           ? panelName
-            ? `اتصال «${panelName}» برقرار است${ms}${grade ? ` · ${grade}` : ""}${via}`
-            : `اتصال برقرار است${ms}${grade ? ` · ${grade}` : ""}${via}`
+            ? `اتصال «${panelName}» برقرار است${ms}${grade ? ` · ${grade}` : ""}${via}${obHint}`
+            : `اتصال برقرار است${ms}${grade ? ` · ${grade}` : ""}${via}${obHint}`
           : `${res.error || "اتصال به پنل ریموت برقرار نشد"}${via}`
       );
       qc.invalidateQueries({ queryKey: ["panels"] });
