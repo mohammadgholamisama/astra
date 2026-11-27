@@ -468,6 +468,37 @@ class WorkerRoutedAdapter:
             return got
         return await self._local.reset_usage(username, remote_id)
 
+    # ── Panel-edit helpers (not on worker wire protocol) ─────────────────
+    # Groups / inbounds / protocols are admin UI reads. Worker agent only
+    # speaks create/modify/delete/usage — so always hit the local adapter.
+    async def list_groups(self) -> list[dict[str, Any]]:
+        fn = getattr(self._local, "list_groups", None)
+        if not callable(fn):
+            raise AttributeError(
+                f"{type(self._local).__name__} has no list_groups"
+            )
+        return await fn()
+
+    async def list_inbounds(self) -> list[dict[str, Any]]:
+        fn = getattr(self._local, "list_inbounds", None)
+        if not callable(fn):
+            raise AttributeError(
+                f"{type(self._local).__name__} has no list_inbounds"
+            )
+        return await fn()
+
+    async def list_protocols(self) -> list[dict[str, Any]]:
+        fn = getattr(self._local, "list_protocols", None)
+        if not callable(fn):
+            raise AttributeError(
+                f"{type(self._local).__name__} has no list_protocols"
+            )
+        return await fn()
+
+    def __getattr__(self, name: str) -> Any:
+        """Forward unknown attrs/methods to the concrete panel adapter."""
+        return getattr(self._local, name)
+
 
 # Avoid unused import warning in type checkers
 _ = asyncio
