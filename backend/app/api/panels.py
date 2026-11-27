@@ -1417,17 +1417,42 @@ async def test_all_panels(
     sem2 = asyncio.Semaphore(12)
     t0 = _time.monotonic()
 
+    def _outbound_warning(probe: dict) -> str | None:
+        raw = probe.get("raw") if isinstance(probe.get("raw"), dict) else {}
+        warn = str(raw.get("outbound_warning") or "").strip()
+        if warn:
+            return warn[:400]
+        ob = raw.get("outbounds") if isinstance(raw.get("outbounds"), dict) else {}
+        bad = [str(x).strip() for x in (ob.get("bad_names") or []) if str(x).strip()]
+        off = [
+            str(x).strip() for x in (ob.get("disabled_names") or []) if str(x).strip()
+        ]
+        bits: list[str] = []
+        if bad:
+            shown = "، ".join(bad[:6])
+            more = f" و {len(bad) - 6} مورد دیگر" if len(bad) > 6 else ""
+            bits.append(f"قطع: {shown}{more}")
+        if off:
+            shown = "، ".join(off[:4])
+            more = f" و {len(off) - 4} مورد دیگر" if len(off) > 4 else ""
+            bits.append(f"خاموش: {shown}{more}")
+        return " · ".join(bits) if bits else None
+
     def _to_out(snap: dict, probe: dict) -> PanelTestOut:
         ok = bool(probe.get("success"))
         ms = probe.get("latency_ms")
         latency = int(ms) if isinstance(ms, (int, float)) and ms >= 0 else None
+        warn = _outbound_warning(probe)
+        err = None if ok else (probe.get("error") or "اتصال ناموفق")
+        # Failures that already name cut hops keep error; also surface warn.
         return PanelTestOut(
             id=snap["id"],
             name=snap["name"],
             type=snap["type"],
             is_active=snap["is_active"],
             success=ok,
-            error=None if ok else (probe.get("error") or "اتصال ناموفق"),
+            error=err,
+            warning=warn,
             latency_ms=latency,
             grade=_panel_test_grade(ok, latency),
             base_url=snap["base_url"],

@@ -834,6 +834,8 @@ export default function PanelsPage() {
       is_active: boolean;
       success: boolean;
       error?: string | null;
+      /** Astra hops without ping — show as قطع even when panel is still «وصل». */
+      warning?: string | null;
       latency_ms?: number | null;
       grade?: PanelTestGrade | string;
       base_url?: string | null;
@@ -1490,9 +1492,16 @@ export default function PanelsPage() {
                     </div>
                     <small>
                       {r.success
-                        ? r.base_url
-                          ? r.base_url
-                          : "اتصال برقرار است"
+                        ? [
+                            r.warning
+                              ? r.warning
+                              : r.base_url
+                                ? r.base_url
+                                : "اتصال برقرار است",
+                            r.warning && r.base_url ? r.base_url : null,
+                          ]
+                            .filter(Boolean)
+                            .join(" · ")
                         : r.error || "اتصال ناموفق"}
                     </small>
                   </li>

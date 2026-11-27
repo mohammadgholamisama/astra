@@ -849,15 +849,8 @@ async def probe_panel_outbounds_health(
             continue
         results.append(item)
 
-    # If a ping blew up under load, fall back to last known ok for that row
-    # instead of inventing a hard قطع.
-    by_prev = {
-        int(r.id): (
-            bool(r.last_ping_ok) if r.last_ping_ok is not None else None,
-            r.last_ping_ms,
-        )
-        for r in snap
-    }
+    # Missing probe under load → قطع. Never keep a stale «وصل» that hides a
+    # really-dead outbound from the panels Test UI.
     merged: list[tuple[int, bool, int | None]] = []
     got_ids = {oid for oid, _, _ in results}
     for oid, ok, ms in results:
@@ -866,11 +859,7 @@ async def probe_panel_outbounds_health(
         rid = int(r.id)
         if rid in got_ids:
             continue
-        prev_ok, prev_ms = by_prev.get(rid, (None, None))
-        if prev_ok is True:
-            merged.append((rid, True, prev_ms))
-        else:
-            merged.append((rid, False, None))
+        merged.append((rid, False, None))
 
     by_merged = {oid: (ok, ms) for oid, ok, ms in merged}
     ok_names = [

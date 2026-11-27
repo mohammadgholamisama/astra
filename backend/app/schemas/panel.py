@@ -44,6 +44,8 @@ class PanelTestOut(BaseModel):
     is_active: bool
     success: bool
     error: str | None = None
+    # Partial Astra hops: success may still be True while some outbounds are cut.
+    warning: str | None = None
     latency_ms: int | None = None
     grade: str | None = None  # fast | ok | slow | fail
     base_url: str | None = None
