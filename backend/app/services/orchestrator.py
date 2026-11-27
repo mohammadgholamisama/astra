@@ -7912,7 +7912,7 @@ async def collect_links_detailed(
 async def expand_subscription_refs_for_accounts(
     accounts: list[PanelAccount],
     *,
-    timeout: float = 12.0,
+    timeout: float = 18.0,
 ) -> int:
     """Turn PasarGuard/Marzban ``https://…/sub/…`` rows into real share links.
 
@@ -7920,15 +7920,18 @@ async def expand_subscription_refs_for_accounts(
     never appears for the client. Network I/O runs without holding a DB
     checkout; updates are applied on a fresh short session so long creates
     do not hit «connection is closed» on flush.
+
+    Relative ``/sub/…`` refs need the panel base URL client — bare GET fails.
     """
     from app.adapters.http_utils import (
         expand_subscription_links,
         is_share_link,
         is_subscription_ref,
+        make_client,
     )
     from app.core.database import AsyncSessionLocal
 
-    jobs: list[tuple[int, list[str], PanelAccount | None]] = []
+    jobs: list[tuple[int, list[str], PanelAccount | None, object | None, str, object]] = []
     for account in accounts:
         if account is None:
             continue
@@ -7948,27 +7951,104 @@ async def expand_subscription_refs_for_accounts(
             is_subscription_ref(x) for x in links
         ):
             continue
-        jobs.append((int(aid), links, account))
+        panel = getattr(account, "panel", None)
+        uname = (getattr(account, "remote_username", None) or "").strip()
+        rid = (
+            getattr(account, "remote_id", None)
+            or getattr(account, "remote_username", None)
+            or uname
+            or None
+        )
+        jobs.append((int(aid), links, account, panel, uname, rid))
     if not jobs:
         return 0
 
     sem = asyncio.Semaphore(max(8, min(32, len(jobs) + 4)))
 
     async def _one(
-        aid: int, refs: list[str]
+        aid: int,
+        refs: list[str],
+        panel,
+        uname: str,
+        rid,
     ) -> tuple[int, list[str]]:
         async with sem:
-            try:
-                shares = await asyncio.wait_for(
-                    expand_subscription_links(None, refs),
-                    timeout=max(4.0, float(timeout)),
-                )
-            except Exception:  # noqa: BLE001
-                shares = []
+            shares: list[str] = []
+            # 1) Panel-base expand (handles relative /sub and //sub typos)
+            if panel is not None and getattr(panel, "base_url", None):
+                client = None
+                try:
+                    client = make_client(
+                        panel.base_url,
+                        bool((getattr(panel, "meta", None) or {}).get("verify_ssl", False)),
+                        timeout=16.0,
+                        xhr=False,
+                    )
+                    shares = await asyncio.wait_for(
+                        expand_subscription_links(client, refs),
+                        timeout=max(6.0, float(timeout)),
+                    )
+                except Exception:  # noqa: BLE001
+                    shares = []
+                finally:
+                    if client is not None:
+                        try:
+                            await client.aclose()
+                        except Exception:  # noqa: BLE001
+                            pass
+            # 2) Adapter get_subscription_links / get_usage (returns AdapterResult)
+            if not shares and panel is not None and (uname or rid):
+                adapter = None
+                try:
+                    adapter = get_adapter(panel)
+                    try:
+                        got = await asyncio.wait_for(
+                            adapter.get_usage(  # type: ignore[call-arg]
+                                uname or str(rid),
+                                rid,
+                                expand_links=True,
+                            ),
+                            timeout=max(8.0, float(timeout)),
+                        )
+                    except TypeError:
+                        got = await asyncio.wait_for(
+                            adapter.get_subscription_links(
+                                uname or str(rid), rid
+                            ),
+                            timeout=max(8.0, float(timeout)),
+                        )
+                    if got is not None and getattr(got, "success", False):
+                        shares = [
+                            str(x).strip()
+                            for x in (getattr(got, "links", None) or [])
+                            if x and is_share_link(str(x).strip())
+                        ]
+                except Exception:  # noqa: BLE001
+                    shares = []
+                finally:
+                    if adapter is not None:
+                        close = getattr(adapter, "close", None)
+                        if callable(close):
+                            try:
+                                await close()
+                            except Exception:  # noqa: BLE001
+                                pass
+            # 3) Bare absolute URLs only
+            if not shares:
+                try:
+                    shares = await asyncio.wait_for(
+                        expand_subscription_links(None, refs),
+                        timeout=max(4.0, float(timeout)),
+                    )
+                except Exception:  # noqa: BLE001
+                    shares = []
             return aid, [x for x in (shares or []) if is_share_link(x)]
 
     results = await asyncio.gather(
-        *[_one(aid, refs) for aid, refs, _ in jobs],
+        *[
+            _one(aid, refs, panel, uname, rid)
+            for aid, refs, _, panel, uname, rid in jobs
+        ],
         return_exceptions=True,
     )
     by_id: dict[int, list[str]] = {}
@@ -7983,7 +8063,7 @@ async def expand_subscription_refs_for_accounts(
 
     now = datetime.now(timezone.utc)
     # Mirror onto in-memory objects for callers that read links next
-    for aid, _refs, acc in jobs:
+    for aid, _refs, acc, *_rest in jobs:
         shares = by_id.get(aid)
         if not shares or acc is None:
             continue
@@ -8334,6 +8414,46 @@ async def hydrate_share_links_pool_safe(user_id: int) -> int:
                 await client.aclose()
             return [x for x in (expanded or []) if is_share_link(x)]
 
+        async def _adapter_sub_links(panel, uname: str, rid) -> list[str]:
+            """Pull share URIs via adapter (get_usage expands /sub on panel client)."""
+            adapter = None
+            try:
+                adapter = get_adapter(panel)
+                try:
+                    got = await asyncio.wait_for(
+                        adapter.get_usage(  # type: ignore[call-arg]
+                            uname or str(rid or ""),
+                            rid,
+                            expand_links=True,
+                        ),
+                        timeout=16.0,
+                    )
+                except TypeError:
+                    getter = getattr(adapter, "get_subscription_links", None)
+                    if not callable(getter):
+                        return []
+                    got = await asyncio.wait_for(
+                        getter(uname or str(rid or ""), rid),
+                        timeout=16.0,
+                    )
+                if got is None or not getattr(got, "success", False):
+                    return []
+                return [
+                    str(x).strip()
+                    for x in (getattr(got, "links", None) or [])
+                    if x and is_share_link(str(x).strip())
+                ]
+            except Exception:
+                return []
+            finally:
+                if adapter is not None:
+                    close = getattr(adapter, "close", None)
+                    if callable(close):
+                        try:
+                            await close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
         async def _fetch_one(job: dict) -> dict | None:
             async with sem:
                 panel = job["panel"]
@@ -8348,12 +8468,17 @@ async def hydrate_share_links_pool_safe(user_id: int) -> int:
                     from app.core.panel_circuit import panel_circuit_open
 
                     pid_h = int(getattr(panel, "id", 0) or 0)
-                    if pid_h and panel_circuit_open(pid_h):
-                        return None
+                    # Still try /sub expand even if circuit is open — HTTP
+                    # subscription fetch is cheap and often works when create
+                    # stampeded the circuit breaker.
+                    circuit_open = bool(pid_h and panel_circuit_open(pid_h))
+
+                    # 1) HTTP expand of stored /sub refs via panel base URL
+                    #    (relative /sub + //sub typos). Proven path for PasarGuard.
                     if any(is_subscription_ref(x) for x in stored):
                         try:
                             shares = await asyncio.wait_for(
-                                _expand_refs(panel, stored), timeout=15.0
+                                _expand_refs(panel, stored), timeout=18.0
                             )
                         except Exception:
                             shares = []
@@ -8362,14 +8487,34 @@ async def hydrate_share_links_pool_safe(user_id: int) -> int:
                                 "account_id": aid,
                                 "links": shares,
                                 "shares": True,
+                                "remote_username": uname,
+                                "remote_id": rid,
+                                "uuid": None,
+                                "used_traffic": int(job["prev_used"] or 0),
                             }
+
+                    # 2) Adapter get_usage / links API (also expands on panel client)
+                    shares = await _adapter_sub_links(panel, uname, rid)
+                    if shares and len(shares) >= max(1, before_n):
+                        return {
+                            "account_id": aid,
+                            "links": shares,
+                            "shares": True,
+                            "remote_username": uname,
+                            "remote_id": rid,
+                            "uuid": None,
+                            "used_traffic": int(job["prev_used"] or 0),
+                        }
+
+                    if circuit_open:
+                        return None
 
                     adapter = get_adapter(panel)
                     try:
                         coro = adapter.get_usage(uname, rid, expand_links=True)  # type: ignore[call-arg]
                     except TypeError:
                         coro = adapter.get_usage(uname, rid)
-                    res = await asyncio.wait_for(coro, timeout=10.0)
+                    res = await asyncio.wait_for(coro, timeout=12.0)
                     if not res or not res.success:
                         return None
 
@@ -8382,12 +8527,14 @@ async def hydrate_share_links_pool_safe(user_id: int) -> int:
                     if any(is_subscription_ref(x) for x in raw_links):
                         try:
                             expanded = await asyncio.wait_for(
-                                _expand_refs(panel, raw_links), timeout=15.0
+                                _expand_refs(panel, raw_links), timeout=18.0
                             )
                         except Exception:
                             expanded = []
                         if expanded and len(expanded) >= len(shares):
                             shares = expanded
+                    if not shares:
+                        shares = await _adapter_sub_links(panel, uname, rid)
 
                     out_links: list[str] | None = None
                     if shares and len(shares) >= max(1, before_n):
@@ -8440,7 +8587,7 @@ async def hydrate_share_links_pool_safe(user_id: int) -> int:
 
         raw_results = await asyncio.gather(
             *[
-                asyncio.wait_for(_fetch_one(j), timeout=16.0)
+                asyncio.wait_for(_fetch_one(j), timeout=45.0)
                 for j in jobs
             ],
             return_exceptions=True,

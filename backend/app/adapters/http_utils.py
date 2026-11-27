@@ -313,6 +313,17 @@ async def expand_subscription_links(
 
     async def _fetch_absolute(url: str) -> list[str]:
         abs_timeout = httpx.Timeout(18.0, connect=3.0)
+        # PasarGuard sometimes stores https://host:port//sub/TOKEN (404).
+        try:
+            parts = urlsplit(url)
+            path = parts.path or ""
+            while "//" in path:
+                path = path.replace("//", "/")
+            url = urlunsplit(
+                (parts.scheme, parts.netloc, path, parts.query, parts.fragment)
+            )
+        except Exception:
+            pass
         try:
             async with httpx.AsyncClient(
                 timeout=abs_timeout,
