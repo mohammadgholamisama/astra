@@ -294,6 +294,8 @@ export interface PanelAccount {
   applied_coefficient?: number | null;
   last_sync_at: string | null;
   configs_count?: number;
+  /** List API omits link URLs — true when remote has real vless/ss/… shares. */
+  has_share_link?: boolean;
 }
 
 export interface User {

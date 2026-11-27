@@ -2828,8 +2828,25 @@ async def _list_users_impl(
 
     # Serialize WHILE the session is still usable — release_db_txn/rollback
     # expires ORM attrs and to_user_response would MissingGreenlet on lazy IO.
+    share_meta: dict[int, tuple[bool, int]] = {}
+    if want_details and users:
+        try:
+            from app.services.users import panel_account_share_meta
+
+            aid_list: list[int] = []
+            for u in users:
+                for a in u.__dict__.get("panel_accounts") or []:
+                    aid = a.__dict__.get("id")
+                    if aid:
+                        aid_list.append(int(aid))
+            share_meta = await panel_account_share_meta(db, aid_list)
+        except Exception:  # noqa: BLE001
+            share_meta = {}
     payload = UsersListResponse(
-        users=[to_user_response(u, include_links=False) for u in users],
+        users=[
+            to_user_response(u, include_links=False, share_meta=share_meta)
+            for u in users
+        ],
         total=total,
         counts=counts,
     )

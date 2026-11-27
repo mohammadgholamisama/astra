@@ -681,10 +681,10 @@ export default function ConfigOrderPage() {
           <p className="page-sub">
             شمارهٔ <strong>#</strong> همان شمارهٔ صفحهٔ ساب است. نوع هر کانفیگ از{" "}
             <strong>گزینهٔ «نوع ترتیب ساب»</strong> روی گروه می‌آید (نه از اسم کانفیگ).
-            چیدمان تست: <strong>۲۰ مستقیم</strong> → <strong>۳۵ تانل</strong> به‌ازای هر
-            هزینه → <strong>۹ گیمینگ</strong> → بقیه. ساب کاربر حداکثر{" "}
-            <strong>۹۹</strong>؛ اپ تست با هر ساب، کل موجودی نمونهٔ پنل‌ها را
-            می‌گیرد (نه فقط گروه‌های همان کاربر).
+            چیدمان: اول <strong>۲۰ مستقیم</strong>، سپس <strong>۵۰ تانل</strong>،
+            سپس <strong>۹ گیمینگ</strong>، سپس <strong>۲۰ باقی‌مانده</strong>{" "}
+            (بهترین‌ها). ساب کاربر حداکثر <strong>۹۹</strong>؛ اپ تست با هر ساب،
+            کل موجودی نمونهٔ پنل‌ها را می‌گیرد (نه فقط گروه‌های همان کاربر).
           </p>
         </div>
         <div className="config-order-hero-actions">

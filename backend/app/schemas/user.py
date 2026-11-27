@@ -61,6 +61,8 @@ class PanelAccountOut(ORMModel):
     applied_coefficient: float | None = None
     last_sync_at: datetime | None
     configs_count: int = 0
+    # List payloads omit share URLs — UI uses this for «N/M پنل» accuracy.
+    has_share_link: bool = False
 
 
 class UserResponse(ORMModel):

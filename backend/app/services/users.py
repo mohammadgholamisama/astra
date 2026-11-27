@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.models.user import PanelAccountStatus, User
 from app.schemas.user import PanelAccountOut, UserResponse
@@ -10,6 +10,57 @@ from app.services.site_settings import get_sub_base_url
 def subscription_url(user: User) -> str:
     base = get_sub_base_url().rstrip("/")
     return f"{base}/sub/{user.sub_token}"
+
+
+async def panel_account_share_meta(
+    db: AsyncSession, account_ids: list[int]
+) -> dict[int, tuple[bool, int]]:
+    """Batch: account_id → (has real share link, link array length).
+
+    List endpoints defer ``links`` JSON — this cheap text probe keeps UI
+    «N/M پنل» honest without shipping full vless payloads.
+    """
+    ids = [int(x) for x in account_ids if x]
+    if not ids:
+        return {}
+    out: dict[int, tuple[bool, int]] = {}
+    # Chunk to stay under param limits on large pages.
+    for i in range(0, len(ids), 800):
+        chunk = ids[i : i + 800]
+        rows = await db.execute(
+            text(
+                """
+                SELECT pa.id,
+                  (
+                    pa.links IS NOT NULL
+                    AND trim(coalesce(pa.links::text, '')) NOT IN ('', '[]', 'null', 'Null')
+                    AND (
+                      pa.links::text ILIKE '%vless://%'
+                      OR pa.links::text ILIKE '%vmess://%'
+                      OR pa.links::text ILIKE '%trojan://%'
+                      OR pa.links::text ILIKE '%ss://%'
+                      OR pa.links::text ILIKE '%shadowsocks://%'
+                      OR pa.links::text ILIKE '%hysteria%'
+                      OR pa.links::text ILIKE '%hy2://%'
+                      OR pa.links::text ILIKE '%tuic://%'
+                      OR pa.links::text ILIKE '%wireguard://%'
+                    )
+                  ) AS has_share,
+                  CASE
+                    WHEN pa.links IS NULL THEN 0
+                    WHEN json_typeof(pa.links::json) = 'array'
+                      THEN json_array_length(pa.links::json)
+                    ELSE 0
+                  END AS cfg_n
+                FROM panel_accounts pa
+                WHERE pa.id = ANY(:ids)
+                """
+            ),
+            {"ids": chunk},
+        )
+        for r in rows.all():
+            out[int(r[0])] = (bool(r[1]), int(r[2] or 0))
+    return out
 
 
 async def load_user(db: AsyncSession, username: str) -> User | None:
@@ -66,13 +117,23 @@ async def load_user_by_token(db: AsyncSession, token: str) -> User | None:
     return result.scalar_one_or_none()
 
 
-def to_user_response(user: User, *, include_links: bool = True) -> UserResponse:
+def to_user_response(
+    user: User,
+    *,
+    include_links: bool = True,
+    share_meta: dict[int, tuple[bool, int]] | None = None,
+) -> UserResponse:
     """Serialize user for API.
 
     include_links=False for list endpoints — cuts payload size a lot when
     many users each have large share-link arrays. List queries may ``defer``
     ``links``; never touch deferred attrs (async lazy-load is unsafe).
+
+    ``share_meta`` maps account_id → (has_share_link, configs_count) from a
+    batch SQL probe so list cards still show accurate «N/M پنل».
     """
+    from app.adapters.http_utils import is_share_link
+
     links: list[str] = []
     seen: set[str] = set()
     accounts = list(user.__dict__.get("panel_accounts") or [])
@@ -114,10 +175,23 @@ def to_user_response(user: User, *, include_links: bool = True) -> UserResponse:
             panel_base = pdict.get("base_url") or pdict.get("url")
             panel_name = pdict.get("name")
         # Never touch deferred/unloaded attrs (async lazy-load → MissingGreenlet).
-        if not include_links or "links" not in adict or is_deleted:
-            raw_links: list = []
-        else:
+        links_loaded = "links" in adict
+        raw_links: list = []
+        if links_loaded and not is_deleted:
             raw_links = [x for x in (adict.get("links") or []) if x]
+        aid = int(adict.get("id") or 0)
+        meta = share_meta.get(aid) if share_meta and aid else None
+        if meta is not None:
+            has_share, cfg_n = bool(meta[0]), int(meta[1] or 0)
+        elif links_loaded:
+            share_rows = [
+                x for x in raw_links if x and is_share_link(str(x))
+            ]
+            has_share = bool(share_rows)
+            cfg_n = len(share_rows)
+        else:
+            has_share = False
+            cfg_n = 0
         # Never surface stale error_message on healthy accounts (UI false positives)
         err = (
             adict.get("error_message")
@@ -136,15 +210,16 @@ def to_user_response(user: User, *, include_links: bool = True) -> UserResponse:
                 panel_is_active=panel_active,
                 remote_username=adict.get("remote_username"),
                 status=status_val,
-                # List view: keep count only (placeholder) — avoid shipping huge URLs
-                links=list(raw_links) if include_links else (["x"] * len(raw_links)),
+                # List view: omit URLs — has_share_link / configs_count carry truth.
+                links=list(raw_links) if include_links else [],
                 error_message=err,
                 used_traffic=used,
                 coeff_anchor_raw=int(adict.get("coeff_anchor_raw") or 0),
                 coeff_anchor_weighted=int(adict.get("coeff_anchor_weighted") or 0),
                 applied_coefficient=adict.get("applied_coefficient"),
                 last_sync_at=adict.get("last_sync_at"),
-                configs_count=len(raw_links),
+                configs_count=cfg_n,
+                has_share_link=has_share,
             )
         )
 

@@ -733,11 +733,11 @@ async def apply_ping_rank(
     One-shot: clear leftover auto-hides from older hub builds that wrongly
     hid dead pings (flag file under data/).
 
-    Order rules:
+    Order rules (group.order_kind only):
     - Up to 20 مستقیم (usage_cost↑ then quality)
-    - Tunnel tiers by usage_cost↑ — up to 35 per cost (e.g. ۵ سپس ۷)
+    - Up to 50 تانل (usage_cost↑ then quality)
     - Up to 9 گیمینگ (usage_cost↑ then quality)
-    - Remaining by cost then quality
+    - Up to 20 leftover (best remaining)
     Untested configs still fill their order_kind slot (sorted after scored peers).
     """
     from app.services.config_hides import clear_stale_ping_auto_hides_once
@@ -1304,7 +1304,20 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
             )
         await db.flush()
 
-    await orchestrator.provision_users_now(db, [user], targets, wait=45.0)
+    # Worker-backed creates (same path as sale users) — wait long enough that
+    # every active panel lands before workspace rebuild.
+    await orchestrator.provision_users_now(db, [user], targets, wait=120.0)
+    try:
+        await orchestrator.heal_user_coverage_pool_safe(
+            int(user.id), wait=60.0, include_empty_links=True
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        await orchestrator.hydrate_share_links_pool_safe(int(user.id))
+        await orchestrator.hydrate_share_links_pool_safe(int(user.id))
+    except Exception:  # noqa: BLE001
+        pass
 
     user = await _get_order_sample_user(db) or user
     trapped_rebecca: list[tuple[Panel, dict, int]] = []

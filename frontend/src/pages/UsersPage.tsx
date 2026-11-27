@@ -139,6 +139,11 @@ function userHasErrors(u: User) {
 }
 
 function accountHasShareLink(a: PanelAccount): boolean {
+  if (typeof a.has_share_link === "boolean") return a.has_share_link;
+  if ((a.configs_count || 0) > 0 && a.status === "active") {
+    // List payload may omit URLs but still report share count from server.
+    return true;
+  }
   const links = a.links || [];
   return links.some((x) => {
     const s = String(x || "").trim().toLowerCase();
