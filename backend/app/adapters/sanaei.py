@@ -868,10 +868,30 @@ class SanaeiAdapter(BasePanelAdapter):
                     # Prefer a converted (positive) clock from any inbound
                     if exp2 and (not exp or (st2 == "active" and st != "active")):
                         st, exp = st2, exp2
+                links: list[str] = []
+                if expand_links:
+                    sub_id = None
+                    try:
+                        obj = best_raw
+                        if isinstance(best_raw, dict):
+                            obj = (
+                                best_raw.get("obj")
+                                if best_raw.get("obj") is not None
+                                else best_raw
+                            )
+                        if isinstance(obj, dict):
+                            sub_id = obj.get("subId") or obj.get("sub_id")
+                    except Exception:  # noqa: BLE001
+                        sub_id = None
+                    try:
+                        links = await self._fetch_links(email, sub_id)
+                    except Exception:  # noqa: BLE001
+                        links = []
                 return AdapterResult(
                     success=True,
                     remote_username=email,
                     used_traffic=int(best),
+                    links=links,
                     raw=best_raw,
                     remote_status=st,
                     remote_expire=exp,
@@ -886,29 +906,54 @@ class SanaeiAdapter(BasePanelAdapter):
             return AdapterResult(success=False, error=str(e))
 
     async def _fetch_links(self, email: str, sub_id: str | None = None) -> list[str]:
-        links: list[str] = []
-        try:
-            resp = await self._request("GET", f"panel/api/clients/links/{email}")
-            ok, data = ok_json(resp)
-            if ok and isinstance(data, dict):
-                obj = data.get("obj") or data
-                links.extend(self._extract_links(obj))
-        except Exception:
-            pass
-        if sub_id:
+        """Pull share links; retry briefly — create often races the links API."""
+        out: list[str] = []
+        for attempt in range(3):
+            links: list[str] = []
             try:
-                resp = await self._request("GET", f"panel/api/clients/subLinks/{sub_id}")
+                resp = await self._request("GET", f"panel/api/clients/links/{email}")
                 ok, data = ok_json(resp)
                 if ok and isinstance(data, dict):
-                    links.extend(self._extract_links(data.get("obj") or data))
+                    obj = data.get("obj") or data
+                    links.extend(self._extract_links(obj))
             except Exception:
                 pass
-        seen: set[str] = set()
-        out: list[str] = []
-        for L in links:
-            if L and L not in seen:
-                seen.add(L)
-                out.append(L)
+            if sub_id:
+                try:
+                    resp = await self._request(
+                        "GET", f"panel/api/clients/subLinks/{sub_id}"
+                    )
+                    ok, data = ok_json(resp)
+                    if ok and isinstance(data, dict):
+                        links.extend(self._extract_links(data.get("obj") or data))
+                except Exception:
+                    pass
+            # Discover subId from traffic if caller didn't pass one
+            if not links and not sub_id:
+                try:
+                    resp = await self._request(
+                        "GET", f"panel/api/clients/traffic/{email}"
+                    )
+                    ok, data = ok_json(resp)
+                    if ok and isinstance(data, dict):
+                        obj = data.get("obj") if data.get("obj") is not None else data
+                        if isinstance(obj, dict):
+                            sid = obj.get("subId") or obj.get("sub_id")
+                            if sid:
+                                sub_id = str(sid)
+                                continue
+                except Exception:
+                    pass
+            seen: set[str] = set()
+            out = []
+            for L in links:
+                if L and L not in seen:
+                    seen.add(L)
+                    out.append(L)
+            if out:
+                return out
+            if attempt < 2:
+                await asyncio.sleep(0.4 * (attempt + 1))
         return out
 
     def _extract_links(self, obj: Any) -> list[str]:

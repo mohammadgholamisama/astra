@@ -138,21 +138,39 @@ function userHasErrors(u: User) {
   );
 }
 
-/** Distinct remote panels (not per-group account rows). */
+function accountHasShareLink(a: PanelAccount): boolean {
+  const links = a.links || [];
+  return links.some((x) => {
+    const s = String(x || "").trim().toLowerCase();
+    return (
+      s.startsWith("vless://") ||
+      s.startsWith("vmess://") ||
+      s.startsWith("ss://") ||
+      s.startsWith("trojan://") ||
+      s.startsWith("hysteria") ||
+      s.startsWith("tuic://") ||
+      s.startsWith("wireguard://")
+    );
+  });
+}
+
+/** Distinct remote panels (not per-group account rows).
+ *  ok = has real share link — status=active with empty//sub alone is NOT ok.
+ */
 function uniquePanelStats(u: User): { ok: number; total: number; errorPanels: number } {
   const accounts = u.panel_accounts || [];
   const all = new Set<number>();
-  const active = new Set<number>();
+  const okPanels = new Set<number>();
   const errored = new Set<number>();
   for (const a of accounts) {
     if (a.panel_is_active === false && a.status !== "active") continue;
     all.add(a.panel_id);
-    if (a.status === "active") active.add(a.panel_id);
+    if (accountHasShareLink(a)) okPanels.add(a.panel_id);
     if (isActionableAccountError(a, u.group_ids)) {
       errored.add(a.panel_id);
     }
   }
-  return { ok: active.size, total: all.size, errorPanels: errored.size };
+  return { ok: okPanels.size, total: all.size, errorPanels: errored.size };
 }
 
 function formatPanelErrorDetail(

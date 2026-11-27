@@ -260,13 +260,25 @@ async def _empty_user_coverage_heal_loop() -> None:
     """
     await asyncio.sleep(25)
     from app.services.orchestrator import (
+        force_heal_zero_active_users,
         heal_recent_empty_users,
         heal_users_missing_panel_accounts,
+        restamp_empty_share_actives,
     )
 
     while True:
         healed = 0
         try:
+            # Active+/sub-only → pending so drain+create never skip ۱۷/۲۱ cards.
+            # Small batches — large restamp+drain stampeded QueuePool (16+8).
+            try:
+                stamped = int(await restamp_empty_share_actives(limit_accounts=120) or 0)
+                if stamped:
+                    healed += 1
+            except Exception:  # noqa: BLE001
+                logger.debug("restamp empty-share skipped", exc_info=True)
+            # ۰/N + partial empty-share first — previously starved behind partial drains.
+            healed += int(await force_heal_zero_active_users(limit_users=12) or 0)
             healed += int(
                 await heal_recent_empty_users(
                     limit_users=60, max_age_hours=168.0
@@ -275,7 +287,7 @@ async def _empty_user_coverage_heal_loop() -> None:
             )
             # Steady chew — avoid pool stampede that blocked freeze/kill.
             healed += int(
-                await heal_users_missing_panel_accounts(limit_users=40)
+                await heal_users_missing_panel_accounts(limit_users=60)
                 or 0
             )
             if healed:
@@ -284,7 +296,7 @@ async def _empty_user_coverage_heal_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("empty-user coverage heal loop failed")
-        await asyncio.sleep(12 if healed else 25)
+        await asyncio.sleep(8 if healed else 18)
 
 
 async def _exhausted_remote_kill_loop() -> None:

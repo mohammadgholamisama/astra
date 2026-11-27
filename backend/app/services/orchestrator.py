@@ -1859,12 +1859,12 @@ _account_prov_sem: asyncio.Semaphore | None = None
 def _get_account_prov_sem() -> asyncio.Semaphore:
     """Cap concurrent creates — pool-safe sessions (open → HTTP → close).
 
-    Was 4/10 then 24 — 80k+ sticky pending after cancel-on-budget meant the
-    drain never caught up. 40 keeps fan-out high without saturating asyncpg.
+    Pool is 16+8 — fan-out above ~12 starves usage/freeze/heal (QueuePool
+    timeout). Prefer steady chew over stampede; coverage loop retries.
     """
     global _account_prov_sem
     if _account_prov_sem is None:
-        _account_prov_sem = asyncio.Semaphore(64)
+        _account_prov_sem = asyncio.Semaphore(12)
     return _account_prov_sem
 
 
@@ -2016,11 +2016,17 @@ async def _provision_account_now(account_id: int) -> bool:
                     "uuid": (acc.uuid or "").strip() or None,
                     "group_id": int(gid) if gid else None,
                     "prev_used": int(acc.used_traffic or 0),
+                    # Username alone is NOT proof of a live remote — sticky
+                    # pending rows often keep a preferred name with rid/links
+                    # empty, which used to skip create forever (modify-only).
                     "has_remote": bool(
-                        (acc.remote_username or "").strip()
-                        or (acc.remote_id or "").strip()
+                        (acc.remote_id or "").strip()
                         or (acc.uuid or "").strip()
-                        or bool(acc.links or [])
+                        or any(
+                            str(x).strip()
+                            for x in (acc.links or [])
+                            if x and str(x).strip()
+                        )
                     ),
                 }
                 await db.commit()
@@ -2131,6 +2137,25 @@ async def _provision_account_now(account_id: int) -> bool:
                             ]
                             if shares:
                                 links = shares
+                        if not any(is_share_link(x) for x in links):
+                            try:
+                                sub = await asyncio.wait_for(
+                                    adapter2.get_subscription_links(  # type: ignore[attr-defined]
+                                        payload.username,
+                                        job.get("remote_id") or payload.username,
+                                    ),
+                                    timeout=10.0,
+                                )
+                                if sub.success:
+                                    shares = [
+                                        str(x).strip()
+                                        for x in (sub.links or [])
+                                        if x and is_share_link(str(x))
+                                    ]
+                                    if shares:
+                                        links = shares
+                            except Exception:  # noqa: BLE001
+                                pass
                     except TypeError:
                         pass
                     except Exception:  # noqa: BLE001
@@ -2153,7 +2178,9 @@ async def _provision_account_now(account_id: int) -> bool:
                 now = datetime.now(timezone.utc)
                 panel_row = acc.panel
                 if res.success:
-                    acc.status = PanelAccountStatus.active
+                    shares_ok = any(
+                        is_share_link(str(x)) for x in (links or []) if x
+                    )
                     acc.remote_username = (
                         res.remote_username
                         or payload.username
@@ -2168,13 +2195,22 @@ async def _provision_account_now(account_id: int) -> bool:
                         int(job["prev_used"]),
                         int(res.used_traffic or 0),
                     )
-                    acc.error_message = None
                     acc.last_sync_at = now
-                    if panel_row is not None:
-                        panel_row.last_ok_at = now
+                    if shares_ok:
+                        acc.status = PanelAccountStatus.active
+                        acc.error_message = None
+                        if panel_row is not None:
+                            panel_row.last_ok_at = now
+                        await db.commit()
+                        invalidate_user_feed_cache(uid)
+                        return True
+                    # Create/modify returned ok but no usable share links —
+                    # keep pending so drain/heal retries expand/create.
+                    acc.status = PanelAccountStatus.pending
+                    acc.error_message = "ساخت شد ولی لینک اشتراک خالی است"
                     await db.commit()
                     invalidate_user_feed_cache(uid)
-                    return True
+                    return False
                 if _is_timeout_err(res.error) or (
                     _is_unreachable_err(res.error)
                     and not _is_hard_down_err(res.error)
@@ -2184,14 +2220,20 @@ async def _provision_account_now(account_id: int) -> bool:
                         or payload.username
                         or job["astra_username"]
                     )
-                    acc.error_message = None
                     if acc.links or links:
                         if links:
                             acc.links = links
-                        acc.status = PanelAccountStatus.active
-                        acc.last_sync_at = now
+                        if any(is_share_link(str(x)) for x in (acc.links or []) if x):
+                            acc.status = PanelAccountStatus.active
+                            acc.error_message = None
+                            acc.last_sync_at = now
+                        else:
+                            acc.status = PanelAccountStatus.pending
+                            acc.error_message = (res.error or "")[:240] or None
                     else:
                         acc.status = PanelAccountStatus.pending
+                        # Keep reason — blank err made sticky panels look healthy.
+                        acc.error_message = (res.error or "timeout/unreachable")[:240]
                     await db.commit()
                     invalidate_user_feed_cache(uid)
                     return False
@@ -2306,6 +2348,15 @@ async def provision_users_now(
                 logger.warning(
                     "provision_users_now astra rebuild wave failed", exc_info=True
                 )
+        # Expand /sub refs → real share links before the API returns.
+        for uid in user_ids:
+            try:
+                await hydrate_share_links_pool_safe(int(uid))
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "provision_users_now hydrate user=%s failed", uid, exc_info=True
+                )
+
         # Anything still pending/error → background finish (does not block UI)
         try:
             rows = await db.execute(
@@ -2896,11 +2947,11 @@ async def drain_pending_panel_accounts(
     limit_accounts: int = 400,
     prefer_partial_users: bool = True,
 ) -> dict[str, int]:
-    """Fire creates for pending/error rows — no age filter, partial users first.
+    """Fire creates for pending/error rows — empties first, then partials.
 
-    One panel failure must never leave siblings stuck forever; this drain is
-    the durable guarantee that every sticky pending slot gets another try.
-    Tasks keep running after this returns (start_account_provisions).
+    Critical: prior «prefer_partial» filled the whole limit with users who
+    already had ≥1 active, so ۰/۹ cards (all pending/error) starved forever.
+    Empties now take the first half of the wave; partials fill the rest.
     """
     from sqlalchemy import text
 
@@ -2917,7 +2968,41 @@ async def drain_pending_panel_accounts(
             order_sql = (
                 "pa.id ASC" if (int(time.time()) // 60) % 2 else "pa.id DESC"
             )
-            if prefer_partial_users:
+            have: set[int] = set()
+            empty_lim = max(10, lim // 2) if prefer_partial_users else lim
+            # Pass A: users with ZERO active remotes (۰/N cards) — never starve.
+            rows = await db.execute(
+                text(
+                    f"""
+                    SELECT pa.id
+                    FROM panel_accounts pa
+                    JOIN users u ON u.id = pa.user_id
+                    JOIN panels p ON p.id = pa.panel_id
+                    WHERE pa.status IN ('pending', 'error')
+                      AND u.status IN ('active', 'on_hold')
+                      AND p.is_active IS TRUE
+                      AND coalesce(pa.error_message, '') NOT LIKE 'ASTRA_QUOTA_FROZEN%'
+                      AND NOT EXISTS (
+                        SELECT 1 FROM panel_accounts a2
+                        WHERE a2.user_id = pa.user_id
+                          AND a2.status = 'active'
+                      )
+                    ORDER BY {order_sql}
+                    LIMIT :lim
+                    """
+                ),
+                {"lim": empty_lim},
+            )
+            for r in rows.all():
+                if not r[0]:
+                    continue
+                aid = int(r[0])
+                if aid in have:
+                    continue
+                ids.append(aid)
+                have.add(aid)
+            if prefer_partial_users and len(ids) < lim:
+                # Pass B: partial users (already have some active).
                 rows = await db.execute(
                     text(
                         f"""
@@ -2940,10 +3025,18 @@ async def drain_pending_panel_accounts(
                     ),
                     {"lim": lim},
                 )
-                ids = [int(r[0]) for r in rows.all() if r[0]]
+                for r in rows.all():
+                    if not r[0]:
+                        continue
+                    aid = int(r[0])
+                    if aid in have:
+                        continue
+                    ids.append(aid)
+                    have.add(aid)
+                    if len(ids) >= lim:
+                        break
             if len(ids) < lim:
-                # Second pass: empties / leftover errors (exclude already queued).
-                have = set(ids)
+                # Pass C: leftover sticky errors of any live user.
                 rows = await db.execute(
                     text(
                         f"""
@@ -2968,6 +3061,7 @@ async def drain_pending_panel_accounts(
                     if aid in have:
                         continue
                     ids.append(aid)
+                    have.add(aid)
                     if len(ids) >= lim:
                         break
             await db.rollback()
@@ -2979,8 +3073,8 @@ async def drain_pending_panel_accounts(
         return {"queued": 0, "ok_now": 0}
 
     tasks = start_account_provisions(ids)
-    # Short wait — tasks keep running after return; don't stall the bg loop.
-    done, _pending = await asyncio.wait(tasks, timeout=8.0)
+    # Wait longer so empties actually land before the next loop tick.
+    done, _pending = await asyncio.wait(tasks, timeout=18.0)
     ok_now = 0
     for t in done:
         try:
@@ -3190,7 +3284,7 @@ async def heal_users_missing_panel_accounts(*, limit_users: int = 20) -> int:
     # Fast path: drain sticky pending/error slots fleet-wide (partial first).
     try:
         drained = await drain_pending_panel_accounts(
-            limit_accounts=max(400, int(limit_users) * 60),
+            limit_accounts=max(80, min(200, int(limit_users) * 12)),
             prefer_partial_users=True,
         )
         if int(drained.get("queued") or 0) > 0:
@@ -3257,6 +3351,11 @@ async def heal_users_missing_panel_accounts(*, limit_users: int = 20) -> int:
                         if gaps:
                             needs_heal = True
                         else:
+                            from app.adapters.http_utils import (
+                                is_share_link as _isl,
+                                is_subscription_ref as _isr,
+                            )
+
                             empty = [
                                 a
                                 for a in (user.panel_accounts or [])
@@ -3266,12 +3365,18 @@ async def heal_users_missing_panel_accounts(*, limit_users: int = 20) -> int:
                                     PanelAccountStatus.error,
                                     PanelAccountStatus.pending,
                                 )
-                                and not (a.links or [])
+                                and not any(
+                                    _isl(str(x)) for x in (a.links or []) if x
+                                )
+                                and any(
+                                    _isr(str(x)) for x in (a.links or []) if x
+                                )
                             ]
                             needs_hydrate = bool(empty)
                     if needs_heal:
+                        # Empties need a real create wave, not a 22s peek.
                         healed = await heal_user_coverage_pool_safe(
-                            int(uid), wait=22.0, include_empty_links=True
+                            int(uid), wait=45.0, include_empty_links=True
                         )
                         if healed:
                             n += 1
@@ -3285,7 +3390,7 @@ async def heal_users_missing_panel_accounts(*, limit_users: int = 20) -> int:
                                 pass
                     elif needs_hydrate:
                         got = await asyncio.wait_for(
-                            hydrate_share_links_pool_safe(int(uid)), timeout=14.0
+                            hydrate_share_links_pool_safe(int(uid)), timeout=22.0
                         )
                         if got:
                             n += 1
@@ -3305,6 +3410,202 @@ async def heal_users_missing_panel_accounts(*, limit_users: int = 20) -> int:
                     )
     except Exception:  # noqa: BLE001
         logger.exception("heal missing panel accounts failed")
+    return n
+
+
+_NO_SHARE_SQL = """
+(
+  pa.links IS NULL
+  OR trim(coalesce(pa.links::text, '')) IN ('', '[]', 'null', 'Null')
+  OR (
+    pa.links::text NOT ILIKE '%vless://%'
+    AND pa.links::text NOT ILIKE '%vmess://%'
+    AND pa.links::text NOT ILIKE '%trojan://%'
+    AND pa.links::text NOT ILIKE '%ss://%'
+    AND pa.links::text NOT ILIKE '%shadowsocks://%'
+    AND pa.links::text NOT ILIKE '%hysteria%'
+    AND pa.links::text NOT ILIKE '%hy2://%'
+    AND pa.links::text NOT ILIKE '%tuic://%'
+    AND pa.links::text NOT ILIKE '%wireguard://%'
+  )
+)
+"""
+
+
+async def restamp_empty_share_actives(*, limit_accounts: int = 800) -> int:
+    """Demote active rows with only /sub or empty links → pending for drain/heal.
+
+    Status=active with no real share link looks «healthy» in old UI counts and
+    was skipped by drain_pending (pending/error only) — classic ۱۷/۲۱ cards.
+    """
+    from sqlalchemy import text
+
+    from app.core.database import AsyncSessionLocal
+
+    lim = max(20, min(5000, int(limit_accounts)))
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            text(
+                f"""
+                UPDATE panel_accounts pa
+                SET status = 'pending',
+                    error_message = NULL
+                WHERE pa.id IN (
+                  SELECT pa2.id
+                  FROM panel_accounts pa2
+                  JOIN users u ON u.id = pa2.user_id
+                  JOIN panels p ON p.id = pa2.panel_id
+                  WHERE pa2.status = 'active'
+                    AND u.status IN ('active', 'on_hold')
+                    AND p.is_active IS TRUE
+                    AND {_NO_SHARE_SQL.replace('pa.', 'pa2.')}
+                  ORDER BY pa2.id DESC
+                  LIMIT :lim
+                )
+                RETURNING pa.id
+                """
+            ),
+            {"lim": lim},
+        )
+        n = len([r for r in result.all() if r[0]])
+        await db.commit()
+    if n:
+        logger.warning("restamp_empty_share_actives n=%s", n)
+    return n
+
+
+async def find_zero_active_user_ids(*, limit: int = 200) -> list[int]:
+    """Active sale users with groups but zero usable (share-linked) remotes."""
+    from sqlalchemy import text
+
+    from app.core.database import AsyncSessionLocal
+
+    lim = max(1, min(2000, int(limit)))
+    async with AsyncSessionLocal() as db:
+        rows = await db.execute(
+            text(
+                f"""
+                SELECT u.id
+                FROM users u
+                WHERE u.status IN ('active', 'on_hold')
+                  AND EXISTS (
+                    SELECT 1 FROM user_groups ug WHERE ug.user_id = u.id
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM panel_accounts pa
+                    JOIN panels p ON p.id = pa.panel_id AND p.is_active IS TRUE
+                    WHERE pa.user_id = u.id
+                      AND pa.status = 'active'
+                      AND NOT {_NO_SHARE_SQL}
+                  )
+                  AND EXISTS (
+                    SELECT 1 FROM panel_accounts pa2
+                    JOIN panels p2 ON p2.id = pa2.panel_id AND p2.is_active IS TRUE
+                    WHERE pa2.user_id = u.id
+                      AND pa2.status IN ('pending', 'error', 'active')
+                  )
+                ORDER BY u.id DESC
+                LIMIT :lim
+                """
+            ),
+            {"lim": lim},
+        )
+        ids = [int(r[0]) for r in rows.all() if r[0]]
+        await db.rollback()
+    return ids
+
+
+async def find_partial_share_user_ids(*, limit: int = 200) -> list[int]:
+    """Users with some share links but still pending/error/empty-share slots."""
+    from sqlalchemy import text
+
+    from app.core.database import AsyncSessionLocal
+
+    lim = max(1, min(2000, int(limit)))
+    async with AsyncSessionLocal() as db:
+        rows = await db.execute(
+            text(
+                f"""
+                SELECT u.id
+                FROM users u
+                WHERE u.status IN ('active', 'on_hold')
+                  AND EXISTS (
+                    SELECT 1 FROM panel_accounts pa
+                    JOIN panels p ON p.id = pa.panel_id AND p.is_active IS TRUE
+                    WHERE pa.user_id = u.id
+                      AND pa.status = 'active'
+                      AND NOT {_NO_SHARE_SQL}
+                  )
+                  AND EXISTS (
+                    SELECT 1 FROM panel_accounts pa2
+                    JOIN panels p2 ON p2.id = pa2.panel_id AND p2.is_active IS TRUE
+                    WHERE pa2.user_id = u.id
+                      AND pa2.status <> 'deleted'
+                      AND (
+                        pa2.status IN ('pending', 'error')
+                        OR (pa2.status = 'active' AND {_NO_SHARE_SQL.replace('pa.', 'pa2.')})
+                      )
+                      AND coalesce(pa2.error_message, '') NOT LIKE 'ASTRA_QUOTA_FROZEN%'
+                  )
+                ORDER BY u.id DESC
+                LIMIT :lim
+                """
+            ),
+            {"lim": lim},
+        )
+        ids = [int(r[0]) for r in rows.all() if r[0]]
+        await db.rollback()
+    return ids
+
+
+async def force_heal_zero_active_users(*, limit_users: int = 40) -> int:
+    """Hard recreate wave for ۰/N (+ a few partials) — drain-first, short waits."""
+    try:
+        await restamp_empty_share_actives(
+            limit_accounts=max(60, min(150, int(limit_users) * 10))
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("restamp before force_heal failed", exc_info=True)
+    # Fleet chew via drain — faster than 50s/user serial HTTP.
+    try:
+        await drain_pending_panel_accounts(
+            limit_accounts=max(60, min(160, int(limit_users) * 10)),
+            prefer_partial_users=True,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("drain before force_heal failed", exc_info=True)
+    ids = await find_zero_active_user_ids(limit=max(5, int(limit_users)))
+    try:
+        # A few partials only — full partial fleet is handled by heal_users_missing.
+        for uid in await find_partial_share_user_ids(
+            limit=max(3, min(15, int(limit_users) // 2))
+        ):
+            if uid not in ids:
+                ids.append(uid)
+    except Exception:  # noqa: BLE001
+        logger.debug("find_partial_share failed", exc_info=True)
+    if not ids:
+        return 0
+    n = 0
+    for uid in ids[: max(5, int(limit_users))]:
+        try:
+            healed = await heal_user_coverage_pool_safe(
+                int(uid), wait=14.0, include_empty_links=True
+            )
+            if healed:
+                n += 1
+            try:
+                await hydrate_share_links_pool_safe(int(uid))
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                from app.api.subscription import invalidate_user_feed_cache
+
+                invalidate_user_feed_cache(int(uid))
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001
+            logger.debug("force_heal_zero_active user=%s failed", uid, exc_info=True)
     return n
 
 

@@ -1931,7 +1931,7 @@ async def fix_user_subscription(
     before_share, before_gaps = _share_gap_stats(user)
     uid = int(user.id)
 
-    # Empty active rows must be retried like errors (retry only sees error/pending).
+    # Empty /sub-only / generic stamp → pending so create+expand run for real.
     marked = 0
     for a in user.panel_accounts or []:
         st = getattr(a.status, "value", a.status)
@@ -1940,9 +1940,18 @@ async def fix_user_subscription(
             for x in (a.links or [])
             if x and is_share_link(str(x))
         ]
-        if st in ("active", "pending") and not links:
-            a.status = PanelAccountStatus.error
-            if not (a.error_message or "").strip():
+        err = (a.error_message or "").strip()
+        generic = (
+            not err
+            or err.startswith("fix-sub:")
+            or "بدون لینک" in err
+            or "ساخت/hydrate" in err
+        )
+        if st in ("active", "pending", "error") and not links:
+            a.status = PanelAccountStatus.pending if generic else PanelAccountStatus.error
+            if generic:
+                a.error_message = None
+            elif not err:
                 a.error_message = "fix-sub: empty links"
             marked += 1
     if marked:
@@ -1957,7 +1966,7 @@ async def fix_user_subscription(
     retried_n = 0
     try:
         got = await orchestrator.retry_failed_accounts(
-            db, user, overall_timeout=45.0
+            db, user, overall_timeout=75.0
         )
         retried_n = len(got or [])
         await db.commit()
@@ -1971,7 +1980,7 @@ async def fix_user_subscription(
     try:
         healed_n = int(
             await orchestrator.heal_user_coverage_pool_safe(
-                uid, wait=28.0, include_empty_links=True
+                uid, wait=55.0, include_empty_links=True
             )
             or 0
         )
@@ -1985,6 +1994,13 @@ async def fix_user_subscription(
         )
     except Exception:  # noqa: BLE001
         hydrated_n = 0
+    # Second expand pass — PasarGuard often lands /sub first, shares on hydrate#2.
+    try:
+        hydrated_n += int(
+            await orchestrator.hydrate_share_links_pool_safe(uid) or 0
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
     try:
         invalidate_user_feed_cache(uid)
