@@ -1247,15 +1247,29 @@ def _openapi_with_fa():
 app.openapi = _openapi_with_fa  # type: ignore[method-assign]
 
 
+# Keep Swagger chrome LTR (arrows/chevrons stay correct). Only Persian text aligns right.
 _DOCS_RTL_INJECT = (
     "<style>"
-    "html{direction:rtl}"
     "body{font-family:Vazirmatn,Tahoma,sans-serif}"
-    ".swagger-ui .opblock-summary-description,.swagger-ui .opblock-tag,"
-    ".swagger-ui .info .title,.swagger-ui .info p,.swagger-ui .info li{text-align:right}"
-    ".swagger-ui .opblock-summary-method{direction:ltr}"
-    ".swagger-ui .opblock-summary-path{direction:ltr;unicode-bidi:plaintext}"
-    ".swagger-ui .scheme-container{direction:rtl}"
+    ".swagger-ui .opblock-summary-description,"
+    ".swagger-ui .opblock-description-wrapper,"
+    ".swagger-ui .opblock-tag,"
+    ".swagger-ui .opblock-tag small,"
+    ".swagger-ui .info .title,"
+    ".swagger-ui .info p,"
+    ".swagger-ui .info li,"
+    ".swagger-ui .markdown p,"
+    ".swagger-ui .renderedMarkdown p{text-align:right;direction:rtl}"
+    ".swagger-ui .opblock-summary-method,"
+    ".swagger-ui .opblock-summary-path,"
+    ".swagger-ui .opblock-summary-path__unsafe-disable-unique-id,"
+    ".swagger-ui table,"
+    ".swagger-ui .parameters,"
+    ".swagger-ui .responses-wrapper{direction:ltr;text-align:left}"
+    ".swagger-ui .expand-operation svg,"
+    ".swagger-ui .expand-methods svg,"
+    ".swagger-ui .arrow,"
+    ".swagger-ui .opblock-control-arrow{transform:none!important}"
     "</style>"
 )
 
