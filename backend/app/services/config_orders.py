@@ -1269,7 +1269,14 @@ async def reconcile_order_with_sample(db: AsyncSession) -> int:
 
 
 async def create_or_refresh_samples(db: AsyncSession) -> dict:
-    """Rebuild order probe exactly like creating a user on every enabled group."""
+    """Rebuild order probe on every active panel — worker-parallel, wall-clock tight.
+
+    Prior path waited 120s+60s heal + 5 hydrate loops and blew the UI 90s
+    timeout so the button looked stuck with zero configs. Now: wipe → seed
+    pending → fire worker creates → short wait → hydrate → reconcile.
+    """
+    from app.core.database import AsyncSessionLocal, release_db_txn
+
     group_ids = await _all_enabled_group_ids(db)
     targets = await _resolve_order_sample_targets(db)
     if not targets:
@@ -1277,219 +1284,222 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
 
     user = await _ensure_order_sample_user(db)
     await _sync_order_sample_groups(db, user, group_ids)
-    # Always remove previous test accounts on remotes before rebuild
     await _wipe_order_sample_on_remotes(db, user, targets)
-    await asyncio.sleep(0.5)
 
     user = await _get_order_sample_user(db) or user
     await _sync_order_sample_groups(db, user, group_ids)
 
-    # Rebecca soft-deletes usernames — pre-seed fresh remote names per (panel×group)
-    rebecca_targets = [
-        (p, c, g)
-        for p, c, g in targets
-        if getattr(p, "type", None) == PanelType.rebecca
-    ]
-    if rebecca_targets:
-        for panel, _cfg, gid in rebecca_targets:
-            fresh = f"astra_o{secrets.token_hex(5)}"[:32]
-            db.add(
-                PanelAccount(
-                    user_id=user.id,
-                    panel_id=panel.id,
-                    group_id=int(gid) if gid else None,
-                    status=PanelAccountStatus.pending,
-                    remote_username=fresh,
-                )
+    # Rebecca: unique remote names so soft-delete ghosts don't block recreate.
+    for panel, _cfg, gid in targets:
+        if getattr(panel, "type", None) != PanelType.rebecca:
+            continue
+        db.add(
+            PanelAccount(
+                user_id=user.id,
+                panel_id=panel.id,
+                group_id=int(gid) if gid else None,
+                status=PanelAccountStatus.pending,
+                remote_username=f"astra_o{secrets.token_hex(5)}"[:32],
             )
-        await db.flush()
+        )
+    await db.flush()
+    await orchestrator.ensure_pending_panel_accounts(db, [user], targets)
+    await db.commit()
 
-    # Worker-backed creates (same path as sale users) — wait long enough that
-    # every active panel lands before workspace rebuild.
-    await orchestrator.provision_users_now(db, [user], targets, wait=120.0)
+    uid = int(user.id)
+    # Collect pending ids then release request txn before worker HTTP.
+    async with AsyncSessionLocal() as sdb:
+        rows = await sdb.execute(
+            select(PanelAccount.id).where(
+                PanelAccount.user_id == uid,
+                PanelAccount.status.in_(
+                    (PanelAccountStatus.pending, PanelAccountStatus.error)
+                ),
+            )
+        )
+        pending_ids = [int(r[0]) for r in rows.all() if r[0]]
+        await sdb.rollback()
+
+    try:
+        await release_db_txn(db)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Fan-out through WorkerRoutedAdapter (same path as sale create).
+    tasks = orchestrator.start_account_provisions(pending_ids) if pending_ids else []
+    if tasks:
+        done, still = await asyncio.wait(tasks, timeout=48.0)
+        # Do not cancel leftovers — workers keep creating in background.
+        logger.info(
+            "order-sample provision queued=%s done=%s bg=%s",
+            len(pending_ids),
+            len(done),
+            len(still),
+        )
+
+    # Short heal for gaps + expand /sub → share links (workers already created).
     try:
         await orchestrator.heal_user_coverage_pool_safe(
-            int(user.id), wait=60.0, include_empty_links=True
+            uid, wait=22.0, include_empty_links=True
         )
     except Exception:  # noqa: BLE001
-        pass
+        logger.debug("order-sample heal skipped", exc_info=True)
     try:
-        await orchestrator.hydrate_share_links_pool_safe(int(user.id))
-        await orchestrator.hydrate_share_links_pool_safe(int(user.id))
+        await orchestrator.hydrate_share_links_pool_safe(uid)
+        await orchestrator.hydrate_share_links_pool_safe(uid)
     except Exception:  # noqa: BLE001
-        pass
+        logger.debug("order-sample hydrate skipped", exc_info=True)
 
-    user = await _get_order_sample_user(db) or user
-    trapped_rebecca: list[tuple[Panel, dict, int]] = []
-    for panel, cfg, gid in rebecca_targets:
-        gid_i = int(gid) if gid else 0
-        acc = next(
-            (
-                a
-                for a in (user.panel_accounts or [])
-                if int(a.panel_id) == int(panel.id)
-                and int(getattr(a, "group_id", 0) or 0) == gid_i
-            ),
-            None,
-        )
-        err = (acc.error_message or "").lower() if acc else ""
-        if acc is None or acc.status != PanelAccountStatus.active or (
-            "soft-delete" in err
-            or "user not found" in err
-            or "already exists" in err
-        ):
-            if acc is not None:
-                acc.remote_username = f"astra_o{secrets.token_hex(5)}"[:32]
-                acc.status = PanelAccountStatus.pending
-                acc.error_message = None
-            trapped_rebecca.append((panel, cfg, gid))
-    if trapped_rebecca:
-        await db.flush()
-        await orchestrator.provision_users_now(
-            db, [user], trapped_rebecca, wait=20.0
-        )
+    # Astra outbounds: one parallel merge pass (no 5× serial loop).
+    try:
+        from app.services import astra_node as astra_node_svc
 
-    for attempt in range(5):
-        user = await _get_order_sample_user(db)
-        if not user:
-            break
-        try:
-            await asyncio.wait_for(
-                orchestrator.hydrate_share_links(db, user),
-                timeout=25.0,
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        user = await _get_order_sample_user(db) or user
-        # Astra: merge live outbound share-links (every outbound remark)
-        try:
-            from app.services import astra_node as astra_node_svc
-
-            for panel, _cfg, _gid in targets:
-                if getattr(panel, "type", None) != PanelType.astra:
-                    continue
-                email = user.username
-                for acc in user.panel_accounts or []:
-                    if int(acc.panel_id) == int(panel.id) and (
-                        acc.remote_username or ""
-                    ).strip():
-                        email = acc.remote_username
-                        break
-                _c, astra_links, _u = await astra_node_svc.client_usage_and_links(
-                    db, panel, email
-                )
-                shares = [
-                    str(x).strip()
-                    for x in (astra_links or [])
-                    if x and is_share_link(str(x))
-                ]
-                if not shares:
-                    continue
-                for acc in user.panel_accounts or []:
-                    if int(acc.panel_id) != int(panel.id):
-                        continue
-                    have = {
-                        str(x).strip()
-                        for x in (acc.links or [])
-                        if x and is_share_link(str(x))
-                    }
-                    merged = list(have)
-                    for lk in shares:
-                        if lk not in have:
-                            merged.append(lk)
-                    acc.links = merged
-                    if acc.status != PanelAccountStatus.active:
-                        acc.status = PanelAccountStatus.active
-                        acc.error_message = None
-        except Exception:  # noqa: BLE001
-            logger.warning("order-sample astra merge failed", exc_info=True)
-
-        def _shares(acc: PanelAccount) -> list[str]:
-            return [
-                str(x).strip()
-                for x in (acc.links or [])
-                if x and is_share_link(str(x))
-            ]
-
-        accounts = [
-            a
-            for a in (user.panel_accounts or [])
-            if getattr(a.status, "value", a.status)
-            not in (PanelAccountStatus.deleted.value, "deleted")
+        astra_panels = [
+            p
+            for p, _c, _g in targets
+            if getattr(p, "type", None) == PanelType.astra
         ]
-        share_total = sum(len(_shares(a)) for a in accounts)
-        still_need = any(not _shares(a) for a in accounts if a.status == PanelAccountStatus.active)
-        if share_total > 0 and not still_need:
-            break
-        if attempt < 4:
-            await asyncio.sleep(0.4 + 0.2 * attempt)
+        # Dedupe by panel id
+        seen_a: set[int] = set()
+        astra_uniq: list[Panel] = []
+        for p in astra_panels:
+            if int(p.id) in seen_a:
+                continue
+            seen_a.add(int(p.id))
+            astra_uniq.append(p)
 
-    await db.commit()
-    # Replace stale fingerprints in saved order with the fresh sample set
-    ordered_n = await reconcile_order_with_sample(db)
+        async with AsyncSessionLocal() as sdb:
+            user = await _get_order_sample_user(sdb)
+            if user and astra_uniq:
+                email_by_panel: dict[int, str] = {}
+                for acc in user.panel_accounts or []:
+                    pid = int(acc.panel_id)
+                    rn = (acc.remote_username or "").strip()
+                    if rn and pid not in email_by_panel:
+                        email_by_panel[pid] = rn
 
-    user = await _get_order_sample_user(db)
-    fps = await _sample_fingerprints(db)
-    link_count = len(fps)
+                async def _merge_one(panel: Panel) -> None:
+                    email = email_by_panel.get(int(panel.id)) or user.username
+                    try:
+                        _c, links, _u = await astra_node_svc.client_usage_and_links(
+                            sdb, panel, email
+                        )
+                    except Exception:  # noqa: BLE001
+                        return
+                    shares = [
+                        str(x).strip()
+                        for x in (links or [])
+                        if x and is_share_link(str(x))
+                    ]
+                    if not shares:
+                        return
+                    for acc in user.panel_accounts or []:
+                        if int(acc.panel_id) != int(panel.id):
+                            continue
+                        have = {
+                            str(x).strip()
+                            for x in (acc.links or [])
+                            if x and is_share_link(str(x))
+                        }
+                        merged = list(have)
+                        for lk in shares:
+                            if lk not in have:
+                                merged.append(lk)
+                        acc.links = merged
+                        if acc.status != PanelAccountStatus.active:
+                            acc.status = PanelAccountStatus.active
+                            acc.error_message = None
 
-    # Per unique panel status for the toast (aggregate panel×group accounts)
-    rows: list[dict[str, Any]] = []
-    ok_count = 0
-    fail_count = 0
-    by_panel: dict[int, list[PanelAccount]] = {}
-    if user is not None:
-        for acc in user.panel_accounts or []:
-            by_panel.setdefault(int(acc.panel_id), []).append(acc)
+                await asyncio.gather(
+                    *[_merge_one(p) for p in astra_uniq],
+                    return_exceptions=True,
+                )
+                await sdb.commit()
+    except Exception:  # noqa: BLE001
+        logger.warning("order-sample astra merge failed", exc_info=True)
 
-    seen_panels: set[int] = set()
-    panel_rows: list[tuple[Panel, list[PanelAccount]]] = []
-    for panel, _cfg, _gid in targets:
-        pid = int(panel.id)
-        if pid in seen_panels:
-            continue
-        seen_panels.add(pid)
-        panel_rows.append((panel, by_panel.get(pid) or []))
+    async with AsyncSessionLocal() as sdb:
+        ordered_n = await reconcile_order_with_sample(sdb)
+        user = await _get_order_sample_user(sdb)
+        fps = await _sample_fingerprints(sdb)
+        link_count = len(fps)
 
-    for panel, accs in panel_rows:
-        n_links = sum(
-            sum(1 for x in (a.links or []) if x and is_share_link(str(x)))
-            for a in accs
-        )
-        any_active = any(
-            getattr(a.status, "value", a.status)
-            in (PanelAccountStatus.active.value, "active")
-            for a in accs
-        )
-        ok = bool(accs and any_active and n_links > 0)
-        if ok:
-            ok_count += 1
-        else:
-            fail_count += 1
-        err = None
-        if not ok:
-            err = next(
-                (a.error_message for a in accs if a.error_message),
-                "بدون لینک" if accs and any_active else "ساخت ناموفق",
+        rows: list[dict[str, Any]] = []
+        ok_count = 0
+        fail_count = 0
+        by_panel: dict[int, list[PanelAccount]] = {}
+        if user is not None:
+            for acc in user.panel_accounts or []:
+                by_panel.setdefault(int(acc.panel_id), []).append(acc)
+
+        seen_panels: set[int] = set()
+        panel_rows: list[tuple[Panel, list[PanelAccount]]] = []
+        for panel, _cfg, _gid in targets:
+            pid = int(panel.id)
+            if pid in seen_panels:
+                continue
+            seen_panels.add(pid)
+            panel_rows.append((panel, by_panel.get(pid) or []))
+
+        for panel, accs in panel_rows:
+            n_links = sum(
+                sum(1 for x in (a.links or []) if x and is_share_link(str(x)))
+                for a in accs
             )
-        rows.append(
-            {
-                "panel_id": int(panel.id),
-                "panel_name": panel.name,
-                "ok": ok,
-                "links_count": n_links,
-                "accounts": len(accs),
-                "error": err,
-            }
-        )
+            any_active = any(
+                getattr(a.status, "value", a.status)
+                in (PanelAccountStatus.active.value, "active")
+                for a in accs
+            )
+            ok = bool(accs and any_active and n_links > 0)
+            if ok:
+                ok_count += 1
+            else:
+                fail_count += 1
+            err = None
+            if not ok:
+                err = next(
+                    (a.error_message for a in accs if a.error_message),
+                    "بدون لینک" if accs and any_active else "ساخت ناموفق",
+                )
+            rows.append(
+                {
+                    "panel_id": int(panel.id),
+                    "panel_name": panel.name,
+                    "ok": ok,
+                    "links_count": n_links,
+                    "accounts": len(accs),
+                    "error": err,
+                }
+            )
 
-    return {
-        "ok_count": ok_count,
-        "fail_count": fail_count,
-        "panels_count": len(panel_rows),
-        "targets_count": len(targets),
-        "groups_count": len(group_ids),
-        "links_count": link_count,
-        "ordered_count": ordered_n,
-        "sample_username": ORDER_SAMPLE_USERNAME,
-        "panels": rows,
-    }
+        # Leftover empties — background chew so UI isn't blocked again.
+        leftover = [
+            int(a.id)
+            for a in (user.panel_accounts or [])
+            if user is not None
+            and getattr(a.status, "value", a.status)
+            in (
+                PanelAccountStatus.pending.value,
+                PanelAccountStatus.error.value,
+                "pending",
+                "error",
+            )
+        ]
+        if leftover:
+            try:
+                orchestrator.start_account_provisions(leftover)
+            except Exception:  # noqa: BLE001
+                pass
+
+        return {
+            "ok_count": ok_count,
+            "fail_count": fail_count,
+            "panels_count": len(panel_rows),
+            "targets_count": len(targets),
+            "groups_count": len(group_ids),
+            "links_count": link_count,
+            "ordered_count": ordered_n,
+            "sample_username": ORDER_SAMPLE_USERNAME,
+            "panels": rows,
+        }

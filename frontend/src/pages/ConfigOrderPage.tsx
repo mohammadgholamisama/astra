@@ -220,7 +220,8 @@ export default function ConfigOrderPage() {
         };
       }>("/api/admin/config-order/sample", {
         method: "POST",
-        timeoutMs: 90_000,
+        // Worker fan-out + hydrate; keep under nginx/proxy ceilings.
+        timeoutMs: 120_000,
       }),
     onSuccess: (res) => {
       const ws = res.workspace;
