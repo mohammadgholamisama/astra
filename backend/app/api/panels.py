@@ -160,8 +160,9 @@ async def _live_test_panel(
         # Sanaei/path panels like masterplus often need ~4s — 3.8s caused false قطع.
         tries = 1
         if is_astra:
+            # Live outbound pings — do not clip so hard that cut hops look «وصل».
             overall_timeout = min(
-                float(overall_timeout), 12.0 if force_fresh_auth else 10.0
+                float(overall_timeout), 18.0 if force_fresh_auth else 16.0
             )
         else:
             overall_timeout = min(
@@ -176,7 +177,7 @@ async def _live_test_panel(
             break
         if quick:
             if is_astra:
-                per_try = min(11.0 if force_fresh_auth else 9.5, remaining)
+                per_try = min(16.0 if force_fresh_auth else 14.0, remaining)
             else:
                 per_try = min(6.5 if force_fresh_auth else 5.5, remaining)
         elif attempt == 0:
@@ -1325,12 +1326,13 @@ async def test_all_panels(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
-    """Probe *active* panels the operator currently sees (tab/search).
+    """Probe active panels (fleet or an explicit ``panel_ids`` list).
 
-    - ``panel_ids`` scopes to the visible list (no other-category ghost names).
+    - Default / FE sends every *active* panel id across all categories —
+      not just the current tab (that made «۴۲ پنل / تست ۱۷» look broken).
     - خاموش panels are skipped entirely (not shown as قطع).
-    - Two-wave probe: fast JWT reuse, then fresh-auth retry only for fails —
-      kills false «قطع» without slowing healthy panels.
+    - Astra always live-pings outbounds; cut hops count as قطع.
+    - Two-wave probe: quick first pass, then fresh-auth retry for fails.
     """
     import time as _time
 
@@ -1412,9 +1414,9 @@ async def test_all_panels(
     await release_db_txn(db)
 
     # Wave 1: parallel, reuse JWT. Wave 2: only fails, fresh auth.
-    # Sem sized for throughput without stampeding CF/Sanaei panels.
-    sem1 = asyncio.Semaphore(24)
-    sem2 = asyncio.Semaphore(12)
+    # Cap fan-out — Astra live-pings outbounds; too wide stampedes the node.
+    sem1 = asyncio.Semaphore(16)
+    sem2 = asyncio.Semaphore(8)
     t0 = _time.monotonic()
 
     def _outbound_warning(probe: dict) -> str | None:
@@ -1472,8 +1474,8 @@ async def test_all_panels(
             str(getattr(snap.get("type"), "value", snap.get("type")) or "")
             == "astra"
         )
-        # Astra uses cached outbound health in quick mode — still leave headroom.
-        budget = max(overall, 8.0) if is_astra else overall
+        # Astra live-pings every enabled outbound — need real headroom.
+        budget = max(overall, 14.0) if is_astra else overall
         async with sem:
             probe = await _live_test_panel(
                 snap["panel"],
@@ -1489,7 +1491,7 @@ async def test_all_panels(
     if snapshots:
         gathered = await asyncio.gather(
             *[
-                _one(s, sem=sem1, overall=6.0, fresh_auth=False)
+                _one(s, sem=sem1, overall=8.0, fresh_auth=False)
                 for s in snapshots
             ],
             return_exceptions=True,
@@ -1531,7 +1533,7 @@ async def test_all_panels(
                     pass
             retry_gathered = await asyncio.gather(
                 *[
-                    _one(s, sem=sem2, overall=8.0, fresh_auth=True)
+                    _one(s, sem=sem2, overall=12.0, fresh_auth=True)
                     for s in retry_snaps
                 ],
                 return_exceptions=True,

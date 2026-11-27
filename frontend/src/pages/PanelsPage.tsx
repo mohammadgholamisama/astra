@@ -993,19 +993,21 @@ export default function PanelsPage() {
     },
   });
 
-  const activeVisiblePanels = useMemo(
-    () => visiblePanels.filter((p) => p.is_active),
-    [visiblePanels]
+  /** All روشن panels across every category — test-all must cover the whole fleet. */
+  const allActivePanels = useMemo(
+    () => data.filter((p) => p.is_active),
+    [data]
   );
 
   const testAll = useMutation({
     mutationFn: () => {
-      // Only active panels in the current tab/search — never خاموش / other cats.
-      const ids = activeVisiblePanels.map((p) => p.id);
+      // Every active panel (all tabs), never خاموش — tab filter was hiding
+      // dead Astra outbounds while uncategorized Sanaei looked «همه وصل».
+      const ids = allActivePanels.map((p) => p.id);
       return api<PanelTestAll>("/api/admin/panels/test-all", {
         method: "POST",
         body: JSON.stringify({ panel_ids: ids }),
-        timeoutMs: 75_000,
+        timeoutMs: 180_000,
       });
     },
     onSuccess: (res) => {
@@ -1194,23 +1196,23 @@ export default function PanelsPage() {
         <span className="muted">
           {searchQ
             ? `${toFaDigits(visiblePanels.length)} از ${toFaDigits(data.length)} پنل`
-            : `${toFaDigits(data.length)} پنل`}
+            : `${toFaDigits(data.length)} پنل · ${toFaDigits(allActivePanels.length)} فعال`}
         </span>
         <button
           type="button"
           className="btn ghost"
           disabled={
             testAll.isPending ||
-            activeVisiblePanels.length === 0 ||
+            allActivePanels.length === 0 ||
             reorderMode
           }
           onClick={() => testAll.mutate()}
-          title="فقط پنل‌های روشن همین لیست تست می‌شوند"
+          title="همه پنل‌های روشن در همه دسته‌ها تست می‌شوند (خاموش‌ها نه)"
         >
           <Wifi size={16} />
           {testAll.isPending
-            ? `در حال تست ${toFaDigits(activeVisiblePanels.length)} پنل…`
-            : `تست اتصال (${toFaDigits(activeVisiblePanels.length)})`}
+            ? `در حال تست ${toFaDigits(allActivePanels.length)} پنل…`
+            : `تست اتصال (${toFaDigits(allActivePanels.length)})`}
         </button>
         {reorderMode ? (
           <>
@@ -1350,9 +1352,11 @@ export default function PanelsPage() {
         <div className="panels-test-all">
           <div className="panels-test-all-head">
             <div className="panels-test-all-title">
-              <strong>نتیجه تست اتصال این لیست</strong>
+              <strong>نتیجه تست همه پنل‌های فعال</strong>
               <span className="muted">
-                {toFaDigits(testAll.data.stats?.total ?? testAll.data.results.length)} پنل همین صفحه
+                {toFaDigits(testAll.data.stats?.total ?? testAll.data.results.length)} پنل روشن
+                {` · وصل ${toFaDigits(testAll.data.stats?.ok ?? testAll.data.ok)}`}
+                {` · قطع ${toFaDigits(testAll.data.stats?.fail ?? testAll.data.fail)}`}
                 {testAll.data.stats?.duration_ms != null
                   ? ` · ${formatLatency(testAll.data.stats.duration_ms)}`
                   : ""}
@@ -1465,6 +1469,9 @@ export default function PanelsPage() {
                 const typeLabel =
                   TYPES.find((t) => t.value === r.type)?.label || r.type;
                 const gClass = gradeClass(r.grade, r.success);
+                // Always prefer the live panel name from the page list.
+                const displayName =
+                  data.find((p) => p.id === r.id)?.name?.trim() || r.name;
                 return (
                   <li key={r.id} className={gClass}>
                     <div className="panels-test-row-main">
@@ -1474,7 +1481,7 @@ export default function PanelsPage() {
                         ) : (
                           <XCircle size={15} />
                         )}
-                        <b>{r.name}</b>
+                        <b dir="auto">{displayName}</b>
                         <em className="panels-test-type">{typeLabel}</em>
                         {r.worker_name ? (
                           <em className="panels-test-type">

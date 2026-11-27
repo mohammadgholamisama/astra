@@ -81,14 +81,14 @@ class AstraAdapter(BasePanelAdapter):
                     raw=health,
                 )
 
-            # test-all sets _probe_quick — prefer recent bg pings to avoid
-            # stampede false «قطع» while staying accurate when cache is stale.
+            # Always live-ping for Test / test-all. Cached «وصل» lied when
+            # the operator re-pinged outbounds and saw قطع.
             quick = bool((self.meta or {}).get("_probe_quick"))
             ob = await node.probe_panel_outbounds_health(
                 int(panel.id),
-                concurrency=2,
-                ping_timeout=5.0 if not quick else 4.0,
-                prefer_cache_sec=180.0 if quick else 0.0,
+                concurrency=3 if quick else 4,
+                ping_timeout=4.5 if quick else 6.0,
+                prefer_cache_sec=0.0,
             )
             health["outbounds"] = ob
             enabled = int(ob.get("enabled") or 0)
@@ -97,8 +97,10 @@ class AstraAdapter(BasePanelAdapter):
             disabled_n = int(ob.get("disabled") or 0)
             bad_names = list(ob.get("bad_names") or [])
             disabled_names = list(ob.get("disabled_names") or [])
+            ok_names = list(ob.get("ok_names") or [])
             names_off = node._format_outbound_names(disabled_names)
             names_bad = node._format_outbound_names(bad_names)
+            names_ok = node._format_outbound_names(ok_names)
             if enabled <= 0:
                 if disabled_n > 0 and names_off:
                     return AdapterResult(
@@ -111,11 +113,13 @@ class AstraAdapter(BasePanelAdapter):
                     error="اوتباند فعالی روی این نود نیست",
                     raw=health,
                 )
-            if ok_n <= 0:
+            # Any cut enabled hop → قطع. Stats must match the Outbounds page.
+            if bad_n > 0:
                 if names_bad:
+                    extra = f" · وصل: {names_ok}" if names_ok else ""
                     return AdapterResult(
                         success=False,
-                        error=f"اوتباند قطع است (پینگ ناموفق): {names_bad}",
+                        error=f"اوتباند قطع است (پینگ ناموفق): {names_bad}{extra}",
                         raw=health,
                     )
                 return AdapterResult(
@@ -123,15 +127,13 @@ class AstraAdapter(BasePanelAdapter):
                     error=f"اوتباند قطع است ({bad_n}/{enabled})",
                     raw=health,
                 )
-            # Partial: still «وصل» but warn which hops are down/off so the
-            # panels toast/test-all list shows the live outbound names.
             warn_bits: list[str] = []
-            if names_bad:
-                warn_bits.append(f"قطع: {names_bad}")
             if names_off:
                 warn_bits.append(f"خاموش: {names_off}")
             if warn_bits:
                 health["outbound_warning"] = " · ".join(warn_bits)
+            if names_ok:
+                health["outbound_ok"] = names_ok
             return AdapterResult(
                 success=True,
                 raw=health,
