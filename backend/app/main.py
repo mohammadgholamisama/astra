@@ -44,6 +44,7 @@ from app.models import panel_analytics as _panel_analytics_model  # noqa: F401
 from app.models import worker as _worker_model  # noqa: F401
 from app.models.user import PanelAccount, User, UserStatus
 from app.core.config import get_settings
+from app.openapi_fa import OPENAPI_DESC, OPENAPI_TAGS, customize_openapi
 from app.core.database import (
     AsyncSessionLocal,
     dispose_engine,
@@ -1132,38 +1133,23 @@ async def lifespan(_app: FastAPI):
         await dispose_engine()
 
 
-_OPENAPI_DESC = """
-پنل Astra — مدیریت کاربران، گروه‌ها، پنل‌ها و ورکرها.
-
-## احراز هویت API
-هدر `X-Api-Key: pg_key_…` (از تنظیمات → کلیدهای API) یا Bearer JWT.
-
-## Integration · گروه‌ها
-- `GET /api/v1/groups` — استعلام همه گروه‌ها
-- `GET /api/v1/groups/{id}` — استعلام یک گروه
-- `POST /api/v1/groups` — افزودن گروه
-- `PUT /api/v1/groups/{id}` — ویرایش گروه
-- `DELETE /api/v1/groups/{id}` — حذف گروه
-
-## Integration · رتبه و تست پنل در ساب
-- `GET /api/v1/panels/sub-status` — برای هر پنل: نتیجه تست پینگ و رتبه کانفیگ‌ها در `/sub`
-- `GET /api/v1/panels/{id}/sub-status` — همان برای یک پنل
-""".strip()
-
 app = FastAPI(
-    title=f"{settings.PANEL_NAME} Panel",
+    title="مستندات API · Astra",
     version="1.0.0",
-    description=_OPENAPI_DESC,
+    description=OPENAPI_DESC,
     lifespan=lifespan,
     default_response_class=ORJSONResponse,
-    openapi_tags=[
-        {
-            "name": "Integration · API خارجی",
-            "description": "گروه‌ها (CRUD) و وضعیت تست/رتبه پنل در لینک ساب — با X-Api-Key",
-        },
-        {"name": "Workers", "description": "ورکرها و تخصیص انحصاری پنل‌ها"},
-        {"name": "Groups", "description": "گروه‌های فروش (UI ادمین)"},
-    ],
+    openapi_tags=OPENAPI_TAGS,
+    docs_url=None,
+    redoc_url=None,
+    swagger_ui_parameters={
+        "docExpansion": "list",
+        "defaultModelsExpandDepth": -1,
+        "displayRequestDuration": True,
+        "filter": True,
+        "tryItOutEnabled": True,
+        "persistAuthorization": True,
+    },
 )
 
 _SUB_HOST_LANDING = """<!DOCTYPE html>
@@ -1241,6 +1227,75 @@ app.include_router(backup.router)
 app.include_router(subscription.router)
 app.include_router(system.router)
 app.include_router(analytics.router)
+
+# Wrap once so /docs shows Persian summaries without recursion.
+_orig_openapi = app.openapi
+_openapi_schema_fa: dict | None = None
+
+
+def _openapi_with_fa():
+    global _openapi_schema_fa
+    if _openapi_schema_fa is not None:
+        return _openapi_schema_fa
+    app.openapi_schema = None
+    schema = customize_openapi(_orig_openapi())
+    _openapi_schema_fa = schema
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _openapi_with_fa  # type: ignore[method-assign]
+
+
+_DOCS_RTL_INJECT = (
+    "<style>"
+    "html{direction:rtl}"
+    "body{font-family:Vazirmatn,Tahoma,sans-serif}"
+    ".swagger-ui .opblock-summary-description,.swagger-ui .opblock-tag,"
+    ".swagger-ui .info .title,.swagger-ui .info p,.swagger-ui .info li{text-align:right}"
+    ".swagger-ui .opblock-summary-method{direction:ltr}"
+    ".swagger-ui .opblock-summary-path{direction:ltr;unicode-bidi:plaintext}"
+    ".swagger-ui .scheme-container{direction:rtl}"
+    "</style>"
+)
+
+
+@app.get("/docs", include_in_schema=False)
+async def swagger_docs():
+    from fastapi.openapi.docs import get_swagger_ui_html
+
+    html = get_swagger_ui_html(
+        openapi_url='/openapi.json',
+        title='Astra API Docs',
+        swagger_ui_parameters={
+            "docExpansion": "list",
+            "defaultModelsExpandDepth": -1,
+            "displayRequestDuration": True,
+            "filter": True,
+            "tryItOutEnabled": True,
+            "persistAuthorization": True,
+        },
+    )
+    body = (
+        html.body.decode("utf-8")
+        if isinstance(html.body, (bytes, bytearray))
+        else str(html.body)
+    )
+    if "</head>" in body:
+        body = body.replace("</head>", _DOCS_RTL_INJECT + "</head>", 1)
+    else:
+        body = _DOCS_RTL_INJECT + body
+    return HTMLResponse(body)
+
+
+@app.get("/redoc", include_in_schema=False)
+async def redoc_docs():
+    from fastapi.openapi.docs import get_redoc_html
+
+    return get_redoc_html(
+        openapi_url='/openapi.json',
+        title='Astra API Docs',
+    )
 
 
 @app.get("/health")

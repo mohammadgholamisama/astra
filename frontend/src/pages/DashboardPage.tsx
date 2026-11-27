@@ -965,7 +965,7 @@ export default function DashboardPage() {
                 className="board-chip"
               >
                     <KeyRound size={16} strokeWidth={2.1} />
-                    <span>API Docs</span>
+                    <span>مستندات API</span>
               </a>
             </div>
           </section>
