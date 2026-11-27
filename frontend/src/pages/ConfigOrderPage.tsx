@@ -220,8 +220,8 @@ export default function ConfigOrderPage() {
         };
       }>("/api/admin/config-order/sample", {
         method: "POST",
-        // Worker fan-out + hydrate; keep under nginx/proxy ceilings.
-        timeoutMs: 120_000,
+        // Backend budgets ~55s; stay under nginx /api 300s with headroom.
+        timeoutMs: 90_000,
       }),
     onSuccess: (res) => {
       const ws = res.workspace;

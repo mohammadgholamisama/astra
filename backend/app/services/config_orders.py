@@ -1268,19 +1268,52 @@ async def reconcile_order_with_sample(db: AsyncSession) -> int:
     return order_i
 
 
+def _dedupe_order_sample_targets(
+    targets: list[tuple[Panel, dict, int]],
+) -> list[tuple[Panel, dict, int]]:
+    """One create per panel — 96 groups × same panel stampeded remotes and
+    blew the UI timeout (button looked stuck). Order inventory only needs
+    each panel's share links once.
+    """
+    out: list[tuple[Panel, dict, int]] = []
+    seen: set[int] = set()
+    for panel, cfg, gid in targets:
+        pid = int(getattr(panel, "id", 0) or 0)
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        out.append((panel, cfg, gid))
+    return out
+
+
 async def create_or_refresh_samples(db: AsyncSession) -> dict:
     """Rebuild order probe on every active panel — worker-parallel, wall-clock tight.
 
-    Prior path waited 120s+60s heal + 5 hydrate loops and blew the UI 90s
-    timeout so the button looked stuck with zero configs. Now: wipe → seed
-    pending → fire worker creates → short wait → hydrate → reconcile.
+    Must finish well under the admin UI / nginx ~120s ceiling. One account per
+    panel (not per group×panel), short provision+heal, then hydrate+reconcile.
+    Leftovers keep creating in background.
     """
+    import time as _time
+
     from app.core.database import AsyncSessionLocal, release_db_txn
 
+    t0 = _time.monotonic()
+    budget_s = 55.0
+
+    def _left() -> float:
+        return max(0.5, budget_s - (_time.monotonic() - t0))
+
     group_ids = await _all_enabled_group_ids(db)
-    targets = await _resolve_order_sample_targets(db)
+    raw_targets = await _resolve_order_sample_targets(db)
+    targets = _dedupe_order_sample_targets(raw_targets)
     if not targets:
         raise ValueError("هیچ پنل فعالی در گروه‌های فروش ثبت نشده است")
+    logger.info(
+        "order-sample start groups=%s raw_targets=%s panels=%s",
+        len(group_ids),
+        len(raw_targets),
+        len(targets),
+    )
 
     user = await _ensure_order_sample_user(db)
     await _sync_order_sample_groups(db, user, group_ids)
@@ -1325,98 +1358,116 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
     except Exception:  # noqa: BLE001
         pass
 
+    # Prior stampede often left circuits open → creates silently skipped.
+    try:
+        from app.core.panel_circuit import clear_panel_circuit
+
+        for panel, _c, _g in targets:
+            clear_panel_circuit(int(panel.id))
+    except Exception:  # noqa: BLE001
+        pass
+
     # Fan-out through WorkerRoutedAdapter (same path as sale create).
     tasks = orchestrator.start_account_provisions(pending_ids) if pending_ids else []
     if tasks:
-        done, still = await asyncio.wait(tasks, timeout=48.0)
+        wait_s = min(28.0, max(8.0, _left() - 18.0))
+        done, still = await asyncio.wait(tasks, timeout=wait_s)
         # Do not cancel leftovers — workers keep creating in background.
         logger.info(
-            "order-sample provision queued=%s done=%s bg=%s",
+            "order-sample provision queued=%s done=%s bg=%s left=%.1f",
             len(pending_ids),
             len(done),
             len(still),
+            _left(),
         )
 
     # Short heal for gaps + expand /sub → share links (workers already created).
-    try:
-        await orchestrator.heal_user_coverage_pool_safe(
-            uid, wait=22.0, include_empty_links=True
-        )
-    except Exception:  # noqa: BLE001
-        logger.debug("order-sample heal skipped", exc_info=True)
-    try:
-        await orchestrator.hydrate_share_links_pool_safe(uid)
-        await orchestrator.hydrate_share_links_pool_safe(uid)
-    except Exception:  # noqa: BLE001
-        logger.debug("order-sample hydrate skipped", exc_info=True)
+    if _left() > 6.0:
+        try:
+            await orchestrator.heal_user_coverage_pool_safe(
+                uid, wait=min(12.0, _left() - 4.0), include_empty_links=True
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("order-sample heal skipped", exc_info=True)
+    if _left() > 3.0:
+        try:
+            await asyncio.wait_for(
+                orchestrator.hydrate_share_links_pool_safe(uid),
+                timeout=min(14.0, _left()),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("order-sample hydrate skipped", exc_info=True)
 
     # Astra outbounds: one parallel merge pass (no 5× serial loop).
-    try:
-        from app.services import astra_node as astra_node_svc
+    if _left() >= 4.0:
+        try:
+            from app.services import astra_node as astra_node_svc
 
-        astra_panels = [
-            p
-            for p, _c, _g in targets
-            if getattr(p, "type", None) == PanelType.astra
-        ]
-        # Dedupe by panel id
-        seen_a: set[int] = set()
-        astra_uniq: list[Panel] = []
-        for p in astra_panels:
-            if int(p.id) in seen_a:
-                continue
-            seen_a.add(int(p.id))
-            astra_uniq.append(p)
+            astra_panels = [
+                p
+                for p, _c, _g in targets
+                if getattr(p, "type", None) == PanelType.astra
+            ]
+            seen_a: set[int] = set()
+            astra_uniq: list[Panel] = []
+            for p in astra_panels:
+                if int(p.id) in seen_a:
+                    continue
+                seen_a.add(int(p.id))
+                astra_uniq.append(p)
 
-        async with AsyncSessionLocal() as sdb:
-            user = await _get_order_sample_user(sdb)
-            if user and astra_uniq:
-                email_by_panel: dict[int, str] = {}
-                for acc in user.panel_accounts or []:
-                    pid = int(acc.panel_id)
-                    rn = (acc.remote_username or "").strip()
-                    if rn and pid not in email_by_panel:
-                        email_by_panel[pid] = rn
-
-                async def _merge_one(panel: Panel) -> None:
-                    email = email_by_panel.get(int(panel.id)) or user.username
-                    try:
-                        _c, links, _u = await astra_node_svc.client_usage_and_links(
-                            sdb, panel, email
-                        )
-                    except Exception:  # noqa: BLE001
-                        return
-                    shares = [
-                        str(x).strip()
-                        for x in (links or [])
-                        if x and is_share_link(str(x))
-                    ]
-                    if not shares:
-                        return
+            async with AsyncSessionLocal() as sdb:
+                user = await _get_order_sample_user(sdb)
+                if user and astra_uniq:
+                    email_by_panel: dict[int, str] = {}
                     for acc in user.panel_accounts or []:
-                        if int(acc.panel_id) != int(panel.id):
-                            continue
-                        have = {
-                            str(x).strip()
-                            for x in (acc.links or [])
-                            if x and is_share_link(str(x))
-                        }
-                        merged = list(have)
-                        for lk in shares:
-                            if lk not in have:
-                                merged.append(lk)
-                        acc.links = merged
-                        if acc.status != PanelAccountStatus.active:
-                            acc.status = PanelAccountStatus.active
-                            acc.error_message = None
+                        pid = int(acc.panel_id)
+                        rn = (acc.remote_username or "").strip()
+                        if rn and pid not in email_by_panel:
+                            email_by_panel[pid] = rn
 
-                await asyncio.gather(
-                    *[_merge_one(p) for p in astra_uniq],
-                    return_exceptions=True,
-                )
-                await sdb.commit()
-    except Exception:  # noqa: BLE001
-        logger.warning("order-sample astra merge failed", exc_info=True)
+                    async def _merge_one(panel: Panel) -> None:
+                        email = email_by_panel.get(int(panel.id)) or user.username
+                        try:
+                            _c, links, _u = await astra_node_svc.client_usage_and_links(
+                                sdb, panel, email
+                            )
+                        except Exception:  # noqa: BLE001
+                            return
+                        shares = [
+                            str(x).strip()
+                            for x in (links or [])
+                            if x and is_share_link(str(x))
+                        ]
+                        if not shares:
+                            return
+                        for acc in user.panel_accounts or []:
+                            if int(acc.panel_id) != int(panel.id):
+                                continue
+                            have = {
+                                str(x).strip()
+                                for x in (acc.links or [])
+                                if x and is_share_link(str(x))
+                            }
+                            merged = list(have)
+                            for lk in shares:
+                                if lk not in have:
+                                    merged.append(lk)
+                            acc.links = merged
+                            if acc.status != PanelAccountStatus.active:
+                                acc.status = PanelAccountStatus.active
+                                acc.error_message = None
+
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *[_merge_one(p) for p in astra_uniq],
+                            return_exceptions=True,
+                        ),
+                        timeout=min(12.0, _left()),
+                    )
+                    await sdb.commit()
+        except Exception:  # noqa: BLE001
+            logger.warning("order-sample astra merge failed", exc_info=True)
 
     async with AsyncSessionLocal() as sdb:
         ordered_n = await reconcile_order_with_sample(sdb)
@@ -1492,6 +1543,15 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
             except Exception:  # noqa: BLE001
                 pass
 
+        elapsed_ms = int((_time.monotonic() - t0) * 1000)
+        logger.info(
+            "order-sample done panels=%s ok=%s fail=%s links=%s ms=%s",
+            len(panel_rows),
+            ok_count,
+            fail_count,
+            link_count,
+            elapsed_ms,
+        )
         return {
             "ok_count": ok_count,
             "fail_count": fail_count,
@@ -1500,6 +1560,7 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
             "groups_count": len(group_ids),
             "links_count": link_count,
             "ordered_count": ordered_n,
+            "elapsed_ms": elapsed_ms,
             "sample_username": ORDER_SAMPLE_USERNAME,
             "panels": rows,
         }
