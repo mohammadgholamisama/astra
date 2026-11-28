@@ -8,39 +8,87 @@ from app.schemas.common import ORMModel
 
 
 class UserCreate(BaseModel):
-    username: str = Field(min_length=3, max_length=32, pattern=r"^[a-zA-Z0-9_]+$")
-    display_name: str | None = Field(default=None, max_length=64)
-    status: UserStatus = UserStatus.active
-    data_limit: int = 0
-    expire: int | None = 0
-    on_hold_expire_duration: int = 0
-    include_promo_first: bool = True
-    note: str | None = None
-    group_ids: list[int] = Field(default_factory=list)
+    username: str = Field(
+        min_length=3,
+        max_length=32,
+        pattern=r"^[a-zA-Z0-9_]+$",
+        description="نام کاربری یکتا (لاتین، عدد، _).",
+    )
+    display_name: str | None = Field(
+        default=None, max_length=64, description="نام نمایشی اختیاری."
+    )
+    status: UserStatus = Field(
+        default=UserStatus.active,
+        description="وضعیت اولیه: active / disabled / on_hold / …",
+    )
+    data_limit: int = Field(
+        default=0,
+        description="سقف حجم به **بایت**. `0` یعنی نامحدود.",
+    )
+    expire: int | None = Field(
+        default=0,
+        description="انقضا به‌صورت unix timestamp **ثانیه‌ای** (UTC). `0` یا null = بدون انقضا.",
+    )
+    on_hold_expire_duration: int = Field(
+        default=0,
+        description="مدت اعتبار پس از اولین اتصال در حالت on_hold — **ثانیه**. `0` = غیرفعال.",
+    )
+    include_promo_first: bool = Field(
+        default=True, description="اگر true، کانفیگ‌های پرومو اول ساب می‌آیند."
+    )
+    note: str | None = Field(default=None, description="یادداشت داخلی ادمین.")
+    group_ids: list[int] = Field(
+        default_factory=list, description="شناسه گروه‌هایی که کاربر عضو می‌شود."
+    )
     # Bind user to a sales category so later category membership changes sync
-    category_id: int | None = None
-    proxies: dict[str, Any] = Field(default_factory=dict)
-    proxy_settings: dict[str, Any] = Field(default_factory=dict)
-    inbounds: dict[str, Any] = Field(default_factory=dict)
-    data_limit_reset_strategy: str = "no_reset"
+    category_id: int | None = Field(
+        default=None,
+        description="شناسه دسته فروش برای همگام‌سازی عضویت بعدی. null = بدون دسته.",
+    )
+    proxies: dict[str, Any] = Field(
+        default_factory=dict,
+        description="تنظیم پروکسی‌ها (مثلاً vless/vmess). معمولاً `{}` کافی است.",
+    )
+    proxy_settings: dict[str, Any] = Field(
+        default_factory=dict, description="تنظیمات اضافه پروکسی؛ معمولاً `{}`."
+    )
+    inbounds: dict[str, Any] = Field(
+        default_factory=dict,
+        description="انتخاب inboundها به ازای پروتکل؛ معمولاً `{}` تا پنل پیش‌فرض بسازد.",
+    )
+    data_limit_reset_strategy: str = Field(
+        default="no_reset",
+        description="استراتژی ریست حجم: `no_reset` / `day` / `week` / `month` / `year`.",
+    )
 
 
 class UserModify(BaseModel):
-    display_name: str | None = Field(default=None, max_length=64)
-    clear_display_name: bool = False
-    status: UserStatus | None = None
-    data_limit: int | None = None
-    expire: int | None = None
-    on_hold_expire_duration: int | None = None
+    display_name: str | None = Field(default=None, max_length=64, description="نام نمایشی.")
+    clear_display_name: bool = Field(default=False, description="اگر true نام نمایشی پاک می‌شود.")
+    status: UserStatus | None = Field(default=None, description="وضعیت جدید کاربر.")
+    data_limit: int | None = Field(
+        default=None, description="سقف حجم به **بایت**. `0` = نامحدود."
+    )
+    expire: int | None = Field(
+        default=None,
+        description="unix timestamp **ثانیه‌ای**. `0` = بدون انقضا.",
+    )
+    on_hold_expire_duration: int | None = Field(
+        default=None, description="مدت on_hold به **ثانیه**."
+    )
     include_promo_first: bool | None = None
     note: str | None = None
-    group_ids: list[int] | None = None
+    group_ids: list[int] | None = Field(
+        default=None, description="لیست کامل group_idهای جدید (جایگزین)."
+    )
     # Set to bind/rebind; null + clear_category clears tracking
-    category_id: int | None = None
-    clear_category: bool = False
+    category_id: int | None = Field(default=None, description="دسته فروش؛ با clear_category پاک می‌شود.")
+    clear_category: bool = Field(default=False, description="اگر true، وابستگی دسته حذف می‌شود.")
     proxies: dict[str, Any] | None = None
     proxy_settings: dict[str, Any] | None = None
-    data_limit_reset_strategy: str | None = None
+    data_limit_reset_strategy: str | None = Field(
+        default=None, description="`no_reset` / `day` / `week` / `month` / `year`."
+    )
 
 
 class PanelAccountOut(ORMModel):

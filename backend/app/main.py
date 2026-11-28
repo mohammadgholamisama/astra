@@ -1250,6 +1250,8 @@ app.openapi = _openapi_with_fa  # type: ignore[method-assign]
 
 # Keep Swagger chrome LTR (arrows/chevrons stay correct). Only Persian text aligns right.
 _DOCS_RTL_INJECT = (
+    '<link rel="stylesheet" '
+    'href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" />'
     "<style>"
     "body{font-family:Vazirmatn,Tahoma,sans-serif}"
     ".swagger-ui .opblock-summary-description,"

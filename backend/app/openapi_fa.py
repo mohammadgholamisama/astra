@@ -30,7 +30,14 @@ OPENAPI_DESC = """
 | **JWT ادمین** | `Authorization: Bearer <token>` | پنل مدیریت بعد از `POST /api/admin/token` |
 | **بدون توکن** | — | فقط مسیرهای عمومی: `/health`، `/sub/{token}`، نصب ورکر عمومی، و خودِ لاگین |
 
-دکمه **Authorize** بالای صفحه را بزنید و یکی از دو روش را وارد کنید. در هر API پایین، نمونه **curl** و پاسخ‌های نمونه هم آمده است.
+در **Authorize** فقط یک کادر `ApiKeyAuth` برای `X-Api-Key` و در صورت نیاز OAuth2 برای JWT ببینید.
+در نمونه‌های **curl** به‌جای `YOUR_PANEL_HOST` آدرس واقعی پنل را بگذارید (مثلاً دامنهٔ عمومی Astra).
+
+### واحدها (مهم)
+
+- `data_limit` / `used_traffic`: **بایت** — مقدار `0` برای سقف یعنی **نامحدود**
+- `expire`: **unix timestamp ثانیه‌ای** (UTC) — `0` یا `null` یعنی بدون انقضا
+- `on_hold_expire_duration`: **ثانیه** مدت اعتبار پس از اولین اتصال (حالت on_hold)
 """
 
 OPENAPI_TAGS: list[dict[str, str]] = [
@@ -265,10 +272,26 @@ _OPS: dict[tuple[str, str], tuple[str, str]] = {
         "صفحه گروه‌ها → جابه‌جایی بین دسته‌ها.",
         "فقط `category_id` گروه را عوض می‌کند؛ پنل‌ها و کاربران دست نخورده می‌مانند.",
     ),
-    ("post", "/api/group/{group_id}/resync-users"): _d(
-        "همگام‌سازی دوباره کاربران این گروه با پنل‌ها",
-        "وقتی پنل‌های گروه عوض شده و بعضی کاربران هنوز پنل قدیمی/ناقص دارند.",
-        "برای اعضای گروه، اکانت‌های کم را می‌سازد و اضافی را جمع می‌کند.",
+    ("post", "/api/group/{group_id}/resync-users"): (
+        "همگام‌سازی دوباره کاربران این گروه با پنل‌ها — صف پس‌زمینه",
+        "\n\n".join(
+            [
+                "**کجا در پنل:** صفحه گروه‌ها → اعمال پنل‌ها روی ساب / resync.",
+                "**عملکرد دقیق:** برای هر عضو گروه (و در صورت دستهٔ فروش، کاربران "
+                "`source_category_id` همان دسته) پنل‌های فعلی گروه را با اکانت ریموت "
+                "مقایسه می‌کند: پنل تازه‌اضافه‌شده → ساخت اکانت + لینک ساب؛ "
+                "پنلی که از گروه برداشته شده → **حذف اکانت از پنل ریموت** "
+                "(مصرف در Astra بانکی می‌ماند و صفر نمی‌شود).",
+                "**اجرا:** درخواست **فوری در پس‌زمینه** صف می‌شود و همین لحظه "
+                "`200` با خلاصه برمی‌گردد — منتظر هزار کاربر نمی‌ماند (تایم‌اوت مرورگر "
+                "نمی‌گیرید). پیشرفت در داشبورد Ops دیده می‌شود.",
+                "**اگر پنلی قطع باشد:** همان پنل در پس‌زمینه خطا/pending می‌ماند؛ "
+                "بقیه ادامه می‌دهند. پاسخ HTTP باز هم `200` با `ok: true` است "
+                "(شکست جزئی در UI/لاگ، نه لزوماً 5xx روی همین فراخوانی).",
+                "**اگر resync قبلی هنوز در حال اجرا باشد:** `queued: true` برمی‌گردد "
+                "و موج قبلی با پنل‌های جدید از نو علامت می‌خورد.",
+            ]
+        ),
     ),
     ("get", "/api/group-categories"): _d(
         "لیست دسته‌های گروه",
@@ -290,10 +313,19 @@ _OPS: dict[tuple[str, str], tuple[str, str]] = {
         "حذف دسته از UI.",
         "دسته را برمی‌دارد؛ گروه‌های داخلش معمولاً بدون دسته می‌شوند (نه حذف گروه).",
     ),
-    ("post", "/api/group-categories/{category_id}/resync-users"): _d(
-        "همگام‌سازی کاربران همه گروه‌های یک دسته",
-        "بعد از تغییر گسترده پنل‌ها در چند گروه هم‌دسته.",
-        "resync را برای تمام گروه‌های آن دسته اجرا می‌کند.",
+    ("post", "/api/group-categories/{category_id}/resync-users"): (
+        "همگام‌سازی کاربران همه گروه‌های یک دسته — صف پس‌زمینه",
+        "\n\n".join(
+            [
+                "**کجا در پنل:** مدیریت دسته گروه‌ها بعد از تغییر گسترده پنل‌ها.",
+                "**عملکرد:** برای هر گروه داخل دسته همان منطق "
+                "`POST /api/group/{group_id}/resync-users` را اجرا می‌کند "
+                "(ساخت کم‌بود، حذف اکانت پنل‌های خارج‌شده از گروه).",
+                "**اجرا:** پس‌زمینه؛ پاسخ سریع `200` با شمارش/وضعیت شروع. "
+                "قطع بودن یک پنل فقط همان شاخه را کند/خطا می‌کند، کل درخواست را "
+                "لزوماً 5xx نمی‌کند.",
+            ]
+        ),
     ),
     # ── Group configs / visibility ─────────────────────────
     ("get", "/api/group/{group_id}/configs"): _d(
@@ -969,52 +1001,146 @@ _PUBLIC_EXACT: set[str] = {
     "/api/admin/token",
 }
 
-_ERROR_EXAMPLES: dict[str, dict[str, Any]] = {
-    "401": {
-        "description": "احراز هویت ناموفق — کلید/توکن نیست یا باطل است",
-        "content": {
-            "application/json": {
-                "examples": {
-                    "invalid_api_key": {
-                        "summary": "کلید API نامعتبر",
-                        "value": {"detail": "Invalid API key"},
-                    },
-                    "not_authenticated": {
-                        "summary": "بدون هدر امنیتی",
-                        "value": {"detail": "Not authenticated"},
-                    },
-                    "invalid_token": {
-                        "summary": "JWT نامعتبر",
-                        "value": {"detail": "Invalid token"},
-                    },
-                }
+_AUTH_401: dict[str, Any] = {
+    "description": "احراز هویت ناموفق — کلید/توکن نیست یا باطل است",
+    "content": {
+        "application/json": {
+            "examples": {
+                "invalid_api_key": {
+                    "summary": "کلید API نامعتبر",
+                    "value": {"detail": "Invalid API key"},
+                },
+                "not_authenticated": {
+                    "summary": "بدون هدر امنیتی",
+                    "value": {"detail": "Not authenticated"},
+                },
+                "invalid_token": {
+                    "summary": "JWT نامعتبر",
+                    "value": {"detail": "Invalid token"},
+                },
             }
-        },
+        }
     },
-    "404": {
-        "description": "منبع پیدا نشد",
-        "content": {
-            "application/json": {
-                "example": {"detail": "گروه پیدا نشد"},
+}
+
+_VALIDATION_422: dict[str, Any] = {
+    "description": "خطای اعتبارسنجی بدنه/پارامتر (نوع، طول، الزام)",
+    "content": {
+        "application/json": {
+            "example": {
+                "detail": [
+                    {
+                        "type": "string_too_short",
+                        "loc": ["body", "username"],
+                        "msg": "String should have at least 3 characters",
+                        "input": "ab",
+                    }
+                ]
             }
-        },
+        }
     },
-    "422": {
-        "description": "خطای اعتبارسنجی بدنه/پارامتر (نوع، طول، الزام)",
-        "content": {
-            "application/json": {
-                "example": {
-                    "detail": [
-                        {
-                            "type": "string_too_short",
-                            "loc": ["body", "name"],
-                            "msg": "String should have at least 3 characters",
-                            "input": "ab",
-                        }
-                    ]
-                }
-            }
-        },
+}
+
+# Path-param → realistic 404 detail (never blanket «گروه پیدا نشد»).
+_PARAM_HELP: dict[str, str] = {
+    "group_id": "شناسه عددی گروه — از `GET /api/groups` یا `/api/v1/groups`.",
+    "category_id": "شناسه دسته گروه‌ها — از لیست دسته‌ها در پنل / `GET`های دسته.",
+    "panel_id": "شناسه پنل مقصد — از صفحه پنل‌ها / `GET /api/panels`.",
+    "user_id": "شناسه داخلی کاربر در Astra.",
+    "username": "نام کاربری دقیقاً همانی که هنگام ساخت ثبت شده.",
+    "key_id": "شناسه کلید API در تنظیمات → کلیدهای API.",
+    "worker_id": "شناسه ورکر از صفحه ورکرها.",
+    "token": "توکن ساب کاربر (بخش بعد از `/sub/`).",
+    "template_id": "شناسه قالب کاربر.",
+    "order_id": "شناسه ردیف ترتیب کانفیگ.",
+}
+
+_BINARY_RESPONSES: dict[tuple[str, str], tuple[str, str]] = {
+    ("get", "/api/public/worker-bundle.tar.gz"): (
+        "application/gzip",
+        "دانلود فایل فشردهٔ agent ورکر (tar.gz).",
+    ),
+    ("get", "/api/public/worker-bundle.tgz"): (
+        "application/gzip",
+        "دانلود فایل فشردهٔ agent ورکر (tgz).",
+    ),
+    ("get", "/api/public/worker-install.sh"): (
+        "text/x-shellscript",
+        "اسکریپت نصب ورکر (متن ساده).",
+    ),
+    ("get", "/api/admin/backup"): (
+        "application/zip",
+        "دانلود بک‌آپ zip دیتابیس/تنظیمات.",
+    ),
+}
+
+_OK_RESPONSE_EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
+    ("post", "/api/group/{group_id}/resync-users"): {
+        "ok": True,
+        "started": True,
+        "queued": False,
+        "detail": "همگام‌سازی در پس‌زمینه شروع شد — داشبورد را ببینید",
+        "group_id": 7,
+        "users": 128,
+        "category_users": 40,
+        "removed_panels": [15],
+    },
+    ("post", "/api/group-categories/{category_id}/resync-users"): {
+        "ok": True,
+        "detail": "همگام‌سازی کاربران این دسته شروع شد — پیشرفت در داشبورد",
+        "category_id": 3,
+    },
+    ("post", "/api/internal/worker/usage-report"): {
+        "ok": True,
+        "panel_id": 12,
+        "meters": 40,
+        "dirty": 12,
+        "exhausted": 0,
+    },
+    ("get", "/health"): {"status": "ok"},
+}
+
+_USAGE_REPORT_BODY_EXAMPLE: dict[str, Any] = {
+    "panel_id": 12,
+    "meters": [
+        {"remote_username": "demo_user", "used_traffic": 104857600},
+    ],
+    "listed": 1,
+    "worker_id": 3,
+    "dt_ms": 120,
+    "full_sync": False,
+    "mode": "hot",
+}
+
+_COMMON_REQUEST_EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
+    ("post", "/api/user"): {
+        "username": "demo_user",
+        "display_name": "Demo",
+        "status": "active",
+        "data_limit": 107374182400,
+        "expire": 1893456000,
+        "on_hold_expire_duration": 0,
+        "include_promo_first": True,
+        "note": None,
+        "group_ids": [7],
+        "category_id": None,
+        "proxies": {},
+        "proxy_settings": {},
+        "inbounds": {},
+        "data_limit_reset_strategy": "no_reset",
+    },
+    ("put", "/api/user/{username}"): {
+        "data_limit": 53687091200,
+        "expire": 1893456000,
+        "status": "active",
+    },
+    ("post", "/api/admin/change-password"): {
+        "current_password": "OLD_SECRET",
+        "new_password": "NEW_SECRET_12",
+    },
+    ("post", "/api/admin/api-keys"): {
+        "name": "shop-bot",
+        "expires_at": None,
     },
 }
 
@@ -1221,7 +1347,7 @@ def _auth_note(path: str, method: str) -> str:
         return (
             "**امنیت:** عمومی — توکن لازم نیست.\n\n"
             "این مسیر برای کلاینت نهایی / healthcheck / لاگین است؛ "
-            "عمداً قفل ندارد."
+            "عمداً قفل ندارد و خطای ۴۰۱ برای نبود توکن اینجا معنی ندارد."
         )
     if _is_worker_internal(path):
         return (
@@ -1240,71 +1366,214 @@ def _auth_note(path: str, method: str) -> str:
     )
 
 
+def _panel_host() -> str:
+    try:
+        from app.core.config import get_settings
+
+        base = (get_settings().PANEL_BASE_URL or "").strip().rstrip("/")
+        if base.startswith("http://") or base.startswith("https://"):
+            # Prefer public-looking hosts; still better than PANEL_HOST placeholder.
+            return base
+    except Exception:  # noqa: BLE001
+        pass
+    return "https://YOUR_PANEL_HOST"
+
+
 def _sample_path(path: str) -> str:
+    import re
+
+    known = {
+        "{group_id}": "7",
+        "{category_id}": "3",
+        "{panel_id}": "12",
+        "{user_id}": "1001",
+        "{key_id}": "3",
+        "{worker_id}": "3",
+        "{token}": "USER_SUB_TOKEN",
+        "{username}": "demo_user",
+        "{template_id}": "2",
+        "{order_id}": "5",
+        "{full_path}": "index.html",
+    }
+    out = path
+    for k, v in known.items():
+        out = out.replace(k, v)
+    return re.sub(r"\{[^}]+\}", "1", out)
+
+
+def _resolve_schema_ref(ref: str, root: dict[str, Any]) -> dict[str, Any]:
+    if not ref.startswith("#/"):
+        return {}
+    node: Any = root
+    for part in ref[2:].split("/"):
+        if not isinstance(node, dict):
+            return {}
+        node = node.get(part)
+    return node if isinstance(node, dict) else {}
+
+
+def _schema_example(sch: dict[str, Any], root: dict[str, Any], depth: int = 0) -> Any:
+    if depth > 5 or not isinstance(sch, dict):
+        return None
+    if "$ref" in sch:
+        return _schema_example(_resolve_schema_ref(str(sch["$ref"]), root), root, depth + 1)
+    if "example" in sch:
+        return sch["example"]
+    if "default" in sch and sch["default"] is not None:
+        return sch["default"]
+    if "enum" in sch and isinstance(sch["enum"], list) and sch["enum"]:
+        return sch["enum"][0]
+    if "anyOf" in sch or "oneOf" in sch:
+        variants = sch.get("anyOf") or sch.get("oneOf") or []
+        for v in variants:
+            if isinstance(v, dict) and v.get("type") == "null":
+                continue
+            if isinstance(v, dict):
+                got = _schema_example(v, root, depth + 1)
+                if got is not None:
+                    return got
+        return None
+    t = sch.get("type")
+    if t == "object" or "properties" in sch:
+        props = sch.get("properties") or {}
+        out: dict[str, Any] = {}
+        required = set(sch.get("required") or [])
+        for k, v in props.items():
+            if not isinstance(v, dict):
+                continue
+            # Prefer required + fields with defaults/examples; skip huge nests.
+            if k not in required and depth > 1 and "default" not in v and "example" not in v:
+                continue
+            val = _schema_example(v, root, depth + 1)
+            if val is not None:
+                out[k] = val
+            elif k in required:
+                out[k] = {}
+        return out
+    if t == "array":
+        items = sch.get("items") if isinstance(sch.get("items"), dict) else {}
+        one = _schema_example(items, root, depth + 1)
+        return [one] if one is not None else []
+    if t == "integer":
+        return 0
+    if t == "number":
+        return 0
+    if t == "boolean":
+        return False
+    if t == "string":
+        return "string"
+    return None
+
+
+def _lookup_request_example(method: str, path: str) -> dict[str, Any] | None:
+    key = (method.lower(), path)
     return (
-        path.replace("{group_id}", "7")
-        .replace("{panel_id}", "12")
-        .replace("{user_id}", "1001")
-        .replace("{key_id}", "3")
-        .replace("{worker_id}", "3")
-        .replace("{token}", "USER_SUB_TOKEN")
-        .replace("{username}", "demo_user")
-        .replace("{full_path}", "index.html")
+        _COMMON_REQUEST_EXAMPLES.get(key)
+        or _V1_REQUEST_EXAMPLES.get(key)
+        or None
     )
 
 
-def _curl_block(method: str, path: str, item: dict[str, Any]) -> str:
+def _body_example_for(method: str, path: str, item: dict[str, Any], root: dict[str, Any]) -> Any:
+    known = _lookup_request_example(method, path)
+    if known is not None:
+        return known
+    if path == "/api/internal/worker/usage-report" and method.lower() == "post":
+        return _USAGE_REPORT_BODY_EXAMPLE
+    body = item.get("requestBody")
+    if not isinstance(body, dict):
+        return None
+    content = body.get("content") or {}
+    app = content.get("application/json") if isinstance(content, dict) else None
+    if not isinstance(app, dict):
+        return None
+    if "example" in app:
+        return app["example"]
+    examples = app.get("examples")
+    if isinstance(examples, dict) and examples:
+        first = next(iter(examples.values()))
+        if isinstance(first, dict) and "value" in first:
+            return first["value"]
+    sch = app.get("schema")
+    if isinstance(sch, dict):
+        return _schema_example(sch, root)
+    return None
+
+
+def _curl_block(
+    method: str, path: str, item: dict[str, Any], root: dict[str, Any] | None = None
+) -> str:
     m = method.upper()
+    host = _panel_host()
     sample = _sample_path(path)
-    lines = [f"curl -sS -X {m} 'https://PANEL_HOST{sample}'"]
-    if _is_public(path, method):
-        if path == "/api/admin/token":
-            lines = [
-                "curl -sS -X POST 'https://PANEL_HOST/api/admin/token' \\",
-                "  -H 'Content-Type: application/x-www-form-urlencoded' \\",
-                "  -d 'username=ADMIN&password=SECRET'",
-            ]
-            return "### نمونه curl\n\n```bash\n" + "\n".join(lines) + "\n```"
-    elif _is_worker_internal(path):
+    root = root or {}
+
+    if _is_public(path, method) and path == "/api/admin/token":
+        bash = (
+            f"curl -sS -X POST '{host}/api/admin/token' \\\n"
+            f"  -H 'Content-Type: application/x-www-form-urlencoded' \\\n"
+            f"  -d 'username=ADMIN&password=SECRET'"
+        )
+        return "### نمونه curl\n\n```bash\n" + bash + "\n```"
+
+    lines: list[str] = [f"curl -sS -X {m} '{host}{sample}'"]
+
+    if _is_worker_internal(path):
         lines.append("  -H 'Authorization: Bearer WORKER_TOKEN'")
-    elif path.startswith("/api/v1"):
-        lines.append("  -H 'X-Api-Key: pg_key_xxxxxxxx'")
-    else:
-        lines.append("  -H 'Authorization: Bearer JWT_TOKEN'")
-        lines.append("  # یا: -H 'X-Api-Key: pg_key_xxxxxxxx'")
+    elif not _is_public(path, method):
+        if path.startswith("/api/v1"):
+            lines.append("  -H 'X-Api-Key: pg_key_xxxxxxxx'")
+        else:
+            # Never put shell comments between continued lines — breaks Bash `\`.
+            lines.append("  -H 'Authorization: Bearer JWT_TOKEN'")
 
     body = item.get("requestBody") or {}
     content = (body.get("content") or {}) if isinstance(body, dict) else {}
-    if "application/json" in content:
+    has_json = isinstance(content, dict) and "application/json" in content
+    # usage-report has no FastAPI body model — still document JSON.
+    force_json = path == "/api/internal/worker/usage-report" and method.lower() == "post"
+    if has_json or force_json:
         lines.append("  -H 'Content-Type: application/json'")
-        example = _V1_REQUEST_EXAMPLES.get((method.lower(), path))
-        if example is None:
-            app_json = content.get("application/json") or {}
-            example = app_json.get("example")
-            if example is None:
-                examples = app_json.get("examples") or {}
-                if isinstance(examples, dict) and examples:
-                    first = next(iter(examples.values()))
-                    if isinstance(first, dict):
-                        example = first.get("value")
+        example = _body_example_for(method, path, item, root)
         if example is not None:
             payload = json.dumps(example, ensure_ascii=False, separators=(",", ":"))
             safe = payload.replace("'", "'\\''")
             lines.append(f"  -d '{safe}'")
-        else:
+        elif has_json:
+            # Last resort only when schema truly empty.
             lines.append("  -d '{}'")
 
     if len(lines) == 1:
         bash = lines[0]
     else:
         bash = " \\\n".join(lines)
+
+    if (
+        not _is_public(path, method)
+        and not _is_worker_internal(path)
+        and not path.startswith("/api/v1")
+    ):
+        bash += (
+            f"\n\n# معادل با کلید API:\n"
+            f"# curl -sS -X {m} '{host}{sample}' \\\n"
+            f"#   -H 'X-Api-Key: pg_key_xxxxxxxx'"
+        )
+        if has_json or force_json:
+            example = _body_example_for(method, path, item, root)
+            if example is not None:
+                payload = json.dumps(example, ensure_ascii=False, separators=(",", ":"))
+                safe = payload.replace("'", "'\\''")
+                bash += f" \\\n#   -H 'Content-Type: application/json' \\\n#   -d '{safe}'"
+
     return "### نمونه curl\n\n```bash\n" + bash + "\n```"
 
 
 def _ensure_security_schemes(schema: dict[str, Any]) -> None:
     comps = schema.setdefault("components", {})
     schemes = comps.setdefault("securitySchemes", {})
-    # Keep FastAPI OAuth2 if present; always expose ApiKey clearly.
+    # Single Authorize box for X-Api-Key (deps uses scheme_name=ApiKeyAuth).
+    for dup in ("APIKeyHeader", "APIKey", "ApiKey"):
+        schemes.pop(dup, None)
     schemes["ApiKeyAuth"] = {
         "type": "apiKey",
         "in": "header",
@@ -1335,6 +1604,26 @@ def _ensure_security_schemes(schema: dict[str, Any]) -> None:
     }
 
 
+def _rewrite_security_refs(item: dict[str, Any]) -> None:
+    """Map any leftover APIKeyHeader refs onto ApiKeyAuth."""
+    sec = item.get("security")
+    if not isinstance(sec, list):
+        return
+    fixed: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in sec:
+        if not isinstance(entry, dict):
+            continue
+        new_entry: dict[str, Any] = {}
+        for name, scopes in entry.items():
+            key = "ApiKeyAuth" if name in ("APIKeyHeader", "APIKey", "ApiKey") else name
+            new_entry[key] = scopes
+            seen.add(key)
+        if new_entry:
+            fixed.append(new_entry)
+    item["security"] = fixed
+
+
 def _apply_security(path: str, method: str, item: dict[str, Any]) -> None:
     if _is_public(path, method):
         item["security"] = []
@@ -1342,17 +1631,86 @@ def _apply_security(path: str, method: str, item: dict[str, Any]) -> None:
     if _is_worker_internal(path):
         item["security"] = [{"WorkerBearer": []}]
         return
-    # OR: ApiKey یا OAuth2
     item["security"] = [{"ApiKeyAuth": []}, {"OAuth2PasswordBearer": []}]
+
+
+def _has_path_params(item: dict[str, Any]) -> bool:
+    params = item.get("parameters") or []
+    return any(
+        isinstance(p, dict) and p.get("in") == "path" for p in params
+    )
+
+
+def _has_request_body(item: dict[str, Any]) -> bool:
+    return isinstance(item.get("requestBody"), dict)
+
+
+def _404_detail_for(path: str, item: dict[str, Any]) -> str:
+    params = item.get("parameters") or []
+    names = [
+        str(p.get("name") or "")
+        for p in params
+        if isinstance(p, dict) and p.get("in") == "path"
+    ]
+    for n in names:
+        if n in ("group_id",) or n.endswith("group_id"):
+            return "گروه پیدا نشد"
+        if "categor" in n:
+            return "دسته پیدا نشد"
+        if "panel" in n:
+            return "پنل پیدا نشد"
+        if n in ("username", "user_id"):
+            return "کاربر پیدا نشد"
+        if "worker" in n:
+            return "ورکر پیدا نشد"
+        if "key" in n:
+            return "کلید پیدا نشد"
+        if "template" in n:
+            return "قالب پیدا نشد"
+    if "group-categor" in path:
+        return "دسته پیدا نشد"
+    if "/group" in path:
+        return "گروه پیدا نشد"
+    if "/user" in path:
+        return "کاربر پیدا نشد"
+    if "/panel" in path:
+        return "پنل پیدا نشد"
+    if "/worker" in path:
+        return "ورکر پیدا نشد"
+    return "منبع پیدا نشد"
+
+
+def _set_json_example(resp: dict[str, Any], example: Any) -> None:
+    content = resp.setdefault("content", {})
+    app = content.setdefault("application/json", {})
+    if isinstance(app, dict):
+        app["example"] = example
 
 
 def _merge_response_examples(method: str, path: str, item: dict[str, Any]) -> None:
     responses = item.setdefault("responses", {})
     if not isinstance(responses, dict):
         return
+    key = (method.lower(), path)
 
-    # Success example for Integration
-    ok_body = _V1_RESPONSE_EXAMPLES.get((method.lower(), path))
+    # Binary / text downloads — not empty JSON.
+    bin_meta = _BINARY_RESPONSES.get(key)
+    if bin_meta:
+        media, desc = bin_meta
+        r200 = responses.setdefault("200", {})
+        if isinstance(r200, dict):
+            r200["description"] = desc
+            content = r200.setdefault("content", {})
+            content.pop("application/json", None)
+            content[media] = {
+                "schema": {"type": "string", "format": "binary"},
+            }
+        # Public downloads: no auth error spam.
+        if _is_public(path, method):
+            return
+
+    # Success examples (v1 + curated ops)
+    ok_body = _V1_RESPONSE_EXAMPLES.get(key)
     if ok_body:
         for code in ("200", "201"):
             if code not in responses:
@@ -1364,46 +1722,146 @@ def _merge_response_examples(method: str, path: str, item: dict[str, Any]) -> No
             app = content.setdefault("application/json", {})
             if isinstance(ok_body.get("application/json"), dict):
                 app.update(ok_body["application/json"])
+    elif key in _OK_RESPONSE_EXAMPLES:
+        for code in ("200", "201"):
+            if code not in responses:
+                if code == "200":
+                    responses["200"] = {"description": "موفق"}
+                else:
+                    continue
+            resp = responses[code]
+            if isinstance(resp, dict):
+                _set_json_example(resp, _OK_RESPONSE_EXAMPLES[key])
+
+    # Sub page: text, not empty JSON object.
+    if path.startswith("/sub") and method.lower() == "get":
+        r200 = responses.setdefault("200", {})
+        if isinstance(r200, dict):
+            r200["description"] = "متن اشتراک / صفحه HTML ساب (بسته به Accept کلاینت)."
+            content = r200.setdefault("content", {})
+            content.pop("application/json", None)
+            content.setdefault(
+                "text/plain",
+                {"schema": {"type": "string"}, "example": "vless://…\\nvmess://…"},
+            )
 
     if _is_public(path, method):
-        if path == "/health":
-            r200 = responses.setdefault("200", {"description": "سرویس بالاست"})
-            if isinstance(r200, dict):
-                content = r200.setdefault("content", {})
-                app = content.setdefault("application/json", {})
-                app.setdefault("example", {"status": "ok"})
+        # Never attach 401/404/422 noise to public routes.
+        for noise in ("401", "403", "404", "422", "409", "429", "502"):
+            # Keep only if FastAPI itself declared something meaningful — strip our junk.
+            existing = responses.get(noise)
+            if isinstance(existing, dict):
+                detail = ""
+                try:
+                    detail = str(
+                        (((existing.get("content") or {})
+                          .get("application/json") or {})
+                         .get("example") or {}).get("detail")
+                        or ""
+                    )
+                except Exception:  # noqa: BLE001
+                    detail = ""
+                if "گروه پیدا نشد" in detail or noise == "401":
+                    responses.pop(noise, None)
         return
 
-    # Auth / validation errors on protected ops
-    for code, payload in _ERROR_EXAMPLES.items():
-        if code == "401" and _is_worker_internal(path):
-            responses[code] = {
-                "description": "توکن ورکر نامعتبر",
+    # Protected: always document 401.
+    if _is_worker_internal(path):
+        responses["401"] = {
+            "description": "توکن ورکر نامعتبر",
+            "content": {
+                "application/json": {"example": {"detail": "Invalid worker token"}}
+            },
+        }
+    else:
+        responses["401"] = _AUTH_401
+
+    # 404 only when the route looks up a resource by id/path param.
+    if _has_path_params(item) or "{" in path:
+        detail = _404_detail_for(path, item)
+        responses["404"] = {
+            "description": "منبع با این شناسه پیدا نشد",
+            "content": {"application/json": {"example": {"detail": detail}}},
+        }
+    else:
+        # Remove mistaken blanket 404 from earlier generators / FastAPI defaults empty.
+        existing = responses.get("404")
+        if isinstance(existing, dict):
+            try:
+                ex = (
+                    ((existing.get("content") or {}).get("application/json") or {})
+                    .get("example")
+                    or {}
+                )
+                if isinstance(ex, dict) and ex.get("detail") == "گروه پیدا نشد":
+                    responses.pop("404", None)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # 422 only when there is a body or query/path validation surface.
+    if _has_request_body(item) or _has_path_params(item):
+        if "422" not in responses:
+            responses["422"] = _VALIDATION_422
+    else:
+        responses.pop("422", None)
+
+    # Extra realistic codes for mutating / remote-touching routes.
+    if method.lower() in ("post", "put", "patch") and (
+        "/user" in path or "/group" in path
+    ):
+        responses.setdefault(
+            "409",
+            {
+                "description": "تکراری — مثلاً username یا نام گروه از قبل وجود دارد",
                 "content": {
-                    "application/json": {"example": {"detail": "Invalid worker token"}}
+                    "application/json": {
+                        "example": {"detail": "User already exists"}
+                    }
                 },
-            }
-            continue
-        if code not in responses:
-            responses[code] = payload
-        else:
-            existing = responses[code]
-            if isinstance(existing, dict) and "content" not in existing:
-                existing["content"] = payload.get("content", {})
-                if not existing.get("description"):
-                    existing["description"] = payload.get("description", "")
+            },
+        )
+    if "/panel" in path and method.lower() in ("post", "get"):
+        responses.setdefault(
+            "502",
+            {
+                "description": "پنل ریموت / ورکر مقصد پاسخ نداد یا قطع است",
+                "content": {
+                    "application/json": {
+                        "example": {"detail": "Upstream panel unreachable"}
+                    }
+                },
+            },
+        )
 
 
-def _inject_request_example(method: str, path: str, item: dict[str, Any]) -> None:
-    example = _V1_REQUEST_EXAMPLES.get((method.lower(), path))
-    if example is None:
+def _inject_request_example(
+    method: str, path: str, item: dict[str, Any], root: dict[str, Any]
+) -> None:
+    # Ensure usage-report has a visible requestBody in /docs.
+    if path == "/api/internal/worker/usage-report" and method.lower() == "post":
+        item["requestBody"] = {
+            "required": True,
+            "description": (
+                "JSON مصرف کاربران (خام یا با `Content-Encoding: gzip`). "
+                "مدل: WorkerUsageReport."
+            ),
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/WorkerUsageReport"},
+                    "example": _USAGE_REPORT_BODY_EXAMPLE,
+                }
+            },
+        }
         return
+
+    example = _body_example_for(method, path, item, root)
     body = item.get("requestBody")
     if not isinstance(body, dict):
         return
     content = body.setdefault("content", {})
     app = content.setdefault("application/json", {})
-    app["example"] = example
+    if example is not None:
+        app["example"] = example
 
 
 def _enrich_param_descriptions(item: dict[str, Any]) -> None:
@@ -1417,22 +1875,121 @@ def _enrich_param_descriptions(item: dict[str, Any]) -> None:
         where = str(p.get("in") or "")
         schema = p.get("schema") if isinstance(p.get("schema"), dict) else {}
         typ = str(schema.get("type") or "string")
+        help_fa = _PARAM_HELP.get(name, "")
+        # Drop machine-echo descriptions like «group_id · in=path · type=integer».
         desc = str(p.get("description") or "").strip()
-        bits = [f"`{name}`", f"in={where}", f"type={typ}"]
-        if "minimum" in schema:
-            bits.append(f"min={schema['minimum']}")
-        if "maximum" in schema:
-            bits.append(f"max={schema['maximum']}")
-        if schema.get("minLength") is not None:
-            bits.append(f"minLength={schema['minLength']}")
-        if schema.get("maxLength") is not None:
-            bits.append(f"maxLength={schema['maxLength']}")
-        prefix = " · ".join(bits)
-        if desc:
-            if prefix not in desc:
-                p["description"] = f"{prefix} — {desc}"
+        if "in=" in desc and "type=" in desc:
+            desc = ""
+        if help_fa:
+            p["description"] = help_fa
+        elif desc:
+            p["description"] = desc
         else:
-            p["description"] = prefix
+            p["description"] = f"پارامتر `{name}` ({where}, {typ})."
+
+
+_SCHEMA_FIELD_HELP: dict[str, dict[str, str]] = {
+    "UserCreate": {
+        "data_limit": "سقف حجم به **بایت**. `0` = نامحدود.",
+        "expire": "unix timestamp **ثانیه‌ای** UTC. `0`/null = بدون انقضا.",
+        "on_hold_expire_duration": "مدت اعتبار بعد از اولین اتصال (on_hold) به **ثانیه**.",
+        "proxies": "تنظیم پروکسی‌ها؛ معمولاً `{}`.",
+        "inbounds": "انتخاب inbound؛ معمولاً `{}`.",
+        "group_ids": "لیست شناسه گروه‌ها.",
+    },
+    "UserModify": {
+        "data_limit": "سقف حجم به **بایت**. `0` = نامحدود.",
+        "expire": "unix timestamp **ثانیه‌ای**. `0` = بدون انقضا.",
+    },
+    "UserResponse": {
+        "used_traffic": "مصرف فعلی به **بایت**.",
+        "lifetime_used_traffic": "مصرف تجمعی به **بایت**.",
+        "data_limit": "سقف حجم به **بایت**. `0` = نامحدود.",
+        "expire": "unix timestamp **ثانیه‌ای** یا null.",
+    },
+    "WorkerUsageReport": {
+        "panel_id": "شناسه پنل مقصد در Astra.",
+        "meters": "لیست مصرف per-remote_username.",
+        "listed": "تعداد کاربران لیست‌شده روی پنل در این گزارش.",
+        "full_sync": "اگر true، مترهای غایب مجاز به کوچک‌شدن/ریست‌اند.",
+        "mode": "حالت جمع‌آوری ورکر: hot | warm | cold.",
+        "dt_ms": "مدت جمع‌آوری روی ورکر به میلی‌ثانیه.",
+    },
+    "WorkerUsageMeter": {
+        "used_traffic": "مصرف به **بایت**.",
+        "remote_username": "نام کاربری روی پنل ریموت.",
+    },
+}
+
+
+def _enrich_component_schemas(schema: dict[str, Any]) -> None:
+    comps = (schema.get("components") or {}).get("schemas")
+    if not isinstance(comps, dict):
+        return
+    for model, fields in _SCHEMA_FIELD_HELP.items():
+        node = comps.get(model)
+        if not isinstance(node, dict):
+            continue
+        props = node.get("properties")
+        if not isinstance(props, dict):
+            continue
+        for fname, help_fa in fields.items():
+            prop = props.get(fname)
+            if isinstance(prop, dict) and not prop.get("description"):
+                prop["description"] = help_fa
+    # Generic unit hints for common traffic/time fields across models.
+    for node in comps.values():
+        if not isinstance(node, dict):
+            continue
+        props = node.get("properties")
+        if not isinstance(props, dict):
+            continue
+        for fname, prop in props.items():
+            if not isinstance(prop, dict) or prop.get("description"):
+                continue
+            if fname in ("data_limit", "used_traffic", "lifetime_used_traffic"):
+                prop["description"] = "مقدار به **بایت** (`0` برای data_limit = نامحدود)."
+            elif fname == "expire":
+                prop["description"] = "unix timestamp **ثانیه‌ای** UTC؛ `0`/null = بدون انقضا."
+            elif fname in ("on_hold_expire_duration",):
+                prop["description"] = "مدت به **ثانیه**."
+            elif fname.endswith("_ms") or fname in ("dt_ms", "ping_ms", "avg_ping_ms"):
+                prop["description"] = "زمان به **میلی‌ثانیه**."
+
+
+def _ensure_servers(schema: dict[str, Any]) -> None:
+    host = _panel_host()
+    schema["servers"] = [
+        {"url": host, "description": "آدرس پایه پنل (از PANEL_BASE_URL)"},
+    ]
+
+
+def _response_notes(path: str, method: str, item: dict[str, Any]) -> str:
+    if _is_public(path, method):
+        return (
+            "### نمونه پاسخ‌ها\n\n"
+            "- **۲xx:** بدنه/فایل موفق در بخش Responses.\n"
+            "- این مسیر عمومی است — برای نبود توکن **۴۰۱ نمی‌گیرید**."
+        )
+    lines = [
+        "### نمونه پاسخ‌ها",
+        "",
+        "- **۲xx:** بدنه موفق در بخش Responses (Example Value).",
+        "- **۴۰۱:** کلید/توکن نامعتبر یا غایب.",
+    ]
+    if _has_path_params(item) or "{" in path:
+        lines.append(
+            f"- **۴۰۴:** `{{\"detail\": \"{_404_detail_for(path, item)}\"}}`."
+        )
+    if _has_request_body(item) or _has_path_params(item):
+        lines.append("- **۴۲۲:** اعتبارسنجی فیلد با `detail[]`.")
+    if method.lower() in ("post", "put", "patch") and (
+        "/user" in path or "/group" in path
+    ):
+        lines.append("- **۴۰۹:** تکراری بودن username / نام گروه.")
+    if "/panel" in path:
+        lines.append("- **۵۰۲:** پنل ریموت یا ورکر مقصد قطع است.")
+    return "\n".join(lines)
 
 
 def customize_openapi(schema: dict[str, Any]) -> dict[str, Any]:
@@ -1441,6 +1998,8 @@ def customize_openapi(schema: dict[str, Any]) -> dict[str, Any]:
     schema["info"]["description"] = OPENAPI_DESC
     schema["tags"] = list(OPENAPI_TAGS)
     _ensure_security_schemes(schema)
+    _ensure_servers(schema)
+    _enrich_component_schemas(schema)
 
     paths = schema.get("paths") or {}
     for path in list(paths.keys()):
@@ -1467,19 +2026,16 @@ def customize_openapi(schema: dict[str, Any]) -> dict[str, Any]:
                 base_desc = str(item.get("description") or "").strip()
 
             _apply_security(path, method, item)
-            _inject_request_example(method, path, item)
+            _rewrite_security_refs(item)
+            _inject_request_example(method, path, item, schema)
             _merge_response_examples(method, path, item)
             _enrich_param_descriptions(item)
 
             parts = [
                 _auth_note(path, method),
                 base_desc,
-                _curl_block(method, path, item),
-                "### نمونه پاسخ‌ها",
-                "- **۲xx:** بدنه موفق در بخش Responses همین API (Example Value).",
-                "- **۴۰۱:** `{\"detail\":\"Invalid API key\"}` یا `Not authenticated` / `Invalid token`.",
-                "- **۴۰۴:** `{\"detail\":\"… پیدا نشد\"}` وقتی id اشتباه باشد.",
-                "- **۴۲۲:** خطای اعتبارسنجی فیلد (طول/نوع/الزام) با `detail[]`.",
+                _curl_block(method, path, item, schema),
+                _response_notes(path, method, item),
             ]
             item["description"] = "\n\n".join(p for p in parts if p)
 

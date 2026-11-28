@@ -14,6 +14,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/admin/token", auto_error=Fal
 api_key_header = APIKeyHeader(
     name="X-Api-Key",
     auto_error=False,
+    scheme_name="ApiKeyAuth",
     description="کلید Integration ساخته‌شده در تنظیمات (مثلاً pg_key_…). جایگزین Bearer JWT.",
 )
 
