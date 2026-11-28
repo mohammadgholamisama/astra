@@ -21,11 +21,20 @@ api_key_header = APIKeyHeader(
 async def get_current_admin(
     request: Request,
     token: str | None = Depends(oauth2_scheme),
-    api_key_dep: str | None = Depends(api_key_header),
     db: AsyncSession = Depends(get_db),
+    api_key_dep: str | None = Depends(api_key_header),
 ) -> Admin:
+    """Auth via X-Api-Key or Bearer JWT.
+
+    Positional callers use ``get_current_admin(request, token, db)`` — keep
+    ``db`` as the 3rd arg so those sites (system/host, users) do not break.
+    """
+    # Manual callers pass only (request, token, db). In that case the 4th
+    # default is still the Depends(...) sentinel — never call .strip() on it.
+    if not isinstance(api_key_dep, str):
+        api_key_dep = None
     # 1) X-Api-Key (header dependency + raw header + Authorization: ApiKey …)
-    api_key = (api_key_dep or "").strip() or request.headers.get("X-Api-Key")
+    api_key = (api_key_dep or "").strip() or (request.headers.get("X-Api-Key") or "")
     auth = request.headers.get("Authorization") or ""
 
     if not api_key and auth.lower().startswith("apikey "):
