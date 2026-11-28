@@ -1402,11 +1402,13 @@ async def check_user_usage(
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
-    """Force live usage pull from every remote panel for one user.
+    """Force live usage pull via workers for one user's remotes.
 
-    Admin «چک مصرف دقیق» — waits for remotes (not background-only) so the
-    returned total matches پنل اصلی right now.
+    Admin «چک مصرف دقیق» — short high-concurrency worker fan-out, then return
+    the fresh user row so the users board can patch in place.
     """
+    from datetime import datetime, timedelta, timezone
+
     user = await load_user(db, username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -1419,14 +1421,14 @@ async def check_user_usage(
     except Exception:  # noqa: BLE001
         pass
 
-    # Complete pull (not quick) so PasarGuard / slow remotes are not skipped.
+    # admin_check: bypass pull-gate, pending remotes, ~16s worker wall.
     after = -1
     try:
         after, _activated, _changed, _st = await asyncio.wait_for(
             orchestrator.refresh_usage_pool_safe(
-                uid, force=True, quick=False
+                uid, force=True, admin_check=True
             ),
-            timeout=90.0,
+            timeout=22.0,
         )
     except asyncio.TimeoutError:
         try:
@@ -1454,6 +1456,14 @@ async def check_user_usage(
     except Exception:  # noqa: BLE001
         pass
 
+    # refresh_usage_pool_safe commits in other sessions — drop this request's
+    # identity map or we keep serving the pre-pull used_traffic (UI "nothing").
+    try:
+        await db.rollback()
+    except Exception:  # noqa: BLE001
+        pass
+    db.expire_all()
+
     user = await load_user(db, username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -1465,6 +1475,7 @@ async def check_user_usage(
 
     panels_out: list[UserCheckUsagePanel] = []
     synced = 0
+    fresh_cut = datetime.now(timezone.utc) - timedelta(seconds=45)
     for a in user.panel_accounts or []:
         st = getattr(a.status, "value", a.status)
         if st == "deleted":
@@ -1477,7 +1488,9 @@ async def check_user_usage(
         last = a.last_sync_at
         last_s = last.isoformat() if last is not None else None
         if last is not None:
-            synced += 1
+            last_aware = last if last.tzinfo else last.replace(tzinfo=timezone.utc)
+            if last_aware >= fresh_cut:
+                synced += 1
         panels_out.append(
             UserCheckUsagePanel(
                 panel_id=int(a.panel_id),

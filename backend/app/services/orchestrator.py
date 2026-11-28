@@ -10062,6 +10062,7 @@ async def refresh_usage_pool_safe(
     *,
     force: bool = False,
     quick: bool = True,
+    admin_check: bool = False,
 ) -> tuple[int, bool, bool, str]:
     """Like refresh_usage but never holds a pool connection during remote HTTP.
 
@@ -10072,13 +10073,18 @@ async def refresh_usage_pool_safe(
 
     Concurrent calls for the same ``user_id`` within 5s share one in-flight
     Future (single-flight) so /sub Update bursts never stampede the same panels.
+
+    ``admin_check=True`` (چک مصرف دقیق): bypasses the global pull gate, includes
+    pending remotes with a username, and uses a short high-concurrency worker
+    fan-out so the users-page button returns in seconds.
     """
     from app.core.database import pool_pressure_blocks_background
 
     uid = int(user_id)
     # Under pool pressure: recount from local meters only — never stampede remotes
     # (that froze /api/users for 10s+ and returned 500s).
-    if pool_pressure_blocks_background():
+    # Admin check still tries a brief remote pull — operator explicitly asked.
+    if pool_pressure_blocks_background() and not admin_check:
         try:
             total = await recount_user_usage_pool_safe(uid)
             return (int(total), False, False, "pool_busy")
@@ -10086,7 +10092,7 @@ async def refresh_usage_pool_safe(
             return (-1, False, False, "pool_busy")
 
     now = time.monotonic()
-    if not force:
+    if not force and not admin_check:
         existing = _USAGE_FLIGHT.get(uid)
         if existing is not None and not existing.done():
             try:
@@ -10105,10 +10111,16 @@ async def refresh_usage_pool_safe(
     _USAGE_FLIGHT[uid] = fut
     _USAGE_FLIGHT_TS[uid] = now
     try:
-        async with _USAGE_PULL_GATE:
+        if admin_check:
+            # Don't wait behind background /sub pulls — operator is watching.
             result = await _refresh_usage_pool_safe_inner(
-                uid, force=force, quick=quick
+                uid, force=True, quick=False, admin_check=True
             )
+        else:
+            async with _USAGE_PULL_GATE:
+                result = await _refresh_usage_pool_safe_inner(
+                    uid, force=force, quick=quick, admin_check=False
+                )
         if not fut.done():
             fut.set_result(result)
         return result
@@ -10134,6 +10146,7 @@ async def _refresh_usage_pool_safe_inner(
     *,
     force: bool = False,
     quick: bool = True,
+    admin_check: bool = False,
 ) -> tuple[int, bool, bool, str]:
     from app.core.database import AsyncSessionLocal
 
@@ -10196,9 +10209,11 @@ async def _refresh_usage_pool_safe_inner(
                 PanelAccountStatus.pending,
             ):
                 continue
-            # Pending without a meter is still provisioning — skip live pull.
+            # Pending without a meter is still provisioning — skip live pull
+            # unless this is an explicit admin check (operator wants truth now).
             if (
-                account.status == PanelAccountStatus.pending
+                not admin_check
+                and account.status == PanelAccountStatus.pending
                 and int(account.used_traffic or 0) <= 0
             ):
                 continue
@@ -10233,9 +10248,18 @@ async def _refresh_usage_pool_safe_inner(
     try:
         from app.services import usage_priority as uprio
 
-        await uprio.enqueue_user_remotes(int(user_id), ttl=900.0)
+        await uprio.enqueue_user_remotes(
+            int(user_id), ttl=600.0 if admin_check else 900.0
+        )
     except Exception:  # noqa: BLE001
         pass
+    if admin_check:
+        try:
+            from app.services import usage_tiers as utiers
+
+            utiers.mark_create_touch(int(user_id))
+        except Exception:  # noqa: BLE001
+            pass
 
     # Astra local sync in its own short sessions (no hold across awaits).
     if astra_panel_ids:
@@ -10298,8 +10322,16 @@ async def _refresh_usage_pool_safe_inner(
     # Cover every live remote in small waves — never stampede 15+ panels at once
     # (that pegged the single uvicorn loop + flooded journald with timeouts).
     # Accuracy: still visit all pullable; slow panels keep previous meters.
-    per_try = 4.5 if quick else 10.0
-    panel_conc = 3 if quick else 5
+    # admin_check: workers already hold meter_cache — fan out fast & wide.
+    if admin_check:
+        per_try = 3.0
+        panel_conc = 12
+    elif quick:
+        per_try = 4.5
+        panel_conc = 3
+    else:
+        per_try = 10.0
+        panel_conc = 5
     results: dict[int, AdapterResult] = {}
     # Rate-limit timeout spam (one line per panel per 60s).
     _usage_warn_ts: dict[int, float] = getattr(
@@ -10397,7 +10429,12 @@ async def _refresh_usage_pool_safe_inner(
 
     if pullable:
         # Hard wall so one sub refresh cannot own the event loop for a minute.
-        wall = 28.0 if quick else 55.0
+        if admin_check:
+            wall = 16.0
+        elif quick:
+            wall = 28.0
+        else:
+            wall = 55.0
         t_deadline = time.monotonic() + wall
         sem = asyncio.Semaphore(max(1, panel_conc))
 
@@ -10411,7 +10448,8 @@ async def _refresh_usage_pool_safe_inner(
                 await _one(aid, panel, uname, rid, aid_gid.get(int(aid)))
 
         # Process in waves so the loop can serve /health + SSH CPU between them.
-        wave = max(1, panel_conc)
+        # admin_check: one wide wave — workers answer from meter_cache fast.
+        wave = max(1, panel_conc if not admin_check else len(pullable))
         for i in range(0, len(pullable), wave):
             if time.monotonic() >= t_deadline:
                 break
@@ -10423,12 +10461,13 @@ async def _refresh_usage_pool_safe_inner(
         miss = max(0, len(pullable) - len(results))
         logger.info(
             "pool-safe usage user=%s pullable=%s ok=%s miss=%s quick=%s "
-            "conc=%s per_try=%.1f wall=%.0fs",
+            "admin_check=%s conc=%s per_try=%.1f wall=%.0fs",
             username,
             len(pullable),
             len(results),
             miss,
             quick,
+            admin_check,
             panel_conc,
             per_try,
             wall,

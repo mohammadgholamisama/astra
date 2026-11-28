@@ -1313,10 +1313,31 @@ export default function UsersPage() {
     mutationFn: (u: string) =>
       api<CheckUsageResult>(
         `/api/user/${encodeURIComponent(u)}/check-usage`,
-        { method: "POST", timeoutMs: 100_000 }
+        { method: "POST", timeoutMs: 35_000 }
       ),
     onSuccess: (r) => {
-      qc.invalidateQueries({ queryKey: ["users"] });
+      // Apply returned user immediately — don't wait for refetch (was "nothing").
+      if (r.user) {
+        patchUserInCache(r.user);
+      } else {
+        qc.setQueryData(usersQueryKey, (prev: UsersListPayload | undefined) => {
+          if (!prev?.users) return prev;
+          return {
+            ...prev,
+            users: prev.users.map((u) =>
+              u.username === r.username
+                ? {
+                    ...u,
+                    used_traffic: r.used_after,
+                    data_limit: r.data_limit ?? u.data_limit,
+                    status: (r.status as User["status"]) || u.status,
+                  }
+                : u
+            ),
+          };
+        });
+      }
+      void qc.invalidateQueries({ queryKey: ["users"] });
       const before = formatTraffic(r.used_before, { empty: "۰" });
       const after = formatTraffic(r.used_after, { empty: "۰" });
       const delta = r.used_after - r.used_before;
