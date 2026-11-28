@@ -214,20 +214,68 @@ async def ping_worker(
     base_url: str,
     token: str,
     timeout: float = 4.0,
+    tries: int = 3,
 ) -> tuple[bool, str]:
+    """Health-check a worker agent with short retries.
+
+    Transient ConnectError / dead keepalives used to flip Settings «تست» to
+    false قطع. Retry quickly; on connect failures use a fresh one-shot client
+    so a poisoned shared pool cannot sticky-fail the probe.
+    """
     url = normalize_panel_base_url(base_url).rstrip("/") + "/health"
-    try:
-        client = await _shared_http()
-        res = await client.get(
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=timeout,
-        )
-        if res.status_code == 200:
-            return True, ""
-        return False, f"HTTP {res.status_code}"
-    except Exception as exc:  # noqa: BLE001
-        return False, str(exc)[:300]
+    headers = {"Authorization": f"Bearer {token}"}
+    last_err = "agent unreachable"
+    n = max(1, int(tries))
+    for attempt in range(n):
+        use_fresh = attempt > 0
+        client: httpx.AsyncClient | None = None
+        owned = False
+        try:
+            if use_fresh:
+                client = httpx.AsyncClient(
+                    timeout=httpx.Timeout(float(timeout), connect=min(3.5, float(timeout))),
+                    verify=False,
+                    limits=httpx.Limits(max_connections=4, max_keepalive_connections=0),
+                    http2=False,
+                )
+                owned = True
+            else:
+                client = await _shared_http()
+            res = await client.get(url, headers=headers, timeout=float(timeout))
+            if res.status_code == 200:
+                return True, ""
+            last_err = f"HTTP {res.status_code}"
+            # 401/403 won't heal on retry — stop early.
+            if res.status_code in (401, 403):
+                return False, last_err
+        except Exception as exc:  # noqa: BLE001
+            last_err = str(exc).strip() or exc.__class__.__name__
+            # Shared pool may be wedged — drop it so the next attempt is clean.
+            low = last_err.lower()
+            if any(
+                x in low
+                for x in (
+                    "all connection attempts failed",
+                    "connecterror",
+                    "connection reset",
+                    "server disconnected",
+                    "pool timeout",
+                    "timed out",
+                )
+            ):
+                try:
+                    await close_shared_http()
+                except Exception:  # noqa: BLE001
+                    pass
+        finally:
+            if owned and client is not None:
+                try:
+                    await client.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+        if attempt + 1 < n:
+            await asyncio.sleep(0.15 + 0.2 * attempt)
+    return False, last_err[:300]
 
 
 async def exec_on_worker(

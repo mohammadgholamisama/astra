@@ -1321,50 +1321,72 @@ async def probe_one_worker(
 ) -> WorkerProbeResult:
     """Accurate single-worker probe: agent /health + optional SSH check.
 
-    Updates ``status`` / ``last_error`` so UI never shows stale «قطع» when the
-    agent is fine, and surfaces the real reason when it is not.
+    Snapshot + release the request session before any remote await (same rule
+    as ``probe_all_workers``) so Settings «تست» never 500s under pool pressure.
+    Retries transient connect blips; updates ``status`` / ``last_error``.
     """
+    from app.core.database import AsyncSessionLocal
     from app.services.worker_install import ssh_probe
 
-    worker = await get_worker(db, worker_id)
-    if worker is None:
-        raise LookupError("worker not found")
+    wid = int(worker_id)
+    # Prefer a short isolated read — caller's ``db`` may already be busy/dirty.
+    async with AsyncSessionLocal() as read_db:
+        worker = await get_worker(read_db, wid)
+        if worker is None:
+            raise LookupError("worker not found")
+        snap = {
+            "id": wid,
+            "name": str(worker.name),
+            "base_url": str(worker.base_url),
+            "is_active": bool(worker.is_active),
+            "ssh_host": (worker.ssh_host or "").strip() or None,
+            "ssh_user": (worker.ssh_user or "root"),
+            "token": wc.peek_raw_token(wid)
+            or str((worker.meta or {}).get("agent_token") or ""),
+        }
+        await read_db.rollback()
 
-    token = wc.peek_raw_token(int(worker.id)) or str(
-        (worker.meta or {}).get("agent_token") or ""
-    )
+    # Caller session must not sit idle-in-transaction across HTTP.
+    try:
+        await db.rollback()
+    except Exception:  # noqa: BLE001
+        pass
+
     agent_ok = False
     agent_err: str | None = None
     latency_ms: int | None = None
-    if not worker.is_active:
+    if not snap["is_active"]:
         agent_err = "Worker غیرفعال است"
-    elif not token:
+    elif not snap["token"]:
         agent_err = "توکن Worker موجود نیست — نصب مجدد یا Rotate"
     else:
         wc.register_worker_route(
-            int(worker.id),
-            str(worker.base_url),
-            token,
+            wid,
+            str(snap["base_url"]),
+            str(snap["token"]),
             active=True,
         )
         t0 = time.monotonic()
         agent_ok, raw_err = await wc.ping_worker(
-            base_url=str(worker.base_url), token=token, timeout=6.0
+            base_url=str(snap["base_url"]),
+            token=str(snap["token"]),
+            timeout=5.0,
+            tries=3,
         )
         latency_ms = int((time.monotonic() - t0) * 1000)
         if not agent_ok:
             agent_err = (raw_err or "agent unreachable")[:400]
-        wc.mark_worker_health(int(worker.id), agent_ok, agent_err)
+        wc.mark_worker_health(wid, agent_ok, agent_err or "")
 
     ssh_tcp_ok: bool | None = None
     ssh_ok: bool | None = None
     ssh_err: str | None = None
-    host = (worker.ssh_host or "").strip()
+    host = snap["ssh_host"]
     if host:
         try:
             port = int(ssh_port or 22)
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=5.0
+                asyncio.open_connection(str(host), port), timeout=4.0
             )
             writer.close()
             try:
@@ -1378,8 +1400,8 @@ async def probe_one_worker(
             ssh_err = f"SSH TCP بسته: {exc}"[:220]
         if ssh_tcp_ok and (ssh_password or "").strip():
             ssh_ok, ssh_detail = await ssh_probe(
-                host=host,
-                username=(worker.ssh_user or "root"),
+                host=str(host),
+                username=str(snap["ssh_user"] or "root"),
                 password=ssh_password or "",
                 ssh_port=int(ssh_port or 22),
             )
@@ -1390,13 +1412,10 @@ async def probe_one_worker(
 
     if agent_ok:
         status = "online"
-        worker.status = status
-        worker.last_seen_at = datetime.now(timezone.utc)
-        worker.last_error = None
         msg = f"آنلاین — agent سالم ({latency_ms or 0}ms)"
+        last_error: str | None = None
     else:
-        status = "offline" if worker.is_active else "unknown"
-        worker.status = status
+        status = "offline" if snap["is_active"] else "unknown"
         detail = agent_err or "agent down"
         if ssh_tcp_ok is True and not agent_ok:
             detail = f"{detail} · SSH پورت باز است (agent نصب/اجرا نشده؟)"
@@ -1404,14 +1423,30 @@ async def probe_one_worker(
             detail = f"{detail} · {ssh_err}"
         elif ssh_err and ssh_ok is False:
             detail = f"{detail} · {ssh_err}"
-        worker.last_error = detail[:400]
+        last_error = detail[:400]
         msg = f"قطع — {detail}"
-    await db.commit()
-    fresh = await get_worker(db, worker_id)
+
+    fresh_out: WorkerOut | None = None
+    try:
+        async with AsyncSessionLocal() as write_db:
+            row = await get_worker(write_db, wid)
+            if row is not None:
+                row.status = status
+                if agent_ok:
+                    row.last_seen_at = datetime.now(timezone.utc)
+                    row.last_error = None
+                else:
+                    row.last_error = last_error
+                await write_db.commit()
+                # Lean payload — full install_log was bloating Settings probe JSON.
+                fresh_out = to_out(row, install_log="")
+    except Exception:  # noqa: BLE001
+        logger.exception("probe_one_worker status write failed worker=%s", wid)
+
     return WorkerProbeResult(
         ok=bool(agent_ok),
-        worker_id=int(worker_id),
-        name=str(worker.name),
+        worker_id=wid,
+        name=str(snap["name"]),
         status=status,
         agent_ok=bool(agent_ok),
         agent_error=agent_err,
@@ -1419,9 +1454,9 @@ async def probe_one_worker(
         ssh_tcp_ok=ssh_tcp_ok,
         ssh_ok=ssh_ok,
         ssh_error=ssh_err,
-        last_error=(fresh.last_error if fresh else worker.last_error),
+        last_error=last_error,
         message=msg[:400],
-        worker=to_out(fresh) if fresh else None,
+        worker=fresh_out,
     )
 
 

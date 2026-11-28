@@ -535,17 +535,56 @@ export default function SettingsPage() {
     },
   });
 
+  const [probingWorkerId, setProbingWorkerId] = useState<number | null>(null);
+
   const probeWorker = useMutation({
-    mutationFn: (id: number) =>
-      api<WorkerProbeResult>(`/api/admin/workers/${id}/probe`, {
-        method: "POST",
-        timeoutMs: 30_000,
-      }),
+    mutationFn: async (id: number) => {
+      setProbingWorkerId(id);
+      try {
+        return await api<WorkerProbeResult>(`/api/admin/workers/${id}/probe`, {
+          method: "POST",
+          timeoutMs: 25_000,
+        });
+      } finally {
+        setProbingWorkerId(null);
+      }
+    },
     onSuccess: (res) => {
-      qc.invalidateQueries({ queryKey: ["workers"] });
+      // Patch row immediately — don't wait for refetch (was looking like «هیچی»).
+      if (res.worker) {
+        qc.setQueryData<WorkerNode[] | undefined>(["workers"], (prev) => {
+          if (!prev) return prev;
+          return prev.map((w) =>
+            w.id === res.worker_id ? { ...w, ...res.worker } : w
+          );
+        });
+      } else {
+        qc.setQueryData<WorkerNode[] | undefined>(["workers"], (prev) => {
+          if (!prev) return prev;
+          return prev.map((w) =>
+            w.id === res.worker_id
+              ? {
+                  ...w,
+                  status: res.status || w.status,
+                  last_error: res.last_error ?? null,
+                  last_seen_at: res.ok
+                    ? new Date().toISOString()
+                    : w.last_seen_at,
+                }
+              : w
+          );
+        });
+      }
+      void qc.invalidateQueries({ queryKey: ["workers"] });
+      const ms =
+        typeof res.agent_latency_ms === "number" && res.agent_latency_ms >= 0
+          ? ` · ${toFaDigits(res.agent_latency_ms)}ms`
+          : "";
       setWorkerActionMsg({
         type: res.ok ? "ok" : "err",
-        text: res.message || (res.ok ? "آنلاین" : "قطع"),
+        text:
+          (res.message || (res.ok ? "آنلاین" : "قطع")) +
+          (res.ok ? ms : ""),
       });
     },
     onError: (e) => {
@@ -1481,11 +1520,15 @@ export default function SettingsPage() {
                       <button
                         type="button"
                         className="btn ghost sm"
-                        disabled={probeWorker.isPending}
+                        disabled={
+                          probeWorker.isPending && probingWorkerId === w.id
+                        }
                         onClick={() => probeWorker.mutate(w.id)}
                         title="تست دقیق agent و پورت SSH"
                       >
-                        {probeWorker.isPending ? "…" : "تست"}
+                        {probeWorker.isPending && probingWorkerId === w.id
+                          ? "…"
+                          : "تست"}
                       </button>
                       <button
                         type="button"

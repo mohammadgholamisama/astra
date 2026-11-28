@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from fastapi.responses import PlainTextResponse
 from sqlalchemy import select
@@ -24,6 +26,7 @@ from app.schemas.workers import (
 )
 from app.services import worker_ops as ops
 
+logger = logging.getLogger("astra.workers.api")
 router = APIRouter(tags=["Workers"])
 
 
@@ -197,11 +200,27 @@ async def probe_worker_api(
     db: AsyncSession = Depends(get_db),
     _admin: Admin = Depends(get_session_admin_only),
 ):
-    """Accurate agent + SSH TCP probe — returns the real reason if offline."""
+    """Accurate agent + SSH TCP probe — returns the real reason if offline.
+
+    Never 500 on transient network blips — Settings «تست» must get a JSON
+    ok/fail payload so the UI can show the real message.
+    """
     try:
         return await ops.probe_one_worker(db, worker_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail="Worker not found") from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("worker probe failed id=%s", worker_id)
+        return WorkerProbeResult(
+            ok=False,
+            worker_id=int(worker_id),
+            name="",
+            status="offline",
+            agent_ok=False,
+            agent_error=str(exc).strip() or exc.__class__.__name__,
+            message=f"قطع — خطای داخلی تست: {(str(exc).strip() or exc.__class__.__name__)[:200]}",
+            last_error=str(exc).strip()[:400] or None,
+        )
 
 
 @router.post("/api/admin/workers/{worker_id}/sync")
