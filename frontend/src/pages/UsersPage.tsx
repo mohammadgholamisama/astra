@@ -238,6 +238,8 @@ type PanelUsageRow = {
   name: string;
   raw: number;
   coefficient: number;
+  /** Distinct coefficients on this panel (stable, sorted) */
+  coefficients: number[];
   weighted: number;
   remoteLimit: number;
   configs: number;
@@ -245,6 +247,20 @@ type PanelUsageRow = {
   banked: boolean;
   /** Synthetic row: users.used_traffic − Σ visible meters */
   residual?: boolean;
+};
+
+type MeterPick = {
+  accountId: number;
+  panelId: number;
+  groupId: number | null;
+  panelName: string;
+  remoteUsername: string;
+  raw: number;
+  coefficient: number;
+  weighted: number;
+  configs: number;
+  banked: boolean;
+  statusRank: number;
 };
 
 type GroupUsageRow = {
@@ -384,15 +400,33 @@ function liveRawForDeleted(
   return best;
 }
 
-function panelUsageRows(u: User, groups: Group[]): PanelUsageRow[] {
-  const astraLimit = Number(u.data_limit) || 0;
-  const usedWeighted = Number(u.used_traffic) || 0;
-  const rows: PanelUsageRow[] = [];
+function statusRank(status: string, banked: boolean): number {
+  if (banked) return 3;
+  if (status === "active" || status === "error") return 0;
+  if (status === "pending") return 1;
+  return 2;
+}
+
+/** Stable pick among twin remotes — same identity must not flip name/volume. */
+function betterMeter(a: MeterPick, b: MeterPick): MeterPick {
+  if (a.statusRank !== b.statusRank) return a.statusRank < b.statusRank ? a : b;
+  if (a.weighted !== b.weighted) return a.weighted > b.weighted ? a : b;
+  if (a.coefficient !== b.coefficient) return a.coefficient > b.coefficient ? a : b;
+  if (a.raw !== b.raw) return a.raw > b.raw ? a : b;
+  // Hard stability: lowest account id wins when meters tie.
+  return a.accountId <= b.accountId ? a : b;
+}
+
+/**
+ * One meter per remote identity (panel_id + remote_username), matching backend Σ.
+ * Banked deleted gaps only keep bytes the live twin does not already hold.
+ */
+function pickUniqueMeters(u: User, groups: Group[]): MeterPick[] {
   const gids = u.group_ids || [];
   const accounts = u.panel_accounts || [];
   const liveKeys = liveRemoteKeys(accounts);
-  // Dedupe identical remotes across groups — same rule as backend weighted Σ.
-  const bestByRemote = new Map<string, PanelUsageRow>();
+  const byRemote = new Map<string, MeterPick>();
+  const orphans: MeterPick[] = [];
 
   for (const a of accounts) {
     const banked = a.status === "deleted";
@@ -414,197 +448,186 @@ function panelUsageRows(u: User, groups: Group[]): PanelUsageRow[] {
     }
 
     const coefficient = accountCoeff(a, groups, gids);
-    const weighted = accountWeighted(raw, coefficient, a);
+    const pick: MeterPick = {
+      accountId: Number(a.id) || 0,
+      panelId: a.panel_id,
+      groupId: a.group_id ?? null,
+      panelName: (a.panel_name || "").trim() || `پنل #${a.panel_id}`,
+      remoteUsername: (a.remote_username || "").trim(),
+      raw,
+      coefficient,
+      weighted: accountWeighted(raw, coefficient, a),
+      configs: banked ? 0 : (a.links || []).filter(Boolean).length,
+      banked,
+      statusRank: statusRank(String(a.status || ""), banked),
+    };
+
+    const rk = remoteKey(a.panel_id, a.remote_username);
+    if (!rk) {
+      orphans.push(pick);
+      continue;
+    }
+    const prev = byRemote.get(rk);
+    byRemote.set(rk, prev ? betterMeter(prev, pick) : pick);
+  }
+
+  const out = [...byRemote.values(), ...orphans];
+  out.sort(
+    (a, b) =>
+      b.weighted - a.weighted ||
+      a.panelId - b.panelId ||
+      a.accountId - b.accountId,
+  );
+  return out;
+}
+
+/** One stable row per panel — name never flips with group winner. */
+function panelUsageRows(u: User, groups: Group[]): PanelUsageRow[] {
+  const astraLimit = Number(u.data_limit) || 0;
+  const usedWeighted = Number(u.used_traffic) || 0;
+  const meters = pickUniqueMeters(u, groups);
+  const byPanel = new Map<number, MeterPick[]>();
+  for (const m of meters) {
+    const list = byPanel.get(m.panelId) || [];
+    list.push(m);
+    byPanel.set(m.panelId, list);
+  }
+
+  const rows: PanelUsageRow[] = [];
+  for (const [panelId, list] of byPanel) {
+    list.sort(
+      (a, b) =>
+        b.weighted - a.weighted || a.accountId - b.accountId,
+    );
+    const raw = list.reduce((s, m) => s + m.raw, 0);
+    const weighted = list.reduce((s, m) => s + m.weighted, 0);
+    const configs = list.reduce((s, m) => s + m.configs, 0);
+    const banked = list.every((m) => m.banked);
+    const coeffs = [
+      ...new Set(list.map((m) => m.coefficient).filter((c) => c >= 0.01)),
+    ].sort((a, b) => a - b);
+    const coefficient = coeffs.length === 1 ? coeffs[0] : list[0]?.coefficient || 1;
+    const name = list[0]?.panelName || `پنل #${panelId}`;
     let remoteLimit = 0;
     if (astraLimit > 0) {
-      const exhausted = usedWeighted >= astraLimit;
-      if (exhausted) {
+      if (usedWeighted >= astraLimit) {
         remoteLimit = Math.max(1, raw || 1);
       } else {
         const remain = Math.max(0, astraLimit - usedWeighted);
-        const grow = coefficient > 0 ? Math.round(remain / coefficient) : remain;
+        const grow =
+          coefficient > 0 ? Math.round(remain / coefficient) : remain;
         remoteLimit = raw + Math.max(0, grow);
       }
     }
-    const gName =
-      a.group_id != null ? groups.find((g) => g.id === a.group_id)?.name : null;
-    const baseName = gName
-      ? `${a.panel_name || `پنل #${a.panel_id}`} · ${gName}`
-      : a.panel_name || `پنل #${a.panel_id}`;
-    const row: PanelUsageRow = {
-      key: `${a.id}-${a.panel_id}-${a.group_id ?? "x"}-${banked ? "b" : "l"}`,
-      panelId: a.panel_id,
-      name: banked ? `${baseName} · ریمو شده` : baseName,
+    rows.push({
+      key: `panel-${panelId}-${banked ? "b" : "l"}`,
+      panelId,
+      name: banked ? `${name} · ریمو شده` : name,
       raw,
       coefficient,
+      coefficients: coeffs.length ? coeffs : [1],
       weighted,
       remoteLimit,
-      configs: banked ? 0 : (a.links || []).filter(Boolean).length,
+      configs,
       banked,
-    };
-    const rk = remoteKey(a.panel_id, a.remote_username);
-    if (rk && !banked) {
-      const prev = bestByRemote.get(rk);
-      if (!prev || row.weighted > prev.weighted || (row.weighted === prev.weighted && row.coefficient > prev.coefficient)) {
-        bestByRemote.set(rk, row);
-      }
-    } else {
-      rows.push(row);
-    }
+    });
   }
-  for (const row of bestByRemote.values()) rows.push(row);
-  rows.sort((a, b) => b.weighted - a.weighted || Number(a.banked) - Number(b.banked));
+  rows.sort(
+    (a, b) =>
+      b.weighted - a.weighted ||
+      Number(a.banked) - Number(b.banked) ||
+      a.name.localeCompare(b.name, "fa") ||
+      a.panelId - b.panelId,
+  );
   return rows;
 }
 
-/** Per-group: Σ (raw × coeff) for live + banked accounts of that group.
-
-  Only:
-  - groups the user currently belongs to, and/or
-  - groups that still have banked (deleted) meters for this user.
-
-  Never paint unrelated Astra groups when membership is empty — that was the
-  «اسم گروه‌های دیگه میاد» bug after removing the only group.
+/**
+ * Per-group rows from the same unique-meter set as panels — no double count,
+ * no stranger groups, stable names.
  */
 function groupUsageRows(u: User, groups: Group[]): GroupUsageRow[] {
   const want = new Set(u.group_ids || []);
-  const accounts = (u.panel_accounts || []).filter(
-    (a) =>
-      a.status === "active" ||
-      a.status === "error" ||
-      a.status === "deleted" ||
-      (a.status === "pending" && (Number(a.used_traffic) || 0) > 0),
-  );
-  const liveKeys = liveRemoteKeys(u.panel_accounts || []);
-  const byGroup = new Map<number, User["panel_accounts"]>();
-  for (const a of accounts) {
-    if (a.group_id == null) continue;
-    const list = byGroup.get(a.group_id) || [];
-    list.push(a);
-    byGroup.set(a.group_id, list);
+  const meters = pickUniqueMeters(u, groups);
+  const byGroup = new Map<number, MeterPick[]>();
+  const ungrouped: MeterPick[] = [];
+
+  for (const m of meters) {
+    if (m.groupId == null) {
+      // Legacy null group_id: attribute to a current membership that links this panel.
+      let attributed = false;
+      for (const gid of [...want].sort((a, b) => a - b)) {
+        const g = groups.find((x) => x.id === gid);
+        if (!g) continue;
+        if (!(g.panels || []).some((p) => p.panel_id === m.panelId)) continue;
+        const list = byGroup.get(gid) || [];
+        list.push(m);
+        byGroup.set(gid, list);
+        attributed = true;
+        break;
+      }
+      if (!attributed) ungrouped.push(m);
+      continue;
+    }
+    const list = byGroup.get(m.groupId) || [];
+    list.push(m);
+    byGroup.set(m.groupId, list);
   }
 
   const rows: GroupUsageRow[] = [];
-  const seenGroup = new Set<number>();
+  const seen = new Set<number>();
 
-  const pushGroup = (g: Group, bankedOnly: boolean) => {
-    seenGroup.add(g.id);
-    let rawSum = 0;
-    let weighted = 0;
-    let panels = 0;
-    let configs = 0;
-    const coeffSet = new Set<number>();
-    // Prefer accounts tagged with this group_id. Legacy null group_id only
-    // when the user is still a member of THIS group (never for strangers).
-    const mine = accounts.filter((a) => a.group_id === g.id);
-    if (mine.length) {
-      for (const a of mine) {
-        let raw = Number(a.used_traffic) || 0;
-        if (a.status === "deleted") {
-          if (raw <= 0) continue;
-          const rk = remoteKey(a.panel_id, a.remote_username);
-          if (rk && liveKeys.has(rk)) {
-            const gap = raw - liveRawForDeleted(a, u.panel_accounts || []);
-            if (gap <= 0) continue;
-            raw = gap;
-          }
-        }
-        const c = accountCoeff(a, groups, u.group_ids || []);
-        rawSum += raw;
-        weighted += accountWeighted(raw, c, a);
-        panels += 1;
-        configs += a.status === "deleted" ? 0 : (a.links || []).filter(Boolean).length;
-        coeffSet.add(c);
-      }
-    } else if (!bankedOnly && want.has(g.id)) {
-      // Legacy: null group_id accounts — only for current memberships.
-      const seenPanel = new Set<number>();
-      for (const gp of g.panels || []) {
-        const a = accounts.find(
-          (x) =>
-            x.panel_id === gp.panel_id &&
-            x.status !== "deleted" &&
-            x.group_id == null,
-        );
-        if (!a || seenPanel.has(a.panel_id)) continue;
-        seenPanel.add(a.panel_id);
-        const c = accountCoeff(a, groups, u.group_ids || []);
-        const raw = Number(a.used_traffic) || 0;
-        rawSum += raw;
-        weighted += accountWeighted(raw, c, a);
-        panels += 1;
-        configs += (a.links || []).filter(Boolean).length;
-        coeffSet.add(c);
-      }
-    }
-    // Hide empty stranger/banked rows; keep empty current memberships only
-    // when the user is still in the group (shows «۰» until first traffic).
-    if (rawSum <= 0 && weighted <= 0 && panels <= 0) {
-      if (bankedOnly || !want.has(g.id)) return;
+  const push = (gid: number, name: string, list: MeterPick[], bankedOnly: boolean) => {
+    seen.add(gid);
+    const raw = list.reduce((s, m) => s + m.raw, 0);
+    const weighted = list.reduce((s, m) => s + m.weighted, 0);
+    const configs = list.reduce((s, m) => s + m.configs, 0);
+    const panels = new Set(list.map((m) => m.panelId)).size;
+    const coeffs = [
+      ...new Set(list.map((m) => m.coefficient).filter((c) => c >= 0.01)),
+    ].sort((a, b) => a - b);
+    const banked = bankedOnly || (list.length > 0 && list.every((m) => m.banked));
+    if (raw <= 0 && weighted <= 0 && panels <= 0) {
+      if (bankedOnly || !want.has(gid)) return;
     }
     rows.push({
-      groupId: g.id,
-      name: bankedOnly ? `${g.name} · ریمو شده` : g.name,
-      raw: rawSum,
+      groupId: gid,
+      name: banked && !want.has(gid) ? `${name} · ریمو شده` : name,
+      raw,
       weighted,
       panels,
       configs,
-      coefficients: [...coeffSet].sort((a, b) => a - b),
-      banked: bankedOnly,
+      coefficients: coeffs.length ? coeffs : [1],
+      banked: banked && !want.has(gid),
     });
   };
 
-  // Current memberships only — never «all groups» when want is empty.
-  for (const g of groups) {
-    if (!want.has(g.id)) continue;
-    pushGroup(g, false);
-  }
-  // Groups removed from the user but still holding banked deleted meters
-  for (const [gid, list] of byGroup) {
-    if (seenGroup.has(gid)) continue;
-    if (!list.some((a) => a.status === "deleted" && (Number(a.used_traffic) || 0) > 0)) {
-      continue;
-    }
+  // Current memberships in stable id order (not map iteration order).
+  for (const gid of [...want].sort((a, b) => a - b)) {
     const g = groups.find((x) => x.id === gid);
-    if (g) {
-      pushGroup(g, true);
-    } else {
-      // Group row deleted from Astra entirely — still show a synthetic label
-      let rawSum = 0;
-      let weighted = 0;
-      let panels = 0;
-      const coeffSet = new Set<number>();
-      for (const a of list) {
-        if (a.status !== "deleted") continue;
-        let raw = Number(a.used_traffic) || 0;
-        if (raw <= 0) continue;
-        const rk = remoteKey(a.panel_id, a.remote_username);
-        if (rk && liveKeys.has(rk)) {
-          const gap = raw - liveRawForDeleted(a, u.panel_accounts || []);
-          if (gap <= 0) continue;
-          raw = gap;
-        }
-        const c = accountCoeff(a, groups, u.group_ids || []);
-        rawSum += raw;
-        weighted += Math.round(raw * c);
-        panels += 1;
-        coeffSet.add(c);
-      }
-      if (rawSum > 0 || weighted > 0) {
-        rows.push({
-          groupId: gid,
-          name: `گروه #${gid} · ریمو شده`,
-          raw: rawSum,
-          weighted,
-          panels,
-          configs: 0,
-          coefficients: [...coeffSet].sort((a, b) => a - b),
-          banked: true,
-        });
-      }
-    }
+    push(gid, g?.name || `گروه #${gid}`, byGroup.get(gid) || [], false);
   }
-  rows.sort((a, b) => b.weighted - a.weighted || a.name.localeCompare(b.name, "fa"));
+
+  // Banked meters on groups the user left.
+  for (const gid of [...byGroup.keys()].sort((a, b) => a - b)) {
+    if (seen.has(gid)) continue;
+    const list = (byGroup.get(gid) || []).filter((m) => m.banked && m.raw > 0);
+    if (!list.length) continue;
+    const g = groups.find((x) => x.id === gid);
+    push(gid, g?.name || `گروه #${gid}`, list, true);
+  }
+
+  // Orphan meters with no group tag and no membership link — residual via caller.
+  if (ungrouped.some((m) => m.raw > 0 || m.weighted > 0)) {
+    // Fold into residual path by leaving them out of group rows; panel rows still show them.
+  }
+
+  rows.sort(
+    (a, b) =>
+      b.weighted - a.weighted ||
+      a.name.localeCompare(b.name, "fa") ||
+      a.groupId - b.groupId,
+  );
   return rows;
 }
 
@@ -1616,15 +1639,18 @@ export default function UsersPage() {
   async function openUsage(u: User, mode: UsageMode = "panels") {
     const fetchId = ++usageFetchId.current;
     setUsageMode(mode);
-    setUsageUser(u);
     setUsageLoading(true);
+    // Keep prior fresh detail for the same user to avoid name/volume flicker
+    // from the lean list snapshot while /api/user loads.
+    setUsageUser((prev) =>
+      prev && prev.username === u.username ? prev : u,
+    );
     try {
       const fresh = await api<User>(`/api/user/${encodeURIComponent(u.username)}`);
       if (usageFetchId.current !== fetchId) return;
       setUsageUser(fresh);
-      qc.invalidateQueries({ queryKey: ["users"] });
     } catch {
-      /* keep list snapshot */
+      /* keep whatever we already show */
     } finally {
       if (usageFetchId.current === fetchId) setUsageLoading(false);
     }
@@ -1643,6 +1669,7 @@ export default function UsersPage() {
         name: "اختلاف متر (بدون ردیف پنل)",
         raw: gap,
         coefficient: 1,
+        coefficients: [1],
         weighted: gap,
         remoteLimit: 0,
         configs: 0,
@@ -4124,8 +4151,8 @@ export default function UsersPage() {
             {usageMode === "panels" ? (
               <>
                 <p className="usage-modal-hint">
-                  مصرف کل باید با جمع ردیف‌های زیر یکی باشد. پنل/گروه حذف‌شده با برچسب «ریمو شده»
-                  می‌ماند تا سقف کم نشود. اگر «اختلاف متر» دیدی، با چک مصرف اصلاح می‌شود.
+                  هر پنل یک ردیف پایدار است (بدون جابه‌جایی اسم گروه). مصرف کل باید با جمع
+                  ردیف‌ها یکی باشد؛ پنل ریمو‌شده برچسب می‌خورد و در سقف می‌ماند.
                 </p>
 
                 <div className="usage-modal-total">
@@ -4169,7 +4196,16 @@ export default function UsersPage() {
                           <div className="usage-panel-meta">
                             <span>خام: {formatTraffic(row.raw, { empty: "۰" })}</span>
                             {!row.residual ? (
-                              <span>ضریب ×{toFaDigits(formatCoeff(row.coefficient))}</span>
+                              <span>
+                                ضریب ×
+                                {toFaDigits(
+                                  (row.coefficients || [row.coefficient]).length === 1
+                                    ? formatCoeff((row.coefficients || [row.coefficient])[0])
+                                    : (row.coefficients || [])
+                                        .map(formatCoeff)
+                                        .join(" / "),
+                                )}
+                              </span>
                             ) : null}
                             {row.residual ? (
                               <span>در هیچ پنل زنده‌ای نیست — معمولاً تورم متر</span>
@@ -4201,8 +4237,8 @@ export default function UsersPage() {
             ) : (
               <>
                 <p className="usage-modal-hint">
-                  فقط گروه‌های همین کاربر. گروه/پنل حذف‌شده = «ریمو شده» با مقدار مصرف‌شده.
-                  جمع ردیف‌ها باید با مصرف کل یکی باشد؛ اختلاف جدا ردیف می‌شود.
+                  فقط گروه‌های همین کاربر؛ هر ریموت فقط به یک گروه حساب می‌شود تا حجم جابه‌جا
+                  نشود. جمع ردیف‌ها باید با مصرف کل یکی باشد.
                 </p>
 
                 <div className="usage-modal-total">
