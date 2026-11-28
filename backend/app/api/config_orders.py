@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_admin
@@ -54,12 +54,17 @@ async def apply_ping_rank(
 
 @router.post("/api/admin/config-order/sample")
 async def refresh_config_order_samples(
+    force: bool = Query(False, description="Wipe remotes and rebuild from scratch"),
     db: AsyncSession = Depends(get_db),
     _admin=Depends(get_current_admin),
 ):
-    """Wipe previous order probe on remotes, recreate on every active panel."""
+    """Refresh order-sample on every sales panel via workers (soft by default).
+
+    Soft path keeps healthy remotes and only heals gaps. Pass ``force=true`` to
+    wipe remotes and rebuild from scratch (slow).
+    """
     try:
-        stats = await order_svc.create_or_refresh_samples(db)
+        stats = await order_svc.create_or_refresh_samples(db, force_wipe=bool(force))
         workspace = await order_svc.list_workspace(db)
         return {
             "ok": True,

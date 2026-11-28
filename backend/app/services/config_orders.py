@@ -1314,20 +1314,23 @@ async def _order_sample_gap_ids(user_id: int) -> list[int]:
     return out
 
 
-async def create_or_refresh_samples(db: AsyncSession) -> dict:
-    """Rebuild order probe on every group×panel — workers fan-out, wait for completeness.
+async def create_or_refresh_samples(
+    db: AsyncSession, *, force_wipe: bool = False
+) -> dict:
+    """Ensure order-sample inventory on every sales group×panel via workers.
 
-    Uses the full sales-group target set (not one-per-panel) so inventory can
-    reach hundreds of unique share links. Waits under nginx ``/api`` 300s, then
-    reconciles once so the Config Order list is stable instead of growing each click.
+    Default is a soft refresh: keep healthy remotes/links, only create missing
+    targets and heal pending/error/empty rows. Full remote wipe only when
+    ``force_wipe`` or there is no usable sample yet — wipe+recreate was making
+    the Config Order page hang for minutes and leave gaps (e.g. 166 mid-build).
     """
     import time as _time
 
     from app.core.database import AsyncSessionLocal, release_db_txn
 
     t0 = _time.monotonic()
-    # Headroom under nginx 300s proxy + UI 280s client timeout.
-    budget_s = 250.0
+    # Soft refresh usually finishes in tens of seconds; wipe path needs more.
+    budget_s = 250.0 if force_wipe else 120.0
 
     def _left() -> float:
         return max(0.5, budget_s - (_time.monotonic() - t0))
@@ -1337,23 +1340,43 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
     if not targets:
         raise ValueError("هیچ پنل فعالی در گروه‌های فروش ثبت نشده است")
     panel_targets = _dedupe_order_sample_targets(targets)
-    logger.info(
-        "order-sample start groups=%s targets=%s panels=%s",
-        len(group_ids),
-        len(targets),
-        len(panel_targets),
-    )
 
     user = await _ensure_order_sample_user(db)
     await _sync_order_sample_groups(db, user, group_ids)
-    await _wipe_order_sample_on_remotes(db, user, targets)
 
-    user = await _get_order_sample_user(db) or user
-    await _sync_order_sample_groups(db, user, group_ids)
+    # Decide wipe: forced, or zero usable share links on the probe user.
+    live_share_n = 0
+    existing_keys: set[tuple[int, int]] = set()
+    for acc in list(user.panel_accounts or []):
+        st = getattr(acc.status, "value", acc.status)
+        if st in (PanelAccountStatus.deleted.value, "deleted"):
+            continue
+        existing_keys.add((int(acc.panel_id), int(getattr(acc, "group_id", 0) or 0)))
+        live_share_n += sum(
+            1 for x in (acc.links or []) if x and is_share_link(str(x))
+        )
+    do_wipe = bool(force_wipe or live_share_n <= 0)
+    logger.info(
+        "order-sample start groups=%s targets=%s panels=%s wipe=%s live_shares=%s",
+        len(group_ids),
+        len(targets),
+        len(panel_targets),
+        do_wipe,
+        live_share_n,
+    )
 
-    # Rebecca: unique remote names so soft-delete ghosts don't block recreate.
+    if do_wipe:
+        await _wipe_order_sample_on_remotes(db, user, targets)
+        user = await _get_order_sample_user(db) or user
+        await _sync_order_sample_groups(db, user, group_ids)
+        existing_keys.clear()
+
+    # Rebecca: unique remote names only for *new* accounts (soft-delete ghosts).
     for panel, _cfg, gid in targets:
         if getattr(panel, "type", None) != PanelType.rebecca:
+            continue
+        key = (int(panel.id), int(gid) if gid else 0)
+        if key in existing_keys:
             continue
         db.add(
             PanelAccount(
@@ -1364,22 +1387,43 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
                 remote_username=f"astra_o{secrets.token_hex(5)}"[:32],
             )
         )
+        existing_keys.add(key)
     await db.flush()
     await orchestrator.ensure_pending_panel_accounts(db, [user], targets)
-    await db.commit()
 
+    # Re-queue broken rows so workers retry without a full wipe.
     uid = int(user.id)
-    async with AsyncSessionLocal() as sdb:
-        rows = await sdb.execute(
-            select(PanelAccount.id).where(
+    requeued = 0
+    rows = (
+        await db.execute(
+            select(PanelAccount).where(
                 PanelAccount.user_id == uid,
                 PanelAccount.status.in_(
-                    (PanelAccountStatus.pending, PanelAccountStatus.error)
+                    (
+                        PanelAccountStatus.pending,
+                        PanelAccountStatus.error,
+                        PanelAccountStatus.active,
+                    )
                 ),
             )
         )
-        pending_ids = [int(r[0]) for r in rows.all() if r[0]]
-        await sdb.rollback()
+    ).scalars().all()
+    for acc in rows:
+        st = getattr(acc.status, "value", acc.status)
+        share_n = sum(1 for x in (acc.links or []) if x and is_share_link(str(x)))
+        if st in (
+            PanelAccountStatus.pending.value,
+            PanelAccountStatus.error.value,
+            "pending",
+            "error",
+        ) or share_n <= 0:
+            if st != PanelAccountStatus.pending.value and st != "pending":
+                acc.status = PanelAccountStatus.pending
+                acc.error_message = None
+                requeued += 1
+    await db.commit()
+
+    pending_ids = list(dict.fromkeys(await _order_sample_gap_ids(uid)))
 
     try:
         await release_db_txn(db)
@@ -1397,19 +1441,24 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
     # Fan-out through workers — wait for the first wave, then drain gaps.
     tasks = orchestrator.start_account_provisions(pending_ids) if pending_ids else []
     if tasks:
-        wait_s = max(45.0, _left() - 70.0)
+        # Soft path: don't burn the whole budget on the first wait.
+        wait_s = min(_left() - 25.0, 90.0 if do_wipe else 45.0)
+        wait_s = max(8.0, wait_s)
         done, still = await asyncio.wait(tasks, timeout=wait_s)
         logger.info(
-            "order-sample provision queued=%s done=%s bg=%s left=%.1f",
+            "order-sample provision queued=%s done=%s bg=%s requeued=%s wipe=%s left=%.1f",
             len(pending_ids),
             len(done),
             len(still),
+            requeued,
+            do_wipe,
             _left(),
         )
 
     # Drain until every live account has share links (or budget for final steps).
+    drain_floor = 20.0 if do_wipe else 12.0
     drain_rounds = 0
-    while _left() > 55.0:
+    while _left() > drain_floor:
         gaps = await _order_sample_gap_ids(uid)
         if not gaps:
             break
@@ -1421,16 +1470,16 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
         try:
             await orchestrator.heal_user_coverage_pool_safe(
                 uid,
-                wait=min(20.0, max(6.0, _left() - 50.0)),
+                wait=min(18.0, max(5.0, _left() - drain_floor)),
                 include_empty_links=True,
             )
         except Exception:  # noqa: BLE001
             logger.debug("order-sample heal round failed", exc_info=True)
-        if _left() > 40.0:
+        if _left() > drain_floor + 8.0:
             try:
                 await asyncio.wait_for(
                     orchestrator.hydrate_share_links_pool_safe(uid),
-                    timeout=min(18.0, _left() - 35.0),
+                    timeout=min(15.0, _left() - drain_floor),
                 )
             except Exception:  # noqa: BLE001
                 logger.debug("order-sample hydrate round failed", exc_info=True)
@@ -1440,9 +1489,9 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
             len(gaps),
             _left(),
         )
-        if drain_rounds >= 12:
+        if drain_rounds >= (12 if do_wipe else 8):
             break
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(0.8 if not do_wipe else 1.2)
 
     # Final hydrate pass.
     if _left() > 8.0:
@@ -1604,7 +1653,7 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
         elapsed_ms = int((_time.monotonic() - t0) * 1000)
         logger.info(
             "order-sample done panels=%s ok=%s fail=%s targets=%s links=%s "
-            "gaps_left=%s drain_rounds=%s ms=%s",
+            "gaps_left=%s drain_rounds=%s wipe=%s ms=%s",
             len(panel_targets),
             ok_count,
             fail_count,
@@ -1612,6 +1661,7 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
             link_count,
             len(leftover),
             drain_rounds,
+            do_wipe,
             elapsed_ms,
         )
         return {
@@ -1624,6 +1674,7 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
             "ordered_count": ordered_n,
             "gaps_left": len(leftover),
             "drain_rounds": drain_rounds,
+            "wiped": bool(do_wipe),
             "elapsed_ms": elapsed_ms,
             "sample_username": ORDER_SAMPLE_USERNAME,
             "panels": rows,

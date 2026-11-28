@@ -66,6 +66,7 @@ type SampleReport = {
   groups_count?: number;
   links_count: number;
   gaps_left?: number;
+  wiped?: boolean;
   elapsed_ms?: number;
   panels: SamplePanelRow[];
 };
@@ -259,6 +260,7 @@ export default function ConfigOrderPage() {
       const tN = s?.targets_count;
       const gaps = s?.gaps_left ?? 0;
       const panels = Array.isArray(s?.panels) ? s.panels : [];
+      const wiped = !!s?.wiped;
       setSampleReport({
         ok_count: okN,
         fail_count: failN,
@@ -267,20 +269,26 @@ export default function ConfigOrderPage() {
         groups_count: gN,
         links_count: linkN,
         gaps_left: gaps,
+        wiped,
         elapsed_ms: s?.elapsed_ms,
         panels,
       });
+      const mode = wiped ? "ساخت از صفر" : "تکمیل سریع";
       const base =
         failN > 0
-          ? `${toFaDigits(okN)} پنل موفق، ${toFaDigits(failN)} ناموفق — ${toFaDigits(linkN)} کانفیگ یکتا`
-          : `${toFaDigits(okN)} پنل${
+          ? `${mode}: ${toFaDigits(okN)} پنل موفق، ${toFaDigits(failN)} ناموفق — ${toFaDigits(linkN)} اندپوینت یکتا`
+          : `${mode}: ${toFaDigits(okN)} پنل${
               gN != null ? ` / ${toFaDigits(gN)} گروه` : ""
-            }${tN != null ? ` / ${toFaDigits(tN)} هدف` : ""} — ${toFaDigits(linkN)} کانفیگ یکتا`;
+            }${tN != null ? ` / ${toFaDigits(tN)} هدف` : ""} — ${toFaDigits(linkN)} اندپوینت یکتا`;
       const gapNote =
         gaps > 0 ? ` — ${toFaDigits(gaps)} اکانت هنوز در حال تکمیل` : "";
+      const msNote =
+        s?.elapsed_ms != null
+          ? ` (${toFaDigits(Math.round(s.elapsed_ms / 1000))}ث)`
+          : "";
       pushToast(
         failN > 0 && okN === 0 ? "err" : failN > 0 ? "err" : "ok",
-        `${base}${gapNote}`
+        `${base}${gapNote}${msNote}`
       );
       if (autoFlag && (ws?.items?.length || 0) > 0) {
         setWantProbe(true);
@@ -718,8 +726,9 @@ export default function ConfigOrderPage() {
             <strong>گزینهٔ «نوع ترتیب ساب»</strong> روی گروه می‌آید (نه از اسم کانفیگ).
             چیدمان: اول <strong>۲۰ مستقیم</strong>، سپس <strong>۵۰ تانل</strong>،
             سپس <strong>۹ گیمینگ</strong>، سپس <strong>۲۰ باقی‌مانده</strong>{" "}
-            (بهترین‌ها). ساب کاربر حداکثر <strong>۹۹</strong>؛ اپ تست با هر ساب،
-            کل موجودی نمونهٔ پنل‌ها را می‌گیرد (نه فقط گروه‌های همان کاربر).
+            (بهترین‌ها). ساب کاربر حداکثر <strong>۹۹</strong>؛ اپ تست کل موجودی
+            نمونه را می‌گیرد. عدد «کانفیگ یکتا» = اندپوینت‌های یکتا (host:port)،
+            نه تعداد پنل — پنل‌های فروش فعال الان حدود ۲۰ تا هستند.
           </p>
         </div>
         <div className="config-order-hero-actions">
@@ -736,9 +745,9 @@ export default function ConfigOrderPage() {
             )}
             <span>
               {buildSamples.isPending
-                ? "در حال ساخت روی همه پنل‌ها…"
+                ? "در حال تکمیل روی ورکر/پنل‌ها…"
                 : sampleReady
-                  ? "ساخت مجدد کانفیگ‌ها"
+                  ? "تکمیل کانفیگ‌های ناقص"
                   : "ساخت کانفیگ‌ها"}
             </span>
           </button>
@@ -761,11 +770,11 @@ export default function ConfigOrderPage() {
       <div className="config-order-meta">
         <span>
           <ListOrdered size={14} aria-hidden />
-          {toFaDigits(items.length)} کانفیگ یکتا
+          {toFaDigits(items.length)} اندپوینت یکتا
         </span>
         <span>
           {totalSample > 0
-            ? `${toFaDigits(totalSample)} از نمونه پنل‌ها`
+            ? `${toFaDigits(totalSample)} از نمونه پنل‌ها (نه تعداد پنل)`
             : "نمونه خالی — اول «ساخت کانفیگ‌ها»"}
         </span>
         {hiddenCount > 0 ? (
@@ -789,9 +798,11 @@ export default function ConfigOrderPage() {
       {sampleReport ? (
         <div className="config-order-sample-report" role="status">
           <div className="config-order-sample-report-head">
-            <strong>نتیجه ساخت نمونه</strong>
+            <strong>
+              {sampleReport.wiped ? "نتیجه ساخت از صفر" : "نتیجه تکمیل سریع"}
+            </strong>
             <span>
-              {toFaDigits(sampleReport.links_count)} کانفیگ یکتا ·{" "}
+              {toFaDigits(sampleReport.links_count)} اندپوینت یکتا ·{" "}
               {toFaDigits(sampleReport.ok_count)}/
               {toFaDigits(sampleReport.panels_count)} پنل
               {sampleReport.targets_count
