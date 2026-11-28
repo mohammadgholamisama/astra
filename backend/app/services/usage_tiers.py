@@ -1,7 +1,7 @@
 """Adaptive Hot / Warm / Cold usage tiers for Worker polling.
 
-Hot  — remaining ≤ 1.5 GB OR used ≥ 90% → priority-probe every ~4s
-Warm — used 50–90% OR /sub in last 15 min → 25s targeted waves
+Hot  — remaining ≤ 3 GB OR used ≥ 85% → priority-probe every ~2–4s
+Warm — used 50–85% OR /sub in last 15 min → 25s targeted waves
 Cold — used < 50% AND idle > 15 min → full sweep every ~120s (4th wave)
 
 All DB work is sequential on a single AsyncSession (never shared across
@@ -19,8 +19,9 @@ from typing import Any
 logger = logging.getLogger("astra.usage.tiers")
 
 _GB = 1024**3
-_HOT_REMAINING = int(1.5 * _GB)
-_HOT_RATIO = 0.90
+# Enter Hot earlier so near-sale users are probed before they overshoot.
+_HOT_REMAINING = int(3 * _GB)
+_HOT_RATIO = 0.85
 _WARM_RATIO = 0.50
 _SUB_WARM_SEC = 15 * 60
 # No hard row cap — newly-created / actively downloading users must stay Hot.

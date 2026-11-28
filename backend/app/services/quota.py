@@ -2,10 +2,11 @@
 Shared Astra traffic quota across remote panels.
 
 Remote caps (create / modify):
-    Each remote gets: used_raw_on_panel + remaining_astra_budget / coefficient.
-    Example: buy 10GB, Astra used 8GB, coeff 1, raw on panel 3GB
-      → remote data_limit = 3GB + 2GB = 5GB (cannot grow past Astra sale).
-    This stops multi-panel overshoot where every panel had the FULL 10GB.
+    Each remote gets:
+        used_raw_on_panel + (remaining_astra_budget / coefficient / active_panel_count)
+    Remaining is split across live remotes so simultaneous download cannot
+    N× overshoot the sale limit. Near the end, absolute headroom caps shrink
+    further (512MiB → 256MiB → 64MiB) so a late meter tick cannot bleed GBs.
 
 Usage (what the end-user / admin sees):
     used_astra = Σ over accounts period-locked weighted bytes:
@@ -24,6 +25,12 @@ _DIGIT_TRANS = str.maketrans(
     "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
     "01234567890123456789",
 )
+
+_MiB = 1024 * 1024
+# Absolute raw grow allowed per panel as remaining shrinks (after split).
+_HEADROOM_3GB = 512 * _MiB
+_HEADROOM_1GB = 256 * _MiB
+_HEADROOM_256MB = 64 * _MiB
 
 
 def norm_coeff(raw: float | str | None, default: float = 1.0) -> float:
@@ -95,12 +102,14 @@ def remote_data_limit(
     used_weighted_total: int = 0,
     used_raw_on_panel: int = 0,
     coefficient: float = 1.0,
+    active_panel_count: int = 1,
 ) -> int:
     """Traffic ceiling (bytes) pushed to one remote panel while user is active.
 
-    Ceiling = raw already on this panel + remaining Astra budget / coeff.
-    So remotes self-cut near the sale end instead of each holding the full
-    purchase (which let users overshoot across many panels).
+    Ceiling = raw already on this panel + share of remaining Astra budget.
+    Remaining is divided by ``active_panel_count`` so multi-panel users cannot
+    download the full leftover on every panel at once (the classic
+    40GB-sale → 44GB+ overshoot). Near the end, absolute headroom caps shrink.
 
     Unlimited Astra (limit<=0) → 0 (unlimited on remote).
     """
@@ -110,9 +119,28 @@ def remote_data_limit(
     used_w = max(0, int(used_weighted_total or 0))
     used_r = max(0, int(used_raw_on_panel or 0))
     c = norm_coeff(coefficient)
+    n = max(1, int(active_panel_count or 1))
     remain_w = max(0, limit - used_w)
-    grow = int(round(remain_w / c)) if c > 0 else int(remain_w)
-    return used_r + max(0, grow)
+    if remain_w <= 0:
+        # No sale budget left — freeze grow at current raw.
+        return max(1, used_r) if used_r > 0 else 1
+
+    remain_raw = int(round(remain_w / c)) if c > 0 else int(remain_w)
+    # Split leftover across live remotes (integer share; remainder stays unallocated).
+    grow = remain_raw // n
+
+    # Absolute headroom as the sale ends — meter lag must not bleed GBs.
+    if remain_w <= 256 * _MiB:
+        grow = min(grow, _HEADROOM_256MB)
+    elif remain_w <= 1024 * _MiB:
+        grow = min(grow, _HEADROOM_1GB)
+    elif remain_w <= 3 * 1024 * _MiB:
+        grow = min(grow, _HEADROOM_3GB)
+
+    grow = min(grow, remain_raw)
+    if grow < 1:
+        grow = 1
+    return used_r + grow
 
 
 def needs_remote_cap_sync(
@@ -132,11 +160,14 @@ def needs_remote_cap_sync(
     """
     if force or status_changed or blocked:
         return True
-    # Mid-flight remaining-cap push — keep rare so hot/fleet don't storm remotes.
-    # Remotes already self-cut via remote_data_limit; tighten again near the end.
-    if used_ratio is not None and float(used_ratio) >= 0.70:
+    ratio = float(used_ratio) if used_ratio is not None else 0.0
+    # Tighten earlier than before — remotes must shrink before Hot lag bleeds.
+    if ratio >= 0.50:
         return True
-    if shrink_shared_caps and used_ratio is not None and float(used_ratio) >= 0.50:
+    # Multi-panel: start splitting pushes even earlier (duplicated headroom risk).
+    if int(active_panel_count or 0) >= 2 and ratio >= 0.35:
         return True
-    _ = (active_panel_count, coefficients)
+    if shrink_shared_caps and ratio >= 0.35:
+        return True
+    _ = coefficients
     return False

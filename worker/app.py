@@ -1873,7 +1873,7 @@ async def _collect_loop() -> None:
 
 
 async def _priority_loop() -> None:
-    """Hot-tier poll every ~3s on its own HTTP pool — never blocked by collect/KILL."""
+    """Hot-tier poll every ~2s on its own HTTP pool — never blocked by collect/KILL."""
     await asyncio.sleep(2)
     while True:
         t0 = time.monotonic()
@@ -1882,10 +1882,10 @@ async def _priority_loop() -> None:
         sent_n = 0
         try:
             if not MASTER_URL or not WORKER_TOKEN:
-                await asyncio.sleep(3.0)
+                await asyncio.sleep(2.0)
                 continue
             if not _ASSIGNED:
-                await asyncio.sleep(3.0)
+                await asyncio.sleep(2.0)
                 continue
             client = await _http_priority()
             items: list[dict[str, Any]] = []
@@ -2070,7 +2070,8 @@ async def _priority_loop() -> None:
         except Exception:  # noqa: BLE001
             logger.warning("priority loop error", exc_info=True)
         elapsed = time.monotonic() - t0
-        await asyncio.sleep(max(0.5, 3.0 - elapsed))
+        # 2s cadence — cut quota overshoot window after sale end.
+        await asyncio.sleep(max(0.35, 2.0 - elapsed))
 
 
 async def _assignment_loop() -> None:

@@ -31,7 +31,7 @@ _DEFAULT_TTL = 60.0
 _NEAR_LIMIT_RATIO = 0.85
 _SEP = "\x1f"
 _MAX_TAKE = 400  # total remotes per priority-probe poll
-_PER_PANEL_CAP = 15  # every active panel gets a slot every 3s tick
+_PER_PANEL_CAP = 20  # every active panel gets a slot every ~2–3s tick
 _QUEUE_CAP = 8000
 _HOT_TTL = 900.0  # create + /sub → Hot for 15 minutes
 

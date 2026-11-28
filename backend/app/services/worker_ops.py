@@ -47,6 +47,9 @@ _PANEL_APPLY_COOLDOWN = float(
     __import__("os").environ.get("ASTRA_USAGE_APPLY_COOLDOWN", "18") or 18
 )
 _LOCAL_APPLY_TS: dict[int, float] = {}
+# Near-sale remote-cap tighten (sync_modify) — avoid storming remotes.
+_CAP_TIGHTEN_UNTIL: dict[int, float] = {}
+_CAP_TIGHTEN_CD = 15.0
 
 
 def _report_wake() -> asyncio.Event:
@@ -319,6 +322,7 @@ async def _apply_usage_report_job(job: dict[str, Any]) -> None:
     dirty: set[int] = set()
     exhausted: list[int] = []
     near_limit_uids: list[int] = []
+    tighten_uids: list[int] = []
     try:
         async with AsyncSessionLocal() as db:
             panel = (
@@ -438,6 +442,9 @@ async def _apply_usage_report_job(job: dict[str, Any]) -> None:
                         and used_i >= int(0.85 * lim_i)
                     ):
                         near_limit_uids.append(int(uid))
+                        # ≥90% → push split/shrunk remote ceilings before overshoot.
+                        if used_i >= int(0.90 * lim_i):
+                            tighten_uids.append(int(uid))
             worker = (
                 await db.execute(select(WorkerNode).where(WorkerNode.id == wid))
             ).scalar_one_or_none()
@@ -462,6 +469,34 @@ async def _apply_usage_report_job(job: dict[str, Any]) -> None:
                 await uprio.enqueue_users_remotes(promote_ids, ttl=600.0)
             except Exception:  # noqa: BLE001
                 pass
+        # Shrink remote headroom now (split remaining / near-end caps).
+        if tighten_uids:
+            now_m = time.monotonic()
+            due: list[int] = []
+            for uid in dict.fromkeys(tighten_uids):
+                until = float(_CAP_TIGHTEN_UNTIL.get(uid, 0.0) or 0.0)
+                if now_m < until:
+                    continue
+                _CAP_TIGHTEN_UNTIL[uid] = now_m + _CAP_TIGHTEN_CD
+                due.append(int(uid))
+                if len(_CAP_TIGHTEN_UNTIL) > 5000:
+                    dead = [
+                        k
+                        for k, u in list(_CAP_TIGHTEN_UNTIL.items())
+                        if float(u or 0) <= now_m
+                    ]
+                    for k in dead[:2000]:
+                        _CAP_TIGHTEN_UNTIL.pop(k, None)
+            for uid in due[:40]:
+                try:
+                    from app.services.orchestrator import sync_modify_user_background
+
+                    asyncio.create_task(
+                        sync_modify_user_background(int(uid)),
+                        name=f"astra-cap-tighten-{uid}",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
     finally:
         try:
             import fcntl

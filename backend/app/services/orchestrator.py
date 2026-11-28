@@ -555,13 +555,15 @@ def remote_data_limit_bytes(
     *,
     used_weighted_total: int = 0,
     used_raw_on_panel: int = 0,
+    active_panel_count: int = 1,
 ) -> int:
-    """Remote ceiling = used_raw + remaining Astra budget / coefficient."""
+    """Remote ceiling = used_raw + (remaining / coeff / live_panel_count)."""
     return quota_math.remote_data_limit(
         user_limit,
         used_weighted_total=used_weighted_total,
         used_raw_on_panel=used_raw_on_panel,
         coefficient=coefficient_from_config(config),
+        active_panel_count=active_panel_count,
     )
 
 
@@ -583,10 +585,11 @@ def build_user_payload(
     used_weighted_total: int | None = None,
     used_raw_on_panel: int = 0,
     remote_username: str | None = None,
+    active_panel_count: int = 1,
 ) -> UserPayload:
     """Build remote payload.
 
-    Active: each panel gets used_raw + remaining_astra/coeff (self-cuts near sale end).
+    Active: each panel gets used_raw + remaining/coeff/N_panels (self-cuts near sale end).
     Limited/expired/disabled: freeze at current raw + disabled status on ALL panels.
     Coefficient also drives Astra usage Σ(raw×coeff).
 
@@ -620,6 +623,7 @@ def build_user_payload(
         cfg,
         used_weighted_total=used_w,
         used_raw_on_panel=used_raw_on_panel,
+        active_panel_count=active_panel_count,
     )
     # Sale finished → freeze every remote so leftover raw bytes cannot be used
     if status in ("limited", "expired", "disabled"):
@@ -1083,6 +1087,7 @@ async def provision_user_on_panels(
             uuid=account.uuid,
             panel_config=config,
             remote_username=preferred,
+            active_panel_count=max(1, len({int(p.id) for p, _c, _g in targets})),
         )
         jobs.append((account, panel, payload, gid))
 
@@ -1478,6 +1483,7 @@ async def provision_users_batch(
                 uuid=account.uuid,
                 panel_config=config,
                 remote_username=preferred,
+                active_panel_count=max(1, len({int(p.id) for p, _c, _g in targets})),
             )
             jobs.append((account, panel, payload, user))
 
@@ -1991,6 +1997,21 @@ async def _provision_account_now(account_id: int) -> bool:
                         )
                     )
                     same_panel = int(n.scalar() or 0)
+                live_panels = await db.execute(
+                    select(func.count(func.distinct(PanelAccount.panel_id)))
+                    .select_from(PanelAccount)
+                    .where(
+                        PanelAccount.user_id == uid,
+                        PanelAccount.status.in_(
+                            (
+                                PanelAccountStatus.active,
+                                PanelAccountStatus.error,
+                                PanelAccountStatus.pending,
+                            )
+                        ),
+                    )
+                )
+                active_panel_n = max(1, int(live_panels.scalar() or 1))
                 existing_name = (acc.remote_username or "").strip()
                 if existing_name:
                     preferred = existing_name
@@ -2003,6 +2024,7 @@ async def _provision_account_now(account_id: int) -> bool:
                     uuid=acc.uuid,
                     panel_config=cfg,
                     remote_username=preferred,
+                    active_panel_count=active_panel_n,
                 )
                 _touch_panel_for_detach(panel)
                 job = {
@@ -4351,6 +4373,17 @@ async def sync_modify_user(
     account_coeffs = await account_coefficients_for_user(db, user, accounts)
     weighted = await _weighted_total(accounts, account_coeffs)
     _assign_user_used_traffic(user, weighted)
+    # Unique live panels — split remaining budget so multi-config can't N× overshoot.
+    active_panel_n = max(
+        1,
+        len(
+            {
+                int(a.panel_id)
+                for a in _active_accounts(accounts)
+                if a.panel is not None and bool(getattr(a.panel, "is_active", True))
+            }
+        ),
+    )
 
     blocked = user.status in (
         UserStatus.limited,
@@ -4412,6 +4445,7 @@ async def sync_modify_user(
             used_weighted_total=weighted,
             used_raw_on_panel=int(account.used_traffic or 0),
             remote_username=rem_name,
+            active_panel_count=active_panel_n,
         )
         # Hard cut: remotes treat "limited" inconsistently — force disabled so
         # Marzban / Sanaei / Rebecca / PasarGuard all stop traffic immediately.
@@ -6399,6 +6433,16 @@ async def _retry_all_failed_accounts_inner(
             uuid=a.uuid,
             panel_config=cfg,
             remote_username=preferred,
+            active_panel_count=max(
+                1,
+                len(
+                    {
+                        int(x.panel_id)
+                        for x in reachable
+                        if int(x.user_id) == int(user.id)
+                    }
+                ),
+            ),
         )
         jobs.append((a, panel, user, payload))
 
@@ -8653,6 +8697,17 @@ async def usage_breakdown_for_user(db: AsyncSession, user: User) -> list[dict]:
     _sync_account_coeff_periods(accounts, account_coeffs)
     user_limit = int(user.data_limit or 0)
     weighted_total = await _weighted_total(accounts, account_coeffs)
+    active_panel_n = max(
+        1,
+        len(
+            {
+                int(a.panel_id)
+                for a in accounts
+                if a.status
+                in (PanelAccountStatus.active, PanelAccountStatus.error)
+            }
+        ),
+    )
     rows: list[dict] = []
     for account in accounts:
         if account.status not in (
@@ -8671,6 +8726,7 @@ async def usage_breakdown_for_user(db: AsyncSession, user: User) -> list[dict]:
             {"coefficient": coeff},
             used_weighted_total=weighted_total,
             used_raw_on_panel=raw,
+            active_panel_count=active_panel_n,
         )
         n_links = len([x for x in (account.links or []) if x])
         rows.append(
@@ -9422,7 +9478,7 @@ async def refresh_users_usage_batch(
         )
         lim = int(u.data_limit or 0)
         used = int(u.used_traffic or 0)
-        near_limit = lim > 0 and used >= int(lim * 0.80)
+        near_limit = lim > 0 and used >= int(lim * 0.70)
         # Quick path: still push when quota just flipped OR user is blocked
         # so every panel stays frozen after volume (with coeff) is exhausted.
         # Near-limit also pushes so remotes shrink ceilings before overshoot.
