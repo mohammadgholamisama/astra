@@ -23,16 +23,19 @@ def _d(summary: str, where: str, does: str, result: str = "") -> tuple[str, str]
 
 # Short auth map only — per-operation docs carry curl / fields / responses.
 OPENAPI_DESC = """
+این صفحه برای **برنامه‌نویس‌های خارجی** (فروشگاه / ربات / Integration) است.
+عملیات داخلی پنل Astra (مثل تغییر رمز ادمین، بک‌آپ، ورکر، تنظیمات) اینجا نشان داده نمی‌شود.
+
 ## احراز هویت
 
 | روش | هدر | کاربرد |
 |---|---|---|
-| **کلید API** | `X-Api-Key: pg_key_…` | فروشگاه / ربات / Integration (`/api/v1/…`) و اکثر APIهای ادمین |
-| **JWT ادمین** | `Authorization: Bearer <token>` | پنل مدیریت بعد از `POST /api/admin/token` |
-| **بدون توکن** | — | فقط مسیرهای عمومی: `/health`، `/sub/{token}`، نصب ورکر عمومی، و خودِ لاگین |
+| **کلید API** | `X-Api-Key: pg_key_…` | فروشگاه / ربات / Integration (`/api/v1/…`) |
+| **JWT ادمین** | `Authorization: Bearer <token>` | بعد از `POST /api/admin/token` |
+| **بدون توکن** | — | `/health`، `/sub/{token}`، خودِ لاگین |
 
-در **Authorize** فقط یک کادر `ApiKeyAuth` برای `X-Api-Key` و در صورت نیاز OAuth2 برای JWT ببینید.
-در نمونه‌های **curl** به‌جای `YOUR_PANEL_HOST` آدرس واقعی پنل را بگذارید (مثلاً دامنهٔ عمومی Astra).
+برای ثبت پنل اول `GET /api/v1/panel-types` را بزنید تا مقدار دقیق `type` را ببینید
+(مثلاً `sanaei`، `pasarguard`، `marzban`).
 
 ### واحدها (مهم)
 
@@ -982,6 +985,18 @@ _OPS: dict[tuple[str, str], tuple[str, str]] = {
         "**path:** `panel_id` int ≥ 1.\n\n"
         "**پاسخ:** یک آبجکت `PanelSubStatusOut`؛ اگر پنل نباشد `404`.",
     ),
+    ("get", "/api/v1/panel-types"): (
+        "لیست تایپ‌های مجاز برای ثبت پنل",
+        "\n\n".join(
+            [
+                "**کجا:** قبل از ساخت پنل با `POST /api/admin/panels`.",
+                "**عملکرد:** همهٔ مقدارهای مجاز فیلد `type` را برمی‌گرداند "
+                "(`sanaei`، `pasarguard`، `marzban`، `rebecca`، `guard`، `astra`).",
+                "**نکته:** مقدار را دقیقاً همین‌طور بفرستید — "
+                "`Sanaei` / `3x-ui` / `marz` پذیرفته نمی‌شود.",
+            ]
+        ),
+    ),
 }
 
 _HIDE_EXACT: set[str] = {
@@ -989,14 +1004,41 @@ _HIDE_EXACT: set[str] = {
     "/{full_path}",
     "/api/groups",
     "/api/groups/reorder",
+    # Internal Astra panel ops — not for external integrators on /docs
+    "/api/admin",
+    "/api/admin/change-password",
 }
+
+# Prefixes hidden from public /docs (still work in the live panel).
+_HIDE_DOCS_PREFIXES: tuple[str, ...] = (
+    "/api/admin/api-keys",
+    "/api/admin/backup",
+    "/api/admin/settings",
+    "/api/admin/workers",
+    "/api/admin/panel-categories",
+    "/api/internal/",
+    "/api/public/worker",
+    "/api/analytics",
+    "/api/system/",
+    "/api/panel",  # legacy aliases; use /api/admin/panels
+)
 
 
 def _should_hide(path: str) -> bool:
     if path in _HIDE_EXACT:
         return True
-    if path.startswith("/api/panel"):
+    for prefix in _HIDE_DOCS_PREFIXES:
+        if path == prefix.rstrip("/") or path.startswith(prefix):
+            return True
+    # Live probes / Astra node internals — not for shop/bot docs
+    if "/outbounds" in path or "/astra-" in path or "/clients" in path:
         return True
+    if path.endswith("/test") or path.endswith("/test-all"):
+        return True
+    if path.endswith("/reorder") or path.endswith("/move"):
+        # UI-only drag/folder ops
+        if "/panels" in path or "/panel-categories" in path:
+            return True
     return False
 
 
@@ -1079,6 +1121,23 @@ _BINARY_RESPONSES: dict[tuple[str, str], tuple[str, str]] = {
 }
 
 _OK_RESPONSE_EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
+    ("get", "/api/v1/panel-types"): [
+        {
+            "type": "sanaei",
+            "label": "سنایی / 3X-UI",
+            "description": "پنل سنایی (3X-UI / x-ui). فیلد type را دقیقاً `sanaei` بگذارید.",
+        },
+        {
+            "type": "pasarguard",
+            "label": "پاسارگاد",
+            "description": "پنل پاسارگاد. فیلد type را دقیقاً `pasarguard` بگذارید.",
+        },
+        {
+            "type": "marzban",
+            "label": "مرزبان",
+            "description": "پنل مرزبان. فیلد type را دقیقاً `marzban` بگذارید.",
+        },
+    ],
     ("post", "/api/group/{group_id}/resync-users"): {
         "ok": True,
         "started": True,

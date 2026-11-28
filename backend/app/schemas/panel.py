@@ -9,7 +9,12 @@ from app.schemas.common import ORMModel
 
 class PanelCreate(BaseModel):
     name: str = Field(min_length=2, max_length=128)
-    type: PanelType
+    type: PanelType = Field(
+        description=(
+            "نوع پنل — مقدار دقیق از `GET /api/v1/panel-types` "
+            "(مثلاً sanaei / pasarguard / marzban / rebecca / guard / astra)."
+        ),
+    )
     base_url: str
     username: str | None = None
     password: str | None = None
