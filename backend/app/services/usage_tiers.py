@@ -30,6 +30,9 @@ _ACCOUNT_CHUNK = 800
 
 # user_id → last /sub monotonic
 _SUB_TOUCH: dict[int, float] = {}
+# user_id → create/priority boost monotonic (brand-new → Hot for 30 min)
+_CREATE_TOUCH: dict[int, float] = {}
+_CREATE_HOT_SEC = 30 * 60
 # panel_id → {hot: set[str], warm: set[str]}
 _PANEL_TIERS: dict[int, dict[str, set[str]]] = {}
 _TASK: asyncio.Task | None = None
@@ -46,6 +49,17 @@ def mark_sub_touch(user_id: int) -> None:
                 _SUB_TOUCH.pop(k, None)
 
 
+def mark_create_touch(user_id: int) -> None:
+    """Keep a newly created user in Hot so first bytes land within seconds."""
+    uid = int(user_id)
+    _CREATE_TOUCH[uid] = time.monotonic()
+    if len(_CREATE_TOUCH) > 20000:
+        cutoff = time.monotonic() - _CREATE_HOT_SEC
+        for k, ts in list(_CREATE_TOUCH.items()):
+            if ts < cutoff:
+                _CREATE_TOUCH.pop(k, None)
+
+
 def classify_user(
     *,
     used: int,
@@ -55,6 +69,10 @@ def classify_user(
 ) -> str:
     """Return ``hot`` | ``warm`` | ``cold``."""
     now = time.monotonic() if now is None else now
+    uid = int(user_id)
+    created = float(_CREATE_TOUCH.get(uid, 0.0) or 0.0)
+    if created and (now - created) <= _CREATE_HOT_SEC:
+        return "hot"
     lim = int(data_limit or 0)
     used_i = max(0, int(used or 0))
     if lim > 0:
@@ -64,7 +82,7 @@ def classify_user(
             return "hot"
         if ratio >= _WARM_RATIO:
             return "warm"
-    last_sub = float(_SUB_TOUCH.get(int(user_id), 0.0) or 0.0)
+    last_sub = float(_SUB_TOUCH.get(uid, 0.0) or 0.0)
     if last_sub and (now - last_sub) <= _SUB_WARM_SEC:
         return "warm"
     return "cold"

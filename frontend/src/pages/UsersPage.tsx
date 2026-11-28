@@ -816,10 +816,12 @@ export default function UsersPage() {
         })}`,
         { timeoutMs: 20_000 }
       ),
-    staleTime: 25_000,
-    refetchInterval: 45_000,
+    staleTime: 6_000,
+    // Workers push meters every ~2–4s; keep the board nearly live without
+    // refresh=true remote stampede.
+    refetchInterval: 8_000,
     refetchOnMount: true,
-    refetchOnWindowFocus: false,
+    refetchOnWindowFocus: true,
     // While typing a search, don't keep the previous board page as placeholder
     // (it looked like the list "vanished" mid-type). Page flips can reuse.
     placeholderData: searchDebounced.trim()
@@ -855,8 +857,9 @@ export default function UsersPage() {
       );
       return true;
     },
-    staleTime: 25_000,
-    refetchOnWindowFocus: false,
+    staleTime: 6_000,
+    refetchInterval: 8_000,
+    refetchOnWindowFocus: true,
   });
 
   // Phase 3 — chip totals (all/active/error/expired/limited) after list is visible.

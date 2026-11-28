@@ -9973,6 +9973,7 @@ async def refresh_usage(
                 panel = account.panel
                 if panel is not None and panel.type == PanelType.astra:
                     account.used_traffic = got
+                    account.last_remote_raw = got
                 else:
                     try:
                         from app.services.panel_usage_bulk import is_nx_inflated_meter
@@ -9983,12 +9984,19 @@ async def refresh_usage(
                             account.used_traffic = max(prev, got)
                     except Exception:  # noqa: BLE001
                         account.used_traffic = max(prev, got)
-                # Keep high-water cursor in sync — stale last_remote_raw made the
-                # next usage-report re-add (got-last) on top of already-applied used.
-                try:
-                    account.last_remote_raw = got
-                except Exception:
-                    pass
+                    # Never collapse the high-water cursor on a 0/blip reading —
+                    # that made the next usage-report re-add the full counter,
+                    # or leave last>>used with used stuck at 0.
+                    try:
+                        if got > 0:
+                            account.last_remote_raw = max(
+                                int(getattr(account, "last_remote_raw", None) or 0),
+                                got,
+                            )
+                        elif getattr(account, "last_remote_raw", None) is None:
+                            account.last_remote_raw = 0
+                    except Exception:
+                        pass
                 # Never replace real share links with raw /sub refs from usage pulls.
                 # Never shrink a richer stored set with a partial panel response
                 # (that was the main cause of fluctuating sub config counts).
@@ -10455,12 +10463,22 @@ async def _refresh_usage_pool_safe_inner(
                     panel = account.panel
                     if panel is not None and panel.type == PanelType.astra:
                         account.used_traffic = got
+                        account.last_remote_raw = got
                     else:
                         account.used_traffic = max(prev, got)
-                    try:
-                        account.last_remote_raw = got
-                    except Exception:
-                        pass
+                        try:
+                            if got > 0:
+                                account.last_remote_raw = max(
+                                    int(
+                                        getattr(account, "last_remote_raw", None)
+                                        or 0
+                                    ),
+                                    got,
+                                )
+                            elif getattr(account, "last_remote_raw", None) is None:
+                                account.last_remote_raw = 0
+                        except Exception:
+                            pass
                     new_shares = [
                         str(x)
                         for x in (res.links or [])

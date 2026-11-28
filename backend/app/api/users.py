@@ -204,12 +204,14 @@ async def _bg_finish_create_provision(username: str, group_ids: list[int]) -> No
                 )
             except Exception:  # noqa: BLE001
                 log.debug("bg create heal user=%s failed", username, exc_info=True)
-            # Brand-new accounts → Hot priority-probe for 15 minutes so
-            # used_traffic moves within 3–5s of first connection.
+            # Brand-new accounts → Hot priority-probe for 15–30 minutes so
+            # used_traffic moves within 2–4s of first connection.
             try:
                 from app.services import usage_priority as uprio
+                from app.services import usage_tiers as utiers
 
-                await uprio.enqueue_user_remotes(int(uid), ttl=900.0)
+                utiers.mark_create_touch(int(uid))
+                await uprio.enqueue_user_remotes(int(uid), ttl=1800.0)
             except Exception:  # noqa: BLE001
                 log.debug(
                     "bg create prio-enqueue user=%s failed",

@@ -354,10 +354,21 @@ def _high_water_delta(
         # Admin reset path: absolute set, no accumulation.
         return 0, got_i, True
     if last is None:
-        # Not primed yet — stamp watermark without inventing a delta
-        # (startup backfill normally sets last = used_traffic before this runs).
+        # First live observation.
+        # Fresh account (no accumulated raw yet) → take absolute remote counter
+        # so brand-new users show usage within the next Hot tick.
+        if got_i > 0 and accumulated <= 0:
+            return got_i, got_i, True
+        # Already has history — prime watermark only (no double-count).
         return 0, accumulated, True
     last_i = int(last or 0)
+    # Heal desync: watermark moved ahead while used_traffic stayed 0/behind
+    # (refresh_usage race / first-prime bug). Credit the missing gap once.
+    if accumulated < last_i and got_i >= last_i:
+        missing = last_i - accumulated
+        growth = got_i - last_i
+        raw_delta = missing + max(0, growth)
+        return raw_delta, accumulated + raw_delta, True
     if got_i >= last_i:
         raw_delta = got_i - last_i
         return max(0, int(raw_delta)), accumulated + max(0, int(raw_delta)), True
