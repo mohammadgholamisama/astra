@@ -758,21 +758,21 @@ async def apply_raw_sample(
     else:
         delta = raw - prev
 
-    # Source/scale jump (bulk panel sync, raw→weighted, cursor heal): rebase
-    # ONLY. Never credit hour/day buckets — that invented multi-TB «این ساعت».
-    # Cap ≈ 80Mbps sustained over the gap (was 500Mbps and still too loose).
+    # Cap ≈ 80Mbps sustained over the gap. Huge jumps used to rebase-and-drop
+    # the whole delta (left usage_hour_buckets frozen for days). Now we credit
+    # up to max_natural each sample and advance the cursor partially so the
+    # next cycles catch up instead of permanently losing traffic.
     max_natural = max(80 * 1024 * 1024, int(dt * (80_000_000 / 8)))
-    if delta > max_natural:
-        state.last_raw_total = raw
-        state.last_sample_at = now
-        return
+    credited = int(delta)
+    if credited > max_natural:
+        credited = int(max_natural)
 
-    rate_bps = (delta * 8.0) / dt_rate if delta > 0 else 0.0
-    active = delta >= _ONLINE_MIN_BYTES
+    rate_bps = (credited * 8.0) / dt_rate if credited > 0 else 0.0
+    active = credited >= _ONLINE_MIN_BYTES
     await _distribute_delta_hours(
         db,
         user_id,
-        delta,
+        credited,
         last_at,
         now,
         peak_bps=rate_bps,
@@ -801,7 +801,7 @@ async def apply_raw_sample(
                 0, raw - int(state.online_raw_at_start or 0)
             )
 
-    if delta >= _ONLINE_MIN_BYTES:
+    if credited >= _ONLINE_MIN_BYTES:
         if state.online_since is None:
             await _open_session(db, state, started_at=now, raw_now=raw)
         else:
@@ -812,7 +812,11 @@ async def apply_raw_sample(
             if state.idle_streak >= _IDLE_STREAK_END:
                 await _close_session(db, state, ended_at=now, raw_now=raw)
 
-    state.last_raw_total = raw
+    # Partial catch-up: only advance by what we credited when capping.
+    if credited < delta:
+        state.last_raw_total = int(prev) + int(credited)
+    else:
+        state.last_raw_total = raw
     state.last_sample_at = now
 
 
@@ -2246,6 +2250,27 @@ async def build_overview(
     month_bytes = await _sum_all(month, next_month_ts)
     prev_month_bytes = await _sum_all(prev_month, month)
 
+    # When per-user hour buckets are stale (gap of days), fill live hour/day
+    # from panel_usage_hour_buckets so the Users analytics page is never blank.
+    panel_hour_overlay = 0
+    panel_day_overlay = 0
+    panel_g24: dict[str, Any] | None = None
+    try:
+        from app.services import panel_analytics as panel_analytics_svc
+
+        panel_g24 = await panel_analytics_svc.build_global_hourly_24h(
+            db, tz_offset_min=tz_offset_min
+        )
+        panel_hour_overlay = int((panel_g24 or {}).get("raw_hour") or 0)
+        panel_day_overlay = int((panel_g24 or {}).get("raw_day") or 0)
+        if cur <= 0 and panel_hour_overlay > 0:
+            cur = panel_hour_overlay
+        if today <= 0 and panel_day_overlay > 0:
+            today = panel_day_overlay
+    except Exception:  # noqa: BLE001
+        logger.debug("panel hour/day overlay failed", exc_info=True)
+        panel_g24 = None
+
     # Global live = Σ User.used_traffic (weighted, same as users page)
     live_all = int(
         (
@@ -2440,6 +2465,20 @@ async def build_overview(
     by_hod_all, peak_all, peak_all_bytes = _peak_for(
         oldest_ts, grid_hour + 3600
     )
+    # If user buckets missed today, rebuild day heat from live panel hours.
+    if not any(by_hod_day) and panel_g24:
+        by_hod_day = [0] * 24
+        for h in list(panel_g24.get("global_hourly") or []):
+            ts = int(h.get("hour_ts") or 0)
+            raw = int(h.get("raw_bytes") or 0)
+            if raw <= 0:
+                continue
+            part = _overlap_bytes(ts, raw, day, day_end)
+            if part > 0:
+                by_hod_day[_hod_index(ts, tz_off)] += part
+        if any(by_hod_day):
+            peak_day = max(range(24), key=lambda i: by_hod_day[i])
+            peak_day_bytes = by_hod_day[peak_day]
     # Legacy overview card: prefer today's peak; fall back to 7d pattern
     by_hod_7d, peak_7d, peak_7d_bytes = _peak_for(
         grid_hour - 7 * 86400, grid_hour + 3600
@@ -2511,6 +2550,47 @@ async def build_overview(
             )
             slot["raw_bytes"] += pend
     top = sorted(top_acc.values(), key=lambda x: -int(x["raw_bytes"]))[:limit_users]
+
+    # User hour buckets can lag; fall back to largest live pending deltas.
+    if not top:
+        try:
+            pend_rows = (
+                await db.execute(
+                    select(
+                        User.id,
+                        User.username,
+                        func.coalesce(User.used_traffic, 0)
+                        - func.coalesce(UserUsageState.last_raw_total, 0),
+                    )
+                    .join(UserUsageState, UserUsageState.user_id == User.id)
+                    .where(
+                        User.status == UserStatus.active,
+                        UserUsageState.last_sample_at.is_not(None),
+                        func.coalesce(User.used_traffic, 0)
+                        > func.coalesce(UserUsageState.last_raw_total, 0),
+                    )
+                    .order_by(
+                        (
+                            func.coalesce(User.used_traffic, 0)
+                            - func.coalesce(UserUsageState.last_raw_total, 0)
+                        ).desc()
+                    )
+                    .limit(limit_users)
+                )
+            ).all()
+            for uid, uname, pend in pend_rows:
+                p = int(pend or 0)
+                if p <= 0:
+                    continue
+                top.append(
+                    {
+                        "username": uname,
+                        "user_id": int(uid),
+                        "raw_bytes": p,
+                    }
+                )
+        except Exception:  # noqa: BLE001
+            logger.debug("top_hour pending fallback failed", exc_info=True)
 
     # Batch health for recent users (no N+1)
     users = list(
@@ -2630,21 +2710,29 @@ async def build_overview(
     health_users.sort(key=lambda x: (order.get(x["health"]["code"], 9), -x["raw_1h"]))
 
     # Canonical 24h series — SAME source as panel analytics (PanelUsageHourBucket).
-    # Skip live remote flush on overview GET (that starved the pool / timed out).
     global_hourly: list[dict[str, Any]] = []
     global_24h_raw = 0
     global_24h_weighted = 0
+    global_24h_source = "panel_usage_hour_buckets"
     try:
-        from app.services import panel_analytics as panel_analytics_svc
+        g24 = panel_g24
+        if not g24:
+            from app.services import panel_analytics as panel_analytics_svc
 
-        g24 = await panel_analytics_svc.build_global_hourly_24h(
-            db, tz_offset_min=tz_offset_min
+            g24 = await panel_analytics_svc.build_global_hourly_24h(
+                db, tz_offset_min=tz_offset_min
+            )
+        global_hourly = list((g24 or {}).get("global_hourly") or [])
+        global_24h_raw = int((g24 or {}).get("raw_24h") or 0)
+        global_24h_weighted = int((g24 or {}).get("weighted_24h") or 0)
+        global_24h_source = str(
+            (g24 or {}).get("source") or "panel_usage_hour_buckets"
         )
-        global_hourly = list(g24.get("global_hourly") or [])
-        global_24h_raw = int(g24.get("raw_24h") or 0)
-        global_24h_weighted = int(g24.get("weighted_24h") or 0)
+        if not any(int(h.get("raw_bytes") or 0) for h in global_hourly):
+            raise RuntimeError("panel hourly empty")
     except Exception:  # noqa: BLE001
         logger.debug("canonical global hourly failed; falling back", exc_info=True)
+        global_24h_source = "usage_hour_buckets"
         g_start = grid_hour - 23 * 3600
         g_rows = (
             await db.execute(
@@ -2658,6 +2746,7 @@ async def build_overview(
             )
         ).all()
         g_map = {int(t): int(v or 0) for t, v in g_rows}
+        global_hourly = []
         for i in range(24):
             ts = g_start + i * 3600
             raw = g_map.get(ts, 0)
@@ -2795,7 +2884,7 @@ async def build_overview(
         "global_24h": {
             "raw_bytes": int(global_24h_raw),
             "weighted_bytes": int(global_24h_weighted),
-            "source": "panel_hour_buckets",
+            "source": global_24h_source,
             "note": (
                 "همان منبع آمار پنل‌ها · ۲۴ ساعت غلتان (نه روز تقویمی). "
                 "ساعت جاری زنده است؛ ساعت‌های قبل بعد از اتمام ساعت ثابت می‌مانند."

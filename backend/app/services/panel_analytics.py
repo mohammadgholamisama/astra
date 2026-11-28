@@ -1190,6 +1190,69 @@ async def refresh_panel_analytics_fast(
         }
 
 
+async def build_global_hourly_24h(
+    db: AsyncSession,
+    *,
+    tz_offset_min: int = 0,
+) -> dict[str, Any]:
+    """Rolling 24h series from ``panel_usage_hour_buckets`` (live panel source).
+
+    Used by the Users analytics overview so the page stays full even when
+    per-user ``usage_hour_buckets`` lag behind.
+    """
+    now = _utc_now()
+    periods = _period_starts(now, tz_offset_min)
+    grid_hour = int(periods["grid_hour"])
+    day = int(periods["day"])
+    day_end = int(periods["day_end"])
+    hour = int(periods["hour"])
+    hour_end = int(periods["hour_end"])
+    g_start = grid_hour - 23 * 3600
+
+    rows = (
+        await db.execute(
+            select(
+                PanelUsageHourBucket.hour_ts,
+                func.coalesce(func.sum(PanelUsageHourBucket.raw_bytes), 0),
+            )
+            .where(
+                PanelUsageHourBucket.hour_ts >= min(g_start, day) - 3600,
+                PanelUsageHourBucket.hour_ts <= grid_hour,
+            )
+            .group_by(PanelUsageHourBucket.hour_ts)
+        )
+    ).all()
+    by_ts = {int(ts): int(raw or 0) for ts, raw in rows}
+
+    global_hourly: list[dict[str, Any]] = []
+    for i in range(24):
+        ts = g_start + i * 3600
+        raw = int(by_ts.get(ts, 0))
+        global_hourly.append(
+            {
+                "hour_ts": ts,
+                "raw_bytes": raw,
+                "weighted_bytes": raw,
+                "is_current": ts == grid_hour,
+            }
+        )
+    raw_24h = sum(int(h["raw_bytes"]) for h in global_hourly)
+    raw_hour = sum(
+        _overlap_bytes(ts, raw, hour, hour_end) for ts, raw in by_ts.items()
+    )
+    raw_day = sum(
+        _overlap_bytes(ts, raw, day, day_end) for ts, raw in by_ts.items()
+    )
+    return {
+        "global_hourly": global_hourly,
+        "raw_24h": int(raw_24h),
+        "weighted_24h": int(raw_24h),
+        "raw_hour": int(raw_hour),
+        "raw_day": int(raw_day),
+        "source": "panel_usage_hour_buckets",
+    }
+
+
 async def prune_panel_analytics(db: AsyncSession) -> dict[str, int]:
     now = _utc_now()
     cut_hour = int((now - timedelta(days=_HOUR_RETENTION_DAYS)).timestamp())
