@@ -2190,9 +2190,8 @@ def is_nx_inflated_meter(accumulated: int, last_remote: int | None) -> bool:
     if last_i <= 0 or acc_i < last_i * 2:
         return False
     ratio = acc_i / float(last_i)
-    # Extreme multiples are virtually always false re-adds (hundreds of
-    # identical panel resets of the same watermark do not happen in practice).
-    if ratio >= 8.0 and last_i >= 10 * 1024 * 1024:  # ≥10MB watermark
+    # Extreme multiples / large sticky inflate — always clamp.
+    if ratio >= 3.0 and last_i >= 5 * 1024 * 1024:  # ≥5MB watermark
         return True
     if last_i < 50 * 1024 * 1024:  # near-integer path needs ≥50MB
         return False
@@ -2207,13 +2206,42 @@ async def clamp_nx_inflated_panel_accounts(
 ) -> dict[str, Any]:
     """Clamp panel_accounts hit by N× watermark re-add; return affected user ids.
 
-    Sets ``used_traffic = last_remote_raw`` when the ratio is a near-integer ≥2.
-    Fast SQL filter first; Python confirms the integer-multiple heuristic.
+    Sets ``used_traffic = last_remote_raw`` when the ratio is a near-integer ≥2
+    or an extreme sticky inflate (≥3×). Uses a bulk SQL pass for ≥3× so a
+    Python row loop cannot miss TB-scale victims.
     """
     from sqlalchemy import text
 
     lim = max(1, min(100000, int(limit)))
     async with AsyncSessionLocal() as db:
+        # Fast path: clamp all ≥3× in one statement (covers 180×/465× class).
+        extreme = (
+            await db.execute(
+                text(
+                    """
+                    UPDATE panel_accounts
+                    SET used_traffic = last_remote_raw,
+                        coeff_anchor_raw = 0,
+                        coeff_anchor_weighted = 0
+                    WHERE id IN (
+                      SELECT id FROM panel_accounts
+                      WHERE status IN ('active', 'error', 'pending')
+                        AND last_remote_raw IS NOT NULL
+                        AND last_remote_raw > :min_last
+                        AND used_traffic > last_remote_raw * 3
+                      ORDER BY used_traffic DESC
+                      LIMIT :lim
+                    )
+                    RETURNING user_id
+                    """
+                ),
+                {"min_last": 5 * 1024 * 1024, "lim": lim},
+            )
+        ).fetchall()
+        user_ids: set[int] = {int(r[0]) for r in extreme}
+        clamped = len(extreme)
+
+        # Second pass: near-integer 2× with ≥50MB watermark (Python confirm).
         rows = (
             await db.execute(
                 text(
@@ -2224,18 +2252,15 @@ async def clamp_nx_inflated_panel_accounts(
                       AND last_remote_raw IS NOT NULL
                       AND last_remote_raw > :min_last
                       AND used_traffic > last_remote_raw * 2
+                      AND used_traffic <= last_remote_raw * 3
                     ORDER BY used_traffic DESC
                     LIMIT :lim
                     """
                 ),
-                # 10MB floor so extreme-ratio victims with small watermarks
-                # (e.g. 0.5GB last × 1500) are still selected for Python check.
-                {"min_last": 10 * 1024 * 1024, "lim": lim},
+                {"min_last": 50 * 1024 * 1024, "lim": lim},
             )
         ).mappings().all()
 
-        clamped = 0
-        user_ids: set[int] = set()
         for r in rows:
             acc = int(r["used_traffic"] or 0)
             last = int(r["last_remote_raw"] or 0)
@@ -2468,3 +2493,166 @@ async def find_near_limit_user_ids(*, limit: int = 80) -> list[int]:
             {"lim": max(1, int(limit))},
         )
         return [int(x) for (x,) in result.all()]
+
+
+async def heal_over_quota_usage_truth(
+    *,
+    limit: int = 8000,
+    unfreeze_limit: int = 500,
+    unfreeze_concurrency: int = 4,
+) -> dict[str, Any]:
+    """Clamp N× meters, shrink inflated used_traffic, unfreeze under-quota users.
+
+    Optimized one-shot for false TB-scale top-consumers:
+      1) clamp sticky panel meters to ``last_remote_raw``
+      2) shrink ``users.used_traffic`` to weighted truth
+      3) reactivate + push remotes via workers when still under limit with time
+    """
+    import time as _time
+
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+
+    from app.services.orchestrator import (
+        enforce_user_quota,
+        recount_user_used_traffic,
+        sync_modify_user,
+    )
+    from app.services.worker_commands import clear_kill_cooldown
+
+    t0 = _time.monotonic()
+    nx_total = 0
+    shrunk = 0
+    reactivated = 0
+    # Repeat clamp until stable — refresh can re-stamp last_remote and expose
+    # more N× rows that were previously ratio≈1 (both sides inflated).
+    for _pass in range(4):
+        nx = await heal_nx_meter_inflation(limit=max(20000, int(limit) * 10))
+        nx_total += int(nx.get("clamped") or 0)
+        shrunk += int(nx.get("shrunk") or 0)
+        reactivated += int(nx.get("reactivated") or 0)
+        if int(nx.get("clamped") or 0) == 0:
+            break
+
+    recon = await reconcile_inflated_used_traffic(
+        limit=limit, gap_bytes=30 * 1024 * 1024
+    )
+    shrunk += int(recon.get("shrunk") or 0)
+    reactivated += int(recon.get("reactivated") or 0)
+
+    # Expired can keep sticky inflate and pollute dashboard top-consumers.
+    expired_inflated = await find_inflated_used_user_ids(
+        limit=limit,
+        statuses=("expired",),
+        gap_bytes=30 * 1024 * 1024,
+    )
+    for uid in expired_inflated:
+        try:
+            async with AsyncSessionLocal() as db:
+                user, accounts = await _load_user_for_recount(db, int(uid))
+                if user is None:
+                    continue
+                before = int(user.used_traffic or 0)
+                after = await recount_user_used_traffic(
+                    db, user, accounts, allow_shrink=True
+                )
+                await db.commit()
+                if after < before:
+                    shrunk += 1
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "heal_over_quota expired shrink user_id=%s failed",
+                uid,
+                exc_info=True,
+            )
+        await asyncio.sleep(0)
+
+    false_ids = await find_false_limited_user_ids(limit=limit)
+    stuck = await find_active_needing_unfreeze_ids(limit=unfreeze_limit)
+    unfreeze_ids = list(dict.fromkeys([*false_ids, *stuck]))[: max(1, int(unfreeze_limit))]
+
+    # Ensure false-limited become active before remote push.
+    now_ts = int(_time.time())
+    ready: list[int] = []
+    for uid in unfreeze_ids:
+        try:
+            async with AsyncSessionLocal() as db:
+                user, accounts = await _load_user_for_recount(db, int(uid))
+                if user is None:
+                    continue
+                await recount_user_used_traffic(
+                    db, user, accounts, allow_shrink=True
+                )
+                await enforce_user_quota(db, user)
+                exp = int(user.expire or 0)
+                has_time = exp <= 0 or exp > now_ts
+                if (
+                    user.status == UserStatus.limited
+                    and int(user.data_limit or 0) > 0
+                    and int(user.used_traffic or 0) < int(user.data_limit or 0)
+                    and has_time
+                ):
+                    user.status = UserStatus.active
+                for acc in accounts:
+                    if (acc.error_message or "") == QUOTA_FROZEN_MARK:
+                        acc.error_message = None
+                try:
+                    clear_kill_cooldown(int(uid))
+                except Exception:  # noqa: BLE001
+                    pass
+                await db.commit()
+                if user.status == UserStatus.active and has_time:
+                    ready.append(int(uid))
+        except Exception:  # noqa: BLE001
+            logger.debug("heal_over_quota prep user_id=%s failed", uid, exc_info=True)
+        await asyncio.sleep(0)
+
+    sem = asyncio.Semaphore(max(1, int(unfreeze_concurrency)))
+    unfreeze_ok = 0
+    unfreeze_fail = 0
+
+    async def _push(uid: int) -> None:
+        nonlocal unfreeze_ok, unfreeze_fail
+        async with sem:
+            try:
+                async with AsyncSessionLocal() as db:
+                    user = (
+                        await db.execute(
+                            select(User)
+                            .where(User.id == int(uid))
+                            .options(
+                                selectinload(User.panel_accounts).selectinload(
+                                    PanelAccount.panel
+                                ),
+                                selectinload(User.groups),
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    if user is None or user.status != UserStatus.active:
+                        return
+                    await sync_modify_user(
+                        db,
+                        user,
+                        skip_nginx_sync=True,
+                        freeze_fast=False,
+                        remote_timeout=18.0,
+                    )
+                    await db.commit()
+                unfreeze_ok += 1
+            except Exception:  # noqa: BLE001
+                unfreeze_fail += 1
+
+    if ready:
+        await asyncio.gather(*(_push(u) for u in ready))
+
+    out = {
+        "nx_clamped": nx_total,
+        "shrunk": shrunk,
+        "reactivated": reactivated,
+        "unfreeze_candidates": len(ready),
+        "unfreeze_ok": unfreeze_ok,
+        "unfreeze_fail": unfreeze_fail,
+        "dt_sec": round(_time.monotonic() - t0, 1),
+    }
+    logger.warning("heal_over_quota_usage_truth %s", out)
+    return out

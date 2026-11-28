@@ -9911,12 +9911,22 @@ async def refresh_usage(
                 got = int(res.used_traffic or 0)
                 prev = int(account.used_traffic or 0)
                 # Astra local node is authoritative (resets must shrink to 0).
-                # Other remotes: never shrink on flaky/partial readings.
+                # Other remotes: never shrink on flaky/partial readings — except
+                # sticky N× inflate (used ≫ live got) which must collapse or the
+                # next last_remote stamp creates a permanent false TB meter.
                 panel = account.panel
                 if panel is not None and panel.type == PanelType.astra:
                     account.used_traffic = got
                 else:
-                    account.used_traffic = max(prev, got)
+                    try:
+                        from app.services.panel_usage_bulk import is_nx_inflated_meter
+
+                        if got > 0 and is_nx_inflated_meter(prev, got):
+                            account.used_traffic = got
+                        else:
+                            account.used_traffic = max(prev, got)
+                    except Exception:  # noqa: BLE001
+                        account.used_traffic = max(prev, got)
                 # Keep high-water cursor in sync — stale last_remote_raw made the
                 # next usage-report re-add (got-last) on top of already-applied used.
                 try:
