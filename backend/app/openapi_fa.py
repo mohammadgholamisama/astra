@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
@@ -19,8 +20,18 @@ def _d(summary: str, where: str, does: str, result: str = "") -> tuple[str, str]
     return visible, "\n\n".join(parts)
 
 
-# Keep info block empty — explanations live on each operation, not here.
-OPENAPI_DESC = ""
+# Short auth map only — per-operation docs carry curl / fields / responses.
+OPENAPI_DESC = """
+## احراز هویت
+
+| روش | هدر | کاربرد |
+|---|---|---|
+| **کلید API** | `X-Api-Key: pg_key_…` | فروشگاه / ربات / Integration (`/api/v1/…`) و اکثر APIهای ادمین |
+| **JWT ادمین** | `Authorization: Bearer <token>` | پنل مدیریت بعد از `POST /api/admin/token` |
+| **بدون توکن** | — | فقط مسیرهای عمومی: `/health`، `/sub/{token}`، نصب ورکر عمومی، و خودِ لاگین |
+
+دکمه **Authorize** بالای صفحه را بزنید و یکی از دو روش را وارد کنید. در هر API پایین، نمونه **curl** و پاسخ‌های نمونه هم آمده است.
+"""
 
 OPENAPI_TAGS: list[dict[str, str]] = [
     {"name": "Integration · API خارجی", "description": "فروشگاه / ربات با X-Api-Key"},
@@ -848,42 +859,92 @@ _OPS: dict[tuple[str, str], tuple[str, str]] = {
         "اگر سرویس بالا باشد `{status: ok}` می‌دهد؛ بدون احراز هویت.",
     ),
     # ── Integration v1 ─────────────────────────────────────
-    ("get", "/api/v1/groups"): _d(
-        "استعلام همه گروه‌های فروش (API خارجی)",
-        "فروشگاه / ربات / سیستم انبارداری با `X-Api-Key`.",
-        "لیست گروه‌ها و پنل‌های وصل را برای نمایش پلن فروش برمی‌گرداند.",
-        "نیاز به کلید API از تنظیمات دارد؛ JWT ادمین لازم نیست.",
+    ("get", "/api/v1/groups"): (
+        "استعلام همه گروه‌های فروش (API خارجی) — لیست پلن‌ها با پنل‌های وصل",
+        "\n\n".join(
+            [
+                "**کجا:** فروشگاه / ربات با `X-Api-Key`.",
+                "**عملکرد:** لیست کامل گروه‌ها + پنل‌های متصل را برمی‌گرداند.",
+                "**ورودی:** بدون body و بدون path param. فقط هدر امنیتی.",
+                "**فیلدهای پاسخ (هر آیتم):** `id` int · `name` string(3…64) · `description` string|null · "
+                "`is_disabled` bool · `config_tag` string(≤200) · `usage_cost` int|null(0…1e6) · "
+                "`order_kind` `direct|tunnel|gaming|other` · `notices` string[] · `category_id` int|null · "
+                "`sort_order` int · `panels[]` · `created_at` datetime|null",
+            ]
+        ),
     ),
-    ("post", "/api/v1/groups"): _d(
-        "افزودن گروه از سیستم خارجی",
-        "اتوماسیون ساخت پلن فروش.",
-        "گروه جدید می‌سازد و در صورت ارسال `panels` آن‌ها را وصل می‌کند.",
+    ("post", "/api/v1/groups"): (
+        "افزودن گروه از سیستم خارجی — ساخت پلن فروش",
+        "\n\n".join(
+            [
+                "**کجا:** اتوماسیون ساخت پلن.",
+                "**عملکرد:** گروه جدید می‌سازد و در صورت ارسال `panels` آن‌ها را وصل می‌کند.",
+                "**بدنه JSON — متغیرها:**",
+                "| فیلد | نوع | الزام | طول/بازه | شرح |\n|---|---|---|---|---|\n"
+                "| `name` | string | بله | 3…64 | نام یکتای گروه |\n"
+                "| `description` | string / null | خیر | ≤2000 | توضیح |\n"
+                "| `is_disabled` | bool | خیر | — | پیش‌فرض false |\n"
+                "| `config_tag` | string | خیر | ≤200 | برچسب اتوماسیون |\n"
+                "| `usage_cost` | int / null | خیر | 0…1000000 | هزینه/ضریب مصرف |\n"
+                "| `order_kind` | string | خیر | enum | `direct`/`tunnel`/`gaming`/`other` |\n"
+                "| `notices` | string[] | خیر | — | اعلان‌ها |\n"
+                "| `category_id` | int / null | خیر | ≥1 | دسته فروش |\n"
+                "| `panels` | object[] | خیر | — | `{panel_id:int≥1, config:object, priority:int 0…10000}` |",
+            ]
+        ),
     ),
-    ("get", "/api/v1/groups/{group_id}"): _d(
-        "استعلام یک گروه با کلید API",
-        "جزئیات پلن در فروشگاه بیرونی.",
-        "همان اطلاعات گروه برای یک id مشخص.",
+    ("get", "/api/v1/groups/{group_id}"): (
+        "استعلام یک گروه با کلید API — جزئیات یک پلن",
+        "\n\n".join(
+            [
+                "**کجا:** جزئیات پلن در فروشگاه بیرونی.",
+                "**path:** `group_id` — integer ≥ 1؛ شناسه گروه.",
+                "**پاسخ:** همان شکل `IntegrationGroupOut` (مثل لیست، فقط یک آبجکت).",
+            ]
+        ),
     ),
-    ("put", "/api/v1/groups/{group_id}"): _d(
-        "ویرایش گروه از API خارجی",
-        "همگام‌سازی پلن فروش از سیستم بیرونی.",
-        "نام/توضیح/پنل‌های گروه را عوض می‌کند.",
+    ("put", "/api/v1/groups/{group_id}"): (
+        "ویرایش گروه از API خارجی — همگام‌سازی پلن",
+        "\n\n".join(
+            [
+                "**path:** `group_id` int ≥ 1.",
+                "**بدنه:** همه فیلدها اختیاری؛ فقط فیلدهای ارسالی عوض می‌شوند.",
+                "| فیلد | نوع | شرح |\n|---|---|---|\n"
+                "| `name` | string(3…64) / null | نام جدید |\n"
+                "| `description` | string / null | توضیح |\n"
+                "| `is_disabled` | bool / null | فعال/غیرفعال |\n"
+                "| `config_tag` | string / null | برچسب ≤200 |\n"
+                "| `usage_cost` | int / null | هزینه؛ برای پاک کردن `clear_usage_cost=true` |\n"
+                "| `clear_usage_cost` | bool / null | پاک کردن usage_cost |\n"
+                "| `order_kind` | enum / null | direct/tunnel/gaming/other |\n"
+                "| `notices` | string[] / null | جایگزینی کامل اعلان‌ها |\n"
+                "| `category_id` | int / null | دسته؛ پاک با `clear_category=true` |\n"
+                "| `clear_category` | bool / null | پاک کردن دسته |\n"
+                "| `panels` | object[] / null | جایگزینی کامل لیست پنل‌ها |",
+            ]
+        ),
     ),
-    ("delete", "/api/v1/groups/{group_id}"): _d(
+    ("delete", "/api/v1/groups/{group_id}"): (
         "حذف گروه از API خارجی",
-        "حذف پلن در فروشگاه که به Astra وصل است.",
-        "گروه و ریموت‌های مرتبط را مثل حذف از UI قطع می‌کند.",
+        "**path:** `group_id` int ≥ 1.\n\n"
+        "**عملکرد:** گروه را حذف/قطع می‌کند (مثل حذف از UI).\n\n"
+        "**پاسخ موفق:** معمولاً `204 No Content` یا تأیید حذف.",
     ),
-    ("get", "/api/v1/panels/sub-status"): _d(
+    ("get", "/api/v1/panels/sub-status"): (
         "وضعیت تست و رتبه کانفیگ همه پنل‌ها در ساب",
-        "مانیتورینگ بیرونی کیفیت پنل/ساب.",
-        "برای هر پنل نتیجه تست اتصال و جایگاه کانفیگ‌ها در ترتیب `/sub` را می‌دهد.",
-        "با `X-Api-Key`؛ برای داشبورد خارج از پنل.",
+        "\n\n".join(
+            [
+                "**کجا:** مانیتورینگ بیرونی کیفیت پنل/ساب.",
+                "**query:** `panel_id` int اختیاری — فقط همان پنل.",
+                "**پاسخ:** `total_panels` int · `total_ordered_configs` int · `panels[]` "
+                "با `sub_rank`، `avg_ping_ms`، `best_ping_ms` و …",
+            ]
+        ),
     ),
-    ("get", "/api/v1/panels/{panel_id}/sub-status"): _d(
+    ("get", "/api/v1/panels/{panel_id}/sub-status"): (
         "وضعیت تست و رتبه ساب فقط برای یک پنل",
-        "مانیتورینگ همان پنل از بیرون.",
-        "همان داده sub-status محدود به یک `panel_id`.",
+        "**path:** `panel_id` int ≥ 1.\n\n"
+        "**پاسخ:** یک آبجکت `PanelSubStatusOut`؛ اگر پنل نباشد `404`.",
     ),
 }
 
@@ -903,11 +964,483 @@ def _should_hide(path: str) -> bool:
     return False
 
 
+_PUBLIC_EXACT: set[str] = {
+    "/health",
+    "/api/admin/token",
+}
+
+_ERROR_EXAMPLES: dict[str, dict[str, Any]] = {
+    "401": {
+        "description": "احراز هویت ناموفق — کلید/توکن نیست یا باطل است",
+        "content": {
+            "application/json": {
+                "examples": {
+                    "invalid_api_key": {
+                        "summary": "کلید API نامعتبر",
+                        "value": {"detail": "Invalid API key"},
+                    },
+                    "not_authenticated": {
+                        "summary": "بدون هدر امنیتی",
+                        "value": {"detail": "Not authenticated"},
+                    },
+                    "invalid_token": {
+                        "summary": "JWT نامعتبر",
+                        "value": {"detail": "Invalid token"},
+                    },
+                }
+            }
+        },
+    },
+    "404": {
+        "description": "منبع پیدا نشد",
+        "content": {
+            "application/json": {
+                "example": {"detail": "گروه پیدا نشد"},
+            }
+        },
+    },
+    "422": {
+        "description": "خطای اعتبارسنجی بدنه/پارامتر (نوع، طول، الزام)",
+        "content": {
+            "application/json": {
+                "example": {
+                    "detail": [
+                        {
+                            "type": "string_too_short",
+                            "loc": ["body", "name"],
+                            "msg": "String should have at least 3 characters",
+                            "input": "ab",
+                        }
+                    ]
+                }
+            }
+        },
+    },
+}
+
+_V1_RESPONSE_EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
+    ("get", "/api/v1/groups"): {
+        "application/json": {
+            "example": [
+                {
+                    "id": 7,
+                    "name": "gold-30day",
+                    "description": "پلن ۳۰ روزه",
+                    "is_disabled": False,
+                    "config_tag": "",
+                    "usage_cost": 100,
+                    "order_kind": "direct",
+                    "notices": ["حجم مشترک"],
+                    "category_id": None,
+                    "sort_order": 10,
+                    "panels": [
+                        {
+                            "panel_id": 12,
+                            "panel_name": "DE-1",
+                            "panel_type": "marzban",
+                            "panel_is_active": True,
+                            "priority": 0,
+                            "config": {},
+                        }
+                    ],
+                    "created_at": "2026-03-20T12:00:00Z",
+                }
+            ]
+        }
+    },
+    ("post", "/api/v1/groups"): {
+        "application/json": {
+            "example": {
+                "id": 7,
+                "name": "gold-30day",
+                "description": "پلن ۳۰ روزه",
+                "is_disabled": False,
+                "config_tag": "",
+                "usage_cost": 100,
+                "order_kind": "direct",
+                "notices": ["حجم مشترک"],
+                "category_id": None,
+                "sort_order": 10,
+                "panels": [
+                    {
+                        "panel_id": 12,
+                        "panel_name": "DE-1",
+                        "panel_type": "marzban",
+                        "panel_is_active": True,
+                        "priority": 0,
+                        "config": {},
+                    }
+                ],
+                "created_at": "2026-03-20T12:00:00Z",
+            }
+        }
+    },
+    ("get", "/api/v1/groups/{group_id}"): {
+        "application/json": {
+            "example": {
+                "id": 7,
+                "name": "gold-30day",
+                "description": "پلن ۳۰ روزه",
+                "is_disabled": False,
+                "config_tag": "",
+                "usage_cost": 100,
+                "order_kind": "direct",
+                "notices": [],
+                "category_id": None,
+                "sort_order": 10,
+                "panels": [],
+                "created_at": "2026-03-20T12:00:00Z",
+            }
+        }
+    },
+    ("put", "/api/v1/groups/{group_id}"): {
+        "application/json": {
+            "example": {
+                "id": 7,
+                "name": "gold-30day-v2",
+                "description": "پلن ۳۰ روزه",
+                "is_disabled": False,
+                "config_tag": "",
+                "usage_cost": 100,
+                "order_kind": "tunnel",
+                "notices": [],
+                "category_id": None,
+                "sort_order": 10,
+                "panels": [
+                    {
+                        "panel_id": 12,
+                        "panel_name": "DE-1",
+                        "panel_type": "marzban",
+                        "panel_is_active": True,
+                        "priority": 1,
+                        "config": {},
+                    }
+                ],
+                "created_at": "2026-03-20T12:00:00Z",
+            }
+        }
+    },
+    ("get", "/api/v1/panels/sub-status"): {
+        "application/json": {
+            "example": {
+                "total_panels": 1,
+                "total_ordered_configs": 1,
+                "panels": [
+                    {
+                        "panel_id": 12,
+                        "name": "DE-1",
+                        "type": "marzban",
+                        "is_active": True,
+                        "worker_id": 3,
+                        "worker_name": "eu-1",
+                        "configs_count": 1,
+                        "tested_count": 1,
+                        "best_ping_ms": 42.5,
+                        "worst_ping_ms": 42.5,
+                        "best_sub_rank": 1,
+                        "configs": [
+                            {
+                                "host": "de1.example.com",
+                                "port": 443,
+                                "match_host": "de1.example.com",
+                                "label": "DE-VIP",
+                                "protocol": "vless",
+                                "sub_rank": 1,
+                                "avg_ping_ms": 42.5,
+                                "device_count": 4,
+                                "tested": True,
+                                "hidden": False,
+                                "group_names": ["gold-30day"],
+                                "category_name": None,
+                                "flag": "DE",
+                            }
+                        ],
+                    }
+                ],
+            }
+        }
+    },
+    ("get", "/api/v1/panels/{panel_id}/sub-status"): {
+        "application/json": {
+            "example": {
+                "panel_id": 12,
+                "name": "DE-1",
+                "type": "marzban",
+                "is_active": True,
+                "worker_id": 3,
+                "worker_name": "eu-1",
+                "configs_count": 1,
+                "tested_count": 1,
+                "best_ping_ms": 42.5,
+                "worst_ping_ms": 42.5,
+                "best_sub_rank": 1,
+                "configs": [],
+            }
+        }
+    },
+}
+
+_V1_REQUEST_EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
+    ("post", "/api/v1/groups"): {
+        "name": "gold-30day",
+        "description": "پلن ۳۰ روزه",
+        "is_disabled": False,
+        "config_tag": "",
+        "usage_cost": 100,
+        "order_kind": "direct",
+        "notices": ["حجم مشترک"],
+        "category_id": None,
+        "panels": [{"panel_id": 12, "config": {}, "priority": 0}],
+    },
+    ("put", "/api/v1/groups/{group_id}"): {
+        "name": "gold-30day-v2",
+        "order_kind": "tunnel",
+        "panels": [{"panel_id": 12, "config": {}, "priority": 1}],
+    },
+}
+
+
+def _is_public(path: str, method: str) -> bool:
+    if path in _PUBLIC_EXACT:
+        return True
+    if path.startswith("/sub"):
+        return True
+    if path.startswith("/api/public/"):
+        return True
+    if path == "/api/admin/token" and method == "post":
+        return True
+    return False
+
+
+def _is_worker_internal(path: str) -> bool:
+    return path.startswith("/api/internal/worker")
+
+
+def _auth_note(path: str, method: str) -> str:
+    if _is_public(path, method):
+        return (
+            "**امنیت:** عمومی — توکن لازم نیست.\n\n"
+            "این مسیر برای کلاینت نهایی / healthcheck / لاگین است؛ "
+            "عمداً قفل ندارد."
+        )
+    if _is_worker_internal(path):
+        return (
+            "**امنیت:** فقط agent ورکر با `Authorization: Bearer <worker_token>`.\n\n"
+            "برای فروشگاه/ربات استفاده نکنید."
+        )
+    if path.startswith("/api/v1"):
+        return (
+            "**امنیت (الزامی):** یکی از این دو:\n"
+            "- `X-Api-Key: pg_key_…` (پیشنهادی برای Integration)\n"
+            "- `Authorization: Bearer <JWT>` بعد از لاگین ادمین"
+        )
+    return (
+        "**امنیت (الزامی):** JWT ادمین `Authorization: Bearer <token>` "
+        "یا کلید `X-Api-Key: pg_key_…`."
+    )
+
+
+def _sample_path(path: str) -> str:
+    return (
+        path.replace("{group_id}", "7")
+        .replace("{panel_id}", "12")
+        .replace("{user_id}", "1001")
+        .replace("{key_id}", "3")
+        .replace("{worker_id}", "3")
+        .replace("{token}", "USER_SUB_TOKEN")
+        .replace("{username}", "demo_user")
+        .replace("{full_path}", "index.html")
+    )
+
+
+def _curl_block(method: str, path: str, item: dict[str, Any]) -> str:
+    m = method.upper()
+    sample = _sample_path(path)
+    lines = [f"curl -sS -X {m} 'https://PANEL_HOST{sample}'"]
+    if _is_public(path, method):
+        if path == "/api/admin/token":
+            lines = [
+                "curl -sS -X POST 'https://PANEL_HOST/api/admin/token' \\",
+                "  -H 'Content-Type: application/x-www-form-urlencoded' \\",
+                "  -d 'username=ADMIN&password=SECRET'",
+            ]
+            return "### نمونه curl\n\n```bash\n" + "\n".join(lines) + "\n```"
+    elif _is_worker_internal(path):
+        lines.append("  -H 'Authorization: Bearer WORKER_TOKEN'")
+    elif path.startswith("/api/v1"):
+        lines.append("  -H 'X-Api-Key: pg_key_xxxxxxxx'")
+    else:
+        lines.append("  -H 'Authorization: Bearer JWT_TOKEN'")
+        lines.append("  # یا: -H 'X-Api-Key: pg_key_xxxxxxxx'")
+
+    body = item.get("requestBody") or {}
+    content = (body.get("content") or {}) if isinstance(body, dict) else {}
+    if "application/json" in content:
+        lines.append("  -H 'Content-Type: application/json'")
+        example = _V1_REQUEST_EXAMPLES.get((method.lower(), path))
+        if example is None:
+            app_json = content.get("application/json") or {}
+            example = app_json.get("example")
+            if example is None:
+                examples = app_json.get("examples") or {}
+                if isinstance(examples, dict) and examples:
+                    first = next(iter(examples.values()))
+                    if isinstance(first, dict):
+                        example = first.get("value")
+        if example is not None:
+            payload = json.dumps(example, ensure_ascii=False, separators=(",", ":"))
+            safe = payload.replace("'", "'\\''")
+            lines.append(f"  -d '{safe}'")
+        else:
+            lines.append("  -d '{}'")
+
+    if len(lines) == 1:
+        bash = lines[0]
+    else:
+        bash = " \\\n".join(lines)
+    return "### نمونه curl\n\n```bash\n" + bash + "\n```"
+
+
+def _ensure_security_schemes(schema: dict[str, Any]) -> None:
+    comps = schema.setdefault("components", {})
+    schemes = comps.setdefault("securitySchemes", {})
+    # Keep FastAPI OAuth2 if present; always expose ApiKey clearly.
+    schemes["ApiKeyAuth"] = {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Api-Key",
+        "description": (
+            "کلید Integration از صفحه تنظیمات → کلیدهای API "
+            "(مقدار کامل شبیه `pg_key_…`). برای `/api/v1` و اکثر APIهای ادمین."
+        ),
+    }
+    schemes.setdefault(
+        "OAuth2PasswordBearer",
+        {
+            "type": "oauth2",
+            "flows": {
+                "password": {
+                    "tokenUrl": "/api/admin/token",
+                    "scopes": {},
+                }
+            },
+            "description": "JWT ادمین بعد از لاگین فرم username/password.",
+        },
+    )
+    schemes["WorkerBearer"] = {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "worker-token",
+        "description": "توکن اختصاصی agent ورکر — فقط `/api/internal/worker/*`.",
+    }
+
+
+def _apply_security(path: str, method: str, item: dict[str, Any]) -> None:
+    if _is_public(path, method):
+        item["security"] = []
+        return
+    if _is_worker_internal(path):
+        item["security"] = [{"WorkerBearer": []}]
+        return
+    # OR: ApiKey یا OAuth2
+    item["security"] = [{"ApiKeyAuth": []}, {"OAuth2PasswordBearer": []}]
+
+
+def _merge_response_examples(method: str, path: str, item: dict[str, Any]) -> None:
+    responses = item.setdefault("responses", {})
+    if not isinstance(responses, dict):
+        return
+
+    # Success example for Integration
+    ok_body = _V1_RESPONSE_EXAMPLES.get((method.lower(), path))
+    if ok_body:
+        for code in ("200", "201"):
+            if code not in responses:
+                continue
+            resp = responses[code]
+            if not isinstance(resp, dict):
+                continue
+            content = resp.setdefault("content", {})
+            app = content.setdefault("application/json", {})
+            if isinstance(ok_body.get("application/json"), dict):
+                app.update(ok_body["application/json"])
+
+    if _is_public(path, method):
+        if path == "/health":
+            r200 = responses.setdefault("200", {"description": "سرویس بالاست"})
+            if isinstance(r200, dict):
+                content = r200.setdefault("content", {})
+                app = content.setdefault("application/json", {})
+                app.setdefault("example", {"status": "ok"})
+        return
+
+    # Auth / validation errors on protected ops
+    for code, payload in _ERROR_EXAMPLES.items():
+        if code == "401" and _is_worker_internal(path):
+            responses[code] = {
+                "description": "توکن ورکر نامعتبر",
+                "content": {
+                    "application/json": {"example": {"detail": "Invalid worker token"}}
+                },
+            }
+            continue
+        if code not in responses:
+            responses[code] = payload
+        else:
+            existing = responses[code]
+            if isinstance(existing, dict) and "content" not in existing:
+                existing["content"] = payload.get("content", {})
+                if not existing.get("description"):
+                    existing["description"] = payload.get("description", "")
+
+
+def _inject_request_example(method: str, path: str, item: dict[str, Any]) -> None:
+    example = _V1_REQUEST_EXAMPLES.get((method.lower(), path))
+    if example is None:
+        return
+    body = item.get("requestBody")
+    if not isinstance(body, dict):
+        return
+    content = body.setdefault("content", {})
+    app = content.setdefault("application/json", {})
+    app["example"] = example
+
+
+def _enrich_param_descriptions(item: dict[str, Any]) -> None:
+    params = item.get("parameters")
+    if not isinstance(params, list):
+        return
+    for p in params:
+        if not isinstance(p, dict):
+            continue
+        name = str(p.get("name") or "")
+        where = str(p.get("in") or "")
+        schema = p.get("schema") if isinstance(p.get("schema"), dict) else {}
+        typ = str(schema.get("type") or "string")
+        desc = str(p.get("description") or "").strip()
+        bits = [f"`{name}`", f"in={where}", f"type={typ}"]
+        if "minimum" in schema:
+            bits.append(f"min={schema['minimum']}")
+        if "maximum" in schema:
+            bits.append(f"max={schema['maximum']}")
+        if schema.get("minLength") is not None:
+            bits.append(f"minLength={schema['minLength']}")
+        if schema.get("maxLength") is not None:
+            bits.append(f"maxLength={schema['maxLength']}")
+        prefix = " · ".join(bits)
+        if desc:
+            if prefix not in desc:
+                p["description"] = f"{prefix} — {desc}"
+        else:
+            p["description"] = prefix
+
+
 def customize_openapi(schema: dict[str, Any]) -> dict[str, Any]:
-    """Apply Persian summaries/tags and drop noisy duplicate paths."""
+    """Persian docs + security + curl + response examples."""
     schema["info"]["title"] = "مستندات API · Astra"
     schema["info"]["description"] = OPENAPI_DESC
     schema["tags"] = list(OPENAPI_TAGS)
+    _ensure_security_schemes(schema)
 
     paths = schema.get("paths") or {}
     for path in list(paths.keys()):
@@ -926,11 +1459,30 @@ def customize_openapi(schema: dict[str, Any]) -> dict[str, Any]:
             fa = _OPS.get(key)
             if fa:
                 item["summary"] = fa[0]
-                item["description"] = fa[1]
+                base_desc = fa[1]
             else:
                 summary = str(item.get("summary") or "").strip()
                 if summary and summary.isascii():
                     item["summary"] = summary
+                base_desc = str(item.get("description") or "").strip()
+
+            _apply_security(path, method, item)
+            _inject_request_example(method, path, item)
+            _merge_response_examples(method, path, item)
+            _enrich_param_descriptions(item)
+
+            parts = [
+                _auth_note(path, method),
+                base_desc,
+                _curl_block(method, path, item),
+                "### نمونه پاسخ‌ها",
+                "- **۲xx:** بدنه موفق در بخش Responses همین API (Example Value).",
+                "- **۴۰۱:** `{\"detail\":\"Invalid API key\"}` یا `Not authenticated` / `Invalid token`.",
+                "- **۴۰۴:** `{\"detail\":\"… پیدا نشد\"}` وقتی id اشتباه باشد.",
+                "- **۴۲۲:** خطای اعتبارسنجی فیلد (طول/نوع/الزام) با `detail[]`.",
+            ]
+            item["description"] = "\n\n".join(p for p in parts if p)
+
             tags = item.get("tags") or []
             item["tags"] = [_TAG_MAP.get(str(t), str(t)) for t in tags] or ["سایر"]
             if path.startswith("/api/internal/worker"):

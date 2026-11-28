@@ -1144,7 +1144,8 @@ app = FastAPI(
     redoc_url=None,
     swagger_ui_parameters={
         "docExpansion": "list",
-        "defaultModelsExpandDepth": -1,
+        "defaultModelsExpandDepth": 2,
+        "defaultModelExpandDepth": 2,
         "displayRequestDuration": True,
         "filter": True,
         "tryItOutEnabled": True,
@@ -1260,16 +1261,25 @@ _DOCS_RTL_INJECT = (
     ".swagger-ui .info li,"
     ".swagger-ui .markdown p,"
     ".swagger-ui .renderedMarkdown p{text-align:right;direction:rtl}"
+    ".swagger-ui .markdown pre,"
+    ".swagger-ui .markdown code,"
+    ".swagger-ui .renderedMarkdown pre,"
+    ".swagger-ui .renderedMarkdown code,"
+    ".swagger-ui .highlight-code,"
+    ".swagger-ui .microlight{direction:ltr;text-align:left}"
     ".swagger-ui .opblock-summary-method,"
     ".swagger-ui .opblock-summary-path,"
     ".swagger-ui .opblock-summary-path__unsafe-disable-unique-id,"
     ".swagger-ui table,"
     ".swagger-ui .parameters,"
-    ".swagger-ui .responses-wrapper{direction:ltr;text-align:left}"
+    ".swagger-ui .responses-wrapper,"
+    ".swagger-ui .model-example,"
+    ".swagger-ui .example{direction:ltr;text-align:left}"
     ".swagger-ui .expand-operation svg,"
     ".swagger-ui .expand-methods svg,"
     ".swagger-ui .arrow,"
     ".swagger-ui .opblock-control-arrow{transform:none!important}"
+    ".swagger-ui .auth-wrapper .authorize{float:none}"
     "</style>"
 )
 
@@ -1283,7 +1293,8 @@ async def swagger_docs():
         title='Astra API Docs',
         swagger_ui_parameters={
             "docExpansion": "list",
-            "defaultModelsExpandDepth": -1,
+            "defaultModelsExpandDepth": 2,
+            "defaultModelExpandDepth": 2,
             "displayRequestDuration": True,
             "filter": True,
             "tryItOutEnabled": True,

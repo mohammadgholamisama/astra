@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from fastapi import Depends, HTTPException, Request, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import APIKeyHeader, OAuth2PasswordBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,15 +11,21 @@ from app.models.admin import Admin
 from app.models.api_key import ApiKey
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/admin/token", auto_error=False)
+api_key_header = APIKeyHeader(
+    name="X-Api-Key",
+    auto_error=False,
+    description="کلید Integration ساخته‌شده در تنظیمات (مثلاً pg_key_…). جایگزین Bearer JWT.",
+)
 
 
 async def get_current_admin(
     request: Request,
     token: str | None = Depends(oauth2_scheme),
+    api_key_dep: str | None = Depends(api_key_header),
     db: AsyncSession = Depends(get_db),
 ) -> Admin:
-    # 1) X-Api-Key
-    api_key = request.headers.get("X-Api-Key")
+    # 1) X-Api-Key (header dependency + raw header + Authorization: ApiKey …)
+    api_key = (api_key_dep or "").strip() or request.headers.get("X-Api-Key")
     auth = request.headers.get("Authorization") or ""
 
     if not api_key and auth.lower().startswith("apikey "):
