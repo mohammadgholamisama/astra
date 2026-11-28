@@ -301,7 +301,7 @@ async def _wipe_order_sample_on_remotes(
                     remote_name,
                     account.remote_id if account else None,
                 ),
-                timeout=1.5,
+                timeout=4.0,
             )
         except Exception:  # noqa: BLE001
             pass
@@ -1271,10 +1271,7 @@ async def reconcile_order_with_sample(db: AsyncSession) -> int:
 def _dedupe_order_sample_targets(
     targets: list[tuple[Panel, dict, int]],
 ) -> list[tuple[Panel, dict, int]]:
-    """One create per panel — 96 groups × same panel stampeded remotes and
-    blew the UI timeout (button looked stuck). Order inventory only needs
-    each panel's share links once.
-    """
+    """Unique panels only — used for panel-level status rows, not create targets."""
     out: list[tuple[Panel, dict, int]] = []
     seen: set[int] = set()
     for panel, cfg, gid in targets:
@@ -1286,33 +1283,65 @@ def _dedupe_order_sample_targets(
     return out
 
 
-async def create_or_refresh_samples(db: AsyncSession) -> dict:
-    """Rebuild order probe on every active panel — worker-parallel, wall-clock tight.
+async def _order_sample_gap_ids(user_id: int) -> list[int]:
+    """Pending/error/empty-link account ids that still need worker create/heal."""
+    from app.core.database import AsyncSessionLocal
 
-    Must finish well under the admin UI / nginx ~120s ceiling. One account per
-    panel (not per group×panel), short provision+heal, then hydrate+reconcile.
-    Leftovers keep creating in background.
+    async with AsyncSessionLocal() as sdb:
+        rows = (
+            await sdb.execute(
+                select(PanelAccount.id, PanelAccount.status, PanelAccount.links).where(
+                    PanelAccount.user_id == int(user_id),
+                    PanelAccount.status.in_(
+                        (
+                            PanelAccountStatus.pending,
+                            PanelAccountStatus.error,
+                            PanelAccountStatus.active,
+                        )
+                    ),
+                )
+            )
+        ).all()
+        await sdb.rollback()
+    out: list[int] = []
+    for aid, st, links in rows:
+        st_s = getattr(st, "value", st)
+        share_n = sum(1 for x in (links or []) if x and is_share_link(str(x)))
+        if st_s in ("pending", "error", PanelAccountStatus.pending.value, PanelAccountStatus.error.value):
+            out.append(int(aid))
+        elif share_n <= 0:
+            out.append(int(aid))
+    return out
+
+
+async def create_or_refresh_samples(db: AsyncSession) -> dict:
+    """Rebuild order probe on every group×panel — workers fan-out, wait for completeness.
+
+    Uses the full sales-group target set (not one-per-panel) so inventory can
+    reach hundreds of unique share links. Waits under nginx ``/api`` 300s, then
+    reconciles once so the Config Order list is stable instead of growing each click.
     """
     import time as _time
 
     from app.core.database import AsyncSessionLocal, release_db_txn
 
     t0 = _time.monotonic()
-    budget_s = 55.0
+    # Headroom under nginx 300s proxy + UI 280s client timeout.
+    budget_s = 250.0
 
     def _left() -> float:
         return max(0.5, budget_s - (_time.monotonic() - t0))
 
     group_ids = await _all_enabled_group_ids(db)
-    raw_targets = await _resolve_order_sample_targets(db)
-    targets = _dedupe_order_sample_targets(raw_targets)
+    targets = await _resolve_order_sample_targets(db)
     if not targets:
         raise ValueError("هیچ پنل فعالی در گروه‌های فروش ثبت نشده است")
+    panel_targets = _dedupe_order_sample_targets(targets)
     logger.info(
-        "order-sample start groups=%s raw_targets=%s panels=%s",
+        "order-sample start groups=%s targets=%s panels=%s",
         len(group_ids),
-        len(raw_targets),
         len(targets),
+        len(panel_targets),
     )
 
     user = await _ensure_order_sample_user(db)
@@ -1340,7 +1369,6 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
     await db.commit()
 
     uid = int(user.id)
-    # Collect pending ids then release request txn before worker HTTP.
     async with AsyncSessionLocal() as sdb:
         rows = await sdb.execute(
             select(PanelAccount.id).where(
@@ -1358,21 +1386,19 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
     except Exception:  # noqa: BLE001
         pass
 
-    # Prior stampede often left circuits open → creates silently skipped.
     try:
         from app.core.panel_circuit import clear_panel_circuit
 
-        for panel, _c, _g in targets:
+        for panel, _c, _g in panel_targets:
             clear_panel_circuit(int(panel.id))
     except Exception:  # noqa: BLE001
         pass
 
-    # Fan-out through WorkerRoutedAdapter (same path as sale create).
+    # Fan-out through workers — wait for the first wave, then drain gaps.
     tasks = orchestrator.start_account_provisions(pending_ids) if pending_ids else []
     if tasks:
-        wait_s = min(28.0, max(8.0, _left() - 18.0))
+        wait_s = max(45.0, _left() - 70.0)
         done, still = await asyncio.wait(tasks, timeout=wait_s)
-        # Do not cancel leftovers — workers keep creating in background.
         logger.info(
             "order-sample provision queued=%s done=%s bg=%s left=%.1f",
             len(pending_ids),
@@ -1381,36 +1407,63 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
             _left(),
         )
 
-    # Short heal for gaps + expand /sub → share links (workers already created).
-    if _left() > 6.0:
+    # Drain until every live account has share links (or budget for final steps).
+    drain_rounds = 0
+    while _left() > 55.0:
+        gaps = await _order_sample_gap_ids(uid)
+        if not gaps:
+            break
+        drain_rounds += 1
+        try:
+            orchestrator.start_account_provisions(gaps)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             await orchestrator.heal_user_coverage_pool_safe(
-                uid, wait=min(12.0, _left() - 4.0), include_empty_links=True
+                uid,
+                wait=min(20.0, max(6.0, _left() - 50.0)),
+                include_empty_links=True,
             )
         except Exception:  # noqa: BLE001
-            logger.debug("order-sample heal skipped", exc_info=True)
-    if _left() > 3.0:
+            logger.debug("order-sample heal round failed", exc_info=True)
+        if _left() > 40.0:
+            try:
+                await asyncio.wait_for(
+                    orchestrator.hydrate_share_links_pool_safe(uid),
+                    timeout=min(18.0, _left() - 35.0),
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("order-sample hydrate round failed", exc_info=True)
+        logger.info(
+            "order-sample drain round=%s gaps=%s left=%.1f",
+            drain_rounds,
+            len(gaps),
+            _left(),
+        )
+        if drain_rounds >= 12:
+            break
+        await asyncio.sleep(1.2)
+
+    # Final hydrate pass.
+    if _left() > 8.0:
         try:
             await asyncio.wait_for(
                 orchestrator.hydrate_share_links_pool_safe(uid),
-                timeout=min(14.0, _left()),
+                timeout=min(20.0, _left() - 5.0),
             )
         except Exception:  # noqa: BLE001
-            logger.debug("order-sample hydrate skipped", exc_info=True)
+            logger.debug("order-sample final hydrate skipped", exc_info=True)
 
-    # Astra outbounds: one parallel merge pass (no 5× serial loop).
-    if _left() >= 4.0:
+    # Astra outbounds: one parallel merge pass.
+    if _left() >= 6.0:
         try:
             from app.services import astra_node as astra_node_svc
 
-            astra_panels = [
-                p
-                for p, _c, _g in targets
-                if getattr(p, "type", None) == PanelType.astra
-            ]
-            seen_a: set[int] = set()
             astra_uniq: list[Panel] = []
-            for p in astra_panels:
+            seen_a: set[int] = set()
+            for p, _c, _g in panel_targets:
+                if getattr(p, "type", None) != PanelType.astra:
+                    continue
                 if int(p.id) in seen_a:
                     continue
                 seen_a.add(int(p.id))
@@ -1463,7 +1516,7 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
                             *[_merge_one(p) for p in astra_uniq],
                             return_exceptions=True,
                         ),
-                        timeout=min(12.0, _left()),
+                        timeout=min(16.0, _left()),
                     )
                     await sdb.commit()
         except Exception:  # noqa: BLE001
@@ -1483,60 +1536,65 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
             for acc in user.panel_accounts or []:
                 by_panel.setdefault(int(acc.panel_id), []).append(acc)
 
-        seen_panels: set[int] = set()
-        panel_rows: list[tuple[Panel, list[PanelAccount]]] = []
-        for panel, _cfg, _gid in targets:
-            pid = int(panel.id)
-            if pid in seen_panels:
-                continue
-            seen_panels.add(pid)
-            panel_rows.append((panel, by_panel.get(pid) or []))
-
-        for panel, accs in panel_rows:
+        for panel, _cfg, _gid in panel_targets:
+            accs = by_panel.get(int(panel.id)) or []
             n_links = sum(
                 sum(1 for x in (a.links or []) if x and is_share_link(str(x)))
                 for a in accs
+            )
+            pending_n = sum(
+                1
+                for a in accs
+                if getattr(a.status, "value", a.status)
+                in (
+                    PanelAccountStatus.pending.value,
+                    PanelAccountStatus.error.value,
+                    "pending",
+                    "error",
+                )
             )
             any_active = any(
                 getattr(a.status, "value", a.status)
                 in (PanelAccountStatus.active.value, "active")
                 for a in accs
             )
-            ok = bool(accs and any_active and n_links > 0)
-            if ok:
+            soft_ok = bool(accs and any_active and n_links > 0)
+            if soft_ok:
                 ok_count += 1
             else:
                 fail_count += 1
             err = None
-            if not ok:
+            if not soft_ok or pending_n:
                 err = next(
-                    (a.error_message for a in accs if a.error_message),
-                    "بدون لینک" if accs and any_active else "ساخت ناموفق",
+                    (
+                        (a.error_message or "").strip()
+                        for a in accs
+                        if (a.error_message or "").strip()
+                    ),
+                    None,
                 )
+                if not err:
+                    if pending_n and soft_ok:
+                        err = f"{pending_n} اکانت هنوز بدون لینک/pending"
+                    elif pending_n:
+                        err = "ساخت ناتمام (pending)"
+                    elif accs and any_active:
+                        err = "بدون لینک share"
+                    else:
+                        err = "ساخت ناموفق"
             rows.append(
                 {
                     "panel_id": int(panel.id),
                     "panel_name": panel.name,
-                    "ok": ok,
+                    "ok": bool(soft_ok),
                     "links_count": n_links,
                     "accounts": len(accs),
+                    "pending": pending_n,
                     "error": err,
                 }
             )
 
-        # Leftover empties — background chew so UI isn't blocked again.
-        leftover = [
-            int(a.id)
-            for a in (user.panel_accounts or [])
-            if user is not None
-            and getattr(a.status, "value", a.status)
-            in (
-                PanelAccountStatus.pending.value,
-                PanelAccountStatus.error.value,
-                "pending",
-                "error",
-            )
-        ]
+        leftover = await _order_sample_gap_ids(uid)
         if leftover:
             try:
                 orchestrator.start_account_provisions(leftover)
@@ -1545,21 +1603,27 @@ async def create_or_refresh_samples(db: AsyncSession) -> dict:
 
         elapsed_ms = int((_time.monotonic() - t0) * 1000)
         logger.info(
-            "order-sample done panels=%s ok=%s fail=%s links=%s ms=%s",
-            len(panel_rows),
+            "order-sample done panels=%s ok=%s fail=%s targets=%s links=%s "
+            "gaps_left=%s drain_rounds=%s ms=%s",
+            len(panel_targets),
             ok_count,
             fail_count,
+            len(targets),
             link_count,
+            len(leftover),
+            drain_rounds,
             elapsed_ms,
         )
         return {
             "ok_count": ok_count,
             "fail_count": fail_count,
-            "panels_count": len(panel_rows),
+            "panels_count": len(panel_targets),
             "targets_count": len(targets),
             "groups_count": len(group_ids),
             "links_count": link_count,
             "ordered_count": ordered_n,
+            "gaps_left": len(leftover),
+            "drain_rounds": drain_rounds,
             "elapsed_ms": elapsed_ms,
             "sample_username": ORDER_SAMPLE_USERNAME,
             "panels": rows,

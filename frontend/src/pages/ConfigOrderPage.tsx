@@ -48,6 +48,28 @@ type Workspace = {
   ordered_count: number;
 };
 
+type SamplePanelRow = {
+  panel_id: number;
+  panel_name: string;
+  ok: boolean;
+  links_count: number;
+  accounts: number;
+  pending?: number;
+  error?: string | null;
+};
+
+type SampleReport = {
+  ok_count: number;
+  fail_count: number;
+  panels_count: number;
+  targets_count: number;
+  groups_count?: number;
+  links_count: number;
+  gaps_left?: number;
+  elapsed_ms?: number;
+  panels: SamplePanelRow[];
+};
+
 function flagEmoji(code: string): string {
   const c = (code || "").trim().toUpperCase();
   if (c.length !== 2) return "";
@@ -139,6 +161,7 @@ export default function ConfigOrderPage() {
     }
   });
   const [wantProbe, setWantProbe] = useState(false);
+  const [sampleReport, setSampleReport] = useState<SampleReport | null>(null);
   const flagPopRef = useRef<HTMLDivElement | null>(null);
   const dragIndex = useRef<number | null>(null);
   const autoBooted = useRef(false);
@@ -210,18 +233,13 @@ export default function ConfigOrderPage() {
       api<{
         ok: boolean;
         workspace: Workspace;
-        sample?: {
-          ok_count?: number;
-          fail_count?: number;
-          panels_count?: number;
-          targets_count?: number;
-          groups_count?: number;
-          links_count?: number;
+        sample?: Partial<SampleReport> & {
+          panels?: SamplePanelRow[];
         };
       }>("/api/admin/config-order/sample", {
         method: "POST",
-        // Backend budgets ~55s; stay under nginx /api 300s with headroom.
-        timeoutMs: 90_000,
+        // Backend budgets ~250s; nginx /api allows 300s.
+        timeoutMs: 280_000,
       }),
     onSuccess: (res) => {
       const ws = res.workspace;
@@ -238,15 +256,31 @@ export default function ConfigOrderPage() {
       const linkN =
         s?.links_count ?? ws?.total_sample_links ?? ws?.items?.length ?? 0;
       const gN = s?.groups_count;
+      const tN = s?.targets_count;
+      const gaps = s?.gaps_left ?? 0;
+      const panels = Array.isArray(s?.panels) ? s.panels : [];
+      setSampleReport({
+        ok_count: okN,
+        fail_count: failN,
+        panels_count: s?.panels_count ?? panels.length,
+        targets_count: tN ?? 0,
+        groups_count: gN,
+        links_count: linkN,
+        gaps_left: gaps,
+        elapsed_ms: s?.elapsed_ms,
+        panels,
+      });
       const base =
         failN > 0
-          ? `تست قبلی حذف شد؛ ${toFaDigits(okN)} پنل موفق، ${toFaDigits(failN)} ناموفق — ${toFaDigits(linkN)} کانفیگ یکتا`
-          : `مثل یوزر همه‌گروه ساخته شد — ${toFaDigits(okN)} پنل${
-              gN != null ? `، ${toFaDigits(gN)} گروه` : ""
-            }، ${toFaDigits(linkN)} کانفیگ یکتا`;
+          ? `${toFaDigits(okN)} پنل موفق، ${toFaDigits(failN)} ناموفق — ${toFaDigits(linkN)} کانفیگ یکتا`
+          : `${toFaDigits(okN)} پنل${
+              gN != null ? ` / ${toFaDigits(gN)} گروه` : ""
+            }${tN != null ? ` / ${toFaDigits(tN)} هدف` : ""} — ${toFaDigits(linkN)} کانفیگ یکتا`;
+      const gapNote =
+        gaps > 0 ? ` — ${toFaDigits(gaps)} اکانت هنوز در حال تکمیل` : "";
       pushToast(
-        failN > 0 && okN === 0 ? "err" : "ok",
-        `${base} — لیست به‌روز شد`
+        failN > 0 && okN === 0 ? "err" : failN > 0 ? "err" : "ok",
+        `${base}${gapNote}`
       );
       if (autoFlag && (ws?.items?.length || 0) > 0) {
         setWantProbe(true);
@@ -751,6 +785,57 @@ export default function ConfigOrderPage() {
         ) : null}
         {dirty ? <span className="dirty">تغییرات ذخیره‌نشده</span> : null}
       </div>
+
+      {sampleReport ? (
+        <div className="config-order-sample-report" role="status">
+          <div className="config-order-sample-report-head">
+            <strong>نتیجه ساخت نمونه</strong>
+            <span>
+              {toFaDigits(sampleReport.links_count)} کانفیگ یکتا ·{" "}
+              {toFaDigits(sampleReport.ok_count)}/
+              {toFaDigits(sampleReport.panels_count)} پنل
+              {sampleReport.targets_count
+                ? ` · ${toFaDigits(sampleReport.targets_count)} هدف گروه×پنل`
+                : ""}
+              {sampleReport.elapsed_ms
+                ? ` · ${toFaDigits(Math.round(sampleReport.elapsed_ms / 1000))}ث`
+                : ""}
+            </span>
+            <button
+              type="button"
+              className="btn ghost config-order-sample-report-close"
+              onClick={() => setSampleReport(null)}
+              aria-label="بستن گزارش"
+            >
+              <X size={14} />
+            </button>
+          </div>
+          {sampleReport.fail_count > 0 || (sampleReport.gaps_left || 0) > 0 ? (
+            <ul className="config-order-sample-errors">
+              {sampleReport.panels
+                .filter((p) => !p.ok || (p.pending || 0) > 0 || p.error)
+                .map((p) => (
+                  <li key={p.panel_id}>
+                    <strong>{p.panel_name}</strong>
+                    <span>
+                      {p.error ||
+                        (!p.ok
+                          ? "ناموفق"
+                          : `${toFaDigits(p.pending || 0)} pending`)}
+                      {p.links_count > 0
+                        ? ` · ${toFaDigits(p.links_count)} لینک`
+                        : ""}
+                    </span>
+                  </li>
+                ))}
+            </ul>
+          ) : (
+            <p className="config-order-sample-ok">
+              همه پنل‌های هدف لینک دادند — لیست بالا پایدار است.
+            </p>
+          )}
+        </div>
+      ) : null}
 
       {items.length > 0 ? (
         <div className="config-order-toolbar">
