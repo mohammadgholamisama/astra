@@ -536,7 +536,8 @@ class MarzbanAdapter(BasePanelAdapter):
         attempt. Keep this to one sharp round — test-all wraps retries.
         """
         last_err = "اتصال ناموفق"
-        probe_t = httpx.Timeout(3.5, connect=1.6)
+        quick = bool((self.meta or {}).get("_probe_quick"))
+        probe_t = httpx.Timeout(2.4 if quick else 3.5, connect=1.25 if quick else 1.6)
         try:
             client, headers = await self._authed()
             resp = await client.get(
@@ -572,6 +573,13 @@ class MarzbanAdapter(BasePanelAdapter):
                 except Exception as e:  # noqa: BLE001
                     last_err = str(e).strip() or last_err
                 return AdapterResult(success=False, error=last_err)
+
+            # Quick probe: skip heavy /inbounds when /api/admin already answered.
+            if quick and resp.status_code not in (404, 405, 501):
+                return AdapterResult(
+                    success=False,
+                    error=err_msg(data, f"HTTP {resp.status_code}"),
+                )
 
             try:
                 resp2 = await client.get(

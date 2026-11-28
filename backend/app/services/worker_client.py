@@ -385,10 +385,31 @@ class WorkerRoutedAdapter:
         return res
 
     async def test_connection(self) -> AdapterResult:
-        got = await self._via_worker("test_connection", {})
-        if got is not None:
+        # Probe must not sit behind the default 40s mutate budget — workers
+        # answer light health checks in <2s. Keep worker hop short so a hung
+        # tunnel still leaves time for master→panel failover inside test-all.
+        prev_to = self._op_timeout
+        self._op_timeout = min(prev_to, 4.5)
+        try:
+            got = await self._via_worker("test_connection", {})
+        finally:
+            self._op_timeout = prev_to
+        if got is not None and got.success:
             return got
-        return await self._local.test_connection()
+        # Worker unreachable OR panel timeout from worker path — try master.
+        # (Tunnel worker lag ≠ panel dead from Astra's network.)
+        try:
+            local = await self._local.test_connection()
+        except Exception as exc:  # noqa: BLE001
+            if got is not None:
+                return got
+            return AdapterResult(
+                success=False,
+                error=str(exc).strip() or exc.__class__.__name__,
+            )
+        if local.success:
+            return local
+        return got if got is not None else local
 
     async def create_user(self, payload: UserPayload) -> AdapterResult:
         got = await self._via_worker(

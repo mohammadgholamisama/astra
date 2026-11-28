@@ -165,8 +165,10 @@ async def _live_test_panel(
                 float(overall_timeout), 18.0 if force_fresh_auth else 16.0
             )
         else:
+            # Light probes finish well under this; keep a little headroom for
+            # tunnel RTT + worker hop so flaky panels don't false-قطع.
             overall_timeout = min(
-                float(overall_timeout), 7.5 if force_fresh_auth else 6.0
+                float(overall_timeout), 7.5 if force_fresh_auth else 6.5
             )
     else:
         tries = 2
@@ -179,7 +181,8 @@ async def _live_test_panel(
             if is_astra:
                 per_try = min(16.0 if force_fresh_auth else 14.0, remaining)
             else:
-                per_try = min(6.5 if force_fresh_auth else 5.5, remaining)
+                # Room for worker hop (~4.5s) + master failover on tunnel miss.
+                per_try = min(7.5 if force_fresh_auth else 6.8, remaining)
         elif attempt == 0:
             per_try = min(12.0, remaining)
         else:

@@ -17,7 +17,7 @@ logger = logging.getLogger("astra.worker.agent")
 MASTER_URL = (os.environ.get("ASTRA_MASTER_URL") or "").rstrip("/")
 WORKER_TOKEN = (os.environ.get("ASTRA_WORKER_TOKEN") or "").strip()
 WORKER_NAME = os.environ.get("ASTRA_WORKER_NAME") or "astra-worker"
-WORKER_VERSION = "1.0.36"
+WORKER_VERSION = "1.0.37"
 
 # Assigned panels for background usage collection (exact lease from Master)
 _ASSIGNED: list[dict[str, Any]] = []
@@ -368,7 +368,25 @@ async def exec_op(body: ExecBody, _auth: None = Depends(_require_token)):
     args = body.args or {}
     try:
         if op == "test_connection":
-            res = await adapter.test_connection()
+            # Bound probe — hung remotes must not pin a worker slot for 40s+.
+            try:
+                res = await asyncio.wait_for(adapter.test_connection(), timeout=8.0)
+            except asyncio.TimeoutError:
+                from types import SimpleNamespace
+
+                res = SimpleNamespace(
+                    success=False,
+                    error="timeout waiting for panel probe",
+                    remote_username=None,
+                    remote_id=None,
+                    uuid=None,
+                    links=[],
+                    used_traffic=0,
+                    raw=None,
+                    remote_status=None,
+                    remote_expire=None,
+                    online_at=None,
+                )
         elif op in _MUTATE_OPS:
             # Bounded fan-out + wall so create never hangs forever behind collect.
             from types import SimpleNamespace

@@ -394,45 +394,102 @@ class SanaeiAdapter(BasePanelAdapter):
         return [int(i["id"]) for i in await self.list_inbounds()]
 
     async def test_connection(self) -> AdapterResult:
+        """Light auth/alive probe — prefer cached ``server/status`` over fat lists.
+
+        ``meta._probe_quick`` (تست کلی): race status+slim with short timeouts so
+        heavy 3x-ui panels stop looking «کند» (~4–5s) while still connecting.
+        Full ``/list`` + curl only on authoritative single-panel Test.
+        """
         try:
             if not self._token() and not (self.username and self.password):
                 return AdapterResult(
                     success=False,
                     error="API Token یا یوزر/رمز سنایی را وارد کنید",
                 )
-            # slim first — full /list often times out on heavy Cloudflare panels
-            last_resp = None
-            last_data: Any = None
-            for path in (
-                "panel/api/inbounds/list/slim",
-                "panel/api/inbounds/list",
+            quick = bool((self.meta or {}).get("_probe_quick"))
+            # status is a 2s-cached snapshot on modern 3x-ui — cheapest proof.
+            light = (
                 "panel/api/server/status",
-            ):
+                "panel/api/inbounds/list/slim",
+            )
+            per = httpx.Timeout(2.0 if quick else 5.0, connect=1.3 if quick else 2.0)
+
+            async def _try_path(path: str) -> AdapterResult | None:
                 try:
-                    resp = await self._request("GET", path)
-                    last_resp = resp
+                    resp = await self._request("GET", path, timeout=per)
                     ok, data = ok_json(resp)
-                    last_data = data
                     if ok:
                         return AdapterResult(success=True, raw=data)
+                    return AdapterResult(
+                        success=False,
+                        error=self._explain_fail(resp, data),
+                        raw=data if isinstance(data, dict) else {},
+                    )
                 except httpx.TimeoutException:
                     logger.warning("sanaei test_connection timeout on %s", path)
-                    continue
-                except httpx.HTTPError as exc:
-                    logger.warning("sanaei test_connection error on %s: %s", path, exc)
-                    continue
-            # Short curl fallback only — never 90s (that froze «تست کلی»).
+                    return None
+                except (httpx.HTTPError, RuntimeError, asyncio.TimeoutError) as exc:
+                    logger.warning(
+                        "sanaei test_connection error on %s: %s", path, exc
+                    )
+                    return None
+
+            last_fail: AdapterResult | None = None
+            if quick:
+                tasks = [
+                    asyncio.create_task(_try_path(p), name=f"sanaei-probe-{p}")
+                    for p in light
+                ]
+                pending: set[asyncio.Task] = set(tasks)
+                try:
+                    while pending:
+                        done, pending = await asyncio.wait(
+                            pending, return_when=asyncio.FIRST_COMPLETED
+                        )
+                        for finished in done:
+                            try:
+                                got = finished.result()
+                            except Exception:  # noqa: BLE001
+                                got = None
+                            if got is not None and got.success:
+                                for t in pending:
+                                    t.cancel()
+                                return got
+                            if got is not None:
+                                last_fail = got
+                finally:
+                    for t in pending:
+                        t.cancel()
+                if last_fail is not None:
+                    return last_fail
+                return AdapterResult(
+                    success=False,
+                    error="timeout یا عدم دسترسی به API سنایی",
+                )
+
+            # Authoritative Test: light paths, then full list, then short curl.
+            for path in (*light, "panel/api/inbounds/list"):
+                got = await _try_path(path)
+                if got is not None and got.success:
+                    return got
+                if got is not None:
+                    last_fail = got
             if self._token():
                 ok_c, data_c, _st = await self._curl_json(
-                    "panel/api/inbounds/list/slim", max_time=4
+                    "panel/api/server/status", max_time=4
                 )
                 if ok_c:
                     return AdapterResult(success=True, raw=data_c)
-            if last_resp is not None:
-                return AdapterResult(
-                    success=False, error=self._explain_fail(last_resp, last_data)
+                ok_c2, data_c2, _st2 = await self._curl_json(
+                    "panel/api/inbounds/list/slim", max_time=4
                 )
-            return AdapterResult(success=False, error="timeout یا عدم دسترسی به API سنایی")
+                if ok_c2:
+                    return AdapterResult(success=True, raw=data_c2)
+            if last_fail is not None:
+                return last_fail
+            return AdapterResult(
+                success=False, error="timeout یا عدم دسترسی به API سنایی"
+            )
         except Exception as e:
             return AdapterResult(success=False, error=str(e))
 
