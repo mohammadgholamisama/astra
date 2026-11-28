@@ -253,6 +253,57 @@ async def _drain_recent_pending_provisions() -> None:
             await asyncio.sleep(30)
 
 
+async def _recent_create_complete_loop() -> None:
+    """Brand-new sales must reach N/N fast — never sit behind the 50k backlog.
+
+    Every ~12s: find users created in the last 90 minutes with pending/empty
+    share and run ``complete_user_panel_coverage`` (clears circuit, parallel
+    create, waits on leftovers).
+    """
+    await asyncio.sleep(18)
+    from app.services.orchestrator import (
+        complete_user_panel_coverage,
+        find_recent_incomplete_user_ids,
+    )
+
+    while True:
+        n_done = 0
+        ids: list[int] = []
+        try:
+            ids = await find_recent_incomplete_user_ids(
+                limit=12, max_age_minutes=90.0
+            )
+            for uid in ids:
+                try:
+                    stats = await complete_user_panel_coverage(
+                        int(uid), max_rounds=3, round_budget=55.0
+                    )
+                    if stats.get("done"):
+                        n_done += 1
+                    else:
+                        logger.warning(
+                            "recent create still partial user_id=%s chip=%s/%s",
+                            uid,
+                            stats.get("ok"),
+                            stats.get("total"),
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "recent create complete failed user_id=%s", uid
+                    )
+            if ids:
+                logger.info(
+                    "recent create complete wave users=%s done=%s",
+                    len(ids),
+                    n_done,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("recent create complete loop failed")
+        await asyncio.sleep(8 if (n_done or ids) else 14)
+
+
 async def _empty_user_coverage_heal_loop() -> None:
     """Never leave users stuck at ۰/۰ or partial ۱۱/۲۶ پنل / empty /sub.
 
@@ -1099,6 +1150,12 @@ async def lifespan(_app: FastAPI):
         bg_tasks.append(
             asyncio.create_task(
                 _drain_recent_pending_provisions(), name="astra-pending-drain"
+            )
+        )
+        bg_tasks.append(
+            asyncio.create_task(
+                _recent_create_complete_loop(),
+                name="astra-recent-create-complete",
             )
         )
         bg_tasks.append(

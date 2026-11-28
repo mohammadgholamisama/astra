@@ -26,16 +26,48 @@ if _BACKEND.is_dir() and str(_BACKEND) not in sys.path:
 
 
 async def _amain(names: list[str], limit: int) -> int:
-    from app.services.orchestrator import repair_incomplete_panel_coverage
+    from sqlalchemy import select
+
+    from app.core.database import AsyncSessionLocal
+    from app.models.user import User
+    from app.services.orchestrator import (
+        complete_user_panel_coverage,
+        repair_incomplete_panel_coverage,
+    )
+
+    if names:
+        report = {"users": [], "repaired": 0, "still_partial": 0}
+        async with AsyncSessionLocal() as db:
+            rows = await db.execute(
+                select(User.id, User.username).where(User.username.in_(names))
+            )
+            found = {str(r[1]): int(r[0]) for r in rows.all() if r[0]}
+            await db.rollback()
+        for n in names:
+            uid = found.get(n)
+            if not uid:
+                report["users"].append(
+                    {"username": n, "ok": False, "detail": "not_found"}
+                )
+                continue
+            stats = await complete_user_panel_coverage(
+                uid, max_rounds=5, round_budget=70.0
+            )
+            report["users"].append({"username": n, **stats})
+            if stats.get("done"):
+                report["repaired"] += 1
+            else:
+                report["still_partial"] += 1
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 1 if report["still_partial"] else 0
 
     report = await repair_incomplete_panel_coverage(
-        usernames=names or None,
+        usernames=None,
         limit_users=limit,
         wait_per_user=90.0,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    still = int(report.get("still_partial") or 0)
-    return 1 if still and names else 0
+    return 0
 
 
 def main() -> None:

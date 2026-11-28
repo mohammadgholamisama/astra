@@ -101,19 +101,17 @@ def _user_created_recently(user: User, *, window_sec: int = 600) -> bool:
 
 # Parallel single-creates (HTTP remotes; DB only short apply sessions).
 # Higher than the 50k drain backlog so a new sale finishes its own panels first.
-_CREATE_PROVISION_BG_SEM = asyncio.Semaphore(24)
+_CREATE_PROVISION_BG_SEM = asyncio.Semaphore(28)
 
 
 async def _bg_finish_create_provision(username: str, group_ids: list[int]) -> None:
-    """Finish remotes after create returned — one fast full-panel wave."""
+    """Finish remotes after create — keep going until N/N or hard budget."""
     from app.core.database import AsyncSessionLocal
-    from app.models.user import PanelAccount, PanelAccountStatus
 
     log = __import__("logging").getLogger("astra.users")
     async with _CREATE_PROVISION_BG_SEM:
         try:
             uid = 0
-            panels: list = []
             async with AsyncSessionLocal() as db:
                 user_row = (
                     await db.execute(select(User).where(User.username == username))
@@ -121,87 +119,27 @@ async def _bg_finish_create_provision(username: str, group_ids: list[int]) -> No
                 if user_row is None:
                     return
                 uid = int(user_row.id)
-                raw_panels = await orchestrator.resolve_panels_for_groups(
-                    db, group_ids
-                )
-                # CRITICAL: rollback() expires ORM attrs. Touch+expunge while
-                # the session is alive so create never hits DetachedInstance.
-                panels = [
-                    (
-                        orchestrator._touch_panel_for_detach(p, db),
-                        dict(cfg or {}),
-                        int(gid or 0),
-                    )
-                    for p, cfg, gid in (raw_panels or [])
-                ]
                 await db.rollback()
-            if panels and uid:
-                sdb = AsyncSessionLocal()
-                try:
-                    # Reload user in this session — prior row is detached.
-                    user_row = (
-                        await sdb.execute(select(User).where(User.id == uid))
-                    ).scalar_one_or_none()
-                    if user_row is None:
-                        return
-                    n_jobs = max(1, len(panels))
-                    # Single-user fast wave: all panels in parallel (no circuit skip).
-                    await orchestrator.provision_user_on_panels(
-                        sdb,
-                        user_row,
-                        panels,
-                        fast=True,
-                        overall_timeout=min(
-                            300.0, max(90.0, 28.0 * ((n_jobs + 23) // 24) + 40.0)
-                        ),
-                    )
-                except Exception:  # noqa: BLE001
-                    log.exception(
-                        "bg create provision failed user=%s", username
-                    )
-                finally:
-                    try:
-                        await sdb.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-
             if not uid:
                 return
+            # Multi-round complete: when panels are up, chip must reach N/N.
             try:
-                await orchestrator.hydrate_share_links_pool_safe(uid)
-            except Exception:  # noqa: BLE001
-                log.debug(
-                    "bg create hydrate user=%s failed", username, exc_info=True
+                stats = await orchestrator.complete_user_panel_coverage(
+                    uid,
+                    group_ids=list(group_ids or []),
+                    max_rounds=5,
+                    round_budget=70.0,
                 )
-            # Drain leftovers with real wait — 3s left 80+ pending after create.
-            try:
-                pending_n = 0
-                async with AsyncSessionLocal() as sdb:
-                    pending_n = int(
-                        (
-                            await sdb.execute(
-                                select(func.count())
-                                .select_from(PanelAccount)
-                                .where(
-                                    PanelAccount.user_id == uid,
-                                    PanelAccount.status.in_(
-                                        (
-                                            PanelAccountStatus.pending,
-                                            PanelAccountStatus.error,
-                                        )
-                                    ),
-                                )
-                            )
-                        ).scalar()
-                        or 0
-                    )
-                    await sdb.rollback()
-                heal_wait = min(180.0, max(20.0, 3.0 * pending_n + 12.0))
-                await orchestrator.heal_user_coverage_pool_safe(
-                    uid, wait=heal_wait, include_empty_links=True
+                log.info(
+                    "bg create complete user=%s chip=%s/%s rounds=%s done=%s",
+                    username,
+                    stats.get("ok"),
+                    stats.get("total"),
+                    stats.get("rounds"),
+                    stats.get("done"),
                 )
             except Exception:  # noqa: BLE001
-                log.debug("bg create heal user=%s failed", username, exc_info=True)
+                log.exception("bg create complete failed user=%s", username)
             # Brand-new accounts → Hot priority-probe for 15–30 minutes so
             # used_traffic moves within 2–4s of first connection.
             try:
@@ -213,30 +151,6 @@ async def _bg_finish_create_provision(username: str, group_ids: list[int]) -> No
             except Exception:  # noqa: BLE001
                 log.debug(
                     "bg create prio-enqueue user=%s failed",
-                    username,
-                    exc_info=True,
-                )
-            try:
-                pending_ids: list[int] = []
-                async with AsyncSessionLocal() as sdb:
-                    rows = await sdb.execute(
-                        select(PanelAccount.id).where(
-                            PanelAccount.user_id == uid,
-                            PanelAccount.status.in_(
-                                (
-                                    PanelAccountStatus.pending,
-                                    PanelAccountStatus.error,
-                                )
-                            ),
-                        )
-                    )
-                    pending_ids = [int(r[0]) for r in rows.all() if r[0]]
-                    await sdb.rollback()
-                if pending_ids:
-                    orchestrator.start_account_provisions(pending_ids)
-            except Exception:  # noqa: BLE001
-                log.debug(
-                    "bg create leftover enqueue user=%s failed",
                     username,
                     exc_info=True,
                 )
