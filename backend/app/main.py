@@ -1143,12 +1143,13 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
     swagger_ui_parameters={
-        "docExpansion": "list",
-        "defaultModelsExpandDepth": 2,
-        "defaultModelExpandDepth": 2,
+        # Collapsed on open — never expand/try every op (esp. live panel probes).
+        "docExpansion": "none",
+        "defaultModelsExpandDepth": 0,
+        "defaultModelExpandDepth": 1,
         "displayRequestDuration": True,
         "filter": True,
-        "tryItOutEnabled": True,
+        "tryItOutEnabled": False,
         "persistAuthorization": True,
     },
 )
@@ -1294,12 +1295,13 @@ async def swagger_docs():
         openapi_url='/openapi.json',
         title='Astra API Docs',
         swagger_ui_parameters={
-            "docExpansion": "list",
-            "defaultModelsExpandDepth": 2,
-            "defaultModelExpandDepth": 2,
+            # Page starts fully collapsed; Try it out is opt-in (no accidental live tests).
+            "docExpansion": "none",
+            "defaultModelsExpandDepth": 0,
+            "defaultModelExpandDepth": 1,
             "displayRequestDuration": True,
             "filter": True,
-            "tryItOutEnabled": True,
+            "tryItOutEnabled": False,
             "persistAuthorization": True,
         },
     )

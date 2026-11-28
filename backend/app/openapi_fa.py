@@ -9,8 +9,9 @@ from typing import Any
 
 def _d(summary: str, where: str, does: str, result: str = "") -> tuple[str, str]:
     """Build (summary shown next to each API, markdown body when expanded)."""
-    # Summary is what Swagger shows inline beside method/path — keep it self-explanatory.
-    visible = f"{summary} — {does}"
+    # Keep the list-row short — long «does» belongs only inside the expanded body
+    # so /docs does not look like it is already «running» every probe on open.
+    visible = summary
     parts = [
         f"**کجا در پنل:** {where}",
         f"**عملکرد دقیق:** {does}",
