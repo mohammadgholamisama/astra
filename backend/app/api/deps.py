@@ -15,8 +15,24 @@ api_key_header = APIKeyHeader(
     name="X-Api-Key",
     auto_error=False,
     scheme_name="ApiKeyAuth",
-    description="کلید Integration ساخته‌شده در تنظیمات (مثلاً pg_key_…). جایگزین Bearer JWT.",
+    description=(
+        "فقط خود کلید (مثل pg_key_…) — بدون کلمه Bearer. "
+        "از تنظیمات → کلیدهای API کپی کنید."
+    ),
 )
+
+
+def _normalize_api_key(raw: str | None) -> str:
+    """Strip accidental Bearer/ApiKey prefixes from Swagger / copy-paste."""
+    key = (raw or "").strip().strip('"').strip("'")
+    if not key:
+        return ""
+    lower = key.lower()
+    if lower.startswith("bearer "):
+        key = key[7:].strip()
+    elif lower.startswith("apikey "):
+        key = key[7:].strip()
+    return key.strip()
 
 
 async def get_current_admin(
@@ -35,11 +51,18 @@ async def get_current_admin(
     if not isinstance(api_key_dep, str):
         api_key_dep = None
     # 1) X-Api-Key (header dependency + raw header + Authorization: ApiKey …)
-    api_key = (api_key_dep or "").strip() or (request.headers.get("X-Api-Key") or "")
+    api_key = _normalize_api_key(api_key_dep) or _normalize_api_key(
+        request.headers.get("X-Api-Key")
+    )
     auth = request.headers.get("Authorization") or ""
 
     if not api_key and auth.lower().startswith("apikey "):
-        api_key = auth[7:].strip()
+        api_key = _normalize_api_key(auth[7:])
+    # Common mistake: Authorization: Bearer pg_key_… (treat as API key)
+    if not api_key and auth.lower().startswith("bearer "):
+        maybe = _normalize_api_key(auth[7:])
+        if maybe.startswith("pg_key_"):
+            api_key = maybe
 
     if api_key:
         # store hash of full key — we look up by hashing

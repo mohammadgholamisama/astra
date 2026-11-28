@@ -1467,8 +1467,9 @@ def _auth_note(path: str, method: str) -> str:
     if path.startswith("/api/v1"):
         return (
             "**امنیت (الزامی):** یکی از این دو:\n"
-            "- `X-Api-Key: pg_key_…` (پیشنهادی برای Integration)\n"
-            "- `Authorization: Bearer <JWT>` بعد از لاگین ادمین"
+            "- `X-Api-Key: pg_key_…` (پیشنهادی برای Integration) — **بدون** `Bearer`\n"
+            "- `Authorization: Bearer <JWT>` بعد از لاگین ادمین\n"
+            "اشتباه: `X-Api-Key: Bearer pg_key_…` → ۴۰۱"
         )
     return (
         "**امنیت (الزامی):** JWT ادمین `Authorization: Bearer <token>` "
@@ -1689,8 +1690,9 @@ def _ensure_security_schemes(schema: dict[str, Any]) -> None:
         "in": "header",
         "name": "X-Api-Key",
         "description": (
-            "کلید Integration از صفحه تنظیمات → کلیدهای API "
-            "(مقدار کامل شبیه `pg_key_…`). برای `/api/v1` و اکثر APIهای ادمین."
+            "فقط خود کلید را بگذارید مثل `pg_key_…` — **بدون** کلمه `Bearer`. "
+            "از تنظیمات → کلیدهای API کپی کنید. "
+            "اشتباه رایج: `X-Api-Key: Bearer pg_key_…` → ۴۰۱ Invalid API key."
         ),
     }
     schemes.setdefault(
