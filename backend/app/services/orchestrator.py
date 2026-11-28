@@ -1125,11 +1125,13 @@ async def provision_user_on_panels(
         adapter = get_adapter(panel)
         t0 = time.monotonic()
         # Local Astra upsert is DB-only when rebuild is deferred.
-        panel_timeout = (
-            max(float(create_timeout), 35.0)
-            if panel.type == PanelType.astra
-            else float(create_timeout)
-        )
+        # Sanaei on hot boxes often needs well above the default create_timeout.
+        if panel.type == PanelType.astra:
+            panel_timeout = max(float(create_timeout), 35.0)
+        elif panel.type == PanelType.sanaei:
+            panel_timeout = max(float(create_timeout), 42.0)
+        else:
+            panel_timeout = float(create_timeout)
         try:
             async with sem:
                 if prefer_modify:
@@ -1404,12 +1406,23 @@ async def provision_user_on_panels(
                     _exc_msg(exc),
                 )
 
+    # Don't touch expired ORM attrs after commit (MissingGreenlet under async).
+    ok_n = err_n = 0
+    for a in accounts:
+        try:
+            st = a.status
+        except Exception:  # noqa: BLE001
+            continue
+        if st == PanelAccountStatus.active:
+            ok_n += 1
+        elif st == PanelAccountStatus.error:
+            err_n += 1
     logger.info(
         "provision done user=%s targets=%s ok=%s err=%s total=%.2fs fast=%s",
         uname_safe,
         len(jobs),
-        sum(1 for a in accounts if a.status == PanelAccountStatus.active),
-        sum(1 for a in accounts if a.status == PanelAccountStatus.error),
+        ok_n,
+        err_n,
         time.monotonic() - t_prov,
         fast,
     )
@@ -1865,12 +1878,13 @@ _account_prov_sem: asyncio.Semaphore | None = None
 def _get_account_prov_sem() -> asyncio.Semaphore:
     """Cap concurrent creates — pool-safe sessions (open → HTTP → close).
 
-    Pool is 16+8 — fan-out above ~12 starves usage/freeze/heal (QueuePool
-    timeout). Prefer steady chew over stampede; coverage loop retries.
+    Pool is 16+8 — keep below ~24 so usage/freeze still get connections, but
+    high enough that a 9–14 panel create wave finishes before the 50k backlog
+    starves brand-new sales.
     """
     global _account_prov_sem
     if _account_prov_sem is None:
-        _account_prov_sem = asyncio.Semaphore(12)
+        _account_prov_sem = asyncio.Semaphore(20)
     return _account_prov_sem
 
 
@@ -1941,8 +1955,14 @@ async def _provision_account_now(account_id: int) -> bool:
                 acc = result.scalar_one_or_none()
                 if acc is None or acc.status == PanelAccountStatus.deleted:
                     return False
-                if acc.status == PanelAccountStatus.active and (acc.links or []):
-                    return True
+                if acc.status == PanelAccountStatus.active:
+                    from app.adapters.http_utils import is_share_link as _isl_early
+
+                    if any(
+                        _isl_early(str(x)) for x in (acc.links or []) if x
+                    ):
+                        return True
+                    # active+/sub-only — keep going so expand can finish the chip.
                 # Intentional freeze marks — never re-create as live remotes.
                 if (acc.error_message or "").startswith("ASTRA_QUOTA_FROZEN"):
                     return False
@@ -1964,11 +1984,19 @@ async def _provision_account_now(account_id: int) -> bool:
                     await db.commit()
                     invalidate_user_feed_cache(uid)
                     return False
+                # Proof of a live remote — username alone is not enough.
+                has_remote_proof = bool(
+                    (acc.remote_id or "").strip()
+                    or (acc.uuid or "").strip()
+                    or any(str(x).strip() for x in (acc.links or []) if x)
+                )
                 try:
                     from app.core.panel_circuit import panel_circuit_open
 
-                    if panel_circuit_open(int(panel.id)):
-                        # Fail-fast: leave pending for a later wave when circuit cools.
+                    if panel_circuit_open(int(panel.id)) and has_remote_proof:
+                        # Fail-fast only when we already have a remote to retry later.
+                        # Brand-new pending (no rid/uuid/links) must still try once —
+                        # otherwise circuit leaves ۵/۹ chips forever on healthy panels.
                         return False
                 except Exception:  # noqa: BLE001
                     pass
@@ -2059,14 +2087,16 @@ async def _provision_account_now(account_id: int) -> bool:
             payload = job["payload"]
             uid = int(job["user_id"])
             adapter = get_adapter(panel)
-            # PasarGuard under worker load often needs >18s; short timeouts
-            # left dozens of pending rows after create.
-            # Drain/heal path: fail faster on dead panels so siblings advance.
-            panel_timeout = (
-                22.0
-                if getattr(panel, "type", None) == PanelType.astra
-                else 14.0
-            )
+            # PasarGuard/Sanaei under worker load often need >18s; short
+            # timeouts left sticky pending on live panels (۵/۹ chips).
+            ptype = getattr(panel, "type", None)
+            if ptype == PanelType.astra:
+                panel_timeout = 22.0
+            elif ptype == PanelType.sanaei:
+                # Overloaded 3x-UI panels (CPU~100%) often need 35–45s to create.
+                panel_timeout = 42.0
+            else:
+                panel_timeout = 22.0
             try:
                 # Heal/edit: modify every known name first — never mint _p* twins
                 # when the live remote already exists under _g* / base.
@@ -2992,6 +3022,34 @@ async def drain_pending_panel_accounts(
             )
             have: set[int] = set()
             empty_lim = max(10, lim // 2) if prefer_partial_users else lim
+            # Pass A0: brand-new sales (last 2h) — never wait behind 50k backlog.
+            rows = await db.execute(
+                text(
+                    f"""
+                    SELECT pa.id
+                    FROM panel_accounts pa
+                    JOIN users u ON u.id = pa.user_id
+                    JOIN panels p ON p.id = pa.panel_id
+                    WHERE pa.status IN ('pending', 'error')
+                      AND u.status IN ('active', 'on_hold')
+                      AND p.is_active IS TRUE
+                      AND coalesce(pa.error_message, '') NOT LIKE 'ASTRA_QUOTA_FROZEN%'
+                      AND u.created_at IS NOT NULL
+                      AND u.created_at > NOW() - INTERVAL '2 hours'
+                    ORDER BY u.created_at DESC, {order_sql}
+                    LIMIT :lim
+                    """
+                ),
+                {"lim": max(20, lim // 2)},
+            )
+            for r in rows.all():
+                if not r[0]:
+                    continue
+                aid = int(r[0])
+                if aid in have:
+                    continue
+                ids.append(aid)
+                have.add(aid)
             # Pass A: users with ZERO active remotes (۰/N cards) — never starve.
             rows = await db.execute(
                 text(
@@ -3578,6 +3636,285 @@ async def find_partial_share_user_ids(*, limit: int = 200) -> list[int]:
         ids = [int(r[0]) for r in rows.all() if r[0]]
         await db.rollback()
     return ids
+
+
+async def _user_panel_chip(uid: int) -> tuple[int, int, int]:
+    """Return (ok_share_panels, total_panels, pending_or_error)."""
+    from app.adapters.http_utils import is_share_link
+    from app.core.database import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        rows = (
+            await db.execute(
+                select(PanelAccount)
+                .where(
+                    PanelAccount.user_id == int(uid),
+                    PanelAccount.status != PanelAccountStatus.deleted,
+                )
+                .options(selectinload(PanelAccount.panel))
+            )
+        ).scalars().all()
+        ok: set[int] = set()
+        allp: set[int] = set()
+        bad = 0
+        for a in rows:
+            panel = a.panel
+            if panel is not None and not bool(getattr(panel, "is_active", True)):
+                if a.status != PanelAccountStatus.active:
+                    continue
+            pid = int(a.panel_id)
+            allp.add(pid)
+            shares = [
+                x for x in (a.links or []) if x and is_share_link(str(x))
+            ]
+            if shares:
+                ok.add(pid)
+            elif a.status in (
+                PanelAccountStatus.pending,
+                PanelAccountStatus.error,
+                PanelAccountStatus.active,
+            ):
+                bad += 1
+        await db.rollback()
+    return len(ok), len(allp), bad
+
+
+async def repair_incomplete_panel_coverage(
+    *,
+    usernames: list[str] | None = None,
+    limit_users: int = 40,
+    wait_per_user: float = 75.0,
+) -> dict:
+    """Inspect + force-complete missing/pending panel slots (bypasses 50k drain queue).
+
+    Used by ops script and can be called for named sticky chips like ۵/۹.
+    Uses ``provision_user_on_panels(fast=True)`` which does not circuit-skip
+    brand-new creates the way drain alone does.
+    """
+    from app.api.subscription import invalidate_user_feed_cache
+    from app.core.database import AsyncSessionLocal
+
+    report: dict = {"users": [], "repaired": 0, "still_partial": 0}
+    ids: list[int] = []
+    names = [str(x).strip() for x in (usernames or []) if str(x).strip()]
+    if names:
+        async with AsyncSessionLocal() as db:
+            rows = await db.execute(
+                select(User.id, User.username).where(User.username.in_(names))
+            )
+            found = {str(r[1]): int(r[0]) for r in rows.all() if r[0]}
+            await db.rollback()
+        for n in names:
+            if n in found:
+                ids.append(found[n])
+            else:
+                report["users"].append(
+                    {"username": n, "ok": False, "detail": "not_found"}
+                )
+    else:
+        # Prefer partial share chips, then missing-row incompletes.
+        for uid in await find_partial_share_user_ids(
+            limit=max(5, int(limit_users))
+        ):
+            if uid not in ids:
+                ids.append(int(uid))
+        for uid in await find_incomplete_coverage_user_ids(
+            limit=max(5, int(limit_users))
+        ):
+            if uid not in ids:
+                ids.append(int(uid))
+        ids = ids[: max(1, int(limit_users))]
+
+    try:
+        await restamp_empty_share_actives(
+            limit_accounts=max(80, min(400, len(ids) * 20 or 80))
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("repair restamp failed", exc_info=True)
+
+    # Clear circuits on panels that still have sticky pending for these users —
+    # otherwise drain/_provision_account_now skips forever while UI shows ۵/۹.
+    try:
+        from app.core.panel_circuit import clear_panel_circuit
+
+        async with AsyncSessionLocal() as db:
+            rows = await db.execute(
+                select(PanelAccount.panel_id)
+                .where(
+                    PanelAccount.user_id.in_(ids or [-1]),
+                    PanelAccount.status.in_(
+                        (
+                            PanelAccountStatus.pending,
+                            PanelAccountStatus.error,
+                        )
+                    ),
+                )
+                .distinct()
+            )
+            pids = [int(r[0]) for r in rows.all() if r[0]]
+            await db.rollback()
+        for pid in pids:
+            clear_panel_circuit(pid)
+    except Exception:  # noqa: BLE001
+        logger.debug("repair clear circuits failed", exc_info=True)
+
+    for uid in ids:
+        before = await _user_panel_chip(uid)
+        uname = ""
+        try:
+            panels: list = []
+            async with AsyncSessionLocal() as db:
+                user = (
+                    await db.execute(
+                        select(User)
+                        .where(User.id == int(uid))
+                        .options(
+                            selectinload(User.panel_accounts).selectinload(
+                                PanelAccount.panel
+                            ),
+                            selectinload(User.groups),
+                        )
+                    )
+                ).scalar_one_or_none()
+                if user is None:
+                    continue
+                uname = str(user.username)
+                gids = [
+                    int(g.id)
+                    for g in (user.groups or [])
+                    if getattr(g, "id", None)
+                ]
+                if not gids:
+                    ug = await db.execute(
+                        select(UserGroup.group_id).where(
+                            UserGroup.user_id == int(uid)
+                        )
+                    )
+                    gids = [int(r[0]) for r in ug.all() if r[0]]
+                raw_panels = await resolve_panels_for_groups(db, gids)
+                panels = [
+                    (_touch_panel_for_detach(p, db), dict(cfg or {}), int(gid or 0))
+                    for p, cfg, gid in (raw_panels or [])
+                ]
+                await db.rollback()
+            if panels:
+                async with AsyncSessionLocal() as sdb:
+                    user2 = (
+                        await sdb.execute(
+                            select(User).where(User.id == int(uid))
+                        )
+                    ).scalar_one_or_none()
+                    if user2 is not None:
+                        n_jobs = max(1, len(panels))
+                        await provision_user_on_panels(
+                            sdb,
+                            user2,
+                            panels,
+                            fast=True,
+                            overall_timeout=min(
+                                240.0,
+                                max(
+                                    float(wait_per_user),
+                                    28.0 * n_jobs / 24.0 + 40.0,
+                                ),
+                            ),
+                        )
+        except Exception:  # noqa: BLE001
+            logger.exception("repair provision user=%s failed", uid)
+
+        try:
+            async with AsyncSessionLocal() as db:
+                user = (
+                    await db.execute(
+                        select(User)
+                        .where(User.id == int(uid))
+                        .options(
+                            selectinload(User.panel_accounts).selectinload(
+                                PanelAccount.panel
+                            ),
+                            selectinload(User.groups),
+                        )
+                    )
+                ).scalar_one_or_none()
+                if user is not None:
+                    uname = str(user.username)
+                    try:
+                        await retry_failed_accounts(
+                            db, user, overall_timeout=45.0
+                        )
+                        await db.commit()
+                    except Exception:  # noqa: BLE001
+                        try:
+                            await db.rollback()
+                        except Exception:  # noqa: BLE001
+                            pass
+        except Exception:  # noqa: BLE001
+            logger.debug("repair retry user=%s failed", uid, exc_info=True)
+
+        try:
+            await heal_user_coverage_pool_safe(
+                int(uid),
+                wait=min(120.0, max(20.0, float(wait_per_user))),
+                include_empty_links=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("repair heal user=%s failed", uid, exc_info=True)
+        try:
+            await hydrate_share_links_pool_safe(int(uid))
+            await hydrate_share_links_pool_safe(int(uid))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            pending_ids: list[int] = []
+            async with AsyncSessionLocal() as db:
+                rows = await db.execute(
+                    select(PanelAccount.id).where(
+                        PanelAccount.user_id == int(uid),
+                        PanelAccount.status.in_(
+                            (
+                                PanelAccountStatus.pending,
+                                PanelAccountStatus.error,
+                            )
+                        ),
+                    )
+                )
+                pending_ids = [int(r[0]) for r in rows.all() if r[0]]
+                await db.rollback()
+            if pending_ids:
+                start_account_provisions(pending_ids)
+                # Brief wait so create wave starts before we re-chip.
+                await asyncio.sleep(min(25.0, 1.5 * len(pending_ids) + 4.0))
+                await hydrate_share_links_pool_safe(int(uid))
+        except Exception:  # noqa: BLE001
+            logger.debug("repair leftover user=%s failed", uid, exc_info=True)
+        try:
+            invalidate_user_feed_cache(int(uid))
+        except Exception:  # noqa: BLE001
+            pass
+        after = await _user_panel_chip(uid)
+        done = after[0] >= after[1] and after[1] > 0
+        if done:
+            report["repaired"] += 1
+        else:
+            report["still_partial"] += 1
+        report["users"].append(
+            {
+                "username": uname or str(uid),
+                "user_id": int(uid),
+                "before": f"{before[0]}/{before[1]}",
+                "after": f"{after[0]}/{after[1]}",
+                "pending_left": after[2],
+                "ok": done,
+            }
+        )
+        logger.info(
+            "repair coverage user=%s %s -> %s ok=%s",
+            uname or uid,
+            f"{before[0]}/{before[1]}",
+            f"{after[0]}/{after[1]}",
+            done,
+        )
+    return report
 
 
 async def force_heal_zero_active_users(*, limit_users: int = 40) -> int:

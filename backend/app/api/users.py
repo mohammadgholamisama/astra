@@ -100,11 +100,12 @@ def _user_created_recently(user: User, *, window_sec: int = 600) -> bool:
 
 
 # Parallel single-creates (HTTP remotes; DB only short apply sessions).
-_CREATE_PROVISION_BG_SEM = asyncio.Semaphore(12)
+# Higher than the 50k drain backlog so a new sale finishes its own panels first.
+_CREATE_PROVISION_BG_SEM = asyncio.Semaphore(24)
 
 
 async def _bg_finish_create_provision(username: str, group_ids: list[int]) -> None:
-    """Finish remotes after create returned — fast parallel wave, non-blocking."""
+    """Finish remotes after create returned — one fast full-panel wave."""
     from app.core.database import AsyncSessionLocal
     from app.models.user import PanelAccount, PanelAccountStatus
 
@@ -124,7 +125,7 @@ async def _bg_finish_create_provision(username: str, group_ids: list[int]) -> No
                     db, group_ids
                 )
                 # CRITICAL: rollback() expires ORM attrs. Touch+expunge while
-                # the session is alive so batch create never hits DetachedInstance.
+                # the session is alive so create never hits DetachedInstance.
                 panels = [
                     (
                         orchestrator._touch_panel_for_detach(p, db),
@@ -144,22 +145,19 @@ async def _bg_finish_create_provision(username: str, group_ids: list[int]) -> No
                     if user_row is None:
                         return
                     n_jobs = max(1, len(panels))
-                    # Enough wall-clock for ≥2 waves of PasarGuard under load.
-                    sem_n = min(48, max(24, n_jobs))
-                    waves = max(1, (n_jobs + sem_n - 1) // sem_n)
-                    create_to = 22.0
-                    overall = min(300.0, max(90.0, waves * create_to + 25.0))
-                    await orchestrator.provision_users_batch(
+                    # Single-user fast wave: all panels in parallel (no circuit skip).
+                    await orchestrator.provision_user_on_panels(
                         sdb,
-                        [user_row],
+                        user_row,
                         panels,
-                        create_timeout=create_to,
-                        concurrency=sem_n,
-                        overall_timeout=overall,
+                        fast=True,
+                        overall_timeout=min(
+                            300.0, max(90.0, 28.0 * ((n_jobs + 23) // 24) + 40.0)
+                        ),
                     )
                 except Exception:  # noqa: BLE001
                     log.exception(
-                        "bg create batch provision failed user=%s", username
+                        "bg create provision failed user=%s", username
                     )
                 finally:
                     try:
@@ -198,7 +196,7 @@ async def _bg_finish_create_provision(username: str, group_ids: list[int]) -> No
                         or 0
                     )
                     await sdb.rollback()
-                heal_wait = min(180.0, max(12.0, 2.2 * pending_n + 8.0))
+                heal_wait = min(180.0, max(20.0, 3.0 * pending_n + 12.0))
                 await orchestrator.heal_user_coverage_pool_safe(
                     uid, wait=heal_wait, include_empty_links=True
                 )
@@ -489,31 +487,9 @@ async def create_user(
         except Exception:  # noqa: BLE001
             pass
 
-    try:
-        pending_ids = [
-            int(a.id)
-            for a in (
-                (
-                    await db.execute(
-                        select(PanelAccount.id).where(
-                            PanelAccount.user_id == int(user.id),
-                            PanelAccount.status.in_(
-                                (
-                                    PanelAccountStatus.pending,
-                                    PanelAccountStatus.error,
-                                )
-                            ),
-                        )
-                    )
-                ).all()
-            )
-            if a[0]
-        ]
-        if pending_ids:
-            orchestrator.start_account_provisions(pending_ids)
-    except Exception:  # noqa: BLE001
-        log.debug("create kick pending failed user=%s", body.username, exc_info=True)
-
+    # One prioritized finish wave (not also start_account_provisions here —
+    # that fought the 50k drain queue and left ۵/۹ chips). Leftovers enqueue
+    # inside _bg_finish_create_provision after the fast wave.
     try:
         asyncio.create_task(
             _bg_finish_create_provision(body.username, list(body.group_ids)),
