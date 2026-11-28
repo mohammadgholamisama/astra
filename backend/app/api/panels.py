@@ -165,11 +165,16 @@ async def _live_test_panel(
                 float(overall_timeout), 18.0 if force_fresh_auth else 16.0
             )
         else:
-            # Light probes finish well under this; keep a little headroom for
-            # tunnel RTT + worker hop so flaky panels don't false-قطع.
-            overall_timeout = min(
-                float(overall_timeout), 7.5 if force_fresh_auth else 6.5
-            )
+            # Headroom for worker hop (~3s) + master failover so congested
+            # tunnels don't false-قطع a panel that Astra can still reach.
+            if via_worker:
+                overall_timeout = min(
+                    float(overall_timeout), 10.0 if force_fresh_auth else 8.5
+                )
+            else:
+                overall_timeout = min(
+                    float(overall_timeout), 7.5 if force_fresh_auth else 6.5
+                )
     else:
         tries = 2
 
@@ -181,8 +186,11 @@ async def _live_test_panel(
             if is_astra:
                 per_try = min(16.0 if force_fresh_auth else 14.0, remaining)
             else:
-                # Room for worker hop (~4.5s) + master failover on tunnel miss.
-                per_try = min(7.5 if force_fresh_auth else 6.8, remaining)
+                # Room for worker hop (~3.2s) + master failover on tunnel miss.
+                if via_worker:
+                    per_try = min(9.5 if force_fresh_auth else 8.2, remaining)
+                else:
+                    per_try = min(7.0 if force_fresh_auth else 6.0, remaining)
         elif attempt == 0:
             per_try = min(12.0, remaining)
         else:
@@ -1416,10 +1424,23 @@ async def test_all_panels(
     # Free Postgres before remote fan-out (idle-in-transaction / SSH rule).
     await release_db_txn(db)
 
-    # Wave 1: parallel, reuse JWT. Wave 2: only fails, fresh auth.
-    # Cap fan-out — Astra live-pings outbounds; too wide stampedes the node.
-    sem1 = asyncio.Semaphore(16)
-    sem2 = asyncio.Semaphore(8)
+    # Wave 1: parallel, reuse JWT. Wave 2: fails + fresh auth.
+    # Wave 3: remaining timeout fails — solo recover (local then worker).
+    # Cap fan-out — too wide stampedes workers and invents false «کند/قطع».
+    sem1 = asyncio.Semaphore(10)
+    sem2 = asyncio.Semaphore(4)
+    sem3 = asyncio.Semaphore(2)
+    # Per-worker gate: one agent must not see 8 probes at once.
+    per_worker: dict[int | None, asyncio.Semaphore] = {}
+
+    def _worker_sem(wid: int | None) -> asyncio.Semaphore:
+        key = int(wid) if wid is not None else None
+        sem = per_worker.get(key)
+        if sem is None:
+            sem = asyncio.Semaphore(3 if key is not None else 4)
+            per_worker[key] = sem
+        return sem
+
     t0 = _time.monotonic()
 
     def _outbound_warning(probe: dict) -> str | None:
@@ -1466,12 +1487,28 @@ async def test_all_panels(
             via_worker=bool(probe.get("via_worker")),
         )
 
+    def _is_timeout_fail(item: PanelTestOut) -> bool:
+        if item.success:
+            return False
+        err = (item.error or "").lower()
+        return any(
+            x in err
+            for x in (
+                "طول کشید",
+                "timeout",
+                "timed out",
+                "unreachable",
+                "connection",
+            )
+        )
+
     async def _one(
         snap: dict,
         *,
         sem: asyncio.Semaphore,
         overall: float,
         fresh_auth: bool,
+        force_local: bool = False,
     ) -> PanelTestOut:
         is_astra = (
             str(getattr(snap.get("type"), "value", snap.get("type")) or "")
@@ -1479,13 +1516,30 @@ async def test_all_panels(
         )
         # Astra live-pings every enabled outbound — need real headroom.
         budget = max(overall, 14.0) if is_astra else overall
-        async with sem:
-            probe = await _live_test_panel(
-                snap["panel"],
-                overall_timeout=budget,
-                quick=True,
-                force_fresh_auth=fresh_auth,
-            )
+        panel_obj = snap["panel"]
+        saved_wid = getattr(panel_obj, "worker_id", None)
+        if force_local:
+            try:
+                panel_obj.worker_id = None
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            async with sem:
+                async with _worker_sem(
+                    None if force_local else snap.get("worker_id")
+                ):
+                    probe = await _live_test_panel(
+                        panel_obj,
+                        overall_timeout=budget,
+                        quick=True,
+                        force_fresh_auth=fresh_auth,
+                    )
+        finally:
+            if force_local:
+                try:
+                    panel_obj.worker_id = saved_wid
+                except Exception:  # noqa: BLE001
+                    pass
         return _to_out(snap, probe)
 
     results: list[PanelTestOut] = []
@@ -1494,7 +1548,7 @@ async def test_all_panels(
     if snapshots:
         gathered = await asyncio.gather(
             *[
-                _one(s, sem=sem1, overall=8.0, fresh_auth=False)
+                _one(s, sem=sem1, overall=9.0, fresh_auth=False)
                 for s in snapshots
             ],
             return_exceptions=True,
@@ -1550,6 +1604,50 @@ async def test_all_panels(
                     results.append(item)
                 elif item.success or not results[idx].success:
                     # Prefer success; on still-fail keep the fresher error/latency.
+                    results[idx] = item
+
+        # Wave 3 — timeout/unreachable only: try master path alone, then worker.
+        # Prevents stampede false-قطع when the panel is fine from Astra.
+        by_id = {int(r.id): i for i, r in enumerate(results)}
+        recover_snaps = [
+            s
+            for s in snapshots
+            if (idx := by_id.get(int(s["id"]))) is not None
+            and _is_timeout_fail(results[idx])
+        ]
+        if recover_snaps:
+            await asyncio.sleep(0.35)
+
+            async def _recover(snap: dict) -> PanelTestOut:
+                local = await _one(
+                    snap,
+                    sem=sem3,
+                    overall=10.0,
+                    fresh_auth=True,
+                    force_local=True,
+                )
+                if local.success:
+                    return local
+                via = await _one(
+                    snap,
+                    sem=sem3,
+                    overall=12.0,
+                    fresh_auth=True,
+                    force_local=False,
+                )
+                return via if via.success else local
+
+            recovered = await asyncio.gather(
+                *[_recover(s) for s in recover_snaps],
+                return_exceptions=True,
+            )
+            for snap, item in zip(recover_snaps, recovered):
+                if isinstance(item, Exception):
+                    continue
+                idx = by_id.get(int(snap["id"]))
+                if idx is None:
+                    continue
+                if item.success or not results[idx].success:
                     results[idx] = item
 
     # Keep result order aligned with the requested / listed panel ids.

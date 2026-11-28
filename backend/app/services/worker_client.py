@@ -433,11 +433,12 @@ class WorkerRoutedAdapter:
         return res
 
     async def test_connection(self) -> AdapterResult:
-        # Probe must not sit behind the default 40s mutate budget — workers
-        # answer light health checks in <2s. Keep worker hop short so a hung
-        # tunnel still leaves time for master→panel failover inside test-all.
+        # Probe must not sit behind the default 40s mutate budget. Keep the
+        # worker hop short (~3s) so a congested tunnel still leaves time for
+        # master→panel failover — otherwise test-all stamps «قطع» when the
+        # panel is fine from Astra (false قطع under fan-out).
         prev_to = self._op_timeout
-        self._op_timeout = min(prev_to, 4.5)
+        self._op_timeout = min(prev_to, 3.2)
         try:
             got = await self._via_worker("test_connection", {})
         finally:
