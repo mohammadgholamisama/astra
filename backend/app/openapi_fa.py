@@ -399,21 +399,51 @@ _OPS: dict[tuple[str, str], tuple[str, str]] = {
         "صفحه **پنل‌ها**.",
         "پنل‌های سنایی، پاسارگاد، مرزبان، آسترا، ربکا و … با وضعیت فعال/خاموش و دسته را برمی‌گرداند.",
     ),
-    ("post", "/api/admin/panels"): _d(
+    ("post", "/api/admin/panels"): (
         "ثبت پنل ریموت جدید",
-        "صفحه پنل‌ها → افزودن پنل.",
-        "آدرس، نوع، یوزر/پسورد یا توکن را ذخیره می‌کند تا بعداً ساخت کاربر و تست روی آن انجام شود.",
-        "تا وقتی پنل را به گروه وصل نکنید در فروش دیده نمی‌شود.",
+        "\n\n".join(
+            [
+                "**کجا:** صفحه پنل‌ها → افزودن پنل / Integration.",
+                "**قبل از ارسال:** `GET /api/v1/panel-types` را بزنید تا مقدار دقیق `type` را بگیرید.",
+                "**بدنه (JSON) — هر فیلد:**",
+                "- **name** — نام پنل در Astra که خودتان می‌گذارید. "
+                "نوع: `string` حداقل ۲ حداکثر ۱۲۸؛ باید یکتا باشد.",
+                "- **type** — نوع پنل ریموت. نوع: `string` فقط یکی از "
+                "`sanaei` | `pasarguard` | `marzban` | `rebecca` | `guard` | `astra`.",
+                "- **base_url** — آدرس پایه پنل. نوع: `string` "
+                "(مثلاً `https://host:2053`). حداکثر ۵۱۲ کاراکتر.",
+                "- **username** — یوزرنیم ادمین پنل ریموت. نوع: `string|null` حداکثر ۱۲۸. "
+                "برای سنایی/مرزبان/پاسارگاد معمولاً اجباری.",
+                "- **password** — رمز ادمین پنل ریموت که خودتان تنظیم کرده‌اید. "
+                "نوع: `string|null` حداکثر ۲۵۵. برای سنایی اجباری.",
+                "- **api_token** — توکن API پنل (سنایی: Settings → API Token). "
+                "نوع: `string|null`.",
+                "- **meta** — تنظیمات اضافه. نوع: `object` معمولاً `{}`.",
+                "- **is_active** — روشن باشد یا نه. نوع: `boolean` پیش‌فرض `true`.",
+                "- **category_id** — دسته UI. نوع: `integer|null`؛ روی فروش اثر ندارد.",
+                "**نتیجه:** پنل ذخیره می‌شود؛ تا به گروه وصل نشود در ساب فروش نمی‌آید.",
+            ]
+        ),
     ),
     ("get", "/api/admin/panels/{panel_id}"): _d(
         "جزئیات تنظیمات یک پنل",
         "ویرایش پنل در UI.",
         "base URL، نوع، متا، ورکر و وضعیت همان پنل را می‌دهد.",
     ),
-    ("put", "/api/admin/panels/{panel_id}"): _d(
+    ("put", "/api/admin/panels/{panel_id}"): (
         "ویرایش آدرس/لاگین/متای پنل",
-        "ذخیره فرم ویرایش پنل.",
-        "اطلاعات اتصال را عوض می‌کند؛ روی یوزرهای قبلی معمولاً فقط از این به بعد اثر دارد مگر resync کنید.",
+        "\n\n".join(
+            [
+                "**کجا:** ذخیره فرم ویرایش پنل.",
+                "**بدنه:** فقط فیلدهایی را بفرستید که می‌خواهید عوض شوند "
+                "(بقیه را نگذارید تا همان قبلی بماند).",
+                "- **password** — رمز جدید ادمین پنل ریموت. نوع: `string|null` حداکثر ۲۵۵.",
+                "- **username** / **base_url** / **api_token** / **meta** / **is_active** "
+                "مثل همان فیلدهای ساخت پنل.",
+                "- **clear_category** — اگر `true` دسته UI پاک می‌شود. نوع: `boolean`.",
+                "**اثر:** اتصال بعدی با اطلاعات جدید است؛ برای اعمال روی ساب‌های قبلی معمولاً resync لازم است.",
+            ]
+        ),
     ),
     ("delete", "/api/admin/panels/{panel_id}"): _d(
         "حذف پنل از Astra",
@@ -1176,6 +1206,21 @@ _USAGE_REPORT_BODY_EXAMPLE: dict[str, Any] = {
 }
 
 _COMMON_REQUEST_EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
+    ("post", "/api/admin/panels"): {
+        "name": "DE-Sanaei-1",
+        "type": "sanaei",
+        "base_url": "https://panel.example.com:2053/secretPath",
+        "username": "admin",
+        "password": "MyPanelPass123",
+        "api_token": "YOUR_3XUI_API_TOKEN",
+        "meta": {},
+        "is_active": True,
+        "category_id": None,
+    },
+    ("put", "/api/admin/panels/{panel_id}"): {
+        "password": "NewPanelPass123",
+        "is_active": True,
+    },
     ("post", "/api/user"): {
         "username": "demo_user",
         "display_name": "Demo",
@@ -1953,34 +1998,98 @@ def _enrich_param_descriptions(item: dict[str, Any]) -> None:
 
 _SCHEMA_FIELD_HELP: dict[str, dict[str, str]] = {
     "UserCreate": {
-        "data_limit": "سقف حجم به **بایت**. `0` = نامحدود.",
-        "expire": "unix timestamp **ثانیه‌ای** UTC. `0`/null = بدون انقضا.",
-        "on_hold_expire_duration": "مدت اعتبار بعد از اولین اتصال (on_hold) به **ثانیه**.",
-        "proxies": "تنظیم پروکسی‌ها؛ معمولاً `{}`.",
-        "inbounds": "انتخاب inbound؛ معمولاً `{}`.",
-        "group_ids": "لیست شناسه گروه‌ها.",
+        "username": (
+            "نام کاربری مشترک که خودتان برای مشتری می‌سازید.\n"
+            "نوع: string — ۳ تا ۳۲ کاراکتر؛ فقط a-z A-Z 0-9 و `_`."
+        ),
+        "data_limit": (
+            "سقف حجم اینترنت کاربر.\n"
+            "نوع: integer (بایت). `0` یعنی نامحدود. مثال ۱۰۰ گیگ: `107374182400`."
+        ),
+        "expire": (
+            "زمان انقضای اکانت.\n"
+            "نوع: integer|null — unix timestamp ثانیه‌ای UTC. `0` یا null = بدون انقضا."
+        ),
+        "on_hold_expire_duration": (
+            "مدت اعتبار بعد از اولین اتصال در حالت on_hold.\n"
+            "نوع: integer — ثانیه. `0` = غیرفعال."
+        ),
+        "password": (
+            "رمز قابل تنظیم توسط شما برای کاربر (اگر سرویس رمز بخواهد).\n"
+            "نوع: string — معمولاً حداکثر حدود ۱۰۰ کاراکتر."
+        ),
+        "proxies": "تنظیم پروکسی‌ها. نوع: object — معمولاً `{}`.",
+        "inbounds": "انتخاب inbound. نوع: object — معمولاً `{}`.",
+        "group_ids": (
+            "شناسه گروه‌هایی که کاربر عضو می‌شود.\n"
+            "نوع: array[integer] — مثال: `[7, 12]`."
+        ),
     },
     "UserModify": {
-        "data_limit": "سقف حجم به **بایت**. `0` = نامحدود.",
-        "expire": "unix timestamp **ثانیه‌ای**. `0` = بدون انقضا.",
+        "data_limit": (
+            "سقف حجم.\nنوع: integer|null — بایت؛ `0` = نامحدود."
+        ),
+        "expire": (
+            "انقضا.\nنوع: integer|null — unix timestamp ثانیه‌ای؛ `0` = بدون انقضا."
+        ),
     },
     "UserResponse": {
-        "used_traffic": "مصرف فعلی به **بایت**.",
-        "lifetime_used_traffic": "مصرف تجمعی به **بایت**.",
-        "data_limit": "سقف حجم به **بایت**. `0` = نامحدود.",
-        "expire": "unix timestamp **ثانیه‌ای** یا null.",
+        "used_traffic": "مصرف فعلی.\nنوع: integer — بایت.",
+        "lifetime_used_traffic": "مصرف تجمعی.\nنوع: integer — بایت.",
+        "data_limit": "سقف حجم.\nنوع: integer — بایت؛ `0` = نامحدود.",
+        "expire": "انقضا.\nنوع: integer|null — unix timestamp ثانیه‌ای.",
+    },
+    "PanelCreate": {
+        "name": (
+            "نام پنل در Astra که خودتان می‌گذارید.\n"
+            "نوع: string — حداقل ۲ حداکثر ۱۲۸؛ یکتا."
+        ),
+        "type": (
+            "نوع پنل ریموت.\n"
+            "نوع: string — فقط: sanaei | pasarguard | marzban | rebecca | guard | astra "
+            "(از GET /api/v1/panel-types)."
+        ),
+        "base_url": (
+            "آدرس پایه پنل ریموت.\n"
+            "نوع: string — مثل https://host:2053 ؛ حداکثر ۵۱۲."
+        ),
+        "username": (
+            "یوزرنیم ادمین پنل ریموت.\n"
+            "نوع: string|null — حداکثر ۱۲۸."
+        ),
+        "password": (
+            "رمز ادمین پنل ریموت که خودتان تنظیم کرده‌اید.\n"
+            "نوع: string|null — حداکثر ۲۵۵؛ برای سنایی اجباری."
+        ),
+        "api_token": (
+            "توکن API پنل ریموت.\n"
+            "نوع: string|null — برای سنایی (3X-UI) اجباری."
+        ),
+        "meta": "تنظیمات اضافه.\nنوع: object — معمولاً {}.",
+        "is_active": "روشن/خاموش.\nنوع: boolean — پیش‌فرض true.",
+        "category_id": "دسته UI.\nنوع: integer|null.",
+    },
+    "PanelUpdate": {
+        "password": (
+            "رمز جدید ادمین پنل ریموت.\n"
+            "نوع: string|null — حداکثر ۲۵۵."
+        ),
+        "username": "یوزرنیم ادمین.\nنوع: string|null — حداکثر ۱۲۸.",
+        "base_url": "آدرس پایه.\nنوع: string|null — حداکثر ۵۱۲.",
+        "api_token": "توکن API.\nنوع: string|null.",
+        "clear_category": "پاک کردن دسته UI.\nنوع: boolean.",
     },
     "WorkerUsageReport": {
-        "panel_id": "شناسه پنل مقصد در Astra.",
-        "meters": "لیست مصرف per-remote_username.",
-        "listed": "تعداد کاربران لیست‌شده روی پنل در این گزارش.",
-        "full_sync": "اگر true، مترهای غایب مجاز به کوچک‌شدن/ریست‌اند.",
-        "mode": "حالت جمع‌آوری ورکر: hot | warm | cold.",
-        "dt_ms": "مدت جمع‌آوری روی ورکر به میلی‌ثانیه.",
+        "panel_id": "شناسه پنل مقصد در Astra.\nنوع: integer.",
+        "meters": "لیست مصرف per-remote_username.\nنوع: array.",
+        "listed": "تعداد کاربران لیست‌شده.\nنوع: integer.",
+        "full_sync": "اجازه کوچک‌شدن مترها.\nنوع: boolean.",
+        "mode": "حالت جمع‌آوری.\nنوع: string|null — hot|warm|cold.",
+        "dt_ms": "مدت جمع‌آوری.\nنوع: integer|null — میلی‌ثانیه.",
     },
     "WorkerUsageMeter": {
-        "used_traffic": "مصرف به **بایت**.",
-        "remote_username": "نام کاربری روی پنل ریموت.",
+        "used_traffic": "مصرف.\nنوع: integer — بایت.",
+        "remote_username": "نام کاربری روی پنل ریموت.\nنوع: string.",
     },
 }
 
@@ -1998,7 +2107,8 @@ def _enrich_component_schemas(schema: dict[str, Any]) -> None:
             continue
         for fname, help_fa in fields.items():
             prop = props.get(fname)
-            if isinstance(prop, dict) and not prop.get("description"):
+            if isinstance(prop, dict):
+                # Prefer our programmer-facing Persian help (type + how to set).
                 prop["description"] = help_fa
     # Generic unit hints for common traffic/time fields across models.
     for node in comps.values():

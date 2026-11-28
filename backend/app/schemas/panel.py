@@ -8,32 +8,154 @@ from app.schemas.common import ORMModel
 
 
 class PanelCreate(BaseModel):
-    name: str = Field(min_length=2, max_length=128)
+    name: str = Field(
+        min_length=2,
+        max_length=128,
+        description=(
+            "نام پنل در Astra که خودتان انتخاب می‌کنید (برای نمایش در UI و گزارش‌ها).\n"
+            "نوع: string — حداقل ۲، حداکثر ۱۲۸ کاراکتر. باید یکتا باشد."
+        ),
+        examples=["DE-1", "Panel-Sanaei-1"],
+    )
     type: PanelType = Field(
         description=(
-            "نوع پنل — مقدار دقیق از `GET /api/v1/panel-types` "
-            "(مثلاً sanaei / pasarguard / marzban / rebecca / guard / astra)."
+            "نوع پنل ریموت — مقدار را دقیقاً از `GET /api/v1/panel-types` کپی کنید.\n"
+            "نوع: string (enum) — فقط یکی از این‌ها: "
+            "`sanaei` | `pasarguard` | `marzban` | `rebecca` | `guard` | `astra`.\n"
+            "مثال اشتباه که کار نمی‌کند: `Sanaei`، `3x-ui`، `marz`."
+        ),
+        examples=["sanaei"],
+    )
+    base_url: str = Field(
+        min_length=1,
+        max_length=512,
+        description=(
+            "آدرس پایه پنل ریموت که Astra به آن وصل می‌شود.\n"
+            "نوع: string — معمولاً با `https://` شروع می‌شود؛ حداکثر ۵۱۲ کاراکتر.\n"
+            "مثال: `https://panel.example.com:2053` یا برای سنایی "
+            "`https://host:port/pathPrefix`."
+        ),
+        examples=["https://panel.example.com:2053"],
+    )
+    username: str | None = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "نام کاربری ادمین پنل ریموت (لاگین همان پنل).\n"
+            "نوع: string | null — حداکثر ۱۲۸ کاراکتر.\n"
+            "برای `sanaei` / `marzban` / `pasarguard` معمولاً اجباری است؛ "
+            "برای `astra` لازم نیست (`null`)."
+        ),
+        examples=["admin"],
+    )
+    password: str | None = Field(
+        default=None,
+        max_length=255,
+        description=(
+            "رمز عبور ادمین پنل ریموت — همان رمزی که خودتان در پنل مقصد گذاشته‌اید.\n"
+            "نوع: string | null — حداکثر ۲۵۵ کاراکتر.\n"
+            "برای `sanaei` اجباری است؛ همراه با `username` فرستاده می‌شود. "
+            "برای `astra` لازم نیست."
+        ),
+        examples=["MyPanelPass123"],
+    )
+    api_token: str | None = Field(
+        default=None,
+        max_length=2048,
+        description=(
+            "توکن API پنل ریموت (اگر پنل به‌جای یا علاوه بر یوزر/پسورد توکن دارد).\n"
+            "نوع: string | null — حداکثر حدود ۲۰۰۰ کاراکتر.\n"
+            "برای `sanaei` (3X-UI): از Settings → Security → API Token اجباری است. "
+            "برای بعضی پنل‌ها اختیاری است؛ برای `astra` لازم نیست."
         ),
     )
-    base_url: str
-    username: str | None = None
-    password: str | None = None
-    api_token: str | None = None
-    meta: dict[str, Any] = Field(default_factory=dict)
-    is_active: bool = True
-    category_id: int | None = None
+    meta: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "تنظیمات اضافی اختیاری پنل (JSON object).\n"
+            "نوع: object — معمولاً `{}`. "
+            "کلیدهای خاص هر نوع پنل اینجا می‌آید (مثلاً host عمومی Astra)."
+        ),
+        examples=[{}],
+    )
+    is_active: bool = Field(
+        default=True,
+        description=(
+            "آیا پنل بعد از ثبت روشن باشد و در ساخت کاربر / ساب استفاده شود.\n"
+            "نوع: boolean — `true` = روشن، `false` = خاموش. پیش‌فرض: `true`."
+        ),
+    )
+    category_id: int | None = Field(
+        default=None,
+        description=(
+            "شناسه دسته/تب UI برای گروه‌بندی پنل‌ها در صفحه پنل‌ها.\n"
+            "نوع: integer | null — اگر `null` باشد در تب پیش‌فرض «همه پنل‌ها» می‌رود. "
+            "روی فروش/ساب اثر ندارد."
+        ),
+    )
 
 
 class PanelUpdate(BaseModel):
-    name: str | None = None
-    base_url: str | None = None
-    username: str | None = None
-    password: str | None = None
-    api_token: str | None = None
-    meta: dict[str, Any] | None = None
-    is_active: bool | None = None
-    category_id: int | None = None
-    clear_category: bool = False
+    name: str | None = Field(
+        default=None,
+        min_length=2,
+        max_length=128,
+        description=(
+            "نام جدید پنل در Astra.\n"
+            "نوع: string | null — حداقل ۲، حداکثر ۱۲۸. اگر نفرستید عوض نمی‌شود."
+        ),
+    )
+    base_url: str | None = Field(
+        default=None,
+        max_length=512,
+        description=(
+            "آدرس پایه جدید پنل ریموت.\n"
+            "نوع: string | null — حداکثر ۵۱۲ کاراکتر."
+        ),
+    )
+    username: str | None = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "نام کاربری ادمین پنل ریموت.\n"
+            "نوع: string | null — حداکثر ۱۲۸ کاراکتر."
+        ),
+    )
+    password: str | None = Field(
+        default=None,
+        max_length=255,
+        description=(
+            "رمز عبور ادمین پنل ریموت که خودتان تنظیم کرده‌اید.\n"
+            "نوع: string | null — حداکثر ۲۵۵ کاراکتر. اگر خالی بفرستید رمز قبلی می‌ماند."
+        ),
+    )
+    api_token: str | None = Field(
+        default=None,
+        max_length=2048,
+        description=(
+            "توکن API پنل ریموت.\n"
+            "نوع: string | null."
+        ),
+    )
+    meta: dict[str, Any] | None = Field(
+        default=None,
+        description="تنظیمات اضافی JSON. نوع: object | null.",
+    )
+    is_active: bool | None = Field(
+        default=None,
+        description="روشن/خاموش بودن پنل. نوع: boolean | null.",
+    )
+    category_id: int | None = Field(
+        default=None,
+        description="شناسه دسته UI. نوع: integer | null.",
+    )
+    clear_category: bool = Field(
+        default=False,
+        description=(
+            "اگر `true` باشد دسته UI پنل پاک می‌شود (به تب پیش‌فرض برمی‌گردد).\n"
+            "نوع: boolean — پیش‌فرض `false`."
+        ),
+    )
 
 
 class PanelActiveSet(BaseModel):
